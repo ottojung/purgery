@@ -7,6 +7,6 @@ log_dir = "/var/log/purgery"
 max_parallel_jobs = 1
 
 [postprocess.steps.compress-video]
-kind = "builtin"
+kind = "compress-video"
 program = "my-compress-video"
-args = ["--input", "{path}"]
+keep_original = true

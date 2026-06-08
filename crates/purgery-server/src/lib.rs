@@ -1,8 +1,11 @@
 use anyhow::{Context, Result};
+use camino::{Utf8Path, Utf8PathBuf};
 use purgery_core::{
-    path_is_within_root, shell_escape, validate_envelope, FileStatus, FileStatusEntry, Manifest,
-    Nickname, PurgeryRoot, RunId, RunPhase, RunState, RunStatus, ServerConfig,
+    check_symlink_in_path, path_is_within_root, validate_envelope, work_dir, FileStatus,
+    FileStatusEntry, Manifest, Nickname, PostprocessKind, PurgeryRoot, RunId, RunPhase, RunState,
+    RunStatus, ServerConfig,
 };
+use std::collections::HashMap;
 use std::fs;
 
 /// A run-level failure — written when the run cannot be processed at all.
@@ -163,7 +166,12 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
         anyhow::bail!("{msg}");
     }
 
-    let sync_map: std::collections::HashMap<&str, &purgery_core::SyncMapping> = client_config
+    // Create work area
+    let work_area = work_dir(config.root.as_path(), nickname, run_id);
+    fs::create_dir_all(&work_area)
+        .with_context(|| format!("failed to create work area: {}", work_area.as_str()))?;
+
+    let sync_map: HashMap<&str, &purgery_core::SyncMapping> = client_config
         .sync
         .iter()
         .map(|s| (s.name.as_str(), s))
@@ -174,20 +182,17 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
     let mut all_imported = true;
 
     for file_entry in &manifest.files {
-        let sync_name = &file_entry.sync_name;
-        let Some(sync) = sync_map.get(sync_name.as_str()) else {
-            eprintln!(
-                "sync mapping '{}' not found in client config, skipping",
-                sync_name
-            );
+        let sync_name = file_entry.sync_name.as_str();
+        let Some(sync) = sync_map.get(sync_name) else {
+            eprintln!("sync mapping '{sync_name}' not found in client config, skipping");
             status_entries.push(FileStatusEntry {
-                sync_name: sync_name.clone(),
-                local_path: file_entry.local_path.clone(),
+                sync_name: file_entry.sync_name.clone(),
+                local_path: file_entry.local_path.as_str().to_owned(),
                 relative_path: file_entry.relative_path.as_str().to_owned(),
                 status: FileStatus::Skipped,
                 final_path: None,
                 postprocess: None,
-                error: Some(format!("sync mapping '{}' not found", sync_name)),
+                error: Some(format!("sync mapping '{sync_name}' not found")),
             });
             all_imported = false;
             continue;
@@ -199,8 +204,8 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
         // Verify path stays within the server root
         if !path_is_within_root(&final_path, root.as_path()) {
             status_entries.push(FileStatusEntry {
-                sync_name: sync_name.clone(),
-                local_path: file_entry.local_path.clone(),
+                sync_name: file_entry.sync_name.clone(),
+                local_path: file_entry.local_path.as_str().to_owned(),
                 relative_path: file_entry.relative_path.as_str().to_owned(),
                 status: FileStatus::Failed,
                 final_path: None,
@@ -211,13 +216,28 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
             continue;
         }
 
+        // Symlink check before committing
+        if let Err(e) = check_symlink_in_path(&final_path, root.as_path()) {
+            status_entries.push(FileStatusEntry {
+                sync_name: file_entry.sync_name.clone(),
+                local_path: file_entry.local_path.as_str().to_owned(),
+                relative_path: file_entry.relative_path.as_str().to_owned(),
+                status: FileStatus::Failed,
+                final_path: None,
+                postprocess: None,
+                error: Some(format!("symlink check failed: {e}")),
+            });
+            all_imported = false;
+            continue;
+        }
+
         let staged_path = file_entry.staged_path.as_str();
         let source_path = processing_path.join(staged_path);
 
         if !source_path.exists() {
             status_entries.push(FileStatusEntry {
-                sync_name: sync_name.clone(),
-                local_path: file_entry.local_path.clone(),
+                sync_name: file_entry.sync_name.clone(),
+                local_path: file_entry.local_path.as_str().to_owned(),
                 relative_path: file_entry.relative_path.as_str().to_owned(),
                 status: FileStatus::Failed,
                 final_path: None,
@@ -229,15 +249,14 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
         }
 
         // Server-side file identity verification
-        let source_utf8 =
-            camino::Utf8PathBuf::from_path_buf(source_path.clone().into_std_path_buf())
-                .unwrap_or_else(|p| camino::Utf8PathBuf::from(p.to_string_lossy().as_ref()));
+        let source_utf8 = Utf8PathBuf::from_path_buf(source_path.clone().into_std_path_buf())
+            .unwrap_or_else(|p| Utf8PathBuf::from(p.to_string_lossy().as_ref()));
         if let Err(e) = file_entry.verify_staged(&source_utf8) {
             let msg = format!("staged file identity check failed: {e}");
             eprintln!("{msg}");
             status_entries.push(FileStatusEntry {
-                sync_name: sync_name.clone(),
-                local_path: file_entry.local_path.clone(),
+                sync_name: file_entry.sync_name.clone(),
+                local_path: file_entry.local_path.as_str().to_owned(),
                 relative_path: file_entry.relative_path.as_str().to_owned(),
                 status: FileStatus::Failed,
                 final_path: None,
@@ -248,39 +267,18 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
             continue;
         }
 
-        if let Some(parent) = final_path.parent() {
+        // Copy staged file to work area
+        let work_path = work_area.join(file_entry.relative_path.as_str());
+        if let Some(parent) = work_path.parent() {
             fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create parent directory: {}", parent.as_str())
+                format!("failed to create work subdirectory: {}", parent.as_str())
             })?;
         }
-
-        // Build temporary import path
-        let rel_part = file_entry.relative_path.as_str().replace('/', "_");
-        let tmp_name = format!(".purgery-importing.{rel_part}.tmp");
-        let tmp_path = final_path
-            .parent()
-            .map(|p| p.join(&tmp_name))
-            .unwrap_or_else(|| final_path.with_file_name(&tmp_name));
-
-        // Move (or copy+delete) to temporary path
-        if let Err(e) = fs::rename(&source_path, &tmp_path) {
-            eprintln!("rename failed (may be cross-filesystem): {e}, falling back to copy");
-            fs::copy(&source_path, &tmp_path).with_context(|| {
-                format!(
-                    "failed to copy {} to {}",
-                    source_path.as_str(),
-                    tmp_path.as_str()
-                )
-            })?;
-            let _ = fs::remove_file(&source_path);
-        }
-
-        // Atomic rename into place
-        fs::rename(&tmp_path, final_path.as_std_path()).with_context(|| {
+        fs::copy(source_path.as_std_path(), work_path.as_std_path()).with_context(|| {
             format!(
-                "failed to rename {} to {}",
-                tmp_path.as_str(),
-                final_path.as_str()
+                "failed to copy {} to {}",
+                source_path.as_str(),
+                work_path.as_str()
             )
         })?;
 
@@ -290,48 +288,99 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
             sync.to_path.as_str(),
             file_entry.relative_path.as_str()
         );
-        let applied_steps =
-            apply_postprocessing(config, &client_config, &normalized_path, &final_path);
+        let postprocess_result =
+            apply_postprocessing(config, &client_config, &normalized_path, &work_path);
 
-        let has_failure = applied_steps.iter().any(|(_, success)| !success);
-        let was_imported = !has_failure;
+        match postprocess_result {
+            Ok(outputs) => {
+                // Create final parent directory
+                if let Some(parent) = final_path.parent() {
+                    fs::create_dir_all(parent).with_context(|| {
+                        format!("failed to create parent directory: {}", parent.as_str())
+                    })?;
+                }
 
-        if was_imported {
-            let steps: Vec<String> = applied_steps.iter().map(|(name, _)| name.clone()).collect();
-            let steps_opt = if steps.is_empty() { None } else { Some(steps) };
-            status_entries.push(FileStatusEntry {
-                sync_name: sync_name.clone(),
-                local_path: file_entry.local_path.clone(),
-                relative_path: file_entry.relative_path.as_str().to_owned(),
-                status: FileStatus::Imported,
-                final_path: Some(
-                    final_path
-                        .strip_prefix(root.as_path())
-                        .unwrap_or(&final_path)
-                        .to_string(),
-                ),
-                postprocess: steps_opt,
-                error: None,
-            });
-        } else {
-            let error_msg = applied_steps
-                .iter()
-                .filter(|(_, success)| !success)
-                .map(|(name, _)| format!("{name} failed"))
-                .collect::<Vec<_>>()
-                .join("; ");
-            status_entries.push(FileStatusEntry {
-                sync_name: sync_name.clone(),
-                local_path: file_entry.local_path.clone(),
-                relative_path: file_entry.relative_path.as_str().to_owned(),
-                status: FileStatus::Failed,
-                final_path: None,
-                postprocess: None,
-                error: Some(error_msg),
-            });
-            all_imported = false;
+                // Commit each output to its final path
+                let mut committed_paths = Vec::new();
+                for output in &outputs {
+                    let output_final = if output == &work_path {
+                        final_path.clone()
+                    } else {
+                        let filename = output.file_name().unwrap_or("");
+                        final_path
+                            .parent()
+                            .map_or_else(|| Utf8PathBuf::from(filename), |p| p.join(filename))
+                    };
+
+                    if let Some(parent) = output_final.parent() {
+                        fs::create_dir_all(parent).with_context(|| {
+                            format!("failed to create parent: {}", parent.as_str())
+                        })?;
+                    }
+                    fs::copy(output.as_std_path(), output_final.as_std_path()).with_context(
+                        || {
+                            format!(
+                                "failed to copy {} to {}",
+                                output.as_str(),
+                                output_final.as_str()
+                            )
+                        },
+                    )?;
+                    committed_paths.push(output_final);
+                }
+
+                // Determine postprocess step names that were applied
+                let applied_steps: Vec<String> = client_config
+                    .postprocess
+                    .rules
+                    .iter()
+                    .filter(|r| {
+                        regex::Regex::new(&r.pattern)
+                            .map(|re| re.is_match(&normalized_path))
+                            .unwrap_or(false)
+                    })
+                    .flat_map(|r| r.steps.clone())
+                    .collect();
+
+                let steps_opt = if applied_steps.is_empty() {
+                    None
+                } else {
+                    Some(applied_steps)
+                };
+
+                status_entries.push(FileStatusEntry {
+                    sync_name: file_entry.sync_name.clone(),
+                    local_path: file_entry.local_path.as_str().to_owned(),
+                    relative_path: file_entry.relative_path.as_str().to_owned(),
+                    status: FileStatus::Imported,
+                    final_path: Some(
+                        final_path
+                            .strip_prefix(root.as_path())
+                            .unwrap_or(&final_path)
+                            .to_string(),
+                    ),
+                    postprocess: steps_opt,
+                    error: None,
+                });
+            }
+            Err(e) => {
+                eprintln!("postprocessing failed for '{}': {e}", normalized_path);
+                status_entries.push(FileStatusEntry {
+                    sync_name: file_entry.sync_name.clone(),
+                    local_path: file_entry.local_path.as_str().to_owned(),
+                    relative_path: file_entry.relative_path.as_str().to_owned(),
+                    status: FileStatus::Failed,
+                    final_path: None,
+                    postprocess: None,
+                    error: Some(e),
+                });
+                all_imported = false;
+            }
         }
     }
+
+    // Clean up work area
+    let _ = fs::remove_dir_all(&work_area);
 
     let run_state = if all_imported {
         RunState::Done
@@ -386,19 +435,18 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
     Ok(())
 }
 
-/// Apply postprocessing rules to a file.
+/// Apply postprocessing rules to a file in the work area.
 ///
-/// Returns a list of (step_name, success) pairs.
-/// Uses `{path}` as the template placeholder in args.
+/// Returns the list of work area paths to commit.
+/// For compress-video: runs `<program> --input <work_path>`, checks for `.Z.webm` output.
 pub fn apply_postprocessing(
     server_config: &ServerConfig,
     client_config: &purgery_core::ClientConfig,
     normalized_path: &str,
-    final_path: impl AsRef<std::path::Path>,
-) -> Vec<(String, bool)> {
-    let final_path = final_path.as_ref();
-    let final_path_str = final_path.to_string_lossy();
-    let mut results = Vec::new();
+    work_path: &Utf8Path,
+) -> Result<Vec<Utf8PathBuf>, String> {
+    let mut results: Vec<Utf8PathBuf> = Vec::new();
+    let mut any_rule_matched = false;
 
     for rule in &client_config.postprocess.rules {
         let Ok(re) = regex::Regex::new(&rule.pattern) else {
@@ -409,54 +457,60 @@ pub fn apply_postprocessing(
         if !re.is_match(normalized_path) {
             continue;
         }
+        any_rule_matched = true;
 
         for step_name in &rule.steps {
             let Some(step_def) = server_config.postprocess.steps.get(step_name) else {
-                eprintln!("postprocess step '{step_name}' not defined on server");
-                results.push((step_name.clone(), false));
-                continue;
+                return Err(format!(
+                    "postprocess step '{step_name}' not defined on server"
+                ));
             };
 
-            // Substitute {path} in args with the actual file path
-            let args: Vec<String> = step_def
-                .args
-                .iter()
-                .map(|a| a.replace("{path}", &final_path_str))
-                .collect();
-
-            eprintln!(
-                "running postprocess step '{step_name}': {} {:?}",
-                step_def.program, args
-            );
-
-            let success = match std::process::Command::new(&step_def.program)
-                .args(&args)
-                .status()
-            {
-                Ok(status) if status.success() => {
-                    eprintln!("postprocess step '{step_name}' succeeded");
-                    true
-                }
-                Ok(status) => {
+            match step_def.kind {
+                PostprocessKind::CompressVideo => {
                     eprintln!(
-                        "postprocess step '{step_name}' failed with exit code: {}",
-                        status
-                            .code()
-                            .map(|c| c.to_string())
-                            .unwrap_or_else(|| "signal".to_owned())
+                        "running postprocess step '{step_name}': {} --input {}",
+                        step_def.program,
+                        work_path.as_str()
                     );
-                    false
+
+                    let status = std::process::Command::new(&step_def.program)
+                        .arg("--input")
+                        .arg(work_path.as_str())
+                        .status()
+                        .map_err(|e| format!("failed to run {step_name}: {e}"))?;
+
+                    if !status.success() {
+                        return Err(format!("{step_name} failed"));
+                    }
+
+                    // Check for expected .Z.webm output
+                    let stem = work_path.file_stem().unwrap_or("");
+                    let compressed_name = format!("{stem}.Z.webm");
+                    let compressed = work_path.with_file_name(&compressed_name);
+
+                    if !compressed.exists() {
+                        return Err(format!(
+                            "expected output not found: {}",
+                            compressed.as_str()
+                        ));
+                    }
+
+                    if step_def.keep_original {
+                        results.push(work_path.to_owned());
+                    }
+                    results.push(compressed);
                 }
-                Err(e) => {
-                    eprintln!("postprocess step '{step_name}' error: {e}");
-                    false
-                }
-            };
-            results.push((step_name.clone(), success));
+            }
         }
     }
 
-    results
+    if !any_rule_matched {
+        // No matching rules, just commit the original
+        results.push(work_path.to_owned());
+    }
+
+    Ok(results)
 }
 
 /// Move a failed run's directory from processing to failed.
@@ -520,7 +574,7 @@ pub fn build_remote_command(program: &str, args: &[String]) -> String {
     cmd.push_str(program);
     for a in args {
         cmd.push(' ');
-        cmd.push_str(&shell_escape(a));
+        cmd.push_str(&purgery_core::shell_escape(a));
     }
     cmd
 }
@@ -528,8 +582,11 @@ pub fn build_remote_command(program: &str, args: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use camino::{Utf8Path, Utf8PathBuf};
-    use purgery_core::{ManifestFileEntry, NormalizedRelativePath, PostprocessConfig, ServerRoot};
+    use camino::Utf8PathBuf;
+    use purgery_core::{
+        ClientLocalPath, ManifestFileEntry, NormalizedRelativePath, PostprocessConfig,
+        PostprocessKind, PostprocessStepDefinition, ServerRoot, SyncName,
+    };
 
     fn test_server_config(purgery_root: &str, server_root: &str) -> ServerConfig {
         ServerConfig {
@@ -583,8 +640,8 @@ delete_after_import = true
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             files: vec![ManifestFileEntry {
-                sync_name: "videos".into(),
-                local_path: "/home/user/Videos/test.mp4".into(),
+                sync_name: SyncName::new("videos".into()).unwrap(),
+                local_path: ClientLocalPath::new("/home/user/Videos/test.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/videos/test.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("test.mp4".into()).unwrap(),
                 size: 11,
@@ -646,8 +703,8 @@ purgery_root = "/tmp/purgery"
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             files: vec![ManifestFileEntry {
-                sync_name: "unknown-sync".into(),
-                local_path: "/tmp/test.mp4".into(),
+                sync_name: SyncName::new("unknown-sync".into()).unwrap(),
+                local_path: ClientLocalPath::new("/tmp/test.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/test.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("test.mp4".into()).unwrap(),
                 size: 11,
@@ -708,8 +765,8 @@ to = "videos"
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             files: vec![ManifestFileEntry {
-                sync_name: "videos".into(),
-                local_path: "/home/user/Videos/missing.mp4".into(),
+                sync_name: SyncName::new("videos".into()).unwrap(),
+                local_path: ClientLocalPath::new("/home/user/Videos/missing.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/videos/missing.mp4".into())
                     .unwrap(),
                 relative_path: NormalizedRelativePath::new("missing.mp4".into()).unwrap(),
@@ -822,8 +879,8 @@ purgery_root = "/tmp/purgery"
             run_id: run_id.clone(),
             nickname: Nickname::new("other-machine".into()).unwrap(),
             files: vec![ManifestFileEntry {
-                sync_name: "videos".into(),
-                local_path: "/tmp/a.mp4".into(),
+                sync_name: SyncName::new("videos".into()).unwrap(),
+                local_path: ClientLocalPath::new("/tmp/a.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/a.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
                 size: 10,
@@ -927,8 +984,8 @@ purgery_root = "/tmp/purgery"
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             files: vec![ManifestFileEntry {
-                sync_name: "videos".into(),
-                local_path: "/tmp/a.mp4".into(),
+                sync_name: SyncName::new("videos".into()).unwrap(),
+                local_path: ClientLocalPath::new("/tmp/a.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/a.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
                 size: 10,
@@ -992,10 +1049,10 @@ purgery_root = "/tmp/purgery"
                     let mut m = std::collections::BTreeMap::new();
                     m.insert(
                         "compress-video".to_owned(),
-                        purgery_core::PostprocessStepDefinition {
-                            kind: "builtin".to_owned(),
+                        PostprocessStepDefinition {
+                            kind: PostprocessKind::CompressVideo,
                             program: "true".to_owned(),
-                            args: vec!["--input".to_owned(), "{path}".to_owned()],
+                            keep_original: true,
                         },
                     );
                     m
@@ -1016,14 +1073,318 @@ purgery_root = "/tmp/purgery"
                 }],
             },
         };
+
+        // Create a temporary work area with the file
+        let tmp = tempfile::tempdir().unwrap();
+        let work_area = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let work_path = work_area.join("some file.mp4");
+        fs::write(&work_path, b"test data").unwrap();
+
+        // Create a fake compressed output that "true" would not create,
+        // so we need to create it ourselves for the test
+        let compressed = work_area.join("some file.Z.webm");
+        fs::write(&compressed, b"compressed data").unwrap();
+
         let results = apply_postprocessing(
             &server_config,
             &client_config,
             "videos/some file.mp4",
-            Utf8Path::new("/data/laptop/videos/some file.mp4"),
+            &work_path,
         );
-        // Should produce one result with success=true (true always exits 0)
-        assert_eq!(results.len(), 1);
-        assert!(results[0].1, "postprocess with spaces should succeed");
+        assert!(results.is_ok(), "postprocess with spaces should succeed");
+        let outputs = results.unwrap();
+        // With keep_original=true, should return [original, compressed]
+        assert_eq!(outputs.len(), 2);
+        assert!(outputs.contains(&work_path));
+        assert!(outputs.contains(&compressed));
+    }
+
+    #[test]
+    fn test_postprocessing_failure_does_not_create_final_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = tmp.path().join("purgery");
+        let server_root = tmp.path().join("storage");
+        let purgery_str = purgery_root.to_string_lossy().to_string();
+        let server_str = server_root.to_string_lossy().to_string();
+
+        // Server config with a program that always fails
+        let server_config = ServerConfig {
+            root: ServerRoot::new(server_str.clone().into()).unwrap(),
+            purgery_root: PurgeryRoot::new(purgery_str.into()).unwrap(),
+            state_dir: None,
+            log_dir: None,
+            postprocess: purgery_core::PostprocessConfig {
+                max_parallel_jobs: 1,
+                steps: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "compress-video".to_owned(),
+                        PostprocessStepDefinition {
+                            kind: PostprocessKind::CompressVideo,
+                            program: "false".to_owned(),
+                            keep_original: true,
+                        },
+                    );
+                    m
+                },
+            },
+        };
+
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("test-fail-pp".into()).unwrap();
+
+        let ready_path = server_config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        fs::create_dir_all(ready_path.join("files/videos")).unwrap();
+        fs::write(ready_path.join("files/videos/test.mp4"), b"video content").unwrap();
+
+        let client_toml = r#"
+nickname = "laptop"
+
+[server]
+host = "example.com"
+purgery_root = "/tmp/purgery"
+
+[[sync]]
+name = "videos"
+from = "/home/user/Videos"
+to = "videos"
+
+[[postprocess.rules]]
+match = '^videos/.*\.mp4$'
+steps = ["compress-video"]
+"#;
+        fs::write(ready_path.join("config.toml"), client_toml).unwrap();
+
+        let manifest = Manifest {
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            files: vec![ManifestFileEntry {
+                sync_name: SyncName::new("videos".into()).unwrap(),
+                local_path: ClientLocalPath::new("/home/user/Videos/test.mp4".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/videos/test.mp4".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("test.mp4".into()).unwrap(),
+                size: 13,
+                mtime_ns: 1000000,
+                sha256: None,
+            }],
+        };
+        fs::write(
+            ready_path.join("manifest.toml"),
+            manifest.to_toml().unwrap(),
+        )
+        .unwrap();
+
+        process_run(&server_config, &nickname, &run_id).unwrap();
+
+        let done_path = server_config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let status_content = fs::read_to_string(done_path.join("status.toml")).unwrap();
+        let status = RunStatus::from_toml(&status_content).unwrap();
+        assert_eq!(status.state, RunState::Partial);
+        assert_eq!(status.files[0].status, FileStatus::Failed);
+        assert!(
+            status.files[0].error.as_ref().unwrap().contains("failed"),
+            "error should mention failure: {:?}",
+            status.files[0].error
+        );
+
+        // No user-visible final output should exist
+        let final_path = server_root.join("laptop/videos/test.mp4");
+        assert!(
+            !final_path.exists(),
+            "failed postprocess must not create final output"
+        );
+    }
+
+    #[test]
+    fn test_compress_video_verify_output_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_area = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let work_path = work_area.join("video.mp4");
+        fs::write(&work_path, b"video").unwrap();
+
+        let server_config = ServerConfig {
+            root: ServerRoot::new("/data".into()).unwrap(),
+            purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
+            state_dir: None,
+            log_dir: None,
+            postprocess: purgery_core::PostprocessConfig {
+                max_parallel_jobs: 1,
+                steps: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "compress-video".to_owned(),
+                        PostprocessStepDefinition {
+                            kind: PostprocessKind::CompressVideo,
+                            program: "true".to_owned(),
+                            keep_original: true,
+                        },
+                    );
+                    m
+                },
+            },
+        };
+        let client_config = purgery_core::ClientConfig {
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            server: purgery_core::ServerConnection {
+                host: purgery_core::RemoteHost::new("example.com".into()).unwrap(),
+                purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
+            },
+            sync: vec![],
+            postprocess: purgery_core::ClientPostprocessConfig {
+                rules: vec![purgery_core::PostprocessRule {
+                    pattern: r"^videos/.*\.mp4$".to_owned(),
+                    steps: vec!["compress-video".to_owned()],
+                }],
+            },
+        };
+
+        // Create the expected .Z.webm output (simulating what the program would create)
+        let compressed = work_area.join("video.Z.webm");
+        fs::write(&compressed, b"compressed").unwrap();
+
+        let result = apply_postprocessing(
+            &server_config,
+            &client_config,
+            "videos/video.mp4",
+            &work_path,
+        );
+        assert!(result.is_ok());
+        let outputs = result.unwrap();
+        assert!(
+            outputs.contains(&compressed),
+            "compressed output must be in list"
+        );
+    }
+
+    #[test]
+    fn test_keep_original_true_commits_both() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_area = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let work_path = work_area.join("video.mp4");
+        fs::write(&work_path, b"video").unwrap();
+
+        let compressed = work_area.join("video.Z.webm");
+        fs::write(&compressed, b"compressed").unwrap();
+
+        let server_config = ServerConfig {
+            root: ServerRoot::new("/data".into()).unwrap(),
+            purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
+            state_dir: None,
+            log_dir: None,
+            postprocess: purgery_core::PostprocessConfig {
+                max_parallel_jobs: 1,
+                steps: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "compress-video".to_owned(),
+                        PostprocessStepDefinition {
+                            kind: PostprocessKind::CompressVideo,
+                            program: "true".to_owned(),
+                            keep_original: true,
+                        },
+                    );
+                    m
+                },
+            },
+        };
+        let client_config = purgery_core::ClientConfig {
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            server: purgery_core::ServerConnection {
+                host: purgery_core::RemoteHost::new("example.com".into()).unwrap(),
+                purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
+            },
+            sync: vec![],
+            postprocess: purgery_core::ClientPostprocessConfig {
+                rules: vec![purgery_core::PostprocessRule {
+                    pattern: r"^videos/.*$".to_owned(),
+                    steps: vec!["compress-video".to_owned()],
+                }],
+            },
+        };
+
+        let result = apply_postprocessing(
+            &server_config,
+            &client_config,
+            "videos/video.mp4",
+            &work_path,
+        );
+        assert!(result.is_ok());
+        let outputs = result.unwrap();
+        assert!(
+            outputs.contains(&work_path),
+            "keep_original=true must include original"
+        );
+        assert!(
+            outputs.contains(&compressed),
+            "keep_original=true must include compressed"
+        );
+    }
+
+    #[test]
+    fn test_keep_original_false_commits_only_compressed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_area = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let work_path = work_area.join("video.mp4");
+        fs::write(&work_path, b"video").unwrap();
+
+        let compressed = work_area.join("video.Z.webm");
+        fs::write(&compressed, b"compressed").unwrap();
+
+        let server_config = ServerConfig {
+            root: ServerRoot::new("/data".into()).unwrap(),
+            purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
+            state_dir: None,
+            log_dir: None,
+            postprocess: purgery_core::PostprocessConfig {
+                max_parallel_jobs: 1,
+                steps: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "compress-video".to_owned(),
+                        PostprocessStepDefinition {
+                            kind: PostprocessKind::CompressVideo,
+                            program: "true".to_owned(),
+                            keep_original: false,
+                        },
+                    );
+                    m
+                },
+            },
+        };
+        let client_config = purgery_core::ClientConfig {
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            server: purgery_core::ServerConnection {
+                host: purgery_core::RemoteHost::new("example.com".into()).unwrap(),
+                purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
+            },
+            sync: vec![],
+            postprocess: purgery_core::ClientPostprocessConfig {
+                rules: vec![purgery_core::PostprocessRule {
+                    pattern: r"^videos/.*$".to_owned(),
+                    steps: vec!["compress-video".to_owned()],
+                }],
+            },
+        };
+
+        let result = apply_postprocessing(
+            &server_config,
+            &client_config,
+            "videos/video.mp4",
+            &work_path,
+        );
+        assert!(result.is_ok());
+        let outputs = result.unwrap();
+        assert!(
+            !outputs.contains(&work_path),
+            "keep_original=false must NOT include original"
+        );
+        assert!(
+            outputs.contains(&compressed),
+            "keep_original=false must include compressed"
+        );
     }
 }

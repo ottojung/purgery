@@ -84,6 +84,10 @@ pub enum ManifestError {
     Nickname(#[from] NicknameError),
     #[error("invalid path: {0}")]
     Path(#[from] PathValidationError),
+    #[error("invalid sync name: {0}")]
+    SyncName(#[from] SyncNameError),
+    #[error("invalid local path: {0}")]
+    LocalPath(#[from] LocalSourcePathError),
     #[error("manifest has no files")]
     NoFiles,
 }
@@ -98,6 +102,8 @@ pub enum StatusError {
     RunId(#[from] RunIdError),
     #[error("invalid nickname: {0}")]
     Nickname(#[from] NicknameError),
+    #[error("invalid sync name: {0}")]
+    SyncName(#[from] SyncNameError),
     #[error("unknown file status value: {0}")]
     UnknownFileStatus(String),
     #[error("unknown run state value: {0}")]
@@ -301,6 +307,39 @@ impl<'de> Deserialize<'de> for LocalSourcePath {
     }
 }
 
+/// A validated client-side local path.
+///
+/// # Invariants
+/// * Non-empty.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ClientLocalPath(String);
+
+impl ClientLocalPath {
+    pub fn new(s: String) -> Result<Self, LocalSourcePathError> {
+        if s.is_empty() {
+            return Err(LocalSourcePathError::Empty);
+        }
+        Ok(ClientLocalPath(s))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Serialize for ClientLocalPath {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ClientLocalPath {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        ClientLocalPath::new(s).map_err(serde::de::Error::custom)
+    }
+}
+
 /// A validated run identifier.
 ///
 /// # Invariants
@@ -327,72 +366,9 @@ impl RunId {
     }
 
     pub fn generate() -> Self {
-        let now = chrono_utc_now_formatted();
-        let suffix = random_four_hex();
-        RunId(format!("{now}-{suffix}"))
+        let ulid = ulid::Ulid::new();
+        RunId(ulid.to_string())
     }
-}
-
-fn chrono_utc_now_formatted() -> String {
-    use std::time::SystemTime;
-    let d = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = d.as_secs();
-    let days = secs / 86400;
-    let time_secs = secs % 86400;
-    let hours = time_secs / 3600;
-    let minutes = (time_secs % 3600) / 60;
-    let seconds = time_secs % 60;
-
-    let mut y = 1970i64;
-    let mut remaining = days as i64;
-    loop {
-        let days_in_year = if is_leap(y) { 366 } else { 365 };
-        if remaining < days_in_year {
-            break;
-        }
-        remaining -= days_in_year;
-        y += 1;
-    }
-    let months_days = if is_leap(y) {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-    let mut m = 0;
-    for (i, &md) in months_days.iter().enumerate() {
-        if remaining < md {
-            m = i + 1;
-            break;
-        }
-        remaining -= md;
-    }
-    if m == 0 {
-        m = 12;
-    }
-    format!(
-        "{:04}-{:02}-{:02}T{:02}-{:02}-{:02}Z",
-        y,
-        m,
-        remaining + 1,
-        hours,
-        minutes,
-        seconds
-    )
-}
-
-fn is_leap(year: i64) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
-}
-
-fn random_four_hex() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("{:04x}", (nanos & 0xFFFF) as u16)
 }
 
 impl Serialize for RunId {
@@ -510,17 +486,37 @@ impl<'de> Deserialize<'de> for PurgeryRoot {
     }
 }
 
+// ── Path Normalization ──────────────────────────────────────────────
+
+/// Normalize a relative path: collapse `//`, remove `.`, reject `..` and absolute.
+pub fn normalize_relative(path: &Utf8Path) -> Result<String, PathValidationError> {
+    if path.is_absolute() {
+        return Err(PathValidationError::NotRelative);
+    }
+    let mut result: Vec<&str> = Vec::new();
+    for component in path.components() {
+        let comp = component.as_str();
+        match comp {
+            ".." => return Err(PathValidationError::ContainsDotDot),
+            "." => continue,
+            "" => continue,
+            _ => result.push(comp),
+        }
+    }
+    if result.is_empty() {
+        return Err(PathValidationError::EmptyComponent);
+    }
+    Ok(result.join("/"))
+}
+
 /// A relative destination path within a sync mapping.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelativeDestinationPath(Utf8PathBuf);
 
 impl RelativeDestinationPath {
     pub fn new(path: Utf8PathBuf) -> Result<Self, PathValidationError> {
-        if path.is_absolute() {
-            return Err(PathValidationError::NotRelative);
-        }
-        validate_no_dotdot_or_empty(&path)?;
-        Ok(RelativeDestinationPath(path))
+        let normalized = normalize_relative(path.as_path())?;
+        Ok(RelativeDestinationPath(Utf8PathBuf::from(normalized)))
     }
 
     pub fn as_path(&self) -> &Utf8Path {
@@ -551,11 +547,8 @@ pub struct NormalizedRelativePath(Utf8PathBuf);
 
 impl NormalizedRelativePath {
     pub fn new(path: Utf8PathBuf) -> Result<Self, PathValidationError> {
-        if path.is_absolute() {
-            return Err(PathValidationError::NotRelative);
-        }
-        validate_no_dotdot_or_empty(&path)?;
-        Ok(NormalizedRelativePath(path))
+        let normalized = normalize_relative(path.as_path())?;
+        Ok(NormalizedRelativePath(Utf8PathBuf::from(normalized)))
     }
 
     pub fn as_str(&self) -> &str {
@@ -578,19 +571,6 @@ impl<'de> Deserialize<'de> for NormalizedRelativePath {
         let p = Utf8PathBuf::deserialize(deserializer)?;
         NormalizedRelativePath::new(p).map_err(serde::de::Error::custom)
     }
-}
-
-fn validate_no_dotdot_or_empty(path: &Utf8Path) -> Result<(), PathValidationError> {
-    for component in path.components() {
-        let comp = component.as_str();
-        if comp == ".." {
-            return Err(PathValidationError::ContainsDotDot);
-        }
-        if comp.is_empty() {
-            return Err(PathValidationError::EmptyComponent);
-        }
-    }
-    Ok(())
 }
 
 // ── Manifest File Identity ───────────────────────────────────────────
@@ -619,8 +599,8 @@ pub struct Manifest {
 /// A single file entry within a manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestFileEntry {
-    pub sync_name: String,
-    pub local_path: String,
+    pub sync_name: SyncName,
+    pub local_path: ClientLocalPath,
     pub staged_path: NormalizedRelativePath,
     pub relative_path: NormalizedRelativePath,
     pub size: u64,
@@ -632,7 +612,7 @@ pub struct ManifestFileEntry {
 impl ManifestFileEntry {
     pub fn identity(&self) -> ManifestFileIdentity {
         ManifestFileIdentity {
-            local_path: Utf8PathBuf::from(&self.local_path),
+            local_path: Utf8PathBuf::from(self.local_path.as_str()),
             size: self.size,
             mtime_ns: self.mtime_ns,
             sha256: self.sha256.clone(),
@@ -787,7 +767,7 @@ pub struct RunStatus {
 /// Per-file status entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileStatusEntry {
-    pub sync_name: String,
+    pub sync_name: SyncName,
     pub local_path: String,
     pub relative_path: String,
     pub status: FileStatus,
@@ -836,15 +816,50 @@ fn default_max_parallel_jobs() -> u32 {
     1
 }
 
+/// The kind of postprocessing step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostprocessKind {
+    CompressVideo,
+}
+
+impl<'de> Deserialize<'de> for PostprocessKind {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "compress-video" => Ok(PostprocessKind::CompressVideo),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown postprocess kind: {other}"
+            ))),
+        }
+    }
+}
+
+impl Serialize for PostprocessKind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let s = match self {
+            PostprocessKind::CompressVideo => "compress-video",
+        };
+        s.serialize(serializer)
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_compress_video_program() -> String {
+    "my-compress-video".to_string()
+}
+
 /// Definition of a postprocessing step on the server.
-///
-/// `args` may contain `{path}` which is substituted with the final file path.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PostprocessStepDefinition {
-    pub kind: String,
+    pub kind: PostprocessKind,
+    #[serde(default = "default_compress_video_program")]
     pub program: String,
-    #[serde(default)]
-    pub args: Vec<String>,
+    #[serde(default = "default_true")]
+    pub keep_original: bool,
 }
 
 /// Client configuration, loaded from a TOML file.
@@ -948,6 +963,66 @@ impl RunStatus {
 /// Check that a resolved path is within the root.
 pub fn path_is_within_root(resolved: &Utf8Path, root: &Utf8Path) -> bool {
     resolved.starts_with(root)
+}
+
+// ── Symlink Escape Hardening ────────────────────────────────────────
+
+/// Check that no component of `final_path` (relative to `server_root`) is a symlink.
+///
+/// For each component of `final_path` relative to `server_root`, check if an existing
+/// path at that component is a symlink. If any existing component is a symlink,
+/// return an error.
+pub fn check_symlink_in_path(final_path: &Utf8Path, server_root: &Utf8Path) -> Result<(), String> {
+    let relative = final_path.strip_prefix(server_root).map_err(|_| {
+        format!(
+            "final path '{}' is not under server root '{}'",
+            final_path.as_str(),
+            server_root.as_str()
+        )
+    })?;
+
+    let mut current = server_root.to_owned();
+    for component in relative.components() {
+        current = current.join(component.as_str());
+        if current.exists() {
+            let metadata = std::fs::symlink_metadata(current.as_std_path())
+                .map_err(|e| format!("failed to read metadata for '{}': {e}", current.as_str()))?;
+            if metadata.file_type().is_symlink() {
+                return Err(format!("symlink detected in path: {}", current.as_str()));
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── Build Rsync Args ────────────────────────────────────────────────
+
+/// Build the argument list for rsync.
+///
+/// Returns: `["--recursive", "--partial", "--archive", "--no-inc-recursive", "--protect-args", source, destination]`
+/// Note: source will have trailing `/` added automatically.
+pub fn build_rsync_args(source: &str, destination: &str) -> Vec<String> {
+    vec![
+        "--recursive".to_string(),
+        "--partial".to_string(),
+        "--archive".to_string(),
+        "--no-inc-recursive".to_string(),
+        "--protect-args".to_string(),
+        format!("{}/", source),
+        destination.to_string(),
+    ]
+}
+
+// ── Work Area ────────────────────────────────────────────────────────
+
+/// Compute the hidden work area path for postprocessing.
+///
+/// Returns: `<server_root>/.purgery-work/<nickname>/<run_id>/`
+pub fn work_dir(server_root: &Utf8Path, nickname: &Nickname, run_id: &RunId) -> Utf8PathBuf {
+    server_root
+        .join(".purgery-work")
+        .join(nickname.as_str())
+        .join(run_id.as_str())
 }
 
 // ── Envelope Validation ─────────────────────────────────────────────
@@ -1080,6 +1155,15 @@ mod tests {
         assert!(SyncName::new("bad/name".into()).is_err());
     }
 
+    #[test]
+    fn sync_name_serde_roundtrip() {
+        let n = SyncName::new("videos".into()).unwrap();
+        let json = serde_json::to_string(&n).unwrap();
+        assert_eq!(json, "\"videos\"");
+        let back: SyncName = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, n);
+    }
+
     // ── RemoteHost tests ──
 
     #[test]
@@ -1106,12 +1190,34 @@ mod tests {
         assert!(LocalSourcePath::new("".into()).is_err());
     }
 
+    // ── ClientLocalPath tests ──
+
+    #[test]
+    fn client_local_path_valid() {
+        let p = ClientLocalPath::new("/home/user/file.mp4".into()).unwrap();
+        assert_eq!(p.as_str(), "/home/user/file.mp4");
+    }
+
+    #[test]
+    fn client_local_path_empty_is_error() {
+        assert!(ClientLocalPath::new("".into()).is_err());
+    }
+
+    #[test]
+    fn client_local_path_serde_roundtrip() {
+        let p = ClientLocalPath::new("/tmp/test.mp4".into()).unwrap();
+        let json = serde_json::to_string(&p).unwrap();
+        assert_eq!(json, "\"/tmp/test.mp4\"");
+        let back: ClientLocalPath = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, p);
+    }
+
     // ── RunId tests ──
 
     #[test]
     fn run_id_valid() {
-        let r = RunId::new("2026-06-08T18-45-12Z-9f03".into()).unwrap();
-        assert_eq!(r.as_str(), "2026-06-08T18-45-12Z-9f03");
+        let r = RunId::new("01ARZ3NDEKTSV4RRFFQ69G5FAV".into()).unwrap();
+        assert_eq!(r.as_str(), "01ARZ3NDEKTSV4RRFFQ69G5FAV");
     }
 
     #[test]
@@ -1140,9 +1246,10 @@ mod tests {
     #[test]
     fn run_id_generates_valid() {
         let id = RunId::generate();
-        assert!(!id.as_str().is_empty());
-        assert!(id.as_str().contains('T'));
-        assert!(id.as_str().contains('Z'));
+        // ULIDs are 26 characters of Crockford base32
+        assert_eq!(id.as_str().len(), 26);
+        // Generated ULID should pass validation
+        assert!(RunId::new(id.as_str().to_owned()).is_ok());
     }
 
     // ── ServerRoot tests ──
@@ -1191,7 +1298,7 @@ mod tests {
 
     #[test]
     fn purgery_root_relative_is_error() {
-        let p = Utf8PathBuf::from("tmp/purgery");
+        let p = Utf8PathBuf::from("tmp/purgy");
         assert_eq!(PurgeryRoot::new(p), Err(PathValidationError::NotAbsolute));
     }
 
@@ -1248,9 +1355,17 @@ mod tests {
     }
 
     #[test]
-    fn relative_dest_allows_consecutive_separators() {
+    fn relative_dest_collapses_consecutive_separators() {
         let p = Utf8PathBuf::from("a//b");
-        assert!(RelativeDestinationPath::new(p).is_ok());
+        let r = RelativeDestinationPath::new(p).unwrap();
+        assert_eq!(r.as_str(), "a/b");
+    }
+
+    #[test]
+    fn relative_dest_removes_dot_components() {
+        let p = Utf8PathBuf::from("a/./b");
+        let r = RelativeDestinationPath::new(p).unwrap();
+        assert_eq!(r.as_str(), "a/b");
     }
 
     /// `to = "../escape"` must be rejected at config parse time.
@@ -1287,6 +1402,38 @@ to = "../escape"
         assert_eq!(
             NormalizedRelativePath::new(p),
             Err(PathValidationError::ContainsDotDot)
+        );
+    }
+
+    #[test]
+    fn normalized_path_collapses_separators() {
+        let p = Utf8PathBuf::from("a//b");
+        let n = NormalizedRelativePath::new(p).unwrap();
+        assert_eq!(n.as_str(), "a/b");
+    }
+
+    #[test]
+    fn normalized_path_removes_dot() {
+        let p = Utf8PathBuf::from("a/./b/c");
+        let n = NormalizedRelativePath::new(p).unwrap();
+        assert_eq!(n.as_str(), "a/b/c");
+    }
+
+    #[test]
+    fn normalized_path_rejects_absolute() {
+        let p = Utf8PathBuf::from("/etc/passwd");
+        assert_eq!(
+            NormalizedRelativePath::new(p),
+            Err(PathValidationError::NotRelative)
+        );
+    }
+
+    #[test]
+    fn normalized_path_rejects_empty_after_normalization() {
+        let p = Utf8PathBuf::from("./.");
+        assert_eq!(
+            NormalizedRelativePath::new(p),
+            Err(PathValidationError::EmptyComponent)
         );
     }
 
@@ -1378,18 +1525,65 @@ log_dir = "/var/log/purgery"
 max_parallel_jobs = 2
 
 [postprocess.steps.compress-video]
-kind = "builtin"
+kind = "compress-video"
 program = "my-compress-video"
-args = ["--input", "{path}"]
+keep_original = true
 "#;
         let config = ServerConfig::from_toml(toml).unwrap();
         assert_eq!(config.root.as_str(), "/universe/synced");
         assert_eq!(config.state_dir.unwrap().as_str(), "/var/lib/purgery");
         assert_eq!(config.postprocess.max_parallel_jobs, 2);
         let step = config.postprocess.steps.get("compress-video").unwrap();
-        assert_eq!(step.kind, "builtin");
+        assert_eq!(step.kind, PostprocessKind::CompressVideo);
         assert_eq!(step.program, "my-compress-video");
-        assert_eq!(step.args, vec!["--input", "{path}"]);
+        assert!(step.keep_original);
+    }
+
+    #[test]
+    fn parse_server_config_new_kind_format() {
+        let toml = r#"
+root = "/universe/synced"
+purgery_root = "/universe/tmp/purgery"
+
+[postprocess.steps.compress-video]
+kind = "compress-video"
+"#;
+        let config = ServerConfig::from_toml(toml).unwrap();
+        let step = config.postprocess.steps.get("compress-video").unwrap();
+        assert_eq!(step.kind, PostprocessKind::CompressVideo);
+        // Should use defaults
+        assert_eq!(step.program, "my-compress-video");
+        assert!(step.keep_original);
+    }
+
+    #[test]
+    fn postprocess_step_rejects_old_command_format() {
+        let toml = r#"
+kind = "compress-video"
+command = "my-compress-video"
+"#;
+        let result: Result<PostprocessStepDefinition, _> = toml::from_str(toml);
+        assert!(result.is_err(), "old 'command' field must be rejected");
+    }
+
+    #[test]
+    fn postprocess_step_rejects_old_args_format() {
+        let toml = r#"
+kind = "compress-video"
+program = "my-compress-video"
+args = ["--input", "{path}"]
+"#;
+        let result: Result<PostprocessStepDefinition, _> = toml::from_str(toml);
+        assert!(result.is_err(), "old 'args' field must be rejected");
+    }
+
+    #[test]
+    fn postprocess_step_rejects_unknown_kind() {
+        let toml = r#"
+kind = "builtin"
+"#;
+        let result: Result<PostprocessStepDefinition, _> = toml::from_str(toml);
+        assert!(result.is_err(), "unknown kind must be rejected");
     }
 
     #[test]
@@ -1474,7 +1668,7 @@ purgery_root = "/universe/tmp/purgery"
     #[test]
     fn parse_manifest() {
         let toml = r#"
-run_id = "2026-06-08T18-45-12Z-9f03"
+run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 
 [[files]]
@@ -1487,15 +1681,56 @@ mtime_ns = 1780944312000000000
 sha256 = "abcd1234"
 "#;
         let manifest = Manifest::from_toml(toml).unwrap();
-        assert_eq!(manifest.run_id.as_str(), "2026-06-08T18-45-12Z-9f03");
+        assert_eq!(manifest.run_id.as_str(), "01ARZ3NDEKTSV4RRFFQ69G5FAV");
         assert_eq!(manifest.files.len(), 1);
+        assert_eq!(manifest.files[0].sync_name.as_str(), "videos");
+        assert_eq!(
+            manifest.files[0].local_path.as_str(),
+            "/home/vitalik/Videos/a.mp4"
+        );
         assert_eq!(manifest.files[0].sha256.as_deref(), Some("abcd1234"));
+    }
+
+    #[test]
+    fn parse_manifest_rejects_invalid_sync_name() {
+        let toml = r#"
+run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+nickname = "laptop"
+
+[[files]]
+sync_name = ""
+local_path = "/home/user/file.mp4"
+staged_path = "files/file.mp4"
+relative_path = "file.mp4"
+size = 100
+mtime_ns = 0
+"#;
+        let result = Manifest::from_toml(toml);
+        assert!(result.is_err(), "empty sync_name must be rejected");
+    }
+
+    #[test]
+    fn parse_manifest_rejects_invalid_local_path() {
+        let toml = r#"
+run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+nickname = "laptop"
+
+[[files]]
+sync_name = "videos"
+local_path = ""
+staged_path = "files/file.mp4"
+relative_path = "file.mp4"
+size = 100
+mtime_ns = 0
+"#;
+        let result = Manifest::from_toml(toml);
+        assert!(result.is_err(), "empty local_path must be rejected");
     }
 
     #[test]
     fn parse_manifest_without_sha256() {
         let toml = r#"
-run_id = "2026-06-08T18-45-12Z-9f03"
+run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 
 [[files]]
@@ -1513,7 +1748,7 @@ mtime_ns = 1780944312000000000
     #[test]
     fn manifest_empty_files_is_error() {
         let toml = r#"
-run_id = "2026-06-08T18-45-12Z-9f03"
+run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 "#;
         let result = Manifest::from_toml(toml);
@@ -1523,9 +1758,27 @@ nickname = "laptop"
     // ── Status tests ──
 
     #[test]
+    fn parse_status_with_sync_name() {
+        let toml = r#"
+run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+nickname = "laptop"
+state = "done"
+
+[[files]]
+sync_name = "videos"
+local_path = "/home/vitalik/Videos/a.mp4"
+relative_path = "a.mp4"
+status = "imported"
+"#;
+        let status = RunStatus::from_toml(toml).unwrap();
+        assert_eq!(status.files[0].sync_name.as_str(), "videos");
+        assert_eq!(status.files[0].local_path, "/home/vitalik/Videos/a.mp4");
+    }
+
+    #[test]
     fn parse_status() {
         let toml = r#"
-run_id = "2026-06-08T18-45-12Z-9f03"
+run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 state = "done"
 
@@ -1552,6 +1805,7 @@ error = "compress-video failed"
             status.files[0].final_path.as_deref(),
             Some("laptop/videos/a.mp4")
         );
+        assert_eq!(status.files[0].sync_name.as_str(), "videos");
         assert_eq!(status.files[1].status, FileStatus::Failed);
         assert_eq!(
             status.files[1].error.as_deref(),
@@ -1562,7 +1816,7 @@ error = "compress-video failed"
     #[test]
     fn parse_status_with_run_error() {
         let toml = r#"
-run_id = "2026-06-08T18-45-12Z-9f03"
+run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 state = "failed"
 error = "failed to parse manifest.toml"
@@ -1582,8 +1836,8 @@ files = []
     #[test]
     fn identity_from_entry() {
         let entry = ManifestFileEntry {
-            sync_name: "videos".into(),
-            local_path: "/home/vitalik/Videos/a.mp4".into(),
+            sync_name: SyncName::new("videos".into()).unwrap(),
+            local_path: ClientLocalPath::new("/home/vitalik/Videos/a.mp4".into()).unwrap(),
             staged_path: NormalizedRelativePath::new("files/videos/a.mp4".into()).unwrap(),
             relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
             size: 100,
@@ -1629,8 +1883,8 @@ files = []
             run_id: RunId::new("test-123".into()).unwrap(),
             nickname: Nickname::new("testbox".into()).unwrap(),
             files: vec![ManifestFileEntry {
-                sync_name: "videos".into(),
-                local_path: "/tmp/test.mp4".into(),
+                sync_name: SyncName::new("videos".into()).unwrap(),
+                local_path: ClientLocalPath::new("/tmp/test.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/videos/test.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("test.mp4".into()).unwrap(),
                 size: 100,
@@ -1644,6 +1898,7 @@ files = []
         assert_eq!(parsed.nickname, manifest.nickname);
         assert_eq!(parsed.files.len(), 1);
         assert_eq!(parsed.files[0].sha256, Some("abcdef".into()));
+        assert_eq!(parsed.files[0].sync_name.as_str(), "videos");
     }
 
     #[test]
@@ -1653,7 +1908,7 @@ files = []
             nickname: Nickname::new("testbox".into()).unwrap(),
             state: RunState::Done,
             files: vec![FileStatusEntry {
-                sync_name: "videos".into(),
+                sync_name: SyncName::new("videos".into()).unwrap(),
                 local_path: "/tmp/test.mp4".into(),
                 relative_path: "test.mp4".into(),
                 status: FileStatus::Imported,
@@ -1668,6 +1923,7 @@ files = []
         assert_eq!(parsed.state, RunState::Done);
         assert_eq!(parsed.files.len(), 1);
         assert_eq!(parsed.files[0].status, FileStatus::Imported);
+        assert_eq!(parsed.files[0].sync_name.as_str(), "videos");
     }
 
     // ── Envelope validation tests ──
@@ -1689,8 +1945,8 @@ files = []
             run_id: run_id.clone(),
             nickname: nick.clone(),
             files: vec![ManifestFileEntry {
-                sync_name: "videos".into(),
-                local_path: "/tmp/a.mp4".into(),
+                sync_name: SyncName::new("videos".into()).unwrap(),
+                local_path: ClientLocalPath::new("/tmp/a.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/a.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
                 size: 10,
@@ -1719,8 +1975,8 @@ files = []
             run_id: run_id.clone(),
             nickname: other_nick,
             files: vec![ManifestFileEntry {
-                sync_name: "videos".into(),
-                local_path: "/tmp/a.mp4".into(),
+                sync_name: SyncName::new("videos".into()).unwrap(),
+                local_path: ClientLocalPath::new("/tmp/a.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/a.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
                 size: 10,
@@ -1749,8 +2005,8 @@ files = []
             run_id: run_id.clone(),
             nickname: other,
             files: vec![ManifestFileEntry {
-                sync_name: "videos".into(),
-                local_path: "/tmp/a.mp4".into(),
+                sync_name: SyncName::new("videos".into()).unwrap(),
+                local_path: ClientLocalPath::new("/tmp/a.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/a.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
                 size: 10,
@@ -1779,8 +2035,8 @@ files = []
             run_id: wrong_run_id,
             nickname: nick.clone(),
             files: vec![ManifestFileEntry {
-                sync_name: "videos".into(),
-                local_path: "/tmp/a.mp4".into(),
+                sync_name: SyncName::new("videos".into()).unwrap(),
+                local_path: ClientLocalPath::new("/tmp/a.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/a.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
                 size: 10,
@@ -1800,11 +2056,11 @@ files = []
         std::fs::write(staged.as_std_path(), b"hello").unwrap();
 
         let entry = ManifestFileEntry {
-            sync_name: "videos".into(),
-            local_path: "/x".into(),
+            sync_name: SyncName::new("videos".into()).unwrap(),
+            local_path: ClientLocalPath::new("/x".into()).unwrap(),
             staged_path: NormalizedRelativePath::new("f.bin".into()).unwrap(),
             relative_path: NormalizedRelativePath::new("f.bin".into()).unwrap(),
-            size: 999, // wrong size
+            size: 999,
             mtime_ns: 0,
             sha256: None,
         };
@@ -1823,8 +2079,8 @@ files = []
         std::fs::write(staged.as_std_path(), b"hello").unwrap();
 
         let entry = ManifestFileEntry {
-            sync_name: "videos".into(),
-            local_path: "/x".into(),
+            sync_name: SyncName::new("videos".into()).unwrap(),
+            local_path: ClientLocalPath::new("/x".into()).unwrap(),
             staged_path: NormalizedRelativePath::new("f.bin".into()).unwrap(),
             relative_path: NormalizedRelativePath::new("f.bin".into()).unwrap(),
             size: 5,
@@ -1846,8 +2102,8 @@ files = []
         std::fs::write(staged.as_std_path(), b"hello").unwrap();
 
         let entry = ManifestFileEntry {
-            sync_name: "videos".into(),
-            local_path: "/x".into(),
+            sync_name: SyncName::new("videos".into()).unwrap(),
+            local_path: ClientLocalPath::new("/x".into()).unwrap(),
             staged_path: NormalizedRelativePath::new("f.bin".into()).unwrap(),
             relative_path: NormalizedRelativePath::new("f.bin".into()).unwrap(),
             size: 5,
@@ -1864,8 +2120,8 @@ files = []
         let staged = Utf8PathBuf::from_path_buf(dir.path().join("nonexistent")).unwrap();
 
         let entry = ManifestFileEntry {
-            sync_name: "videos".into(),
-            local_path: "/x".into(),
+            sync_name: SyncName::new("videos".into()).unwrap(),
+            local_path: ClientLocalPath::new("/x".into()).unwrap(),
             staged_path: NormalizedRelativePath::new("nonexistent".into()).unwrap(),
             relative_path: NormalizedRelativePath::new("nonexistent".into()).unwrap(),
             size: 5,
@@ -1880,17 +2136,190 @@ files = []
         ));
     }
 
-    // ── PostprocessStepDefinition tests ──
+    // ── Normalize relative tests ──
 
     #[test]
-    fn parse_postprocess_step_new_format() {
-        let toml = r#"
-kind = "builtin"
-program = "ffmpeg"
-args = ["-i", "{path}", "out.mp4"]
-"#;
-        let step: PostprocessStepDefinition = toml::from_str(toml).unwrap();
-        assert_eq!(step.program, "ffmpeg");
-        assert_eq!(step.args, vec!["-i", "{path}", "out.mp4"]);
+    fn normalize_relative_basic() {
+        assert_eq!(normalize_relative(Utf8Path::new("a/b/c")).unwrap(), "a/b/c");
+    }
+
+    #[test]
+    fn normalize_relative_collapses_double_slash() {
+        assert_eq!(normalize_relative(Utf8Path::new("a//b")).unwrap(), "a/b");
+    }
+
+    #[test]
+    fn normalize_relative_removes_dot() {
+        assert_eq!(normalize_relative(Utf8Path::new("a/./b")).unwrap(), "a/b");
+    }
+
+    #[test]
+    fn normalize_relative_removes_all_dots() {
+        assert_eq!(
+            normalize_relative(Utf8Path::new("./a/./b/.")).unwrap(),
+            "a/b"
+        );
+    }
+
+    #[test]
+    fn normalize_relative_rejects_dotdot() {
+        assert!(normalize_relative(Utf8Path::new("a/../b")).is_err());
+    }
+
+    #[test]
+    fn normalize_relative_rejects_absolute() {
+        assert!(normalize_relative(Utf8Path::new("/a/b")).is_err());
+    }
+
+    #[test]
+    fn normalize_relative_rejects_empty_result() {
+        assert!(normalize_relative(Utf8Path::new("./.")).is_err());
+    }
+
+    // ── Build Rsync Args tests ──
+
+    #[test]
+    fn build_rsync_args_basic() {
+        let args = build_rsync_args("/home/user/Videos", "example.com:/remote/path");
+        assert_eq!(
+            args,
+            vec![
+                "--recursive",
+                "--partial",
+                "--archive",
+                "--no-inc-recursive",
+                "--protect-args",
+                "/home/user/Videos/",
+                "example.com:/remote/path",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_rsync_args_includes_protect_args() {
+        let args = build_rsync_args("/src", "host:/dst");
+        assert!(args.contains(&"--protect-args".to_string()));
+    }
+
+    #[test]
+    fn build_rsync_args_with_spaces_in_source() {
+        let args = build_rsync_args("/home/user/My Videos", "host:/dst");
+        assert_eq!(args[5], "/home/user/My Videos/");
+    }
+
+    // ── Symlink Check tests ──
+
+    #[test]
+    fn check_symlink_in_path_no_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let final_path = sub.join("file.txt");
+        std::fs::write(&final_path, b"hello").unwrap();
+
+        assert!(check_symlink_in_path(&final_path, &root).is_ok());
+    }
+
+    #[test]
+    fn check_symlink_in_path_rejects_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let target = root.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = root.join("link_to_target");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let final_path = link.join("file.txt");
+        std::fs::write(&final_path, b"hello").unwrap();
+
+        let result = check_symlink_in_path(&final_path, &root);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("symlink detected"));
+    }
+
+    #[test]
+    fn check_symlink_in_path_component_is_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let real_dir = root.join("realdir");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let link = root.join("linked");
+        std::os::unix::fs::symlink(&real_dir, &link).unwrap();
+        let final_path = link.join("sub/file.txt");
+        std::fs::create_dir_all(real_dir.join("sub")).unwrap();
+        std::fs::write(&final_path, b"data").unwrap();
+
+        let result = check_symlink_in_path(&final_path, &root);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("symlink detected"));
+    }
+
+    // ── Work Dir tests ──
+
+    #[test]
+    fn work_dir_returns_correct_path() {
+        let root = Utf8Path::new("/data");
+        let nick = Nickname::new("laptop".into()).unwrap();
+        let run = RunId::new("run1".into()).unwrap();
+        let wd = work_dir(root, &nick, &run);
+        assert_eq!(wd.as_str(), "/data/.purgery-work/laptop/run1");
+    }
+
+    // ── PostprocessKind serde tests ──
+
+    #[test]
+    fn postprocess_kind_compress_video() {
+        let kind: PostprocessKind = serde_json::from_str("\"compress-video\"").unwrap();
+        assert_eq!(kind, PostprocessKind::CompressVideo);
+    }
+
+    #[test]
+    fn postprocess_kind_rejects_unknown() {
+        let result: Result<PostprocessKind, _> = serde_json::from_str("\"builtin\"");
+        assert!(result.is_err());
+    }
+
+    // ── Example config parsing tests ──
+
+    #[test]
+    fn parse_example_client_config() {
+        let toml = include_str!("../../../examples/client.toml");
+        let config = ClientConfig::from_toml(toml).unwrap();
+        assert_eq!(config.nickname.as_str(), "laptop");
+        assert_eq!(config.sync.len(), 2);
+    }
+
+    #[test]
+    fn parse_example_server_config() {
+        let toml = include_str!("../../../examples/server.toml");
+        let config = ServerConfig::from_toml(toml).unwrap();
+        assert_eq!(config.root.as_str(), "/universe/synced");
+        let step = config.postprocess.steps.get("compress-video").unwrap();
+        assert_eq!(step.kind, PostprocessKind::CompressVideo);
+        assert_eq!(step.program, "my-compress-video");
+        assert!(step.keep_original);
+    }
+
+    // ── normalize_relative helper tests ──
+
+    #[test]
+    fn test_normalize_relative() {
+        assert_eq!(normalize_relative(Utf8Path::new("a/b/c")).unwrap(), "a/b/c");
+        assert_eq!(normalize_relative(Utf8Path::new("a//b")).unwrap(), "a/b");
+        assert_eq!(normalize_relative(Utf8Path::new("a/./b")).unwrap(), "a/b");
+        assert!(normalize_relative(Utf8Path::new("a/../b")).is_err());
+        assert!(normalize_relative(Utf8Path::new("/abs")).is_err());
+        assert!(normalize_relative(Utf8Path::new("./.")).is_err());
+    }
+
+    // ── RunId ULID validation test ──
+
+    #[test]
+    fn generated_ulid_validates() {
+        for _ in 0..10 {
+            let id = RunId::generate();
+            assert!(RunId::new(id.as_str().to_owned()).is_ok());
+            assert_eq!(id.as_str().len(), 26);
+        }
     }
 }

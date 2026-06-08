@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use purgery_core::{
-    shell_escape, ClientConfig, Manifest, ManifestFileEntry, NormalizedRelativePath, RunId,
-    RunStatus,
+    build_rsync_args, shell_escape, ClientConfig, ClientLocalPath, Manifest, ManifestFileEntry,
+    NormalizedRelativePath, RunId, RunStatus,
 };
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -98,11 +98,9 @@ fn sync_and_cleanup(config_path: &str) -> Result<()> {
 
         eprintln!("syncing {from_path} -> {remote_files_dir}");
         let rsync_dest = format!("{}:{}", config.server.host.as_str(), remote_files_dir);
+        let args = build_rsync_args(from_path, &rsync_dest);
         let status = std::process::Command::new("rsync")
-            .args(["--recursive", "--partial", "--archive"])
-            .arg("--no-inc-recursive") // less memory pressure for large dirs
-            .arg(format!("{}/", from_path))
-            .arg(&rsync_dest)
+            .args(&args)
             .status()
             .with_context(|| format!("failed to execute rsync for {from_path}"))?;
 
@@ -199,8 +197,9 @@ fn build_manifest(config: &ClientConfig, run_id: &RunId) -> Result<Manifest> {
             let sha256 = compute_sha256(path).ok();
 
             files.push(ManifestFileEntry {
-                sync_name: sync.name.as_str().to_owned(),
-                local_path: path.to_string_lossy().to_string(),
+                sync_name: sync.name.clone(),
+                local_path: ClientLocalPath::new(path.to_string_lossy().to_string())
+                    .with_context(|| format!("invalid local path for: {}", path.display()))?,
                 staged_path: NormalizedRelativePath::new(staged_path_str.into())
                     .with_context(|| format!("invalid staged path for: {}", path.display()))?,
                 relative_path: NormalizedRelativePath::new(relative_str.into())
@@ -361,11 +360,11 @@ fn delete_confirmed_files(
         let Some(sync) = config
             .sync
             .iter()
-            .find(|s| s.name.as_str() == manifest_entry.sync_name)
+            .find(|s| s.name.as_str() == manifest_entry.sync_name.as_str())
         else {
             eprintln!(
                 "warning: no sync mapping for '{}'",
-                manifest_entry.sync_name
+                manifest_entry.sync_name.as_str()
             );
             continue;
         };
@@ -375,7 +374,8 @@ fn delete_confirmed_files(
             continue;
         }
 
-        let local_path = Path::new(&manifest_entry.local_path);
+        let local_path_str = manifest_entry.local_path.as_str();
+        let local_path = Path::new(local_path_str);
 
         // Check that file still exists and matches identity
         if !local_path.exists() {

@@ -53,8 +53,9 @@ log_dir = "/var/log/purgery"
 max_parallel_jobs = 1
 
 [postprocess.steps.compress-video]
-kind = "builtin"
-command = "my-compress-video"
+kind = "compress-video"
+program = "my-compress-video"
+keep_original = true
 ```
 
 ## Safety Rule
