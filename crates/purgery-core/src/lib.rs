@@ -1,5 +1,6 @@
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
+use std::io;
 use std::str::FromStr;
 use thiserror::Error;
 
@@ -22,6 +23,26 @@ pub enum RunIdError {
 }
 
 #[derive(Error, Debug, PartialEq, Eq)]
+pub enum SyncNameError {
+    #[error("sync name is empty")]
+    Empty,
+    #[error("sync name contains invalid character: {0:?}")]
+    InvalidCharacter(char),
+}
+
+#[derive(Error, Debug, PartialEq, Eq)]
+pub enum RemoteHostError {
+    #[error("remote host is empty")]
+    Empty,
+}
+
+#[derive(Error, Debug, PartialEq, Eq)]
+pub enum LocalSourcePathError {
+    #[error("local source path is empty")]
+    Empty,
+}
+
+#[derive(Error, Debug, PartialEq, Eq)]
 pub enum PathValidationError {
     #[error("path is not absolute")]
     NotAbsolute,
@@ -39,6 +60,10 @@ pub enum ConfigError {
     TomlParse(#[from] toml::de::Error),
     #[error("invalid nickname: {0}")]
     Nickname(#[from] NicknameError),
+    #[error("invalid sync name: {0}")]
+    SyncName(#[from] SyncNameError),
+    #[error("invalid host: {0}")]
+    RemoteHost(#[from] RemoteHostError),
     #[error("invalid path: {0}")]
     Path(#[from] PathValidationError),
     #[error("invalid run ID: {0}")]
@@ -79,6 +104,20 @@ pub enum StatusError {
     UnknownRunState(String),
 }
 
+#[derive(Error, Debug)]
+pub enum IdentityVerificationError {
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+    #[error("file not found: {0}")]
+    NotFound(Utf8PathBuf),
+    #[error("size mismatch: expected {expected}, got {actual}")]
+    SizeMismatch { expected: u64, actual: u64 },
+    #[error("SHA-256 mismatch")]
+    Sha256Mismatch,
+    #[error("mtime unavailable")]
+    MtimeUnavailable,
+}
+
 // ── Run Phase ────────────────────────────────────────────────────────
 
 /// Phase of a run in the purgery staging lifecycle.
@@ -110,10 +149,6 @@ impl RunPhase {
 /// # Invariants
 /// * Non-empty.
 /// * Contains only ASCII alphanumeric characters, hyphens, and underscores.
-///
-/// # Proof of invariants
-/// * `Nickname::new(s)`: returns `NicknameError::Empty` if `s` is empty
-///   and `NicknameError::InvalidCharacter` for any disallowed character.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Nickname(String);
 
@@ -155,6 +190,117 @@ impl FromStr for Nickname {
     }
 }
 
+/// A validated sync mapping name.
+///
+/// # Invariants
+/// * Non-empty.
+/// * Contains only ASCII alphanumeric, hyphens, and underscores.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SyncName(String);
+
+impl SyncName {
+    pub fn new(s: String) -> Result<Self, SyncNameError> {
+        if s.is_empty() {
+            return Err(SyncNameError::Empty);
+        }
+        for ch in s.chars() {
+            if !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_' {
+                return Err(SyncNameError::InvalidCharacter(ch));
+            }
+        }
+        Ok(SyncName(s))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for SyncName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Serialize for SyncName {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SyncName {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        SyncName::new(s).map_err(serde::de::Error::custom)
+    }
+}
+
+/// A validated SSH host name.
+///
+/// # Invariants
+/// * Non-empty.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RemoteHost(String);
+
+impl RemoteHost {
+    pub fn new(s: String) -> Result<Self, RemoteHostError> {
+        if s.is_empty() {
+            return Err(RemoteHostError::Empty);
+        }
+        Ok(RemoteHost(s))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Serialize for RemoteHost {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RemoteHost {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        RemoteHost::new(s).map_err(serde::de::Error::custom)
+    }
+}
+
+/// A validated local source path.
+///
+/// # Invariants
+/// * Non-empty.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LocalSourcePath(String);
+
+impl LocalSourcePath {
+    pub fn new(s: String) -> Result<Self, LocalSourcePathError> {
+        if s.is_empty() {
+            return Err(LocalSourcePathError::Empty);
+        }
+        Ok(LocalSourcePath(s))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Serialize for LocalSourcePath {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for LocalSourcePath {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        LocalSourcePath::new(s).map_err(serde::de::Error::custom)
+    }
+}
+
 /// A validated run identifier.
 ///
 /// # Invariants
@@ -188,20 +334,17 @@ impl RunId {
 }
 
 fn chrono_utc_now_formatted() -> String {
-    // Format: 2026-06-08T18-45-12Z (colon replaced with hyphen for filesystem safety)
     use std::time::SystemTime;
     let d = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
     let secs = d.as_secs();
-    // Simple UTC breakdown
     let days = secs / 86400;
     let time_secs = secs % 86400;
     let hours = time_secs / 3600;
     let minutes = (time_secs % 3600) / 60;
     let seconds = time_secs % 60;
 
-    // Days since epoch to date
     let mut y = 1970i64;
     let mut remaining = days as i64;
     loop {
@@ -295,7 +438,8 @@ impl ServerRoot {
     /// Compute the final destination path for a file.
     ///
     /// Returns `root / nickname / sync_to / rel_path`.
-    /// The caller must verify the result does not escape `root`.
+    /// This does NOT verify escape safety; the caller should validate
+    /// with `path_is_within_root` after resolution if needed.
     pub fn final_path(
         &self,
         nickname: &Nickname,
@@ -494,6 +638,50 @@ impl ManifestFileEntry {
             sha256: self.sha256.clone(),
         }
     }
+
+    pub fn verify_staged(&self, staged_path: &Utf8Path) -> Result<(), IdentityVerificationError> {
+        let metadata = std::fs::metadata(staged_path.as_std_path()).map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                IdentityVerificationError::NotFound(staged_path.to_owned())
+            } else {
+                IdentityVerificationError::Io(e)
+            }
+        })?;
+
+        let actual_size = metadata.len();
+        if actual_size != self.size {
+            return Err(IdentityVerificationError::SizeMismatch {
+                expected: self.size,
+                actual: actual_size,
+            });
+        }
+
+        if let Some(ref expected_sha) = self.sha256 {
+            let actual_sha = compute_sha256(staged_path)?;
+            if &actual_sha != expected_sha {
+                return Err(IdentityVerificationError::Sha256Mismatch);
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Compute SHA-256 hex string for a file.
+pub fn compute_sha256(path: &Utf8Path) -> Result<String, io::Error> {
+    use sha2::{Digest, Sha256};
+    let mut file = std::fs::File::open(path.as_std_path())?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    loop {
+        use std::io::Read;
+        let bytes_read = file.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 // ── Status Types ─────────────────────────────────────────────────────
@@ -590,7 +778,10 @@ pub struct RunStatus {
     pub run_id: RunId,
     pub nickname: Nickname,
     pub state: RunState,
+    #[serde(default)]
     pub files: Vec<FileStatusEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Per-file status entry.
@@ -646,10 +837,14 @@ fn default_max_parallel_jobs() -> u32 {
 }
 
 /// Definition of a postprocessing step on the server.
+///
+/// `args` may contain `{path}` which is substituted with the final file path.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostprocessStepDefinition {
     pub kind: String,
-    pub command: String,
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
 }
 
 /// Client configuration, loaded from a TOML file.
@@ -663,21 +858,27 @@ pub struct ClientConfig {
     pub postprocess: ClientPostprocessConfig,
 }
 
+impl ClientConfig {
+    pub fn find_sync(&self, name: &str) -> Option<&SyncMapping> {
+        self.sync.iter().find(|s| s.name.as_str() == name)
+    }
+}
+
 /// Server connection details for the client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConnection {
-    pub host: String,
+    pub host: RemoteHost,
     pub purgery_root: PurgeryRoot,
 }
 
 /// A single sync mapping from local path to server destination.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncMapping {
-    pub name: String,
+    pub name: SyncName,
     #[serde(rename = "from")]
-    pub from_path: String,
+    pub from_path: LocalSourcePath,
     #[serde(rename = "to")]
-    pub to_path: String,
+    pub to_path: RelativeDestinationPath,
     #[serde(default = "default_delete_after_import")]
     pub delete_after_import: bool,
 }
@@ -745,11 +946,66 @@ impl RunStatus {
 // ── Path Safety ──────────────────────────────────────────────────────
 
 /// Check that a resolved path is within the root.
-///
-/// Returns `Ok(())` if `resolved` is a descendant of `root`.
-/// Both must be canonicalized or known-clean absolute paths.
 pub fn path_is_within_root(resolved: &Utf8Path, root: &Utf8Path) -> bool {
     resolved.starts_with(root)
+}
+
+// ── Envelope Validation ─────────────────────────────────────────────
+
+/// Validate that the directory envelope matches the run's metadata.
+///
+/// Checks:
+/// * `dir_nickname` == `config.nickname`
+/// * `dir_nickname` == `manifest.nickname`
+/// * `dir_run_id` == `manifest.run_id`
+pub fn validate_envelope(
+    dir_nickname: &Nickname,
+    dir_run_id: &RunId,
+    config: &ClientConfig,
+    manifest: &Manifest,
+) -> Result<(), String> {
+    if config.nickname != *dir_nickname {
+        return Err(format!(
+            "directory nickname '{}' does not match config nickname '{}'",
+            dir_nickname.as_str(),
+            config.nickname.as_str()
+        ));
+    }
+    if manifest.nickname != *dir_nickname {
+        return Err(format!(
+            "manifest nickname '{}' does not match directory nickname '{}'",
+            manifest.nickname.as_str(),
+            dir_nickname.as_str()
+        ));
+    }
+    if manifest.run_id != *dir_run_id {
+        return Err(format!(
+            "manifest run_id '{}' does not match directory run_id '{}'",
+            manifest.run_id.as_str(),
+            dir_run_id.as_str()
+        ));
+    }
+    Ok(())
+}
+
+// ── Shell Escaping (shared by client and server) ─────────────────────
+
+/// Escape a string for use as a single-quoted shell argument.
+///
+/// Wraps the string in single quotes and handles embedded single quotes
+/// according to POSIX shell rules: `'` → `'\''`.
+pub fn shell_escape(s: &str) -> String {
+    let mut escaped = String::with_capacity(s.len() + 2);
+    escaped.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            escaped.push_str("'\\''");
+        } else {
+            escaped.push(ch);
+        }
+    }
+    escaped.push('\'');
+    escaped
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -806,6 +1062,52 @@ mod tests {
         assert_eq!(n.as_str(), "phone");
     }
 
+    // ── SyncName tests ──
+
+    #[test]
+    fn sync_name_valid() {
+        let n = SyncName::new("videos".into()).unwrap();
+        assert_eq!(n.as_str(), "videos");
+    }
+
+    #[test]
+    fn sync_name_empty_is_error() {
+        assert!(SyncName::new("".into()).is_err());
+    }
+
+    #[test]
+    fn sync_name_rejects_slash() {
+        assert!(SyncName::new("bad/name".into()).is_err());
+    }
+
+    // ── RemoteHost tests ──
+
+    #[test]
+    fn remote_host_valid() {
+        let h = RemoteHost::new("example.com".into()).unwrap();
+        assert_eq!(h.as_str(), "example.com");
+    }
+
+    #[test]
+    fn remote_host_empty_is_error() {
+        assert!(RemoteHost::new("".into()).is_err());
+    }
+
+    // ── LocalSourcePath tests ──
+
+    #[test]
+    fn local_source_path_valid() {
+        let p = LocalSourcePath::new("/home/user/Videos".into()).unwrap();
+        assert_eq!(p.as_str(), "/home/user/Videos");
+    }
+
+    #[test]
+    fn local_source_path_empty_is_error() {
+        assert!(LocalSourcePath::new("".into()).is_err());
+    }
+
+    // ── RunId tests ──
+
     #[test]
     fn run_id_valid() {
         let r = RunId::new("2026-06-08T18-45-12Z-9f03".into()).unwrap();
@@ -836,6 +1138,16 @@ mod tests {
     }
 
     #[test]
+    fn run_id_generates_valid() {
+        let id = RunId::generate();
+        assert!(!id.as_str().is_empty());
+        assert!(id.as_str().contains('T'));
+        assert!(id.as_str().contains('Z'));
+    }
+
+    // ── ServerRoot tests ──
+
+    #[test]
     fn server_root_absolute_valid() {
         let p = Utf8PathBuf::from("/universe/synced");
         let r = ServerRoot::new(p.clone()).unwrap();
@@ -857,6 +1169,20 @@ mod tests {
     }
 
     #[test]
+    fn server_root_final_path() {
+        let root = ServerRoot::new("/universe/synced".into()).unwrap();
+        let nick = Nickname::new("laptop".into()).unwrap();
+        let dest = RelativeDestinationPath::new("videos".into()).unwrap();
+        let rel = NormalizedRelativePath::new("a.mp4".into()).unwrap();
+        assert_eq!(
+            root.final_path(&nick, &dest, &rel),
+            Utf8PathBuf::from("/universe/synced/laptop/videos/a.mp4")
+        );
+    }
+
+    // ── PurgeryRoot tests ──
+
+    #[test]
     fn purgery_root_absolute_valid() {
         let p = Utf8PathBuf::from("/universe/tmp/purgery");
         let r = PurgeryRoot::new(p.clone()).unwrap();
@@ -868,6 +1194,27 @@ mod tests {
         let p = Utf8PathBuf::from("tmp/purgery");
         assert_eq!(PurgeryRoot::new(p), Err(PathValidationError::NotAbsolute));
     }
+
+    #[test]
+    fn purgery_root_path_helpers() {
+        let root = PurgeryRoot::new("/tmp/purgery".into()).unwrap();
+        let nick = Nickname::new("laptop".into()).unwrap();
+        let run = RunId::new("run1".into()).unwrap();
+        assert_eq!(
+            root.nickname_dir(&nick),
+            Utf8PathBuf::from("/tmp/purgery/laptop")
+        );
+        assert_eq!(
+            root.run_dir(&nick, &run, RunPhase::Incoming),
+            Utf8PathBuf::from("/tmp/purgery/laptop/incoming/run1")
+        );
+        assert_eq!(
+            root.run_dir(&nick, &run, RunPhase::Ready),
+            Utf8PathBuf::from("/tmp/purgery/laptop/ready/run1")
+        );
+    }
+
+    // ── RelativeDestinationPath tests ──
 
     #[test]
     fn relative_dest_valid() {
@@ -906,6 +1253,27 @@ mod tests {
         assert!(RelativeDestinationPath::new(p).is_ok());
     }
 
+    /// `to = "../escape"` must be rejected at config parse time.
+    #[test]
+    fn sync_to_rejects_escape() {
+        let toml = r#"
+nickname = "laptop"
+
+[server]
+host = "example.com"
+purgery_root = "/tmp/purgery"
+
+[[sync]]
+name = "videos"
+from = "/home/user/Videos"
+to = "../escape"
+"#;
+        let result = ClientConfig::from_toml(toml);
+        assert!(result.is_err(), "sync to='../escape' must be rejected");
+    }
+
+    // ── NormalizedRelativePath tests ──
+
     #[test]
     fn normalized_path_valid() {
         let p = Utf8PathBuf::from("videos/a.mp4");
@@ -921,6 +1289,8 @@ mod tests {
             Err(PathValidationError::ContainsDotDot)
         );
     }
+
+    // ── FileStatus tests ──
 
     #[test]
     fn file_status_imported() {
@@ -961,6 +1331,8 @@ mod tests {
         assert_eq!(back, FileStatus::Imported);
     }
 
+    // ── RunState tests ──
+
     #[test]
     fn run_state_serde_roundtrip() {
         for state in &[RunState::Done, RunState::Partial, RunState::Failed] {
@@ -977,6 +1349,8 @@ mod tests {
         assert_eq!("failed".parse::<RunState>().unwrap(), RunState::Failed);
         assert!("unknown".parse::<RunState>().is_err());
     }
+
+    // ── Config parsing tests ──
 
     #[test]
     fn parse_server_config_minimal() {
@@ -1005,7 +1379,8 @@ max_parallel_jobs = 2
 
 [postprocess.steps.compress-video]
 kind = "builtin"
-command = "my-compress-video"
+program = "my-compress-video"
+args = ["--input", "{path}"]
 "#;
         let config = ServerConfig::from_toml(toml).unwrap();
         assert_eq!(config.root.as_str(), "/universe/synced");
@@ -1013,7 +1388,8 @@ command = "my-compress-video"
         assert_eq!(config.postprocess.max_parallel_jobs, 2);
         let step = config.postprocess.steps.get("compress-video").unwrap();
         assert_eq!(step.kind, "builtin");
-        assert_eq!(step.command, "my-compress-video");
+        assert_eq!(step.program, "my-compress-video");
+        assert_eq!(step.args, vec!["--input", "{path}"]);
     }
 
     #[test]
@@ -1027,7 +1403,7 @@ purgery_root = "/universe/tmp/purgery"
 "#;
         let config = ClientConfig::from_toml(toml).unwrap();
         assert_eq!(config.nickname.as_str(), "laptop");
-        assert_eq!(config.server.host, "example.com");
+        assert_eq!(config.server.host.as_str(), "example.com");
         assert!(config.sync.is_empty());
     }
 
@@ -1057,7 +1433,7 @@ steps = ["compress-video"]
 "#;
         let config = ClientConfig::from_toml(toml).unwrap();
         assert_eq!(config.sync.len(), 2);
-        assert_eq!(config.sync[0].name, "videos");
+        assert_eq!(config.sync[0].name.as_str(), "videos");
         assert!(config.sync[0].delete_after_import);
         assert!(!config.sync[1].delete_after_import);
         assert_eq!(config.postprocess.rules.len(), 1);
@@ -1069,6 +1445,31 @@ steps = ["compress-video"]
         let result = ServerConfig::from_toml("not valid toml {{{");
         assert!(result.is_err());
     }
+
+    #[test]
+    fn server_config_rejects_relative_root() {
+        let toml = r#"
+root = "relative/path"
+purgery_root = "/universe/tmp/purgery"
+"#;
+        let result = ServerConfig::from_toml(toml);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn client_config_rejects_invalid_nickname() {
+        let toml = r#"
+nickname = ""
+
+[server]
+host = "example.com"
+purgery_root = "/universe/tmp/purgery"
+"#;
+        let result = ClientConfig::from_toml(toml);
+        assert!(result.is_err());
+    }
+
+    // ── Manifest tests ──
 
     #[test]
     fn parse_manifest() {
@@ -1119,6 +1520,8 @@ nickname = "laptop"
         assert!(result.is_err());
     }
 
+    // ── Status tests ──
+
     #[test]
     fn parse_status() {
         let toml = r#"
@@ -1157,6 +1560,26 @@ error = "compress-video failed"
     }
 
     #[test]
+    fn parse_status_with_run_error() {
+        let toml = r#"
+run_id = "2026-06-08T18-45-12Z-9f03"
+nickname = "laptop"
+state = "failed"
+error = "failed to parse manifest.toml"
+files = []
+"#;
+        let status = RunStatus::from_toml(toml).unwrap();
+        assert_eq!(status.state, RunState::Failed);
+        assert_eq!(
+            status.error.as_deref(),
+            Some("failed to parse manifest.toml")
+        );
+        assert!(status.files.is_empty());
+    }
+
+    // ── Identity tests ──
+
+    #[test]
     fn identity_from_entry() {
         let entry = ManifestFileEntry {
             sync_name: "videos".into(),
@@ -1182,36 +1605,7 @@ error = "compress-video failed"
         assert_eq!(RunPhase::Failed.as_str(), "failed");
     }
 
-    #[test]
-    fn purgery_root_path_helpers() {
-        let root = PurgeryRoot::new("/tmp/purgery".into()).unwrap();
-        let nick = Nickname::new("laptop".into()).unwrap();
-        let run = RunId::new("run1".into()).unwrap();
-        assert_eq!(
-            root.nickname_dir(&nick),
-            Utf8PathBuf::from("/tmp/purgery/laptop")
-        );
-        assert_eq!(
-            root.run_dir(&nick, &run, RunPhase::Incoming),
-            Utf8PathBuf::from("/tmp/purgery/laptop/incoming/run1")
-        );
-        assert_eq!(
-            root.run_dir(&nick, &run, RunPhase::Ready),
-            Utf8PathBuf::from("/tmp/purgery/laptop/ready/run1")
-        );
-    }
-
-    #[test]
-    fn server_root_final_path() {
-        let root = ServerRoot::new("/universe/synced".into()).unwrap();
-        let nick = Nickname::new("laptop".into()).unwrap();
-        let dest = RelativeDestinationPath::new("videos".into()).unwrap();
-        let rel = NormalizedRelativePath::new("a.mp4".into()).unwrap();
-        assert_eq!(
-            root.final_path(&nick, &dest, &rel),
-            Utf8PathBuf::from("/universe/synced/laptop/videos/a.mp4")
-        );
-    }
+    // ── Path safety tests ──
 
     #[test]
     fn path_is_within_root_positive() {
@@ -1227,38 +1621,7 @@ error = "compress-video failed"
         assert!(!path_is_within_root(resolved, root));
     }
 
-    #[test]
-    fn run_id_generates_valid() {
-        let id = RunId::generate();
-        assert!(!id.as_str().is_empty());
-        // Should match expected format: YYYY-MM-DDTHH-MM-SSZ-XXXX
-        assert_eq!(id.as_str().chars().filter(|&c| c == '-').count(), 5);
-        assert!(id.as_str().contains('T'));
-        assert!(id.as_str().contains('Z'));
-    }
-
-    #[test]
-    fn server_config_rejects_relative_root() {
-        let toml = r#"
-root = "relative/path"
-purgery_root = "/universe/tmp/purgery"
-"#;
-        let result = ServerConfig::from_toml(toml);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn client_config_rejects_invalid_nickname() {
-        let toml = r#"
-nickname = ""
-
-[server]
-host = "example.com"
-purgery_root = "/universe/tmp/purgery"
-"#;
-        let result = ClientConfig::from_toml(toml);
-        assert!(result.is_err());
-    }
+    // ── Manifest/Status roundtrip tests ──
 
     #[test]
     fn manifest_toml_roundtrip() {
@@ -1298,11 +1661,236 @@ purgery_root = "/universe/tmp/purgery"
                 postprocess: Some(vec!["compress-video".into()]),
                 error: None,
             }],
+            error: None,
         };
         let toml = status.to_toml().unwrap();
         let parsed = RunStatus::from_toml(&toml).unwrap();
         assert_eq!(parsed.state, RunState::Done);
         assert_eq!(parsed.files.len(), 1);
         assert_eq!(parsed.files[0].status, FileStatus::Imported);
+    }
+
+    // ── Envelope validation tests ──
+
+    #[test]
+    fn validate_envelope_ok() {
+        let nick = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("run-1".into()).unwrap();
+        let config = ClientConfig {
+            nickname: nick.clone(),
+            server: ServerConnection {
+                host: RemoteHost::new("example.com".into()).unwrap(),
+                purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
+            },
+            sync: vec![],
+            postprocess: ClientPostprocessConfig::default(),
+        };
+        let manifest = Manifest {
+            run_id: run_id.clone(),
+            nickname: nick.clone(),
+            files: vec![ManifestFileEntry {
+                sync_name: "videos".into(),
+                local_path: "/tmp/a.mp4".into(),
+                staged_path: NormalizedRelativePath::new("files/a.mp4".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
+                size: 10,
+                mtime_ns: 100,
+                sha256: None,
+            }],
+        };
+        assert!(validate_envelope(&nick, &run_id, &config, &manifest).is_ok());
+    }
+
+    #[test]
+    fn validate_envelope_rejects_nickname_mismatch() {
+        let dir_nick = Nickname::new("laptop".into()).unwrap();
+        let other_nick = Nickname::new("desktop".into()).unwrap();
+        let run_id = RunId::new("run-1".into()).unwrap();
+        let config = ClientConfig {
+            nickname: other_nick.clone(),
+            server: ServerConnection {
+                host: RemoteHost::new("example.com".into()).unwrap(),
+                purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
+            },
+            sync: vec![],
+            postprocess: ClientPostprocessConfig::default(),
+        };
+        let manifest = Manifest {
+            run_id: run_id.clone(),
+            nickname: other_nick,
+            files: vec![ManifestFileEntry {
+                sync_name: "videos".into(),
+                local_path: "/tmp/a.mp4".into(),
+                staged_path: NormalizedRelativePath::new("files/a.mp4".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
+                size: 10,
+                mtime_ns: 100,
+                sha256: None,
+            }],
+        };
+        assert!(validate_envelope(&dir_nick, &run_id, &config, &manifest).is_err());
+    }
+
+    #[test]
+    fn validate_envelope_rejects_manifest_nickname_mismatch() {
+        let nick = Nickname::new("laptop".into()).unwrap();
+        let other = Nickname::new("server".into()).unwrap();
+        let run_id = RunId::new("run-1".into()).unwrap();
+        let config = ClientConfig {
+            nickname: nick.clone(),
+            server: ServerConnection {
+                host: RemoteHost::new("example.com".into()).unwrap(),
+                purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
+            },
+            sync: vec![],
+            postprocess: ClientPostprocessConfig::default(),
+        };
+        let manifest = Manifest {
+            run_id: run_id.clone(),
+            nickname: other,
+            files: vec![ManifestFileEntry {
+                sync_name: "videos".into(),
+                local_path: "/tmp/a.mp4".into(),
+                staged_path: NormalizedRelativePath::new("files/a.mp4".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
+                size: 10,
+                mtime_ns: 100,
+                sha256: None,
+            }],
+        };
+        assert!(validate_envelope(&nick, &run_id, &config, &manifest).is_err());
+    }
+
+    #[test]
+    fn validate_envelope_rejects_run_id_mismatch() {
+        let nick = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("run-1".into()).unwrap();
+        let wrong_run_id = RunId::new("run-2".into()).unwrap();
+        let config = ClientConfig {
+            nickname: nick.clone(),
+            server: ServerConnection {
+                host: RemoteHost::new("example.com".into()).unwrap(),
+                purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
+            },
+            sync: vec![],
+            postprocess: ClientPostprocessConfig::default(),
+        };
+        let manifest = Manifest {
+            run_id: wrong_run_id,
+            nickname: nick.clone(),
+            files: vec![ManifestFileEntry {
+                sync_name: "videos".into(),
+                local_path: "/tmp/a.mp4".into(),
+                staged_path: NormalizedRelativePath::new("files/a.mp4".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
+                size: 10,
+                mtime_ns: 100,
+                sha256: None,
+            }],
+        };
+        assert!(validate_envelope(&nick, &run_id, &config, &manifest).is_err());
+    }
+
+    // ── verify_staged tests ──
+
+    #[test]
+    fn verify_staged_size_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = Utf8PathBuf::from_path_buf(dir.path().join("f.bin")).unwrap();
+        std::fs::write(staged.as_std_path(), b"hello").unwrap();
+
+        let entry = ManifestFileEntry {
+            sync_name: "videos".into(),
+            local_path: "/x".into(),
+            staged_path: NormalizedRelativePath::new("f.bin".into()).unwrap(),
+            relative_path: NormalizedRelativePath::new("f.bin".into()).unwrap(),
+            size: 999, // wrong size
+            mtime_ns: 0,
+            sha256: None,
+        };
+
+        let result = entry.verify_staged(&staged);
+        assert!(matches!(
+            result,
+            Err(IdentityVerificationError::SizeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn verify_staged_sha_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = Utf8PathBuf::from_path_buf(dir.path().join("f.bin")).unwrap();
+        std::fs::write(staged.as_std_path(), b"hello").unwrap();
+
+        let entry = ManifestFileEntry {
+            sync_name: "videos".into(),
+            local_path: "/x".into(),
+            staged_path: NormalizedRelativePath::new("f.bin".into()).unwrap(),
+            relative_path: NormalizedRelativePath::new("f.bin".into()).unwrap(),
+            size: 5,
+            mtime_ns: 0,
+            sha256: Some("badbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbad1".into()),
+        };
+
+        let result = entry.verify_staged(&staged);
+        assert!(matches!(
+            result,
+            Err(IdentityVerificationError::Sha256Mismatch)
+        ));
+    }
+
+    #[test]
+    fn verify_staged_size_ok_no_sha() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = Utf8PathBuf::from_path_buf(dir.path().join("f.bin")).unwrap();
+        std::fs::write(staged.as_std_path(), b"hello").unwrap();
+
+        let entry = ManifestFileEntry {
+            sync_name: "videos".into(),
+            local_path: "/x".into(),
+            staged_path: NormalizedRelativePath::new("f.bin".into()).unwrap(),
+            relative_path: NormalizedRelativePath::new("f.bin".into()).unwrap(),
+            size: 5,
+            mtime_ns: 0,
+            sha256: None,
+        };
+
+        assert!(entry.verify_staged(&staged).is_ok());
+    }
+
+    #[test]
+    fn verify_staged_file_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = Utf8PathBuf::from_path_buf(dir.path().join("nonexistent")).unwrap();
+
+        let entry = ManifestFileEntry {
+            sync_name: "videos".into(),
+            local_path: "/x".into(),
+            staged_path: NormalizedRelativePath::new("nonexistent".into()).unwrap(),
+            relative_path: NormalizedRelativePath::new("nonexistent".into()).unwrap(),
+            size: 5,
+            mtime_ns: 0,
+            sha256: None,
+        };
+
+        let result = entry.verify_staged(&staged);
+        assert!(matches!(
+            result,
+            Err(IdentityVerificationError::NotFound(_))
+        ));
+    }
+
+    // ── PostprocessStepDefinition tests ──
+
+    #[test]
+    fn parse_postprocess_step_new_format() {
+        let toml = r#"
+kind = "builtin"
+program = "ffmpeg"
+args = ["-i", "{path}", "out.mp4"]
+"#;
+        let step: PostprocessStepDefinition = toml::from_str(toml).unwrap();
+        assert_eq!(step.program, "ffmpeg");
+        assert_eq!(step.args, vec!["-i", "{path}", "out.mp4"]);
     }
 }

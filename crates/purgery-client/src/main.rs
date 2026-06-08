@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use purgery_core::{
-    ClientConfig, Manifest, ManifestFileEntry, NormalizedRelativePath, RunId, RunStatus,
+    shell_escape, ClientConfig, Manifest, ManifestFileEntry, NormalizedRelativePath, RunId,
+    RunStatus,
 };
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -68,34 +69,35 @@ fn sync_and_cleanup(config_path: &str) -> Result<()> {
     );
 
     // 4. Create directories on server via SSH
-    ssh_run(
-        &config.server.host,
-        &format!("mkdir -p {remote_incoming_dir}/files"),
-    )?;
+    let mkdir_cmd = format!(
+        "mkdir -p {}",
+        purgery_core::shell_escape(&format!("{remote_incoming_dir}/files"))
+    );
+    ssh_run(config.server.host.as_str(), &mkdir_cmd)?;
 
     // 5. Write config and manifest to server
     let config_toml = fs::read_to_string(config_path)
         .with_context(|| format!("failed to read config: {config_path}"))?;
     write_remote_file(
-        &config.server.host,
+        config.server.host.as_str(),
         &format!("{remote_incoming_dir}/config.toml"),
         &config_toml,
     )?;
     let manifest_toml = manifest.to_toml()?;
     write_remote_file(
-        &config.server.host,
+        config.server.host.as_str(),
         &format!("{remote_incoming_dir}/manifest.toml"),
         &manifest_toml,
     )?;
 
     // 6. Rsync files per sync mapping
     for sync in &config.sync {
-        let from_path = &sync.from_path;
-        let to_path = &sync.to_path;
+        let from_path = sync.from_path.as_str();
+        let to_path = sync.to_path.as_str();
         let remote_files_dir = format!("{remote_incoming_dir}/files/{to_path}/");
 
         eprintln!("syncing {from_path} -> {remote_files_dir}");
-        let rsync_dest = format!("{}:{}", config.server.host, remote_files_dir);
+        let rsync_dest = format!("{}:{}", config.server.host.as_str(), remote_files_dir);
         let status = std::process::Command::new("rsync")
             .args(["--recursive", "--partial", "--archive"])
             .arg("--no-inc-recursive") // less memory pressure for large dirs
@@ -116,10 +118,12 @@ fn sync_and_cleanup(config_path: &str) -> Result<()> {
         config.nickname.as_str(),
         run_id.as_str()
     );
-    ssh_run(
-        &config.server.host,
-        &format!("mv {remote_incoming_dir} {remote_ready_dir}"),
-    )?;
+    let ready_cmd = format!(
+        "mv {} {}",
+        purgery_core::shell_escape(&remote_incoming_dir),
+        purgery_core::shell_escape(&remote_ready_dir),
+    );
+    ssh_run(config.server.host.as_str(), &ready_cmd)?;
     eprintln!("run moved to ready");
 
     // 8. Poll for status in done or failed directory
@@ -136,7 +140,7 @@ fn sync_and_cleanup(config_path: &str) -> Result<()> {
         run_id.as_str()
     );
 
-    let status = poll_for_status(&config.server.host, &done_dir, &failed_dir)?;
+    let status = poll_for_status(config.server.host.as_str(), &done_dir, &failed_dir)?;
 
     // 9. Delete confirmed local files
     let deletion_count = delete_confirmed_files(&config, &manifest, &status)?;
@@ -158,8 +162,8 @@ fn build_manifest(config: &ClientConfig, run_id: &RunId) -> Result<Manifest> {
     let nickname = config.nickname.clone();
 
     for sync in &config.sync {
-        let from_path = &sync.from_path;
-        let to_path = &sync.to_path;
+        let from_path = sync.from_path.as_str();
+        let to_path = sync.to_path.as_str();
         let from = Path::new(from_path);
 
         if !from.exists() {
@@ -195,7 +199,7 @@ fn build_manifest(config: &ClientConfig, run_id: &RunId) -> Result<Manifest> {
             let sha256 = compute_sha256(path).ok();
 
             files.push(ManifestFileEntry {
-                sync_name: sync.name.clone(),
+                sync_name: sync.name.as_str().to_owned(),
                 local_path: path.to_string_lossy().to_string(),
                 staged_path: NormalizedRelativePath::new(staged_path_str.into())
                     .with_context(|| format!("invalid staged path for: {}", path.display()))?,
@@ -255,9 +259,10 @@ fn ssh_run(host: &str, cmd: &str) -> Result<String> {
 
 /// Write content to a remote file via SSH.
 fn write_remote_file(host: &str, path: &str, content: &str) -> Result<()> {
+    let remote_cmd = format!("cat > {}", purgery_core::shell_escape(path));
     let mut child = std::process::Command::new("ssh")
         .arg(host)
-        .arg(format!("cat > {}", shell_escape(path)))
+        .arg(&remote_cmd)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -281,21 +286,6 @@ fn write_remote_file(host: &str, path: &str, content: &str) -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Simple shell escaping for remote file paths.
-fn shell_escape(s: &str) -> String {
-    let mut escaped = String::with_capacity(s.len() + 2);
-    escaped.push('\'');
-    for ch in s.chars() {
-        if ch == '\'' {
-            escaped.push_str("'\\''");
-        } else {
-            escaped.push(ch);
-        }
-    }
-    escaped.push('\'');
-    escaped
 }
 
 /// Poll for status.toml in done or failed directories.
@@ -371,7 +361,7 @@ fn delete_confirmed_files(
         let Some(sync) = config
             .sync
             .iter()
-            .find(|s| s.name == manifest_entry.sync_name)
+            .find(|s| s.name.as_str() == manifest_entry.sync_name)
         else {
             eprintln!(
                 "warning: no sync mapping for '{}'",

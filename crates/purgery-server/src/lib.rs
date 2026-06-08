@@ -1,11 +1,44 @@
 use anyhow::{Context, Result};
 use purgery_core::{
-    FileStatus, FileStatusEntry, Manifest, Nickname, PurgeryRoot, RunId, RunPhase, RunState,
-    RunStatus, ServerConfig,
+    path_is_within_root, shell_escape, validate_envelope, FileStatus, FileStatusEntry, Manifest,
+    Nickname, PurgeryRoot, RunId, RunPhase, RunState, RunStatus, ServerConfig,
 };
-use regex::Regex;
 use std::fs;
-use std::path::Path;
+
+/// A run-level failure — written when the run cannot be processed at all.
+fn write_run_failure(
+    purgery_root: &PurgeryRoot,
+    nickname: &Nickname,
+    run_id: &RunId,
+    error_msg: &str,
+) {
+    let processing_path = purgery_root.run_dir(nickname, run_id, RunPhase::Processing);
+    if let Some(parent) = processing_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    let status = RunStatus {
+        run_id: run_id.clone(),
+        nickname: nickname.clone(),
+        state: RunState::Failed,
+        files: vec![],
+        error: Some(error_msg.to_owned()),
+    };
+
+    if let Ok(toml_str) = status.to_toml() {
+        let status_path = processing_path.join("status.toml");
+        let tmp_path = processing_path.join("status.toml.tmp");
+        if fs::write(&tmp_path, &toml_str).is_ok() {
+            let _ = fs::rename(&tmp_path, &status_path);
+        }
+    }
+
+    let failed_path = purgery_root.run_dir(nickname, run_id, RunPhase::Failed);
+    if let Some(parent) = failed_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::rename(&processing_path, &failed_path);
+}
 
 /// Find all ready runs across all nicknames.
 pub fn find_ready_runs(purgery_root: &PurgeryRoot) -> Result<Vec<(Nickname, RunId)>> {
@@ -67,7 +100,6 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
         .purgery_root
         .run_dir(nickname, run_id, RunPhase::Processing);
 
-    // Ensure parent of processing path exists
     if let Some(parent) = processing_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create processing parent: {}", parent.as_str()))?;
@@ -81,25 +113,63 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
         )
     })?;
 
+    // Read client config
     let config_path = processing_path.join("config.toml");
-    let client_config_content = fs::read_to_string(&config_path)
-        .with_context(|| format!("failed to read client config: {}", config_path.as_str()))?;
-    let client_config = purgery_core::ClientConfig::from_toml(&client_config_content)
-        .with_context(|| "failed to parse client config from run")?;
+    let client_config_content = match fs::read_to_string(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("failed to read client config: {e}");
+            eprintln!("{msg}");
+            write_run_failure(&config.purgery_root, nickname, run_id, &msg);
+            anyhow::bail!("{msg}");
+        }
+    };
+    let client_config = match purgery_core::ClientConfig::from_toml(&client_config_content) {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("failed to parse client config: {e}");
+            eprintln!("{msg}");
+            write_run_failure(&config.purgery_root, nickname, run_id, &msg);
+            anyhow::bail!("{msg}");
+        }
+    };
 
+    // Read manifest
     let manifest_path = processing_path.join("manifest.toml");
-    let manifest_content = fs::read_to_string(&manifest_path)
-        .with_context(|| format!("failed to read manifest: {}", manifest_path.as_str()))?;
-    let manifest =
-        Manifest::from_toml(&manifest_content).with_context(|| "failed to parse manifest")?;
+    let manifest_content = match fs::read_to_string(&manifest_path) {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("failed to read manifest: {e}");
+            eprintln!("{msg}");
+            write_run_failure(&config.purgery_root, nickname, run_id, &msg);
+            anyhow::bail!("{msg}");
+        }
+    };
+    let manifest = match Manifest::from_toml(&manifest_content) {
+        Ok(m) => m,
+        Err(e) => {
+            let msg = format!("failed to parse manifest: {e}");
+            eprintln!("{msg}");
+            write_run_failure(&config.purgery_root, nickname, run_id, &msg);
+            anyhow::bail!("{msg}");
+        }
+    };
 
-    let root = &config.root;
+    // Envelope validation: directory nickname/config/manifest must agree
+    if let Err(e) = validate_envelope(nickname, run_id, &client_config, &manifest) {
+        let msg = format!("envelope validation failed: {e}");
+        eprintln!("{msg}");
+        write_run_failure(&config.purgery_root, nickname, run_id, &msg);
+        anyhow::bail!("{msg}");
+    }
+
     let sync_map: std::collections::HashMap<&str, &purgery_core::SyncMapping> = client_config
         .sync
         .iter()
         .map(|s| (s.name.as_str(), s))
         .collect();
 
+    let root = &config.root;
     let mut status_entries = Vec::new();
     let mut all_imported = true;
 
@@ -123,13 +193,11 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
             continue;
         };
 
-        let sync_to = &sync.to_path;
-        let rel_path = file_entry.relative_path.as_str();
-        let nick_str = nickname.as_str();
+        // Compute final path via validated API
+        let final_path = root.final_path(nickname, &sync.to_path, &file_entry.relative_path);
 
-        let final_path = root.as_path().join(nick_str).join(sync_to).join(rel_path);
-
-        if !final_path.starts_with(root.as_path()) {
+        // Verify path stays within the server root
+        if !path_is_within_root(&final_path, root.as_path()) {
             status_entries.push(FileStatusEntry {
                 sync_name: sync_name.clone(),
                 local_path: file_entry.local_path.clone(),
@@ -160,19 +228,41 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
             continue;
         }
 
+        // Server-side file identity verification
+        let source_utf8 =
+            camino::Utf8PathBuf::from_path_buf(source_path.clone().into_std_path_buf())
+                .unwrap_or_else(|p| camino::Utf8PathBuf::from(p.to_string_lossy().as_ref()));
+        if let Err(e) = file_entry.verify_staged(&source_utf8) {
+            let msg = format!("staged file identity check failed: {e}");
+            eprintln!("{msg}");
+            status_entries.push(FileStatusEntry {
+                sync_name: sync_name.clone(),
+                local_path: file_entry.local_path.clone(),
+                relative_path: file_entry.relative_path.as_str().to_owned(),
+                status: FileStatus::Failed,
+                final_path: None,
+                postprocess: None,
+                error: Some(msg),
+            });
+            all_imported = false;
+            continue;
+        }
+
         if let Some(parent) = final_path.parent() {
             fs::create_dir_all(parent).with_context(|| {
                 format!("failed to create parent directory: {}", parent.as_str())
             })?;
         }
 
-        let tmp_name = format!(".purgery-importing.{}.tmp", rel_path.replace('/', "_"));
-        let tmp_path = if let Some(parent) = final_path.parent() {
-            parent.join(&tmp_name)
-        } else {
-            final_path.with_file_name(&tmp_name)
-        };
+        // Build temporary import path
+        let rel_part = file_entry.relative_path.as_str().replace('/', "_");
+        let tmp_name = format!(".purgery-importing.{rel_part}.tmp");
+        let tmp_path = final_path
+            .parent()
+            .map(|p| p.join(&tmp_name))
+            .unwrap_or_else(|| final_path.with_file_name(&tmp_name));
 
+        // Move (or copy+delete) to temporary path
         if let Err(e) = fs::rename(&source_path, &tmp_path) {
             eprintln!("rename failed (may be cross-filesystem): {e}, falling back to copy");
             fs::copy(&source_path, &tmp_path).with_context(|| {
@@ -185,7 +275,8 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
             let _ = fs::remove_file(&source_path);
         }
 
-        fs::rename(&tmp_path, &final_path).with_context(|| {
+        // Atomic rename into place
+        fs::rename(&tmp_path, final_path.as_std_path()).with_context(|| {
             format!(
                 "failed to rename {} to {}",
                 tmp_path.as_str(),
@@ -193,7 +284,12 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
             )
         })?;
 
-        let normalized_path = format!("{sync_to}/{rel_path}");
+        // Apply postprocessing
+        let normalized_path = format!(
+            "{}/{}",
+            sync.to_path.as_str(),
+            file_entry.relative_path.as_str()
+        );
         let applied_steps =
             apply_postprocessing(config, &client_config, &normalized_path, &final_path);
 
@@ -246,8 +342,9 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
     let run_status = RunStatus {
         run_id: run_id.clone(),
         nickname: nickname.clone(),
-        state: run_state.clone(),
+        state: run_state,
         files: status_entries,
+        error: None,
     };
 
     let status_toml = run_status
@@ -283,7 +380,7 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
         "run {}/{} completed with state {}",
         nickname.as_str(),
         run_id.as_str(),
-        run_state.as_str()
+        run_status.state.as_str()
     );
 
     Ok(())
@@ -292,17 +389,19 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
 /// Apply postprocessing rules to a file.
 ///
 /// Returns a list of (step_name, success) pairs.
+/// Uses `{path}` as the template placeholder in args.
 pub fn apply_postprocessing(
     server_config: &ServerConfig,
     client_config: &purgery_core::ClientConfig,
     normalized_path: &str,
-    final_path: impl AsRef<Path>,
+    final_path: impl AsRef<std::path::Path>,
 ) -> Vec<(String, bool)> {
     let final_path = final_path.as_ref();
+    let final_path_str = final_path.to_string_lossy();
     let mut results = Vec::new();
 
     for rule in &client_config.postprocess.rules {
-        let Ok(re) = Regex::new(&rule.pattern) else {
+        let Ok(re) = regex::Regex::new(&rule.pattern) else {
             eprintln!("invalid regex pattern: {}", rule.pattern);
             continue;
         };
@@ -318,36 +417,39 @@ pub fn apply_postprocessing(
                 continue;
             };
 
-            let cmd_str = step_def
-                .command
-                .replace("$path", &final_path.to_string_lossy());
-            eprintln!("running postprocess step '{step_name}': {cmd_str}");
+            // Substitute {path} in args with the actual file path
+            let args: Vec<String> = step_def
+                .args
+                .iter()
+                .map(|a| a.replace("{path}", &final_path_str))
+                .collect();
 
-            let parts = shell_words_split(&cmd_str);
-            let success = if parts.is_empty() {
-                false
-            } else {
-                let program = &parts[0];
-                let args = &parts[1..];
-                match std::process::Command::new(program).args(args).status() {
-                    Ok(status) if status.success() => {
-                        eprintln!("postprocess step '{step_name}' succeeded");
-                        true
-                    }
-                    Ok(status) => {
-                        eprintln!(
-                            "postprocess step '{step_name}' failed with exit code: {}",
-                            status
-                                .code()
-                                .map(|c| c.to_string())
-                                .unwrap_or_else(|| "signal".to_owned())
-                        );
-                        false
-                    }
-                    Err(e) => {
-                        eprintln!("postprocess step '{step_name}' error: {e}");
-                        false
-                    }
+            eprintln!(
+                "running postprocess step '{step_name}': {} {:?}",
+                step_def.program, args
+            );
+
+            let success = match std::process::Command::new(&step_def.program)
+                .args(&args)
+                .status()
+            {
+                Ok(status) if status.success() => {
+                    eprintln!("postprocess step '{step_name}' succeeded");
+                    true
+                }
+                Ok(status) => {
+                    eprintln!(
+                        "postprocess step '{step_name}' failed with exit code: {}",
+                        status
+                            .code()
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "signal".to_owned())
+                    );
+                    false
+                }
+                Err(e) => {
+                    eprintln!("postprocess step '{step_name}' error: {e}");
+                    false
                 }
             };
             results.push((step_name.clone(), success));
@@ -355,44 +457,6 @@ pub fn apply_postprocessing(
     }
 
     results
-}
-
-/// Split a command string into program and arguments, respecting shell quoting.
-pub fn shell_words_split(cmd: &str) -> Vec<String> {
-    let mut args = Vec::new();
-    let mut current = String::new();
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut chars = cmd.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
-            ' ' | '\t' if !in_single && !in_double => {
-                if !current.is_empty() {
-                    args.push(current.clone());
-                    current.clear();
-                }
-            }
-            '\\' if !in_single => {
-                if let Some(&next) = chars.peek() {
-                    if in_double && next != '"' && next != '\\' && next != '$' && next != '`' {
-                        current.push('\\');
-                    }
-                    current.push(next);
-                    chars.next();
-                } else {
-                    current.push('\\');
-                }
-            }
-            _ => current.push(ch),
-        }
-    }
-    if !current.is_empty() {
-        args.push(current);
-    }
-    args
 }
 
 /// Move a failed run's directory from processing to failed.
@@ -445,11 +509,27 @@ pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
     Ok(())
 }
 
+// ── Remote shell escaping ──────────────────────────────────────────
+
+/// Build a remote SSH command from a program and arguments.
+///
+/// Each argument is shell-escaped individually to avoid shell injection
+/// from paths containing spaces or special characters.
+pub fn build_remote_command(program: &str, args: &[String]) -> String {
+    let mut cmd = String::new();
+    cmd.push_str(program);
+    for a in args {
+        cmd.push(' ');
+        cmd.push_str(&shell_escape(a));
+    }
+    cmd
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use camino::Utf8PathBuf;
-    use purgery_core::{ManifestFileEntry, NormalizedRelativePath, ServerRoot};
+    use camino::{Utf8Path, Utf8PathBuf};
+    use purgery_core::{ManifestFileEntry, NormalizedRelativePath, PostprocessConfig, ServerRoot};
 
     fn test_server_config(purgery_root: &str, server_root: &str) -> ServerConfig {
         ServerConfig {
@@ -457,7 +537,7 @@ mod tests {
             purgery_root: PurgeryRoot::new(purgery_root.into()).unwrap(),
             state_dir: None,
             log_dir: None,
-            postprocess: purgery_core::PostprocessConfig::default(),
+            postprocess: PostprocessConfig::default(),
         }
     }
 
@@ -473,19 +553,16 @@ mod tests {
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-run-001".into()).unwrap();
 
-        // Set up a ready run
         let ready_path = config
             .purgery_root
             .run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
 
-        // Create a staged file
         let files_dir = ready_path.join("files/videos");
         fs::create_dir_all(&files_dir).unwrap();
         let staged_file_path = files_dir.join("test.mp4");
         fs::write(&staged_file_path, b"hello world").unwrap();
 
-        // Write client config
         let client_toml = r#"
 nickname = "laptop"
 
@@ -502,7 +579,6 @@ delete_after_import = true
         .to_string();
         fs::write(ready_path.join("config.toml"), &client_toml).unwrap();
 
-        // Write manifest
         let manifest = Manifest {
             run_id: run_id.clone(),
             nickname: nickname.clone(),
@@ -519,16 +595,13 @@ delete_after_import = true
         let manifest_toml = manifest.to_toml().unwrap();
         fs::write(ready_path.join("manifest.toml"), &manifest_toml).unwrap();
 
-        // Process the run
         process_run(&config, &nickname, &run_id).unwrap();
 
-        // Verify: run moved to done
         let done_path = config
             .purgery_root
             .run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(done_path.exists());
 
-        // Verify: status.toml exists and is valid
         let status_path = done_path.join("status.toml");
         assert!(status_path.exists());
         let status_content = fs::read_to_string(&status_path).unwrap();
@@ -537,12 +610,9 @@ delete_after_import = true
         assert_eq!(status.files.len(), 1);
         assert_eq!(status.files[0].status, FileStatus::Imported);
 
-        // Verify: file moved to final storage
         let final_path = server_root.join("laptop/videos/test.mp4");
         assert!(final_path.exists());
         assert_eq!(fs::read_to_string(&final_path).unwrap(), "hello world");
-
-        // Verify: staged file no longer exists (was moved)
         assert!(!staged_file_path.exists());
     }
 
@@ -563,7 +633,6 @@ delete_after_import = true
             .run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(ready_path.join("files")).unwrap();
 
-        // Client config with no sync mappings
         let client_toml = r#"
 nickname = "laptop"
 
@@ -677,30 +746,13 @@ to = "videos"
             pattern: r"^videos/.*\.(mp4|mov|mkv|webm)$".into(),
             steps: vec!["compress-video".into()],
         };
-        let re = Regex::new(&rule.pattern).unwrap();
+        let re = regex::Regex::new(&rule.pattern).unwrap();
 
         assert!(re.is_match("videos/a.mp4"));
         assert!(re.is_match("videos/subdir/b.mov"));
         assert!(re.is_match("videos/c.webm"));
         assert!(!re.is_match("audio/song.mp3"));
         assert!(!re.is_match("videos/a.txt"));
-    }
-
-    #[test]
-    fn test_shell_words_split_simple() {
-        let result = shell_words_split("my-compress-video --input \"$path\"");
-        assert_eq!(result, vec!["my-compress-video", "--input", "$path"]);
-    }
-
-    #[test]
-    fn test_shell_words_split_with_quotes() {
-        let result = shell_words_split("echo 'hello world'");
-        assert_eq!(result, vec!["echo", "hello world"]);
-    }
-
-    #[test]
-    fn test_shell_words_split_empty() {
-        assert!(shell_words_split("").is_empty());
     }
 
     #[test]
@@ -721,7 +773,6 @@ to = "videos"
                 .unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
 
-        // Create ready dirs
         let run1 = root.run_dir(
             &nickname,
             &RunId::new("run-1".into()).unwrap(),
@@ -737,5 +788,242 @@ to = "videos"
 
         let runs = find_ready_runs(&root).unwrap();
         assert_eq!(runs.len(), 2);
+    }
+
+    /// Envelope validation: directory nickname != config nickname -> run fails
+    #[test]
+    fn test_nickname_mismatch_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = tmp.path().join("purgery");
+        let server_root = tmp.path().join("storage");
+        let purgery_str = purgery_root.to_string_lossy().to_string();
+        let server_str = server_root.to_string_lossy().to_string();
+
+        let config = test_server_config(&purgery_str, &server_str);
+        let dir_nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("test-env-001".into()).unwrap();
+
+        let ready_path = config
+            .purgery_root
+            .run_dir(&dir_nickname, &run_id, RunPhase::Ready);
+        fs::create_dir_all(&ready_path).unwrap();
+
+        // Config has a different nickname than the directory
+        let client_toml = r#"
+nickname = "other-machine"
+
+[server]
+host = "example.com"
+purgery_root = "/tmp/purgery"
+"#;
+        fs::write(ready_path.join("config.toml"), client_toml).unwrap();
+
+        let manifest = Manifest {
+            run_id: run_id.clone(),
+            nickname: Nickname::new("other-machine".into()).unwrap(),
+            files: vec![ManifestFileEntry {
+                sync_name: "videos".into(),
+                local_path: "/tmp/a.mp4".into(),
+                staged_path: NormalizedRelativePath::new("files/a.mp4".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
+                size: 10,
+                mtime_ns: 100,
+                sha256: None,
+            }],
+        };
+        fs::write(
+            ready_path.join("manifest.toml"),
+            manifest.to_toml().unwrap(),
+        )
+        .unwrap();
+
+        // The run should fail because envelope validation fails
+        let result = process_run(&config, &dir_nickname, &run_id);
+        assert!(result.is_err());
+
+        // A failed status should have been written
+        let failed_path = config
+            .purgery_root
+            .run_dir(&dir_nickname, &run_id, RunPhase::Failed);
+        let status_path = failed_path.join("status.toml");
+        assert!(
+            status_path.exists(),
+            "failed status must be written on envelope mismatch"
+        );
+        let status_content = fs::read_to_string(&status_path).unwrap();
+        let status = RunStatus::from_toml(&status_content).unwrap();
+        assert_eq!(status.state, RunState::Failed);
+        assert!(status.error.unwrap().contains("envelope validation failed"));
+    }
+
+    /// Bad manifest still produces a readable failed status
+    #[test]
+    fn test_bad_manifest_produces_failed_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = tmp.path().join("purgery");
+        let server_root = tmp.path().join("storage");
+        let purgery_str = purgery_root.to_string_lossy().to_string();
+        let server_str = server_root.to_string_lossy().to_string();
+
+        let config = test_server_config(&purgery_str, &server_str);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("test-bad-manifest".into()).unwrap();
+
+        let ready_path = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        fs::create_dir_all(&ready_path).unwrap();
+
+        let client_toml = r#"
+nickname = "laptop"
+
+[server]
+host = "example.com"
+purgery_root = "/tmp/purgery"
+"#;
+        fs::write(ready_path.join("config.toml"), client_toml).unwrap();
+        // Write garbage as manifest
+        fs::write(ready_path.join("manifest.toml"), "not valid toml {{{").unwrap();
+
+        let result = process_run(&config, &nickname, &run_id);
+        assert!(result.is_err());
+
+        let failed_path = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        let status_path = failed_path.join("status.toml");
+        assert!(
+            status_path.exists(),
+            "failed status must exist after bad manifest"
+        );
+        let status_content = fs::read_to_string(&status_path).unwrap();
+        let status = RunStatus::from_toml(&status_content).unwrap();
+        assert_eq!(status.state, RunState::Failed);
+        assert!(status.error.unwrap().contains("failed to parse manifest"));
+    }
+
+    /// Bad config produces a readable failed status
+    #[test]
+    fn test_bad_config_produces_failed_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = tmp.path().join("purgery");
+        let server_root = tmp.path().join("storage");
+        let purgery_str = purgery_root.to_string_lossy().to_string();
+        let server_str = server_root.to_string_lossy().to_string();
+
+        let config = test_server_config(&purgery_str, &server_str);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("test-bad-config".into()).unwrap();
+
+        let ready_path = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        fs::create_dir_all(&ready_path).unwrap();
+
+        // Write garbage as config
+        fs::write(ready_path.join("config.toml"), "not valid toml {{{").unwrap();
+        // Valid manifest
+        let manifest = Manifest {
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            files: vec![ManifestFileEntry {
+                sync_name: "videos".into(),
+                local_path: "/tmp/a.mp4".into(),
+                staged_path: NormalizedRelativePath::new("files/a.mp4".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
+                size: 10,
+                mtime_ns: 100,
+                sha256: None,
+            }],
+        };
+        fs::write(
+            ready_path.join("manifest.toml"),
+            manifest.to_toml().unwrap(),
+        )
+        .unwrap();
+
+        let result = process_run(&config, &nickname, &run_id);
+        assert!(result.is_err());
+
+        let failed_path = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        let status_path = failed_path.join("status.toml");
+        assert!(
+            status_path.exists(),
+            "failed status must exist after bad config"
+        );
+        let status_content = fs::read_to_string(&status_path).unwrap();
+        let status = RunStatus::from_toml(&status_content).unwrap();
+        assert_eq!(status.state, RunState::Failed);
+        assert!(status
+            .error
+            .unwrap()
+            .contains("failed to parse client config"));
+    }
+
+    #[test]
+    fn test_build_remote_command() {
+        let args = vec!["--input".to_string(), "/path/file.mp4".to_string()];
+        let cmd = build_remote_command("my-compress-video", &args);
+        assert_eq!(cmd, "my-compress-video '--input' '/path/file.mp4'");
+    }
+
+    #[test]
+    fn test_build_remote_command_with_spaces() {
+        let args = vec![
+            "--input".to_string(),
+            "/path/with spaces/file.mp4".to_string(),
+        ];
+        let cmd = build_remote_command("rsync", &args);
+        assert_eq!(cmd, "rsync '--input' '/path/with spaces/file.mp4'");
+    }
+
+    #[test]
+    fn test_postprocessing_path_with_spaces() {
+        let server_config = ServerConfig {
+            root: ServerRoot::new("/data".into()).unwrap(),
+            purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
+            state_dir: None,
+            log_dir: None,
+            postprocess: purgery_core::PostprocessConfig {
+                max_parallel_jobs: 1,
+                steps: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "compress-video".to_owned(),
+                        purgery_core::PostprocessStepDefinition {
+                            kind: "builtin".to_owned(),
+                            program: "true".to_owned(),
+                            args: vec!["--input".to_owned(), "{path}".to_owned()],
+                        },
+                    );
+                    m
+                },
+            },
+        };
+        let client_config = purgery_core::ClientConfig {
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            server: purgery_core::ServerConnection {
+                host: purgery_core::RemoteHost::new("example.com".into()).unwrap(),
+                purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
+            },
+            sync: vec![],
+            postprocess: purgery_core::ClientPostprocessConfig {
+                rules: vec![purgery_core::PostprocessRule {
+                    pattern: r"^videos/.*$".to_owned(),
+                    steps: vec!["compress-video".to_owned()],
+                }],
+            },
+        };
+        let results = apply_postprocessing(
+            &server_config,
+            &client_config,
+            "videos/some file.mp4",
+            Utf8Path::new("/data/laptop/videos/some file.mp4"),
+        );
+        // Should produce one result with success=true (true always exits 0)
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1, "postprocess with spaces should succeed");
     }
 }
