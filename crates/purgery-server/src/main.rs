@@ -1,4 +1,8 @@
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use purgery_core::ServerConfig;
+use purgery_server::process_once_raw;
+use std::fs;
 
 #[derive(Parser)]
 #[command(
@@ -21,12 +25,16 @@ enum Command {
     },
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::ProcessOnce { config } => {
-            eprintln!("not yet implemented: purgery-server process-once --config {config}");
-            Ok(())
+            let config_content = fs::read_to_string(&config)
+                .with_context(|| format!("failed to read server config: {config}"))?;
+            let server_config = ServerConfig::from_toml(&config_content)
+                .with_context(|| "failed to parse server config")?;
+            process_once_raw(&server_config)?;
         }
     }
+    Ok(())
 }
