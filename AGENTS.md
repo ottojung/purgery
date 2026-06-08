@@ -74,5 +74,4 @@ Each newtype documents:
 
 ## 6. Compatibility
 
-- Correctness may override backwards compatibility early in the project.
-- Persisted formats (config, manifest, status TOML) require explicit migration consideration once released.
+- Correctness and beauty must override backwards compatibility.
