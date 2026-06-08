@@ -2,7 +2,7 @@
 
 A Rust client/server file sync and postprocessing tool.
 
-Clients upload files to a server over SSH via `rsync`. The server validates runs, applies optional postprocessing (e.g., video compression), moves files into final storage, and writes a status file. The client then deletes only the local files confirmed as successfully imported.
+Clients upload files to a server. The server validates runs, applies optional postprocessing (e.g., video compression), moves files into final storage, and writes a status file. The client then deletes only the local files confirmed as successfully imported.
 
 ## Lifecycle
 
