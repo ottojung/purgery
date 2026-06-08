@@ -84,6 +84,7 @@ jobs:
           context: .
           file: Dockerfile
           push: ${{ github.ref == 'refs/heads/master' }}
+          load: true
           build-args: |
             PURGERY_ALLOW_RELEASE_BLOCKERS=1
           tags: |
@@ -93,4 +94,4 @@ jobs:
           cache-to: type=gha,mode=max,scope=docker-purgery
 
       - name: Run docker image entrypoint
-        run: docker run ghcr.io/ottojung/purgery --version
+        run: docker run ghcr.io/ottojung/purgery:${{ steps.gitver.outputs.version }} --version
