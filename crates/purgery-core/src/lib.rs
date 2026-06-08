@@ -771,8 +771,8 @@ pub struct FileStatusEntry {
     pub local_path: String,
     pub relative_path: String,
     pub status: FileStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub final_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub final_paths: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub postprocess: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1023,6 +1023,19 @@ pub fn work_dir(server_root: &Utf8Path, nickname: &Nickname, run_id: &RunId) -> 
         .join(".purgery-work")
         .join(nickname.as_str())
         .join(run_id.as_str())
+}
+
+/// Build a temporary commit path in the same directory as `final_path`.
+///
+/// Returns `parent / .purgery-commit.<run_id>.<filename>.tmp`.
+/// This path is on the same filesystem as `final_path`, so the final
+/// rename is atomic.
+pub fn commit_temp_path(final_path: &Utf8Path, run_id: &RunId) -> Utf8PathBuf {
+    let filename = final_path.file_name().unwrap_or("unknown");
+    let tmp_name = format!(".purgery-commit.{}.{}.tmp", run_id.as_str(), filename);
+    final_path
+        .parent()
+        .map_or_else(|| Utf8PathBuf::from(&tmp_name), |p| p.join(&tmp_name))
 }
 
 // ── Envelope Validation ─────────────────────────────────────────────
@@ -1787,7 +1800,7 @@ sync_name = "videos"
 local_path = "/home/vitalik/Videos/a.mp4"
 relative_path = "a.mp4"
 status = "imported"
-final_path = "laptop/videos/a.mp4"
+final_paths = ["laptop/videos/a.mp4"]
 postprocess = ["compress-video"]
 
 [[files]]
@@ -1801,10 +1814,7 @@ error = "compress-video failed"
         assert_eq!(status.state, RunState::Done);
         assert_eq!(status.files.len(), 2);
         assert_eq!(status.files[0].status, FileStatus::Imported);
-        assert_eq!(
-            status.files[0].final_path.as_deref(),
-            Some("laptop/videos/a.mp4")
-        );
+        assert_eq!(status.files[0].final_paths, vec!["laptop/videos/a.mp4"]);
         assert_eq!(status.files[0].sync_name.as_str(), "videos");
         assert_eq!(status.files[1].status, FileStatus::Failed);
         assert_eq!(
@@ -1912,7 +1922,7 @@ files = []
                 local_path: "/tmp/test.mp4".into(),
                 relative_path: "test.mp4".into(),
                 status: FileStatus::Imported,
-                final_path: Some("laptop/videos/test.mp4".into()),
+                final_paths: vec!["laptop/videos/test.mp4".into()],
                 postprocess: Some(vec!["compress-video".into()]),
                 error: None,
             }],
@@ -1924,6 +1934,7 @@ files = []
         assert_eq!(parsed.files.len(), 1);
         assert_eq!(parsed.files[0].status, FileStatus::Imported);
         assert_eq!(parsed.files[0].sync_name.as_str(), "videos");
+        assert_eq!(parsed.files[0].final_paths, vec!["laptop/videos/test.mp4"]);
     }
 
     // ── Envelope validation tests ──
@@ -2252,6 +2263,27 @@ files = []
         let result = check_symlink_in_path(&final_path, &root);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("symlink detected"));
+    }
+
+    // ── Commit temp path tests ──
+
+    #[test]
+    fn commit_temp_path_basic() {
+        let final_path = Utf8Path::new("/data/laptop/videos/a.mp4");
+        let run_id = RunId::new("01ARZ3NDEKTSV4RRFFQ69G5FAV".into()).unwrap();
+        let tmp = commit_temp_path(final_path, &run_id);
+        assert_eq!(
+            tmp.as_str(),
+            "/data/laptop/videos/.purgery-commit.01ARZ3NDEKTSV4RRFFQ69G5FAV.a.mp4.tmp"
+        );
+    }
+
+    #[test]
+    fn commit_temp_path_same_filesystem_as_parent() {
+        let final_path = Utf8Path::new("/root/sub/file.txt");
+        let run_id = RunId::new("run-1".into()).unwrap();
+        let tmp = commit_temp_path(final_path, &run_id);
+        assert_eq!(tmp.parent(), final_path.parent());
     }
 
     // ── Work Dir tests ──
