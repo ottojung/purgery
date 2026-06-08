@@ -75,3 +75,16 @@ Each newtype documents:
 ## 6. Compatibility
 
 - Correctness and beauty must override backwards compatibility.
+
+## Git is good
+
+If you have access to `git`, then:
+- commit frequently,
+- and write helpful commit messages.
+
+It is always safe to commit, do it even if you weren't explicitly told to.
+
+## Github code of conduct
+
+When posting a comment on github, include `@ottojung` substring at the end.
+Github posts must use humor and metaphors.
