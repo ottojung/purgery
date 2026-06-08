@@ -3,7 +3,8 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "purgery-client",
-    about = "Purgery client: sync files to server and clean up imported files"
+    about = "Purgery client: sync files to server and clean up imported files",
+    version
 )]
 struct Cli {
     #[command(subcommand)]

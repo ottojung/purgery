@@ -3,7 +3,8 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "purgery-server",
-    about = "Purgery server: process staged uploads and move files to final storage"
+    about = "Purgery server: process staged uploads and move files to final storage",
+    version
 )]
 struct Cli {
     #[command(subcommand)]
