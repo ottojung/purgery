@@ -1,0 +1,10 @@
+[package]
+name = "purgery-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+purgery-core = { path = "../purgery-core" }
+anyhow = "1"

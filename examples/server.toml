@@ -1,0 +1,11 @@
+root = "/universe/synced"
+purgery_root = "/universe/tmp/purgery"
+state_dir = "/var/lib/purgery"
+log_dir = "/var/log/purgery"
+
+[postprocess]
+max_parallel_jobs = 1
+
+[postprocess.steps.compress-video]
+kind = "builtin"
+command = "my-compress-video"

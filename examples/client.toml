@@ -1,0 +1,21 @@
+nickname = "laptop"
+
+[server]
+host = "example.com"
+purgery_root = "/universe/tmp/purgery"
+
+[[sync]]
+name = "videos"
+from = "/home/vitalik/Videos"
+to = "videos"
+delete_after_import = true
+
+[[sync]]
+name = "pictures"
+from = "/home/vitalik/Pictures"
+to = "pictures"
+delete_after_import = true
+
+[[postprocess.rules]]
+match = '^videos/.*\.(mp4|mov|mkv|webm)$'
+steps = ["compress-video"]
