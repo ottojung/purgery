@@ -48,3 +48,49 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace
+
+  docker:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # Fetch all history for git describe
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive version from latest git tag
+        id: gitver
+        shell: bash
+        run: |
+          VERSION="$(git describe | sed 's/^v//')"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Using version: $VERSION"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          push: ${{ github.ref == 'refs/heads/master' }}
+          build-args: |
+            PURGERY_ALLOW_RELEASE_BLOCKERS=1
+          tags: |
+            ghcr.io/ottojung/purgery:${{ steps.gitver.outputs.version }}
+            ghcr.io/ottojung/purgery:latest
+          cache-from: type=gha,scope=docker-purgery
+          cache-to: type=gha,mode=max,scope=docker-purgery
+
+      - name: Run docker image entrypoint
+        run: docker run ghcr.io/ottojung/purgery --version
