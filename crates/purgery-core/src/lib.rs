@@ -1982,6 +1982,33 @@ impl RunConfig {
     pub fn sync_map(&self) -> BTreeMap<&str, &RunConfigSync> {
         self.sync.iter().map(|s| (s.name.as_str(), s)).collect()
     }
+
+    /// Validate scoped rule references.
+    /// Checks that `for` lists are non-empty and reference syncs in this config.
+    /// Called during `from_toml` and available for independent use.
+    pub fn validate_sync_scoped_rules(&self) -> Result<(), String> {
+        let sync_names: Vec<SyncName> = self.sync.iter().map(|s| s.name.clone()).collect();
+        self.postprocess.validate(&sync_names)
+    }
+
+    /// Full validation for an uploaded purgatory run config.
+    /// Confirms all rules are scoped correctly AND every included sync has
+    /// `delete_after_import = true`. Passthrough-only syncs are excluded by
+    /// the client, so the server should never see a run config sync with
+    /// `delete_after_import = false`.
+    pub fn validate_uploaded_purgatory_run(&self) -> Result<(), String> {
+        self.validate_sync_scoped_rules()?;
+        for sync in &self.sync {
+            if !sync.delete_after_import {
+                return Err(format!(
+                    "sync group '{}' in purgatory run config has delete_after_import = false; \
+                     postprocessing requires delete_after_import = true",
+                    sync.name.as_str()
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 // ── Shell Escaping (shared by client and server) ─────────────────────
@@ -3410,6 +3437,93 @@ steps = ["compress-video"]
         assert_eq!(config.sync[0].name.as_str(), "videos");
         assert_eq!(config.postprocess.rules.len(), 1);
         assert_eq!(config.postprocess.rules[0].pattern, "*.mp4");
+    }
+
+    #[test]
+    fn from_toml_rejects_for_empty() {
+        let toml = r#"
+nickname = "laptop"
+
+[[sync]]
+name = "videos"
+to = "videos"
+delete_after_import = true
+
+[[postprocess.rules]]
+match = "*.mp4"
+steps = ["pack"]
+for = []
+"#;
+        let result = RunConfig::from_toml(toml);
+        assert!(result.is_err(), "empty for must be rejected by from_toml");
+    }
+
+    #[test]
+    fn from_toml_rejects_for_unknown_sync() {
+        let toml = r#"
+nickname = "laptop"
+
+[[sync]]
+name = "videos"
+to = "videos"
+delete_after_import = true
+
+[[postprocess.rules]]
+match = "*.mp4"
+steps = ["pack"]
+for = ["missing"]
+"#;
+        let result = RunConfig::from_toml(toml);
+        assert!(
+            result.is_err(),
+            "unknown sync in for must be rejected by from_toml"
+        );
+    }
+
+    #[test]
+    fn validate_uploaded_purgatory_run_rejects_delete_after_import_false() {
+        let toml = r#"
+nickname = "laptop"
+
+[[sync]]
+name = "videos"
+to = "videos"
+delete_after_import = false
+
+[[postprocess.rules]]
+match = "*.mp4"
+steps = ["pack"]
+"#;
+        let config = RunConfig::from_toml(toml).unwrap();
+        let result = config.validate_uploaded_purgatory_run();
+        assert!(
+            result.is_err(),
+            "delete_after_import=false must be rejected in purgatory run"
+        );
+    }
+
+    #[test]
+    fn validate_uploaded_purgatory_run_accepts_valid() {
+        let toml = r#"
+nickname = "laptop"
+
+[[sync]]
+name = "videos"
+to = "videos"
+delete_after_import = true
+
+[[postprocess.rules]]
+match = "*.mp4"
+steps = ["pack"]
+for = ["videos"]
+"#;
+        let config = RunConfig::from_toml(toml).unwrap();
+        let result = config.validate_uploaded_purgatory_run();
+        assert!(
+            result.is_ok(),
+            "valid purgatory run must be accepted: {:?}",
+            result.err()
+        );
     }
 
     #[test]

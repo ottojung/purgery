@@ -1809,22 +1809,10 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
     let run_config = purgery_core::RunConfig::from_toml(&run_config_content)
         .with_context(|| "failed to parse run config")?;
 
-    // Validate the purgatory invariant: every sync in a purgatory run config
-    // must have delete_after_import = true. Passthrough-only groups (which
-    // may have delete_after_import = false) are excluded from the purgatory
-    // run config on the client side.
-    {
-        let daisy = &run_config;
-        for sync in &daisy.sync {
-            if !sync.delete_after_import {
-                anyhow::bail!(
-                    "sync group '{}' in purgatory run config has delete_after_import = false; \
-                     postprocessing requires delete_after_import = true",
-                    sync.name.as_str()
-                );
-            }
-        }
-    }
+    // Validate the uploaded purgatory run config centrally.
+    run_config
+        .validate_uploaded_purgatory_run()
+        .map_err(|e| anyhow::anyhow!("uploaded run config validation failed: {e}"))?;
 
     let manifest_path = incoming_path.join("manifest.toml");
     let manifest_content =
