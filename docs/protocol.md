@@ -95,11 +95,13 @@ Covered descendants are excluded from independent transfer roots. They are trans
 
 ### Transfer planning vs identity bookkeeping
 
-Path planning computes lightweight records (sync name, relative path, kind, classification) for rsync filter generation. Identity bookkeeping computes size, mtime, and SHA-256 for cleanup.
+Path planning produces `TransferPlanEntry` records (sync name, relative path, kind, classification, mode). These are lightweight and carry no identity-bearing fields (no size, mtime, or SHA-256).
+
+Identity bookkeeping produces `ManifestEntry` records (with size, mtime, SHA-256) and `CleanupEntry` records (for durable local cleanup state). These are created only for entries that need them.
 
 Identity bookkeeping is separated from path planning:
 
-- Path planning runs for all entries regardless of mode
+- Path planning (`TransferPlanEntry`) runs for all entries regardless of mode
 - Identity is computed only when needed (delete_after_import=true passthrough regular files, or postprocess entries)
 - No-delete passthrough entries get no identity bookkeeping
 
