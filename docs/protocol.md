@@ -7,12 +7,16 @@
 ```
 client: local checks (config, executables)
 client: resolve destinations over SSH -> server computes final storage paths (side-effect-free)
-client: for each sync group:
-           run passthrough rsync directly to final storage
-           if delete_after_import=true:
-             write durable cleanup state atomically
-             delete confirmed passthrough regular files
+client: for each passthrough group:
+            run direct unfiltered rsync to final storage
+            if PassthroughDeleteAfterImport:
+              write durable cleanup state atomically
+              delete confirmed regular files
 ```
+
+There is no per-entry filtered transfer loop in the pure passthrough path.
+Every passthrough group uses direct unfiltered rsync.
+No passthrough group is transferred more than once.
 
 ### Path B: Mixed invocation (purgatory groups + passthrough groups)
 
@@ -177,6 +181,7 @@ Ordinary passthrough entries are excluded.
 - **mode**: must match the pattern classification (postprocess or covered)
 - **covered_by**: for covered entries, must equal the source-relative path of the nearest postprocessed directory ancestor
 - **postprocess_steps**: for covered entries, must be empty
+- **scoped rules**: every `postprocess.rules[].for` entry must reference a sync name that exists in the run config. Empty `for` is rejected.
 
 If any covered entry has the wrong `covered_by` or non-empty `postprocess_steps`, the run is rejected.
 
