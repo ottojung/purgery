@@ -296,7 +296,14 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
     });
 
     if has_postprocess {
-        run_postprocess_path(config, host, server_command, &manifest, &transfer_plan, &run_id)
+        run_postprocess_path(
+            config,
+            host,
+            server_command,
+            &manifest,
+            &transfer_plan,
+            &run_id,
+        )
     } else {
         run_passthrough_path(config, host, server_command, &manifest, &transfer_plan)
     }
@@ -1668,9 +1675,11 @@ steps = ["compress-video"]
         let manifest = build_manifest(&config, &run_id).unwrap();
 
         // Find the passthrough entry
-        let passthrough_entry = manifest.entries.iter().find(|e| {
-            e.kind == ManifestEntryKind::RegularFile
-        }).expect("must have a regular file");
+        let passthrough_entry = manifest
+            .entries
+            .iter()
+            .find(|e| e.kind == ManifestEntryKind::RegularFile)
+            .expect("must have a regular file");
 
         // Create a status that references the passthrough entry's local_path
         let status_entries = vec![EntryStatusEntry {
@@ -1695,6 +1704,9 @@ steps = ["compress-video"]
         // status says imported, because passthrough entries are not tracked by server status.
         let count = delete_confirmed_files(&config, &manifest, &status).unwrap();
         assert_eq!(count, 0, "must not delete passthrough files from status");
-        assert!(source.join("file.txt").exists(), "passthrough file must remain");
+        assert!(
+            source.join("file.txt").exists(),
+            "passthrough file must remain"
+        );
     }
 }
