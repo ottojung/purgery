@@ -1023,21 +1023,47 @@ impl PostprocessStepDefinition {
     ///
     /// Only the file name portion of the resolved pattern is used; the output
     /// is always placed in the same directory as the input file.
-    pub fn resolve_expected_outputs(&self, work_path: &Utf8Path) -> Vec<Utf8PathBuf> {
+    /// Each pattern is validated as a plain file name before resolution.
+    pub fn resolve_expected_outputs(
+        &self,
+        work_path: &Utf8Path,
+    ) -> Result<Vec<Utf8PathBuf>, String> {
         let parent = work_path
             .parent()
             .map(|p| p.to_owned())
             .unwrap_or_else(|| Utf8PathBuf::from("."));
-        self.expected_outputs
-            .iter()
-            .map(|pat| {
-                let resolved = self.resolve_placeholders(work_path, pat);
-                let p = Utf8Path::new(&resolved);
-                let fname = p.file_name().unwrap_or(resolved.as_str());
-                parent.join(fname)
-            })
-            .collect()
+        let mut results = Vec::with_capacity(self.expected_outputs.len());
+        for pat in &self.expected_outputs {
+            validate_expected_output_name(pat)?;
+            let resolved = self.resolve_placeholders(work_path, pat);
+            let p = Utf8Path::new(&resolved);
+            let fname = p.file_name().unwrap_or(resolved.as_str());
+            results.push(parent.join(fname));
+        }
+        Ok(results)
     }
+}
+
+/// Validate that an expected output name is a plain file name.
+///
+/// Rejects empty names, `.`, `..`, absolute paths, and names containing
+/// path separators (`/` or `\`). This is used at config validation time
+/// and at pattern resolution time to maintain the invariant that expected
+/// outputs are always placed next to the input file in the work directory.
+pub fn validate_expected_output_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("expected output name is empty".into());
+    }
+    if name == "." || name == ".." {
+        return Err(format!("expected output name must not be '{name}'"));
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err("expected output name must not contain path separators".into());
+    }
+    if Utf8Path::new(name).is_absolute() {
+        return Err("expected output name must not be absolute".into());
+    }
+    Ok(())
 }
 
 /// Client configuration, loaded from a TOML file.
@@ -2687,7 +2713,7 @@ to = "videos"
             keep_original: false,
         };
         let work_path = Utf8Path::new("/work/videos/video.mp4");
-        let outputs = step.resolve_expected_outputs(work_path);
+        let outputs = step.resolve_expected_outputs(work_path).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].as_str(), "/work/videos/video.Z.webm");
     }

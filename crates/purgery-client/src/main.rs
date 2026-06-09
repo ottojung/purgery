@@ -348,16 +348,14 @@ fn sync_and_cleanup(config_path: &str) -> Result<()> {
             }
         }
 
-        // 6. Check heartbeat one last time before finish-run. If the lease has
-        // expired, finish-run would succeed but the client would still exit
-        // without polling status — operationally awkward, not data-lossy,
-        // but still better to fail early here.
+        // 6. Finish run: move from incoming to ready.
+        // Check heartbeat right before the call — no output or logic between
+        // the check and the command, so there is no window for finish-run to
+        // proceed after the lease has already been lost.
+        eprintln!("finishing run...");
         if let Some(err) = hb_error.lock().unwrap().take() {
             anyhow::bail!("{err}");
         }
-
-        // 7. Finish run: move from incoming to ready
-        eprintln!("finishing run...");
         server_cmd(
             host,
             server_command,
@@ -377,13 +375,8 @@ fn sync_and_cleanup(config_path: &str) -> Result<()> {
     stop_hb.store(true, Ordering::Relaxed);
     let _ = hb_handle.join();
 
-    // Propagate sync/finish error first
+    // Propagate sync/finish/heartbeat error first
     sync_result?;
-
-    // Then check for heartbeat failure
-    if let Some(err) = hb_error.lock().unwrap().take() {
-        anyhow::bail!("{err}");
-    }
 
     // 6. Poll for status via server command
     let status = poll_for_status(host, server_command, &config.nickname, &run_id)?;

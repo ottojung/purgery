@@ -753,7 +753,9 @@ pub fn apply_postprocessing(
                     }
 
                     // Check expected outputs exist and are within the work area
-                    let expected = step_def.resolve_expected_outputs(work_path);
+                    let expected = step_def
+                        .resolve_expected_outputs(work_path)
+                        .map_err(|e| format!("{}: {e}", step.step_name))?;
                     for exp in &expected {
                         if !exp.starts_with(work_parent) {
                             return Err(format!(
@@ -1085,25 +1087,11 @@ pub fn server_check(config: &ServerConfig) -> Result<()> {
             );
         }
 
-        // Validate expected_outputs are simple file names (no paths, no separators)
+        // Validate expected_outputs are plain file names
         for output in &step.expected_outputs {
-            let p = Utf8Path::new(output);
-            if p.is_absolute() {
-                anyhow::bail!(
-                    "postprocess step '{}': expected_output '{}' is absolute; \
-                     must be a file name (output is always placed next to the input)",
-                    name,
-                    output
-                );
-            }
-            if output.contains('/') {
-                anyhow::bail!(
-                    "postprocess step '{}': expected_output '{}' contains a path separator; \
-                     must be a file name, not a path",
-                    name,
-                    output
-                );
-            }
+            purgery_core::validate_expected_output_name(output).map_err(|e| {
+                anyhow::anyhow!("postprocess step '{name}': expected_output {output:?}: {e}")
+            })?;
         }
 
         purgery_core::resolve_executable(program).map(|r| {
@@ -1212,7 +1200,7 @@ pub fn run_gc(config: &ServerConfig) -> Result<()> {
                                         lease.run_id,
                                     );
                                 }
-                                valid && now >= lease.expires_at_unix_secs
+                                !valid || now >= lease.expires_at_unix_secs
                             }
                             Err(_) => true, // malformed lease -> expire
                         }
