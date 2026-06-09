@@ -815,6 +815,31 @@ pub fn process_processing_run(
     }
 
     let sync_map: HashMap<&str, &RunConfigSync> = run_config.sync_map().into_iter().collect();
+
+    // Implicit sync-root directory entries.
+    //
+    // Each sync mapping's `to` path resolves to a directory that must exist
+    // as a real directory before child entries are imported.  If it already
+    // exists as a file or symlink, `commit_directory_entry` replaces it
+    // (matching rsync's behaviour).  This ensures <root>/<nickname>/<sync.to>
+    // behaves like the root of the imported source tree, not like an
+    // external prerequisite that the user must set up manually.
+    for sync in run_config.sync.iter() {
+        let root_dir = config
+            .root
+            .as_path()
+            .join(nickname.as_str())
+            .join(sync.to_path.as_str());
+        if let Err(error) = commit_directory_entry(&root_dir, config.root.as_path()) {
+            warn!(
+                sync_name = %sync.name.as_str(),
+                path = %root_dir.as_str(),
+                error = %error,
+                "sync root directory setup failed"
+            );
+        }
+    }
+
     let mut outcomes: Vec<EntryOutcome> = Vec::new();
 
     for entry in &manifest.entries {
@@ -1020,6 +1045,23 @@ impl RunPlan {
                         "postprocess step '{step_name}' referenced by rule is not defined on server"
                     ));
                 };
+
+                // Validate expected_outputs patterns at plan-build time so
+                // that bad server configuration is caught before entry
+                // processing mutates final storage.
+                for output in &def.expected_outputs {
+                    purgery_core::validate_expected_output_name(output).map_err(|e| {
+                        format!("postprocess step '{step_name}': expected_output {output:?}: {e}")
+                    })?;
+                }
+
+                if !def.keep_original && def.expected_outputs.is_empty() {
+                    return Err(format!(
+                        "postprocess step '{step_name}': keep_original=false with no \
+                         expected_outputs would produce zero committed outputs"
+                    ));
+                }
+
                 steps.push(ResolvedStep {
                     step_name: step_name.clone(),
                     step_def: def.clone(),

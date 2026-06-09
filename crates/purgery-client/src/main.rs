@@ -709,10 +709,28 @@ fn delete_confirmed_files(
         let local_path_str = manifest_entry.local_path.as_str();
         let local_path = Path::new(local_path_str);
 
-        // Check that file still exists and matches identity
-        if !local_path.exists() {
-            // File already gone — idempotent, count as success
-            count += 1;
+        // Use symlink_metadata to detect post-upload symlink replacements.
+        let symmeta = match fs::symlink_metadata(local_path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // File already gone — idempotent, count as success
+                count += 1;
+                continue;
+            }
+            Err(_) => {
+                warn!(path = %local_path.display(), "cannot read metadata, not deleting");
+                continue;
+            }
+        };
+
+        // Refuse to delete if the current path is not a regular file.
+        // This prevents cleanup from deleting a symlink that replaced the
+        // original regular file after upload.
+        if !symmeta.file_type().is_file() || symmeta.file_type().is_symlink() {
+            warn!(
+                path = %local_path.display(),
+                "local path is no longer a regular file, not deleting"
+            );
             continue;
         }
 
@@ -872,5 +890,53 @@ delete_after_import = true
             .unwrap()
             .file_type()
             .is_symlink());
+    }
+
+    #[test]
+    fn cleanup_does_not_delete_symlink_replacing_original_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("file.txt"), "data").unwrap();
+
+        let config = config_for(&source);
+        let run_id = RunId::new("symlink-safety".into()).unwrap();
+        let manifest = build_manifest(&config, &run_id).unwrap();
+
+        // After upload, the original regular file is replaced by a symlink
+        fs::remove_file(source.join("file.txt")).unwrap();
+        let target = tmp.path().join("other");
+        fs::write(&target, "other data").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, source.join("file.txt")).unwrap();
+
+        let status_entries: Vec<_> = manifest
+            .entries
+            .iter()
+            .map(|entry| EntryStatusEntry {
+                kind: entry.kind,
+                sync_name: entry.sync_name.clone(),
+                local_path: entry.local_path.as_str().to_owned(),
+                relative_path: entry.relative_path.as_str().to_owned(),
+                status: FileStatus::Imported,
+                final_paths: vec![],
+                postprocess: None,
+                error: None,
+            })
+            .collect();
+        let status = RunStatus {
+            run_id,
+            nickname: config.nickname.clone(),
+            state: RunState::Done,
+            entries: status_entries,
+            error: None,
+        };
+
+        let count = delete_confirmed_files(&config, &manifest, &status).unwrap();
+        assert_eq!(count, 0, "should not delete symlink");
+        assert!(
+            fs::symlink_metadata(source.join("file.txt")).is_ok(),
+            "symlink must still exist"
+        );
     }
 }
