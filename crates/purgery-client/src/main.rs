@@ -301,7 +301,10 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
     if let Err(e) = config.postprocess.validate(&sync_names) {
         anyhow::bail!("postprocess config validation failed: {e}");
     }
-    if let Err(e) = config.postprocess.validate_delete_after_import(&config.sync) {
+    if let Err(e) = config
+        .postprocess
+        .validate_delete_after_import(&config.sync)
+    {
         anyhow::bail!("postprocess config validation failed: {e}");
     }
     info!("postprocess rules validated");
@@ -560,7 +563,9 @@ fn run_postprocess_path(
     );
 
     // 0a. Resolve destinations for passthrough-only groups via resolve-destinations
-    let passthrough_dest_map: std::collections::HashMap<String, String> = if !direct_rsync_syncs.is_empty() {
+    let passthrough_dest_map: std::collections::HashMap<String, String> = if !direct_rsync_syncs
+        .is_empty()
+    {
         let run_config_all = build_run_config(config, false);
         let run_config_all_toml = run_config_all
             .to_toml()
@@ -576,8 +581,8 @@ fn run_postprocess_path(
             &run_config_all_toml,
         )
         .context("resolve-destinations failed")?;
-        let resolve_resp: purgery_core::ResolveDestinationsResponse =
-            toml::from_str(&resolve_out).context("failed to parse resolve-destinations response")?;
+        let resolve_resp: purgery_core::ResolveDestinationsResponse = toml::from_str(&resolve_out)
+            .context("failed to parse resolve-destinations response")?;
         resolve_resp
             .destinations
             .into_iter()

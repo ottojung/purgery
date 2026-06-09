@@ -3739,7 +3739,7 @@ match = "*.mp4"
 steps = ["compress-video"]
 "#;
         let config = ClientConfig::from_toml(toml).unwrap();
-        assert_eq!(config.sync[0].delete_after_import, true);
+        assert!(config.sync[0].delete_after_import);
         assert_eq!(config.postprocess.rules.len(), 1);
     }
 
@@ -3770,7 +3770,7 @@ for = ["pictures"]
 "#;
         let config = ClientConfig::from_toml(toml).unwrap();
         assert!(!config.sync[0].delete_after_import);
-        assert_eq!(config.sync[1].delete_after_import, true);
+        assert!(config.sync[1].delete_after_import);
     }
 
     // ── PostprocessRule `for` field tests ──
