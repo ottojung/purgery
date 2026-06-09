@@ -525,7 +525,7 @@ fn run_passthrough_path(
     }
 
     // Handle PassthroughDeleteAfterImport groups:
-    // direct unfiltered rsync + cleanup from manifest entries.
+    // direct unfiltered rsync + filesystem scan for cleanup.
     for sync in passthrough_cleanup {
         let sync_name = sync.name.as_str();
         if let Some(dest) = dest_map.get(sync_name) {
@@ -545,7 +545,7 @@ fn run_passthrough_path(
             if !status.success() {
                 anyhow::bail!("rsync failed for sync mapping '{sync_name}'");
             }
-            process_cleanup_entries(config, sync_name, manifest)?;
+            scan_and_cleanup_sync(config, sync)?;
         }
     }
 
@@ -677,7 +677,7 @@ fn run_postprocess_path(
     }
 
     // 0c. Handle PassthroughDeleteAfterImport groups:
-    //     direct unfiltered rsync + cleanup from manifest entries.
+    //     direct unfiltered rsync + filesystem scan for cleanup.
     for sync in passthrough_cleanup {
         let sync_name = sync.name.as_str();
         if let Some(passthrough_dest) = passthrough_dest_map.get(sync_name) {
@@ -697,7 +697,7 @@ fn run_postprocess_path(
             if !status.success() {
                 anyhow::bail!("rsync failed for sync mapping '{sync_name}'");
             }
-            process_cleanup_entries(config, sync_name, manifest)?;
+            scan_and_cleanup_sync(config, sync)?;
         }
     }
 
@@ -1638,6 +1638,124 @@ fn compute_sha256(path: &Path) -> Result<String> {
         hasher.update(&buffer[..bytes_read]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Scan a source directory after rsync and build cleanup entries for regular files,
+/// then write durable cleanup state and delete verified files.
+/// Used for PassthroughDeleteAfterImport groups after direct unfiltered rsync.
+fn scan_and_cleanup_sync(config: &ClientConfig, sync: &purgery_core::SyncMapping) -> Result<()> {
+    let from_path = sync.from_path.as_str();
+    let from = Path::new(from_path);
+    if !from.exists() {
+        return Ok(());
+    }
+
+    let mut cleanup_entries = Vec::new();
+    for entry in WalkDir::new(from).sort_by_file_name() {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let local_path = entry.path();
+        let metadata = match fs::symlink_metadata(local_path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let relative = match local_path.strip_prefix(from) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let relative_str = relative.to_string_lossy().replace('\\', "/");
+
+        let file_meta = match fs::metadata(local_path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let size = file_meta.len();
+        let mtime_ns = file_meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        let sha256 = compute_sha256(local_path).ok();
+
+        cleanup_entries.push(purgery_core::CleanupEntry {
+            sync_name: sync.name.as_str().to_owned(),
+            relative_path: relative_str,
+            local_path: local_path.to_string_lossy().into_owned(),
+            size,
+            mtime_ns,
+            sha256,
+            rsync_succeeded: true,
+            cleaned: false,
+        });
+    }
+
+    if cleanup_entries.is_empty() {
+        return Ok(());
+    }
+
+    let cleanup_state = purgery_core::DurableCleanupState {
+        nickname: config.nickname.as_str().to_owned(),
+        operation_id: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_string(),
+        entries: cleanup_entries,
+    };
+
+    let state_path = write_cleanup_state(&cleanup_state)?;
+
+    for entry in &cleanup_state.entries {
+        let local_path = Path::new(&entry.local_path);
+        let symmeta = match fs::symlink_metadata(local_path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let _ = mark_cleaned(&state_path, &entry.sync_name, &entry.local_path);
+                continue;
+            }
+            Err(_) => continue,
+        };
+        if !symmeta.file_type().is_file() || symmeta.file_type().is_symlink() {
+            continue;
+        }
+        let Ok(meta) = fs::metadata(local_path) else {
+            continue;
+        };
+        if meta.len() != entry.size {
+            continue;
+        }
+        let current_mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        if current_mtime != entry.mtime_ns {
+            continue;
+        }
+        if let Some(ref expected_sha) = entry.sha256 {
+            if let Ok(actual_sha) = compute_sha256(local_path) {
+                if &actual_sha != expected_sha {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+        }
+        if let Err(e) = fs::remove_file(local_path) {
+            warn!(path = %entry.local_path, error = %e, "failed to delete");
+        } else {
+            let _ = mark_cleaned(&state_path, &entry.sync_name, &entry.local_path);
+        }
+    }
+
+    Ok(())
 }
 
 /// Poll for status via the server's status command.
