@@ -856,7 +856,12 @@ fn process_manifest_entry(
             Ok(p) => p,
             Err(error) => return failed_entry(entry, error),
         };
-        match apply_postprocessing(run_plan, entry.sync_name.as_str(), &normalized_path, &work_path) {
+        match apply_postprocessing(
+            run_plan,
+            entry.sync_name.as_str(),
+            &normalized_path,
+            &work_path,
+        ) {
             Ok(outputs) => {
                 let mut final_paths = Vec::new();
                 for output in outputs {
@@ -5027,9 +5032,13 @@ steps = ["compress-video"]
         fs::write(&work_path, "input").unwrap();
         fs::write(work_path.with_file_name("input.out"), "output").unwrap();
 
-        let outputs =
-            apply_postprocessing(&expected_output_test_plan(), "data", "data/input.txt", &work_path)
-                .unwrap();
+        let outputs = apply_postprocessing(
+            &expected_output_test_plan(),
+            "data",
+            "data/input.txt",
+            &work_path,
+        )
+        .unwrap();
         assert_eq!(outputs, vec![work_path.with_file_name("input.out")]);
     }
 
@@ -5039,9 +5048,13 @@ steps = ["compress-video"]
         let work_path = Utf8PathBuf::from_path_buf(tmp.path().join("input.txt")).unwrap();
         fs::write(&work_path, "input").unwrap();
 
-        let error =
-            apply_postprocessing(&expected_output_test_plan(), "data", "data/input.txt", &work_path)
-                .unwrap_err();
+        let error = apply_postprocessing(
+            &expected_output_test_plan(),
+            "data",
+            "data/input.txt",
+            &work_path,
+        )
+        .unwrap_err();
         assert!(error.contains("expected output not found"));
     }
 
@@ -5056,9 +5069,13 @@ steps = ["compress-video"]
         // itself must be accepted — Purgery must not follow or reject it.
         std::os::unix::fs::symlink(&target, work_path.with_file_name("input.out")).unwrap();
 
-        let outputs =
-            apply_postprocessing(&expected_output_test_plan(), "data", "data/input.txt", &work_path)
-                .unwrap();
+        let outputs = apply_postprocessing(
+            &expected_output_test_plan(),
+            "data",
+            "data/input.txt",
+            &work_path,
+        )
+        .unwrap();
         assert!(
             outputs.contains(&work_path.with_file_name("input.out")),
             "symlink expected output must be accepted"
@@ -5080,9 +5097,13 @@ steps = ["compress-video"]
         fs::write(&work_path, "input").unwrap();
         fs::create_dir(work_path.with_file_name("input.out")).unwrap();
 
-        let outputs =
-            apply_postprocessing(&expected_output_test_plan(), "data", "data/input.txt", &work_path)
-                .unwrap();
+        let outputs = apply_postprocessing(
+            &expected_output_test_plan(),
+            "data",
+            "data/input.txt",
+            &work_path,
+        )
+        .unwrap();
         assert!(outputs.contains(&work_path.with_file_name("input.out")));
     }
 
@@ -5093,9 +5114,13 @@ steps = ["compress-video"]
         fs::write(&work_path, "input").unwrap();
         std::os::unix::fs::symlink("some-target", work_path.with_file_name("input.out")).unwrap();
 
-        let outputs =
-            apply_postprocessing(&expected_output_test_plan(), "data", "data/input.txt", &work_path)
-                .unwrap();
+        let outputs = apply_postprocessing(
+            &expected_output_test_plan(),
+            "data",
+            "data/input.txt",
+            &work_path,
+        )
+        .unwrap();
         assert!(outputs.contains(&work_path.with_file_name("input.out")));
     }
 
@@ -5110,9 +5135,13 @@ steps = ["compress-video"]
             .status()
             .unwrap();
 
-        let error =
-            apply_postprocessing(&expected_output_test_plan(), "data", "data/input.txt", &work_path)
-                .unwrap_err();
+        let error = apply_postprocessing(
+            &expected_output_test_plan(),
+            "data",
+            "data/input.txt",
+            &work_path,
+        )
+        .unwrap_err();
         assert!(error.contains("expected output is not a supported entry type"));
     }
 
@@ -6709,7 +6738,8 @@ for = ["videos"]
         // videos/ has a matching file pattern, but the rule is scoped to "pictures"
         fs::create_dir_all(ready.join("files/videos")).unwrap();
         fs::write(ready.join("files/videos/a.mp4"), b"video").unwrap();
-        fs::write(ready.join("run.toml"),
+        fs::write(
+            ready.join("run.toml"),
             br#"nickname = "laptop"
 [[sync]]
 name = "videos"
@@ -6725,7 +6755,9 @@ delete_after_import = true
 match = "*.mp4"
 steps = ["pack"]
 for = ["pictures"]
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         let manifest = Manifest {
             run_id: run_id.clone(),
@@ -6749,13 +6781,18 @@ for = ["pictures"]
 
         // process_run must succeed — the rule is out of scope for videos
         process_run(&config, &nickname, &run_id).unwrap();
-        let done = config.purgery_root.run_dir(&nickname, &run_id, RunPhase::Done);
+        let done = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Done);
         let status_content = fs::read_to_string(done.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
         // videos/a.mp4 must be imported as passthrough, not processed by pack
         assert_eq!(status.entries.len(), 1);
         assert_eq!(status.entries[0].status, FileStatus::Imported);
-        assert!(status.entries[0].postprocess.is_none() || status.entries[0].postprocess.as_deref() == Some(&[]));
+        assert!(
+            status.entries[0].postprocess.is_none()
+                || status.entries[0].postprocess.as_deref() == Some(&[])
+        );
     }
 
     #[test]
@@ -6791,7 +6828,8 @@ for = ["pictures"]
         fs::create_dir_all(&incoming).unwrap();
         fs::create_dir_all(incoming.join("files/videos")).unwrap();
         fs::write(incoming.join("files/videos/album"), b"video-data").unwrap();
-        fs::write(incoming.join("run.toml"),
+        fs::write(
+            incoming.join("run.toml"),
             br#"nickname = "laptop"
 [[sync]]
 name = "videos"
@@ -6807,7 +6845,9 @@ delete_after_import = true
 match = "album"
 steps = ["pack"]
 for = ["videos"]
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         // Build the run config and run plan
         let run_config_content = fs::read_to_string(incoming.join("run.toml")).unwrap();
@@ -6848,8 +6888,15 @@ for = ["videos"]
         let videos_sync = sync_map.get("videos").unwrap();
         let pictures_sync = sync_map.get("pictures").unwrap();
 
-        let videos_outputs = planned_entry_outputs(&config, &nickname, videos_sync, &videos_entry, &run_plan);
-        let pictures_outputs = planned_entry_outputs(&config, &nickname, pictures_sync, &pictures_entry, &run_plan);
+        let videos_outputs =
+            planned_entry_outputs(&config, &nickname, videos_sync, &videos_entry, &run_plan);
+        let pictures_outputs = planned_entry_outputs(
+            &config,
+            &nickname,
+            pictures_sync,
+            &pictures_entry,
+            &run_plan,
+        );
 
         // videos/album should have postprocess outputs (keep_original + .out)
         assert!(

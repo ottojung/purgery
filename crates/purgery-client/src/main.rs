@@ -309,10 +309,11 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
     }
     info!("postprocess rules validated");
 
-    // 2. For each sync group, decide whether to walk based on applicable rules.
+    // 2. Partition sync groups by their execution class.
     let run_id = RunId::generate();
     let mut all_manifest_entries: Vec<purgery_core::ManifestEntry> = Vec::new();
     let mut direct_rsync_syncs: Vec<&purgery_core::SyncMapping> = Vec::new();
+    let mut cleanup_rsync_syncs: Vec<&purgery_core::SyncMapping> = Vec::new();
     let mut any_postprocess = false;
 
     for sync in &config.sync {
@@ -320,14 +321,24 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
         let applicable = purgery_core::applicable_rules(&config.postprocess.rules, sync_name);
 
         if applicable.is_empty() && !sync.delete_after_import {
-            // No applicable rules + no-delete = direct unfiltered rsync, no walking
+            // Passthrough no-delete: direct unfiltered rsync, no walking, no cleanup
             info!(
                 sync = sync_name,
                 "no applicable postprocess rules, direct rsync only"
             );
             direct_rsync_syncs.push(sync);
+        } else if applicable.is_empty() && sync.delete_after_import {
+            // Passthrough delete-after-import: direct unfiltered rsync, then cleanup.
+            // Walk the source for cleanup identity only, not for transfer planning.
+            info!(
+                sync = sync_name,
+                "no applicable postprocess rules, direct rsync with cleanup"
+            );
+            let (entries, _) = walk_and_classify_sync(config, sync, &run_id, &applicable)?;
+            all_manifest_entries.extend(entries);
+            cleanup_rsync_syncs.push(sync);
         } else {
-            // Walk this sync group and build manifest entries
+            // Purgatory group: walk and classify
             let (entries, has_pp) = walk_and_classify_sync(config, sync, &run_id, &applicable)?;
             if has_pp {
                 any_postprocess = true;
@@ -359,6 +370,7 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
             &transfer_plan,
             &run_id,
             &direct_rsync_syncs,
+            &cleanup_rsync_syncs,
         )
     } else {
         run_passthrough_path(
@@ -368,6 +380,7 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
             &manifest,
             &transfer_plan,
             &direct_rsync_syncs,
+            &cleanup_rsync_syncs,
         )
     }
 }
@@ -383,6 +396,7 @@ fn run_passthrough_path(
     manifest: &Manifest,
     _transfer_plan: &[purgery_core::TransferPlanEntry],
     direct_rsync_syncs: &[&purgery_core::SyncMapping],
+    cleanup_rsync_syncs: &[&purgery_core::SyncMapping],
 ) -> Result<()> {
     let _span = span!(
         Level::INFO,
@@ -494,6 +508,31 @@ fn run_passthrough_path(
         }
     }
 
+    // Handle cleanup_rsync_syncs (no-rule delete-after-import groups):
+    // direct unfiltered rsync + cleanup from manifest entries.
+    for sync in cleanup_rsync_syncs {
+        let sync_name = sync.name.as_str();
+        if let Some(dest) = dest_map.get(sync_name) {
+            let rsync_dest = format!("{}:{}/", host, dest.passthrough_dest);
+            info!(
+                sync = sync_name,
+                dest = %dest.passthrough_dest,
+                "cleanup direct rsync (no-rule delete-after-import)"
+            );
+            let rsync_args = build_rsync_args(sync.from_path.as_str(), &rsync_dest);
+            let status = std::process::Command::new("rsync")
+                .args(&rsync_args)
+                .status()
+                .with_context(|| {
+                    format!("failed to execute rsync for {}", sync.from_path.as_str())
+                })?;
+            if !status.success() {
+                anyhow::bail!("rsync failed for sync mapping '{sync_name}'");
+            }
+            process_cleanup_entries(config, sync_name, manifest)?;
+        }
+    }
+
     info!("passthrough run complete");
     Ok(())
 }
@@ -537,6 +576,7 @@ fn run_unfiltered_rsync(
 ///
 /// Passthrough-only sync groups (no applicable rules) are handled outside
 /// the purgatory run lifecycle via resolve-destinations + direct rsync.
+#[allow(clippy::too_many_arguments)]
 fn run_postprocess_path(
     config: &ClientConfig,
     host: &str,
@@ -545,6 +585,7 @@ fn run_postprocess_path(
     transfer_plan: &[purgery_core::TransferPlanEntry],
     run_id: &RunId,
     direct_rsync_syncs: &[&purgery_core::SyncMapping],
+    cleanup_rsync_syncs: &[&purgery_core::SyncMapping],
 ) -> Result<()> {
     let _span = span!(
         Level::INFO,
@@ -563,34 +604,34 @@ fn run_postprocess_path(
     );
 
     // 0a. Resolve destinations for passthrough-only groups via resolve-destinations
-    let passthrough_dest_map: std::collections::HashMap<String, String> = if !direct_rsync_syncs
-        .is_empty()
-    {
-        let run_config_all = build_run_config(config, false);
-        let run_config_all_toml = run_config_all
-            .to_toml()
-            .with_context(|| "failed to serialize run config")?;
-        let resolve_out = server_cmd_with_stdin(
-            host,
-            server_command,
-            &[
-                "resolve-destinations",
-                "--nickname",
-                config.nickname.as_str(),
-            ],
-            &run_config_all_toml,
-        )
-        .context("resolve-destinations failed")?;
-        let resolve_resp: purgery_core::ResolveDestinationsResponse = toml::from_str(&resolve_out)
-            .context("failed to parse resolve-destinations response")?;
-        resolve_resp
-            .destinations
-            .into_iter()
-            .map(|d| (d.sync_name, d.passthrough_dest))
-            .collect()
-    } else {
-        std::collections::HashMap::new()
-    };
+    let passthrough_dest_map: std::collections::HashMap<String, String> =
+        if !direct_rsync_syncs.is_empty() || !cleanup_rsync_syncs.is_empty() {
+            let run_config_all = build_run_config(config, false);
+            let run_config_all_toml = run_config_all
+                .to_toml()
+                .with_context(|| "failed to serialize run config")?;
+            let resolve_out = server_cmd_with_stdin(
+                host,
+                server_command,
+                &[
+                    "resolve-destinations",
+                    "--nickname",
+                    config.nickname.as_str(),
+                ],
+                &run_config_all_toml,
+            )
+            .context("resolve-destinations failed")?;
+            let resolve_resp: purgery_core::ResolveDestinationsResponse =
+                toml::from_str(&resolve_out)
+                    .context("failed to parse resolve-destinations response")?;
+            resolve_resp
+                .destinations
+                .into_iter()
+                .map(|d| (d.sync_name, d.passthrough_dest))
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
 
     // 0b. Handle direct-rsync groups (passthrough, no applicable rules) before the purgatory run.
     //     These groups are outside the purgatory lifecycle.
@@ -619,7 +660,32 @@ fn run_postprocess_path(
         }
     }
 
-    // 0c. The purgatory-only run config excludes passthrough-only sync groups
+    // 0c. Handle cleanup_rsync_syncs (no-rule delete-after-import):
+    //     direct unfiltered rsync + cleanup from manifest entries.
+    for sync in cleanup_rsync_syncs {
+        let sync_name = sync.name.as_str();
+        if let Some(passthrough_dest) = passthrough_dest_map.get(sync_name) {
+            let rsync_dest = format!("{}:{}/", host, passthrough_dest);
+            info!(
+                sync = sync_name,
+                dest = %passthrough_dest,
+                "cleanup direct rsync (no-rule delete-after-import)"
+            );
+            let rsync_args = build_rsync_args(sync.from_path.as_str(), &rsync_dest);
+            let status = std::process::Command::new("rsync")
+                .args(&rsync_args)
+                .status()
+                .with_context(|| {
+                    format!("failed to execute rsync for {}", sync.from_path.as_str())
+                })?;
+            if !status.success() {
+                anyhow::bail!("rsync failed for sync mapping '{sync_name}'");
+            }
+            process_cleanup_entries(config, sync_name, manifest)?;
+        }
+    }
+
+    // 0d. The purgatory-only run config excludes passthrough-only sync groups
     let run_config = build_run_config(config, true);
     let run_config_toml = run_config
         .to_toml()
@@ -786,9 +852,16 @@ fn run_postprocess_path(
         }
     });
 
-    // 5. Transfer per sync group
+    // 5. Transfer per purgatory sync group
     let sync_result = (|| -> Result<()> {
         for sync in &config.sync {
+            // Skip groups already handled as direct rsync (passthrough-only)
+            if direct_rsync_syncs
+                .iter()
+                .any(|s| s.name.as_str() == sync.name.as_str())
+            {
+                continue;
+            }
             let sync_name = sync.name.as_str();
             let from_path = sync.from_path.as_str();
             let dest = dest_map
