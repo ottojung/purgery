@@ -1481,6 +1481,25 @@ pub struct PrepareRunResponse {
     pub destinations: Vec<SyncDestination>,
 }
 
+/// Response from `purgery-server resolve-destinations`.
+/// Side-effect-free destination resolution for pure passthrough groups.
+/// Does not create run directories, leases, manifests, or status files.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolveDestinationsResponse {
+    pub protocol_version: u32,
+    pub nickname: String,
+    /// Per-sync passthrough destinations.
+    pub destinations: Vec<SyncPassthroughDestination>,
+}
+
+/// A passthrough-only destination for one sync mapping (no purgatory).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncPassthroughDestination {
+    pub sync_name: String,
+    /// Passthrough destination (append trailing `/` for rsync source).
+    pub passthrough_dest: String,
+}
+
 // ── Parsing Helpers ──────────────────────────────────────────────────
 
 impl ServerConfig {
@@ -1532,6 +1551,28 @@ impl Manifest {
 
     pub fn to_toml(&self) -> Result<String, ManifestError> {
         toml::to_string(self).map_err(|e| ManifestError::TomlSerialize(e.to_string()))
+    }
+
+    /// Build a server manifest containing only entries that need server-side bookkeeping.
+    ///
+    /// The server manifest includes:
+    /// - Postprocess roots (mode = Postprocess)
+    /// - Covered descendants of postprocessed directory roots (mode = Covered)
+    ///
+    /// Ordinary passthrough entries are excluded because they are handled by
+    /// direct client rsync without server bookkeeping.
+    pub fn build_server_manifest(&self) -> Manifest {
+        let entries: Vec<ManifestEntry> = self
+            .entries
+            .iter()
+            .filter(|e| e.mode != ManifestEntryMode::Passthrough)
+            .cloned()
+            .collect();
+        Manifest {
+            run_id: self.run_id.clone(),
+            nickname: self.nickname.clone(),
+            entries,
+        }
     }
 }
 

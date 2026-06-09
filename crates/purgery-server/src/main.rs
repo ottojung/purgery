@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use purgery_core::{ColorMode, LogFormat, LogLevel, Nickname, RunId, ServerConfig};
 use purgery_server::{
     begin_run, bootstrap, finish_run, heartbeat_run, prepare_run, process_once_raw,
-    read_run_status, run_gc, server_check,
+    read_run_status, resolve_destinations, run_gc, server_check,
 };
 use std::fs;
 
@@ -109,6 +109,14 @@ enum Command {
         #[arg(long)]
         run_id: String,
     },
+    /// Resolve final storage destinations for pure passthrough groups (side-effect-free)
+    ResolveDestinations {
+        #[arg(long)]
+        nickname: String,
+        /// Path to run config TOML (client sub-set with sync mappings)
+        #[arg(long)]
+        run_config: String,
+    },
 }
 
 /// Apply CLI logging overrides on top of a base config.
@@ -196,6 +204,15 @@ fn main() -> Result<()> {
             let nickname = Nickname::new(nickname).with_context(|| "invalid nickname")?;
             let run_id = RunId::new(run_id).with_context(|| "invalid run ID")?;
             heartbeat_run(&server_config, &nickname, &run_id)?;
+        }
+        Command::ResolveDestinations { nickname, run_config } => {
+            let nickname = Nickname::new(nickname).with_context(|| "invalid nickname")?;
+            let config_content = fs::read_to_string(&run_config)
+                .with_context(|| format!("failed to read run config: {run_config}"))?;
+            let run_config = purgery_core::RunConfig::from_toml(&config_content)
+                .with_context(|| "failed to parse run config")?;
+            let response = resolve_destinations(&server_config, &nickname, &run_config)?;
+            print!("{response}");
         }
     }
 

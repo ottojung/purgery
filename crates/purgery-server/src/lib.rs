@@ -1966,6 +1966,39 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
         .map_err(|e| anyhow::anyhow!("failed to serialize prepare-run response: {e}"))
 }
 
+/// Server-side subcommand: resolve final storage destinations for pure passthrough groups.
+///
+/// Side-effect-free. Does not create run directories, leases, manifests, or status files.
+/// Returns the same passthrough destinations that `prepare-run` would return, without
+/// requiring a run ID or creating any run state.
+pub fn resolve_destinations(
+    config: &ServerConfig,
+    nickname: &Nickname,
+    run_config: &purgery_core::RunConfig,
+) -> Result<String> {
+    let final_root = config.root.as_path().join(nickname.as_str());
+    let destinations: Vec<purgery_core::SyncPassthroughDestination> = run_config
+        .sync
+        .iter()
+        .map(|sync| {
+            let passthrough_dest = final_root.join(sync.to_path.as_str());
+            purgery_core::SyncPassthroughDestination {
+                sync_name: sync.name.as_str().to_owned(),
+                passthrough_dest: passthrough_dest.as_str().to_owned(),
+            }
+        })
+        .collect();
+
+    let response = purgery_core::ResolveDestinationsResponse {
+        protocol_version: 1,
+        nickname: nickname.as_str().to_owned(),
+        destinations,
+    };
+
+    toml::to_string(&response)
+        .map_err(|e| anyhow::anyhow!("failed to serialize resolve-destinations response: {e}"))
+}
+
 pub fn finish_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> Result<()> {
     let incoming_path = config
         .purgery_root
