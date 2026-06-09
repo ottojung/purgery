@@ -756,6 +756,9 @@ pub struct ManifestEntry {
     pub sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link_target: Option<Utf8PathBuf>,
+    /// Postprocess step names if this entry is postprocessed; `None` if passthrough.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub postprocess_steps: Option<Vec<String>>,
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -1556,6 +1559,35 @@ pub fn build_rsync_args(source: &str, destination: &str) -> Vec<String> {
         format!("{}/", source),
         destination.to_string(),
     ]
+}
+
+/// Generate rsync filter file content for a purgatory (selected) transfer set.
+///
+/// The filter includes directories needed for traversal, then includes entries
+/// matching any of the given patterns, then excludes everything else.
+pub fn purgatory_filter_content(patterns: &[String]) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    lines.push("+ */".to_string()); // include all directories for traversal
+    for pat in patterns {
+        lines.push(format!("+ {pat}"));
+    }
+    lines.push("- *".to_string()); // exclude everything else
+    lines.join("\n")
+}
+
+/// Generate rsync filter file content for a passthrough transfer set.
+///
+/// The filter includes directories needed for traversal, excludes entries
+/// matching any of the given patterns, and rsync defaults to including
+/// everything else.
+pub fn passthrough_filter_content(patterns: &[String]) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    lines.push("+ */".to_string()); // include all directories for traversal
+    for pat in patterns {
+        lines.push(format!("- {pat}")); // exclude postprocess-selected entries
+    }
+    // rsync default is include for non-matched entries
+    lines.join("\n")
 }
 
 // ── Work Area ────────────────────────────────────────────────────────
@@ -2483,6 +2515,7 @@ files = []
             mtime_ns: 200,
             sha256: Some("abc".into()),
             link_target: None,
+            postprocess_steps: None,
         };
         let identity = entry.identity();
         assert_eq!(identity.size, 100);
@@ -2532,6 +2565,7 @@ files = []
                 mtime_ns: 200,
                 sha256: Some("abcdef".into()),
                 link_target: None,
+                postprocess_steps: None,
             }],
         };
         let toml = manifest.to_toml().unwrap();
@@ -2597,6 +2631,7 @@ files = []
                 mtime_ns: 100,
                 sha256: None,
                 link_target: None,
+                postprocess_steps: None,
             }],
         };
         assert!(validate_envelope(&nick, &run_id, &run_config, &manifest).is_ok());
@@ -2625,6 +2660,7 @@ files = []
                 mtime_ns: 100,
                 sha256: None,
                 link_target: None,
+                postprocess_steps: None,
             }],
         };
         assert!(validate_envelope(&dir_nick, &run_id, &run_config, &manifest).is_err());
@@ -2653,6 +2689,7 @@ files = []
                 mtime_ns: 100,
                 sha256: None,
                 link_target: None,
+                postprocess_steps: None,
             }],
         };
         assert!(validate_envelope(&nick, &run_id, &run_config, &manifest).is_err());
@@ -2681,6 +2718,7 @@ files = []
                 mtime_ns: 100,
                 sha256: None,
                 link_target: None,
+                postprocess_steps: None,
             }],
         };
         assert!(validate_envelope(&nick, &run_id, &run_config, &manifest).is_err());
@@ -2704,6 +2742,7 @@ files = []
             mtime_ns: 0,
             sha256: None,
             link_target: None,
+            postprocess_steps: None,
         };
 
         let result = entry.verify_staged(&staged);
@@ -2729,6 +2768,7 @@ files = []
             mtime_ns: 0,
             sha256: Some("badbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbad1".into()),
             link_target: None,
+            postprocess_steps: None,
         };
 
         let result = entry.verify_staged(&staged);
@@ -2754,6 +2794,7 @@ files = []
             mtime_ns: 0,
             sha256: None,
             link_target: None,
+            postprocess_steps: None,
         };
 
         assert!(entry.verify_staged(&staged).is_ok());
@@ -2774,6 +2815,7 @@ files = []
             mtime_ns: 0,
             sha256: None,
             link_target: None,
+            postprocess_steps: None,
         };
 
         let result = entry.verify_staged(&staged);

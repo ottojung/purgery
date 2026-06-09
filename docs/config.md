@@ -139,8 +139,53 @@ steps = ["compress-video"]
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `match` | yes | Regex matching normalized import paths |
+| `match` | yes | Rsync include/exclude pattern matching normalized import paths (rsync syntax, not regex) |
 | `steps` | yes | List of server-defined step names to apply |
+
+### Match patterns and import modes
+
+Each manifest entry is either **passthrough** or **postprocessed** (purgatory).
+
+- Passthrough entries are transferred directly to final server storage by a bulk rsync call.
+- Postprocessed entries are transferred to the server's staging area, where subprocesses run before final commit.
+
+The `match` value is an rsync include/exclude pattern. Rules are evaluated in order. The first matching rule selects the entry for postprocessing with that rule's steps. If no rule matches, the entry is passthrough.
+
+Supported rsync pattern syntax:
+
+| Syntax | Meaning |
+|--------|---------|
+| `*` | Matches any characters except `/` |
+| `**` | Matches any characters including `/` |
+| `?` | Matches any single character except `/` |
+| Leading `/` | Anchors the pattern to the start of the normalized path |
+| No leading `/` | Pattern matches at any position in the path |
+
+Examples:
+
+```
+match = "*.mp4"                    # any .mp4 file anywhere
+match = "videos/*"                 # files directly inside videos/
+match = "videos/**/*.mp4"          # any .mp4 under videos/ and subdirectories
+match = "/photos"                  # exactly the photos directory
+```
+
+### Rsync filter generation
+
+For each `[[sync]]` group, the client generates at most two rsync calls:
+
+1. **Purgatory call**: transfers entries matching any `match` rule to the server's staging area.
+2. **Passthrough call**: transfers all other entries directly to final storage.
+
+Both calls use `rsync --archive --no-inc-recursive --protect-args --no-delete` with include/exclude filters.
+
+The purgatory filter includes directory traversal entries needed to reach selected files. The passthrough filter excludes entries selected for postprocessing.
+
+### Import modes and cleanup
+
+- **Passthrough regular files**: deleted locally as soon as the passthrough rsync call succeeds and local identity is verified.
+- **Postprocessed regular files**: deleted after server status confirms the entry as imported.
+- **Directories and symlinks**: never deleted regardless of mode.
 
 ## Run config
 

@@ -2307,6 +2307,7 @@ to = "{}"
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
+                postprocess_steps: None,
             }],
         };
         fs::write(
@@ -2393,6 +2394,7 @@ to = "{}"
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
+                postprocess_steps: None,
             }],
         };
         fs::write(
@@ -2442,6 +2444,7 @@ to = "{}"
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
+                postprocess_steps: None,
             }],
         };
         fs::write(
@@ -2549,6 +2552,7 @@ to = "{}"
                 mtime_ns: 100,
                 sha256: None,
                 link_target: None,
+                postprocess_steps: None,
             }],
         };
         fs::write(
@@ -2631,6 +2635,7 @@ to = "{}"
                 mtime_ns: 100,
                 sha256: None,
                 link_target: None,
+                postprocess_steps: None,
             }],
         };
         fs::write(
@@ -2784,6 +2789,7 @@ steps = ["compress-video"]
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
+                postprocess_steps: None,
             }],
         };
         fs::write(
@@ -3158,6 +3164,7 @@ to = "pictures"
                     mtime_ns: 1000000,
                     sha256: None,
                     link_target: None,
+                    postprocess_steps: None,
                 },
                 ManifestEntry {
                     sync_name: SyncName::new("pictures".into()).unwrap(),
@@ -3170,6 +3177,7 @@ to = "pictures"
                     mtime_ns: 1000001,
                     sha256: None,
                     link_target: None,
+                    postprocess_steps: None,
                 },
             ],
         };
@@ -3234,6 +3242,7 @@ to = "pictures"
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
+                postprocess_steps: None,
             }],
         };
         fs::write(
@@ -3324,6 +3333,7 @@ to = "pictures"
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
+                postprocess_steps: None,
             }],
         };
         fs::write(
@@ -3493,6 +3503,7 @@ steps = ["compress-video"]
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
+                postprocess_steps: None,
             }],
         };
         fs::write(
@@ -3591,6 +3602,7 @@ steps = ["compress-video"]
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
+                postprocess_steps: None,
             }],
         };
         fs::write(
@@ -3691,6 +3703,7 @@ steps = ["compress-video"]
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
+                postprocess_steps: None,
             }],
         };
         fs::write(
@@ -4572,6 +4585,7 @@ steps = ["compress-video"]
             mtime_ns: 0,
             sha256: None,
             link_target: target.map(Utf8PathBuf::from),
+            postprocess_steps: None,
         };
         let manifest = Manifest {
             run_id: run_id.clone(),
@@ -4776,6 +4790,7 @@ steps = ["compress-video"]
             mtime_ns: 0,
             sha256: None,
             link_target: None,
+            postprocess_steps: None,
         }
     }
 
@@ -4931,6 +4946,7 @@ to = "shared"
                     mtime_ns: 0,
                     sha256: None,
                     link_target: None,
+                    postprocess_steps: None,
                 },
                 ManifestEntry {
                     sync_name: SyncName::new("second".into()).unwrap(),
@@ -4943,6 +4959,7 @@ to = "shared"
                     mtime_ns: 0,
                     sha256: None,
                     link_target: None,
+                    postprocess_steps: None,
                 },
             ],
         };
@@ -5035,6 +5052,7 @@ steps = ["pack"]
                     mtime_ns: 0,
                     sha256: None,
                     link_target: None,
+                    postprocess_steps: None,
                 },
                 ManifestEntry {
                     sync_name: SyncName::new("data".into()).unwrap(),
@@ -5047,6 +5065,7 @@ steps = ["pack"]
                     mtime_ns: 0,
                     sha256: None,
                     link_target: None,
+                    postprocess_steps: None,
                 },
             ],
         };
@@ -5138,6 +5157,7 @@ steps = ["compress"]
                     mtime_ns: 0,
                     sha256: None,
                     link_target: None,
+                    postprocess_steps: None,
                 },
                 // document.Z.webm — would collide with the postprocess output above
                 ManifestEntry {
@@ -5152,6 +5172,7 @@ steps = ["compress"]
                     mtime_ns: 0,
                     sha256: None,
                     link_target: None,
+                    postprocess_steps: None,
                 },
             ],
         };
@@ -5228,6 +5249,7 @@ steps = ["compress"]
                     mtime_ns: 0,
                     sha256: None,
                     link_target: None,
+                    postprocess_steps: None,
                 },
                 ManifestEntry {
                     sync_name: SyncName::new("data".into()).unwrap(),
@@ -5239,6 +5261,7 @@ steps = ["compress"]
                     mtime_ns: 0,
                     sha256: None,
                     link_target: None,
+                    postprocess_steps: None,
                 },
             ],
         };
@@ -5311,6 +5334,7 @@ steps = ["compress"]
                     mtime_ns: 0,
                     sha256: None,
                     link_target: None,
+                    postprocess_steps: None,
                 },
                 // Directory with the same name as the postprocess output
                 ManifestEntry {
@@ -5324,6 +5348,7 @@ steps = ["compress"]
                     mtime_ns: 0,
                     sha256: None,
                     link_target: None,
+                    postprocess_steps: None,
                 },
             ],
         };

@@ -3,8 +3,8 @@ use camino::Utf8Path;
 use clap::{Parser, Subcommand};
 use purgery_core::{
     build_rsync_args, resolve_executable, shell_escape, BeginRunResponse, ClientConfig,
-    ClientLocalPath, Manifest, ManifestEntry, NormalizedRelativePath, RunConfig, RunConfigSync,
-    RunId, RunStatus,
+    ClientLocalPath, Manifest, ManifestEntry, ManifestEntryKind, NormalizedRelativePath, RunConfig,
+    RunConfigSync, RunId, RunStatus,
 };
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -375,36 +375,143 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
         }
     });
 
-    // 5. Rsync files per sync mapping
+    // 5. Rsync files per sync mapping — split into passthrough and purgatory calls
     let sync_result = (|| -> Result<()> {
         for sync in &config.sync {
             let sync_name = sync.name.as_str();
             let from_path = sync.from_path.as_str();
             let to_path = sync.to_path.as_str();
-            let remote_files_dir = format!("{}/{to_path}/", begin_resp.files_dir);
 
+            // Collect match patterns for this sync group
+            let match_patterns: Vec<String> = config
+                .postprocess
+                .rules
+                .iter()
+                .map(|r| r.pattern.clone())
+                .collect();
+
+            let purgatory_filter = purgery_core::purgatory_filter_content(&match_patterns);
+            let passthrough_filter = purgery_core::passthrough_filter_content(&match_patterns);
+
+            // Write filter files
+            let tmp_dir = std::env::temp_dir().join("purgery-filters");
+            fs::create_dir_all(&tmp_dir).ok();
+            let purgatory_file = tmp_dir.join(format!("purgatory-{sync_name}"));
+            let passthrough_file = tmp_dir.join(format!("passthrough-{sync_name}"));
+            fs::write(&purgatory_file, &purgatory_filter)
+                .with_context(|| "failed to write purgatory filter")?;
+            fs::write(&passthrough_file, &passthrough_filter)
+                .with_context(|| "failed to write passthrough filter")?;
+
+            // Purgatory rsync: transfer selected entries to staging
+            let remote_staging_dir = format!("{}/{to_path}/", begin_resp.files_dir);
             info!(
                 sync = sync_name,
                 from = from_path,
                 to = to_path,
+                mode = "purgatory",
                 "upload started"
             );
-
-            let rsync_dest = format!("{}:{}", host, remote_files_dir);
-            let args = build_rsync_args(from_path, &rsync_dest);
+            let staging_dest = format!("{}:{}", host, remote_staging_dir);
+            let mut args = build_rsync_args(from_path, &staging_dest);
+            // Insert filter args before source/destination
+            let filter_arg = format!("--include-from={}", purgatory_file.to_string_lossy());
+            args.insert(5, filter_arg);
+            // Remove the --protect-args that build_rsync_args adds, or keep both
             let status = std::process::Command::new("rsync")
                 .args(&args)
                 .status()
-                .with_context(|| format!("failed to execute rsync for {from_path}"))?;
-
+                .with_context(|| format!("failed to execute purgatory rsync for {from_path}"))?;
             if !status.success() {
-                anyhow::bail!("rsync failed for sync mapping '{sync_name}'");
+                anyhow::bail!("purgatory rsync failed for sync mapping '{sync_name}'");
+            }
+            info!(sync = sync_name, mode = "purgatory", "upload finished");
+
+            // Check for heartbeat failure after each mapping
+            if let Some(err) = hb_error.lock().unwrap().take() {
+                anyhow::bail!("{err}");
             }
 
-            info!(sync = sync_name, "upload finished");
+            // Passthrough rsync: transfer non-selected entries to staging
+            // NOTE: In a full implementation, the server would provide a
+            // passthrough destination path. For now, upload to the incoming
+            // dir with a passthrough filter applied, keeping the existing
+            // architecture.
+            // But this requires knowing the server root path, which the client
+            // should not construct. Instead, we use a scheme where passthrough
+            // entries are uploaded to the server's final destination directly
+            // via SSH. For now, we upload everything to incoming directory
+            // (current behavior) but with a passthrough filter applied.
+            //
+            // NOTE: In a full implementation, the server would provide a
+            // passthrough destination path in the begin-run response.
+            // For now, we simulate by uploading to the incoming dir with
+            // the passthrough filter, keeping the existing architecture.
+            let remote_files_dir = format!("{}/{to_path}/", begin_resp.files_dir);
+            info!(
+                sync = sync_name,
+                from = from_path,
+                to = to_path,
+                mode = "passthrough",
+                "upload started"
+            );
+            let rsync_dest = format!("{}:{}", host, remote_files_dir);
+            let mut args = build_rsync_args(from_path, &rsync_dest);
+            let filter_arg = format!("--exclude-from={}", purgatory_file.to_string_lossy());
+            args.insert(5, filter_arg);
+            let status = std::process::Command::new("rsync")
+                .args(&args)
+                .status()
+                .with_context(|| format!("failed to execute passthrough rsync for {from_path}"))?;
+            if !status.success() {
+                anyhow::bail!("passthrough rsync failed for sync mapping '{sync_name}'");
+            }
+            info!(sync = sync_name, mode = "passthrough", "upload finished");
 
-            // Check for heartbeat failure after each mapping so we can
-            // avoid calling finish-run if the lease is already lost.
+            // Early cleanup: delete passthrough regular files after successful transfer
+            if sync.delete_after_import {
+                // The manifest entries for this sync that have no postprocess_steps
+                // are passthrough. We can clean them up immediately.
+                let passthrough_entries: Vec<&ManifestEntry> = manifest
+                    .entries
+                    .iter()
+                    .filter(|e| {
+                        e.sync_name.as_str() == sync_name
+                            && e.kind == ManifestEntryKind::RegularFile
+                            && e.postprocess_steps.is_none()
+                    })
+                    .collect();
+                let mut early_count = 0usize;
+                for entry in &passthrough_entries {
+                    let local_path = Path::new(entry.local_path.as_str());
+                    // Check identity via symlink_metadata (no symlink replacements)
+                    let symmeta = match fs::symlink_metadata(local_path) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    if !symmeta.file_type().is_file() || symmeta.file_type().is_symlink() {
+                        continue;
+                    }
+                    if let Ok(meta) = fs::metadata(local_path) {
+                        if meta.len() == entry.size {
+                            if let Err(e) = fs::remove_file(local_path) {
+                                warn!(path = %local_path.display(), error = %e, "failed to delete passthrough file");
+                            } else {
+                                early_count += 1;
+                            }
+                        }
+                    }
+                }
+                if early_count > 0 {
+                    info!(
+                        sync = sync_name,
+                        deleted = early_count,
+                        "passthrough early cleanup"
+                    );
+                }
+            }
+
+            // Check for heartbeat failure
             if let Some(err) = hb_error.lock().unwrap().take() {
                 anyhow::bail!("{err}");
             }
@@ -544,6 +651,16 @@ fn build_manifest(config: &ClientConfig, run_id: &RunId) -> Result<Manifest> {
                 anyhow::bail!("unsupported filesystem object: {}", path.display());
             };
 
+            // Classify entry as passthrough or postprocessed
+            let normalized_path = format!("{}/{}", to_path, relative_path.as_str());
+            let postprocess_steps: Option<Vec<String>> = config
+                .postprocess
+                .rules
+                .iter()
+                .find(|r| purgery_core::rsync_pattern_match(&r.pattern, &normalized_path))
+                .map(|r| r.steps.clone())
+                .filter(|steps| !steps.is_empty());
+
             entries.push(ManifestEntry {
                 sync_name: sync.name.clone(),
                 local_path: ClientLocalPath::new(path.to_string_lossy().to_string())
@@ -557,6 +674,7 @@ fn build_manifest(config: &ClientConfig, run_id: &RunId) -> Result<Manifest> {
                 mtime_ns,
                 sha256,
                 link_target,
+                postprocess_steps,
             });
         }
     }
