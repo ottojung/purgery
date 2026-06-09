@@ -6641,4 +6641,191 @@ for = ["videos"]
             "docs/album/report.txt must be imported, not skipped as covered"
         );
     }
+
+    #[ignore = "expected to fail until scoped matching is used in process_manifest_entry"]
+    #[test]
+    fn out_of_scope_rule_does_not_process_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&purgery_root, &server_root);
+        let config = ServerConfig {
+            postprocess: PostprocessConfig {
+                steps: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "pack".to_owned(),
+                        PostprocessStepDefinition {
+                            kind: PostprocessKind::Subprocess,
+                            program: "true".into(),
+                            args: vec![],
+                            expected_outputs: vec![],
+                            keep_original: true,
+                        },
+                    );
+                    m
+                },
+            },
+            ..config
+        };
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("scoped-processing".into()).unwrap();
+        let ready = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Ready);
+
+        // videos/ has a matching file pattern, but the rule is scoped to "pictures"
+        fs::create_dir_all(ready.join("files/videos")).unwrap();
+        fs::write(ready.join("files/videos/a.mp4"), b"video").unwrap();
+        fs::write(ready.join("run.toml"),
+            br#"nickname = "laptop"
+[[sync]]
+name = "videos"
+to = "videos"
+delete_after_import = true
+
+[[sync]]
+name = "pictures"
+to = "pictures"
+delete_after_import = true
+
+[[postprocess.rules]]
+match = "*.mp4"
+steps = ["pack"]
+for = ["pictures"]
+"#).unwrap();
+
+        let manifest = Manifest {
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![ManifestEntry {
+                sync_name: SyncName::new("videos".into()).unwrap(),
+                local_path: ClientLocalPath::new("/src/a.mp4".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/videos/a.mp4".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
+                size: 5,
+                mtime_ns: 100,
+                sha256: None,
+                link_target: None,
+                mode: purgery_core::ManifestEntryMode::Passthrough,
+                postprocess_steps: Vec::new(),
+                covered_by: None,
+            }],
+        };
+        fs::write(ready.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+
+        // process_run must succeed — the rule is out of scope for videos
+        process_run(&config, &nickname, &run_id).unwrap();
+        let done = config.purgery_root.run_dir(&nickname, &run_id, RunPhase::Done);
+        let status_content = fs::read_to_string(done.join("status.toml")).unwrap();
+        let status = RunStatus::from_toml(&status_content).unwrap();
+        // videos/a.mp4 must be imported as passthrough, not processed by pack
+        assert_eq!(status.entries.len(), 1);
+        assert_eq!(status.entries[0].status, FileStatus::Imported);
+        assert!(status.entries[0].postprocess.is_none() || status.entries[0].postprocess.as_deref() == Some(&[]));
+    }
+
+    #[ignore = "expected to fail until scoped matching is used in planned_entry_outputs"]
+    #[test]
+    fn out_of_scope_rule_does_not_affect_planned_outputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&purgery_root, &server_root);
+        let config = ServerConfig {
+            postprocess: PostprocessConfig {
+                steps: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "pack".to_owned(),
+                        PostprocessStepDefinition {
+                            kind: PostprocessKind::Subprocess,
+                            program: "true".into(),
+                            args: vec![],
+                            expected_outputs: vec![],
+                            keep_original: false,
+                        },
+                    );
+                    m
+                },
+            },
+            ..config
+        };
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("scoped-outputs".into()).unwrap();
+        let ready = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Ready);
+
+        // Two sync groups with the same file name, but rule only matches one
+        fs::create_dir_all(ready.join("files/videos")).unwrap();
+        fs::write(ready.join("files/videos/album"), b"video-data").unwrap();
+        fs::create_dir_all(ready.join("files/pictures")).unwrap();
+        fs::write(ready.join("files/pictures/album"), b"picture-data").unwrap();
+        fs::write(ready.join("run.toml"),
+            br#"nickname = "laptop"
+[[sync]]
+name = "videos"
+to = "videos"
+delete_after_import = true
+
+[[sync]]
+name = "pictures"
+to = "pictures"
+delete_after_import = true
+
+[[postprocess.rules]]
+match = "album"
+steps = ["pack"]
+for = ["videos"]
+"#).unwrap();
+
+        // Both entries are postprocess, but the rule only applies to videos
+        let manifest = Manifest {
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![
+                ManifestEntry {
+                    sync_name: SyncName::new("videos".into()).unwrap(),
+                    local_path: ClientLocalPath::new("/src/videos/album".into()).unwrap(),
+                    staged_path: NormalizedRelativePath::new("files/videos/album".into()).unwrap(),
+                    relative_path: NormalizedRelativePath::new("album".into()).unwrap(),
+                    kind: ManifestEntryKind::RegularFile,
+                    size: 9,
+                    mtime_ns: 100,
+                    sha256: None,
+                    link_target: None,
+                    mode: purgery_core::ManifestEntryMode::Postprocess,
+                    postprocess_steps: vec!["pack".into()],
+                    covered_by: None,
+                },
+                ManifestEntry {
+                    sync_name: SyncName::new("pictures".into()).unwrap(),
+                    local_path: ClientLocalPath::new("/src/pictures/album".into()).unwrap(),
+                    staged_path: NormalizedRelativePath::new("files/pictures/album".into()).unwrap(),
+                    relative_path: NormalizedRelativePath::new("album".into()).unwrap(),
+                    kind: ManifestEntryKind::RegularFile,
+                    size: 12,
+                    mtime_ns: 200,
+                    sha256: None,
+                    link_target: None,
+                    mode: purgery_core::ManifestEntryMode::Postprocess,
+                    postprocess_steps: vec!["pack".into()],
+                    covered_by: None,
+                },
+            ],
+        };
+        fs::write(ready.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+
+        process_run(&config, &nickname, &run_id).unwrap();
+        let done = config.purgery_root.run_dir(&nickname, &run_id, RunPhase::Done);
+        let status_content = fs::read_to_string(done.join("status.toml")).unwrap();
+        let status = RunStatus::from_toml(&status_content).unwrap();
+        // Both should succeed
+        assert_eq!(status.entries.len(), 2);
+        for e in &status.entries {
+            assert_eq!(e.status, FileStatus::Imported, "entry {:?} should be imported", e.relative_path);
+        }
+    }
 }
