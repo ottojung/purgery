@@ -144,47 +144,29 @@ pub struct ResolvedExecutable {
     pub path: Utf8PathBuf,
 }
 
-/// Check that a path is a regular file (follows symlinks).
-/// Returns true if the target is a regular file.
-fn is_regular_file(path: &Utf8Path) -> bool {
-    std::fs::metadata(path.as_std_path())
-        .map(|m| m.file_type().is_file())
-        .unwrap_or(false)
-}
-
 /// Resolve an executable program path.
 ///
 /// Rules:
 /// - Absolute path: follow symlinks, require target exists and is a regular file, require executable bit set.
 /// - Relative name: search PATH, follow symlinks, require target is regular file, require executable bit set.
 /// - Directories and broken symlinks are rejected.
+///
+/// Uses a single `metadata()` call per candidate to check both the file type
+/// (following symlinks) and the executable permission bits on Unix.
 pub fn resolve_executable(program: &str) -> Result<ResolvedExecutable, ExecutableError> {
     if program.is_empty() {
         return Err(ExecutableError::EmptyProgram);
     }
 
-    let program_path = Utf8Path::new(program);
-
-    if program_path.is_absolute() {
-        if !program_path.exists() {
-            return Err(ExecutableError::AbsoluteNotFound(program.to_owned()));
-        }
-        // Check it's not a directory
-        if program_path.is_dir() {
-            return Err(ExecutableError::NotExecutable(format!(
-                "'{}' is a directory",
-                program
-            )));
-        }
-        // Follow symlinks to verify target is a regular file
-        if !is_regular_file(program_path) {
-            return Err(ExecutableError::NotExecutable(format!(
-                "'{}' target is not a regular file",
-                program
-            )));
-        }
-        let meta = std::fs::metadata(program_path.as_std_path())
+    fn check(path: &Utf8Path, program: &str) -> Result<ResolvedExecutable, ExecutableError> {
+        let meta = std::fs::metadata(path.as_std_path())
             .map_err(|e| ExecutableError::Io(program.to_owned(), e))?;
+        if !meta.file_type().is_file() {
+            return Err(ExecutableError::NotExecutable(format!(
+                "'{}' is not a regular file",
+                path.as_str()
+            )));
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -196,8 +178,17 @@ pub fn resolve_executable(program: &str) -> Result<ResolvedExecutable, Executabl
             }
         }
         Ok(ResolvedExecutable {
-            path: program_path.to_owned(),
+            path: path.to_owned(),
         })
+    }
+
+    let program_path = Utf8Path::new(program);
+
+    if program_path.is_absolute() {
+        if !program_path.exists() {
+            return Err(ExecutableError::AbsoluteNotFound(program.to_owned()));
+        }
+        check(program_path, program)
     } else {
         let path_var = std::env::var("PATH").unwrap_or_default();
         for dir in path_var.split(':') {
@@ -208,22 +199,9 @@ pub fn resolve_executable(program: &str) -> Result<ResolvedExecutable, Executabl
             if !candidate.exists() {
                 continue;
             }
-            if candidate.is_dir() {
-                continue;
+            if check(&candidate, program).is_ok() {
+                return Ok(ResolvedExecutable { path: candidate });
             }
-            if !is_regular_file(&candidate) {
-                continue;
-            }
-            let meta = std::fs::metadata(candidate.as_std_path())
-                .map_err(|e| ExecutableError::Io(program.to_owned(), e))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if meta.permissions().mode() & 0o111 == 0 {
-                    continue;
-                }
-            }
-            return Ok(ResolvedExecutable { path: candidate });
         }
         Err(ExecutableError::NotFound(program.to_owned()))
     }
@@ -239,6 +217,7 @@ const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 60;
 
 /// GC configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GCConfig {
     #[serde(default = "default_incoming_lease_secs")]
     pub incoming_lease_secs: u64,
@@ -265,6 +244,7 @@ fn default_heartbeat_interval_secs() -> u64 {
 
 /// Lease file written to incoming run directories.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LeaseFile {
     pub protocol_version: u32,
     pub nickname: String,
@@ -1040,6 +1020,9 @@ impl PostprocessStepDefinition {
     }
 
     /// Resolve expected output paths relative to the work parent directory.
+    ///
+    /// Only the file name portion of the resolved pattern is used; the output
+    /// is always placed in the same directory as the input file.
     pub fn resolve_expected_outputs(&self, work_path: &Utf8Path) -> Vec<Utf8PathBuf> {
         let parent = work_path
             .parent()
@@ -1049,13 +1032,9 @@ impl PostprocessStepDefinition {
             .iter()
             .map(|pat| {
                 let resolved = self.resolve_placeholders(work_path, pat);
-                // If resolved is absolute, use as-is; otherwise join with parent
                 let p = Utf8Path::new(&resolved);
-                if p.is_absolute() {
-                    p.to_owned()
-                } else {
-                    parent.join(p)
-                }
+                let fname = p.file_name().unwrap_or(resolved.as_str());
+                parent.join(fname)
             })
             .collect()
     }

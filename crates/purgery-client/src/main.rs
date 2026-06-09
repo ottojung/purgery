@@ -340,9 +340,23 @@ fn sync_and_cleanup(config_path: &str) -> Result<()> {
             if !status.success() {
                 anyhow::bail!("rsync failed for sync mapping '{}'", sync.name);
             }
+
+            // Check for heartbeat failure after each mapping so we can
+            // avoid calling finish-run if the lease is already lost.
+            if let Some(err) = hb_error.lock().unwrap().take() {
+                anyhow::bail!("{err}");
+            }
         }
 
-        // 6. Finish run: move from incoming to ready
+        // 6. Check heartbeat one last time before finish-run. If the lease has
+        // expired, finish-run would succeed but the client would still exit
+        // without polling status — operationally awkward, not data-lossy,
+        // but still better to fail early here.
+        if let Some(err) = hb_error.lock().unwrap().take() {
+            anyhow::bail!("{err}");
+        }
+
+        // 7. Finish run: move from incoming to ready
         eprintln!("finishing run...");
         server_cmd(
             host,

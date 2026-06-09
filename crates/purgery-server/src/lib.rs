@@ -892,7 +892,19 @@ pub fn begin_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> 
         .unwrap_or_default()
         .as_secs();
 
-    fs::create_dir_all(&files_dir)
+    // Atomic single-use: create_dir fails atomically if the directory already exists.
+    // This prevents two concurrent clients from both accepting the same run ID.
+    if let Some(parent) = incoming_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create incoming parent: {}", parent.as_str()))?;
+    }
+    fs::create_dir(incoming_path.as_std_path()).with_context(|| {
+        format!(
+            "failed to create incoming dir '{}' (race: run may have been created concurrently)",
+            incoming_path.as_str()
+        )
+    })?;
+    fs::create_dir(files_dir.as_std_path())
         .with_context(|| format!("failed to create files dir: {}", files_dir.as_str()))?;
 
     // Write lease file
@@ -1009,6 +1021,22 @@ pub fn read_run_status(
 pub fn server_check(config: &ServerConfig) -> Result<()> {
     eprintln!("checking server configuration...");
 
+    // Validate GC config: heartbeat must be frequent enough to keep the lease alive
+    if config.gc.incoming_lease_secs == 0 {
+        anyhow::bail!("gc.incoming_lease_secs must be greater than 0");
+    }
+    if config.gc.heartbeat_interval_secs == 0 {
+        anyhow::bail!("gc.heartbeat_interval_secs must be greater than 0");
+    }
+    if config.gc.heartbeat_interval_secs * 2 > config.gc.incoming_lease_secs {
+        anyhow::bail!(
+            "gc.heartbeat_interval_secs ({}) * 2 must be <= gc.incoming_lease_secs ({}) \
+             to provide a safety margin for lease renewal",
+            config.gc.heartbeat_interval_secs,
+            config.gc.incoming_lease_secs
+        );
+    }
+
     // Check root path exists and is a directory
     let root_path = config.root.as_path();
     if !root_path.exists() {
@@ -1041,7 +1069,7 @@ pub fn server_check(config: &ServerConfig) -> Result<()> {
     }
     eprintln!("  purgery_root: {} (exists)", purgery_path.as_str());
 
-    // Check postprocess programs
+    // Check postprocess programs and validate step definitions
     for (name, step) in &config.postprocess.steps {
         let program = &step.program;
         if program.is_empty() {
@@ -1051,9 +1079,31 @@ pub fn server_check(config: &ServerConfig) -> Result<()> {
         // Validate step produces at least one output
         if !step.keep_original && step.expected_outputs.is_empty() {
             anyhow::bail!(
-                "postprocess step '{}': keep_original=false with no expected_outputs would produce zero committed outputs",
+                "postprocess step '{}': keep_original=false with no expected_outputs \
+                 would produce zero committed outputs",
                 name
             );
+        }
+
+        // Validate expected_outputs are simple file names (no paths, no separators)
+        for output in &step.expected_outputs {
+            let p = Utf8Path::new(output);
+            if p.is_absolute() {
+                anyhow::bail!(
+                    "postprocess step '{}': expected_output '{}' is absolute; \
+                     must be a file name (output is always placed next to the input)",
+                    name,
+                    output
+                );
+            }
+            if output.contains('/') {
+                anyhow::bail!(
+                    "postprocess step '{}': expected_output '{}' contains a path separator; \
+                     must be a file name, not a path",
+                    name,
+                    output
+                );
+            }
         }
 
         purgery_core::resolve_executable(program).map(|r| {
@@ -1146,7 +1196,24 @@ pub fn run_gc(config: &ServerConfig) -> Result<()> {
                 match fs::read_to_string(lease_path.as_std_path()) {
                     Ok(content) => {
                         match toml::from_str::<purgery_core::LeaseFile>(&content) {
-                            Ok(lease) => now >= lease.expires_at_unix_secs,
+                            Ok(lease) => {
+                                // Validate lease envelope — mismatched lease is treated as expired
+                                let valid = lease.protocol_version == 1
+                                    && lease.nickname == nickname.as_str()
+                                    && lease.run_id == run_id.as_str();
+                                if !valid {
+                                    eprintln!(
+                                        "gc: lease envelope mismatch for {}/{} \
+                                         (protocol={}, nickname={:?}, run_id={:?})",
+                                        nickname.as_str(),
+                                        run_id.as_str(),
+                                        lease.protocol_version,
+                                        lease.nickname,
+                                        lease.run_id,
+                                    );
+                                }
+                                valid && now >= lease.expires_at_unix_secs
+                            }
                             Err(_) => true, // malformed lease -> expire
                         }
                     }
@@ -1275,6 +1342,28 @@ pub fn heartbeat_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId)
         .with_context(|| "failed to read lease file")?;
     let mut lease: purgery_core::LeaseFile =
         toml::from_str(&lease_content).with_context(|| "failed to parse lease file")?;
+
+    // Validate lease envelope — confirm this lease really belongs to this run
+    if lease.protocol_version != 1 {
+        anyhow::bail!(
+            "lease protocol version {} does not match expected 1",
+            lease.protocol_version
+        );
+    }
+    if lease.nickname != nickname.as_str() {
+        anyhow::bail!(
+            "lease nickname '{}' does not match expected '{}'",
+            lease.nickname,
+            nickname.as_str()
+        );
+    }
+    if lease.run_id != run_id.as_str() {
+        anyhow::bail!(
+            "lease run_id '{}' does not match expected '{}'",
+            lease.run_id,
+            run_id.as_str()
+        );
+    }
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
