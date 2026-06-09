@@ -1395,6 +1395,10 @@ pub struct ClientPostprocessConfig {
 ///
 /// Rules are evaluated in order. If no rule matches, the entry is passthrough.
 /// The `match` value is an rsync include/exclude pattern, not a regex.
+///
+/// The optional `for` field scopes the rule to specific sync groups.
+/// Omitted `for` means every sync group. Empty `for` is rejected.
+/// Unknown sync names in `for` are rejected during config validation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PostprocessRule {
@@ -1403,6 +1407,51 @@ pub struct PostprocessRule {
     pub pattern: String,
     /// Postprocess step names to apply when this rule matches.
     pub steps: Vec<String>,
+    /// Optional sync group name scoping.
+    /// Renamed from `sync_names` to `for` in config.
+    #[serde(rename = "for", default, skip_serializing_if = "Option::is_none")]
+    pub sync_names: Option<Vec<SyncName>>,
+}
+
+impl PostprocessRule {
+    /// Returns true if this rule applies to the given sync group name.
+    /// A rule applies when `for` is omitted or the sync name is listed.
+    pub fn applies_to(&self, sync_name: &str) -> bool {
+        match &self.sync_names {
+            None => true,
+            Some(names) => names.iter().any(|n| n.as_str() == sync_name),
+        }
+    }
+}
+
+/// Returns the subset of rules applicable to a given sync group.
+pub fn applicable_rules<'a>(rules: &'a [PostprocessRule], sync_name: &str) -> Vec<&'a PostprocessRule> {
+    rules.iter().filter(|r| r.applies_to(sync_name)).collect()
+}
+
+impl ClientPostprocessConfig {
+    /// Validate postprocess rules against the sync mapping list.
+    /// Returns an error if:
+    /// - A rule has an empty `for` list
+    /// - A rule references a sync name that does not exist in the config
+    pub fn validate(&self, sync_names: &[SyncName]) -> Result<(), String> {
+        for rule in &self.rules {
+            if let Some(ref names) = rule.sync_names {
+                if names.is_empty() {
+                    return Err("postprocess rule has empty for list".into());
+                }
+                for name in names {
+                    if !sync_names.iter().any(|s| s == name) {
+                        return Err(format!(
+                            "postprocess rule references unknown sync name '{}' in for",
+                            name.as_str()
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Server-relevant per-run configuration uploaded alongside files.
