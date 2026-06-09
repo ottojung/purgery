@@ -5678,4 +5678,409 @@ steps = ["compress"]
         );
         assert_eq!(entry_descendant.covered_by.as_deref(), Some("photos"));
     }
+
+    // ── prepare-run covered_by validation tests ──
+
+    #[ignore = "expected to fail until covered_by validation is implemented"]
+    #[test]
+    fn prepare_run_rejects_covered_entry_with_missing_covered_by() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&purgery_root, &server_root);
+        // Set up a postprocess step so the directory can be postprocessed
+        let config = ServerConfig {
+            root: config.root,
+            purgery_root: config.purgery_root,
+            postprocess: PostprocessConfig {
+                steps: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "pack".to_owned(),
+                        PostprocessStepDefinition {
+                            kind: PostprocessKind::Subprocess,
+                            program: "true".into(),
+                            args: vec![],
+                            expected_outputs: vec![],
+                            keep_original: true,
+                        },
+                    );
+                    m
+                },
+            },
+            ..config
+        };
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("covered-by-missing".into()).unwrap();
+        let incoming = config.purgery_root.run_dir(&nickname, &run_id, RunPhase::Incoming);
+        fs::create_dir_all(&incoming).unwrap();
+        write_run_toml_with_sync(&incoming, &nickname, "data", "data");
+        let run_config_content = r#"
+nickname = "laptop"
+
+[[sync]]
+name = "data"
+to = "data"
+
+[[postprocess.rules]]
+match = "album"
+steps = ["pack"]
+"#;
+        fs::write(incoming.join("run.toml"), run_config_content).unwrap();
+        let manifest = Manifest {
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![
+                ManifestEntry {
+                    sync_name: SyncName::new("data".into()).unwrap(),
+                    local_path: ClientLocalPath::new("/source/album".into()).unwrap(),
+                    staged_path: NormalizedRelativePath::new("files/data/album".into()).unwrap(),
+                    relative_path: NormalizedRelativePath::new("album".into()).unwrap(),
+                    kind: ManifestEntryKind::Directory,
+                    size: 0,
+                    mtime_ns: 0,
+                    sha256: None,
+                    link_target: None,
+                    mode: purgery_core::ManifestEntryMode::Postprocess,
+                    postprocess_steps: vec!["pack".into()],
+                    covered_by: None,
+                },
+                ManifestEntry {
+                    sync_name: SyncName::new("data".into()).unwrap(),
+                    local_path: ClientLocalPath::new("/source/album/song.mp3".into()).unwrap(),
+                    staged_path: NormalizedRelativePath::new("files/data/album/song.mp3".into()).unwrap(),
+                    relative_path: NormalizedRelativePath::new("album/song.mp3".into()).unwrap(),
+                    kind: ManifestEntryKind::RegularFile,
+                    size: 100,
+                    mtime_ns: 0,
+                    sha256: None,
+                    link_target: None,
+                    mode: purgery_core::ManifestEntryMode::Covered,
+                    postprocess_steps: Vec::new(),
+                    covered_by: None,
+                },
+            ],
+        };
+        fs::write(incoming.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+        let error = prepare_run(&config, &nickname, &run_id).unwrap_err();
+        assert!(error.to_string().contains("covered_by"), "must reject missing covered_by: {error}");
+    }
+
+    #[ignore = "expected to fail until covered_by validation is implemented"]
+    #[test]
+    fn prepare_run_rejects_covered_entry_with_wrong_covered_by() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&purgery_root, &server_root);
+        let config = ServerConfig {
+            postprocess: PostprocessConfig {
+                steps: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "pack".to_owned(),
+                        PostprocessStepDefinition {
+                            kind: PostprocessKind::Subprocess,
+                            program: "true".into(),
+                            args: vec![],
+                            expected_outputs: vec![],
+                            keep_original: true,
+                        },
+                    );
+                    m
+                },
+            },
+            ..config
+        };
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("covered-by-wrong".into()).unwrap();
+        let incoming = config.purgery_root.run_dir(&nickname, &run_id, RunPhase::Incoming);
+        fs::create_dir_all(&incoming).unwrap();
+        fs::write(incoming.join("run.toml"), r#"
+nickname = "laptop"
+
+[[sync]]
+name = "data"
+to = "data"
+
+[[postprocess.rules]]
+match = "album"
+steps = ["pack"]
+"#).unwrap();
+        let manifest = Manifest {
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![
+                ManifestEntry {
+                    sync_name: SyncName::new("data".into()).unwrap(),
+                    local_path: ClientLocalPath::new("/source/album".into()).unwrap(),
+                    staged_path: NormalizedRelativePath::new("files/data/album".into()).unwrap(),
+                    relative_path: NormalizedRelativePath::new("album".into()).unwrap(),
+                    kind: ManifestEntryKind::Directory,
+                    size: 0,
+                    mtime_ns: 0,
+                    sha256: None,
+                    link_target: None,
+                    mode: purgery_core::ManifestEntryMode::Postprocess,
+                    postprocess_steps: vec!["pack".into()],
+                    covered_by: None,
+                },
+                ManifestEntry {
+                    sync_name: SyncName::new("data".into()).unwrap(),
+                    local_path: ClientLocalPath::new("/source/album/song.mp3".into()).unwrap(),
+                    staged_path: NormalizedRelativePath::new("files/data/album/song.mp3".into()).unwrap(),
+                    relative_path: NormalizedRelativePath::new("album/song.mp3".into()).unwrap(),
+                    kind: ManifestEntryKind::RegularFile,
+                    size: 100,
+                    mtime_ns: 0,
+                    sha256: None,
+                    link_target: None,
+                    mode: purgery_core::ManifestEntryMode::Covered,
+                    postprocess_steps: Vec::new(),
+                    covered_by: Some("wrong-path".into()),
+                },
+            ],
+        };
+        fs::write(incoming.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+        let error = prepare_run(&config, &nickname, &run_id).unwrap_err();
+        assert!(error.to_string().contains("covered_by"), "must reject wrong covered_by: {error}");
+    }
+
+    #[ignore = "expected to fail until covered_by validation is implemented"]
+    #[test]
+    fn prepare_run_rejects_covered_entry_with_non_empty_postprocess_steps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&purgery_root, &server_root);
+        let config = ServerConfig {
+            postprocess: PostprocessConfig {
+                steps: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "pack".to_owned(),
+                        PostprocessStepDefinition {
+                            kind: PostprocessKind::Subprocess,
+                            program: "true".into(),
+                            args: vec![],
+                            expected_outputs: vec![],
+                            keep_original: true,
+                        },
+                    );
+                    m
+                },
+            },
+            ..config
+        };
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("covered-steps".into()).unwrap();
+        let incoming = config.purgery_root.run_dir(&nickname, &run_id, RunPhase::Incoming);
+        fs::create_dir_all(&incoming).unwrap();
+        fs::write(incoming.join("run.toml"), r#"
+nickname = "laptop"
+
+[[sync]]
+name = "data"
+to = "data"
+
+[[postprocess.rules]]
+match = "album"
+steps = ["pack"]
+"#).unwrap();
+        let manifest = Manifest {
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![
+                ManifestEntry {
+                    sync_name: SyncName::new("data".into()).unwrap(),
+                    local_path: ClientLocalPath::new("/source/album".into()).unwrap(),
+                    staged_path: NormalizedRelativePath::new("files/data/album".into()).unwrap(),
+                    relative_path: NormalizedRelativePath::new("album".into()).unwrap(),
+                    kind: ManifestEntryKind::Directory,
+                    size: 0,
+                    mtime_ns: 0,
+                    sha256: None,
+                    link_target: None,
+                    mode: purgery_core::ManifestEntryMode::Postprocess,
+                    postprocess_steps: vec!["pack".into()],
+                    covered_by: None,
+                },
+                ManifestEntry {
+                    sync_name: SyncName::new("data".into()).unwrap(),
+                    local_path: ClientLocalPath::new("/source/album/song.mp3".into()).unwrap(),
+                    staged_path: NormalizedRelativePath::new("files/data/album/song.mp3".into()).unwrap(),
+                    relative_path: NormalizedRelativePath::new("album/song.mp3".into()).unwrap(),
+                    kind: ManifestEntryKind::RegularFile,
+                    size: 100,
+                    mtime_ns: 0,
+                    sha256: None,
+                    link_target: None,
+                    mode: purgery_core::ManifestEntryMode::Covered,
+                    postprocess_steps: vec!["pack".into()],
+                    covered_by: Some("album".into()),
+                },
+            ],
+        };
+        fs::write(incoming.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+        let error = prepare_run(&config, &nickname, &run_id).unwrap_err();
+        assert!(error.to_string().contains("postprocess_steps"), "must reject non-empty steps: {error}");
+    }
+
+    #[test]
+    fn prepare_run_rejects_descendant_marked_passthrough_under_postprocessed_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&purgery_root, &server_root);
+        let config = ServerConfig {
+            postprocess: PostprocessConfig {
+                steps: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "pack".to_owned(),
+                        PostprocessStepDefinition {
+                            kind: PostprocessKind::Subprocess,
+                            program: "true".into(),
+                            args: vec![],
+                            expected_outputs: vec![],
+                            keep_original: true,
+                        },
+                    );
+                    m
+                },
+            },
+            ..config
+        };
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("descendant-passthrough".into()).unwrap();
+        let incoming = config.purgery_root.run_dir(&nickname, &run_id, RunPhase::Incoming);
+        fs::create_dir_all(&incoming).unwrap();
+        fs::write(incoming.join("run.toml"), r#"
+nickname = "laptop"
+
+[[sync]]
+name = "data"
+to = "data"
+
+[[postprocess.rules]]
+match = "album"
+steps = ["pack"]
+"#).unwrap();
+        let manifest = Manifest {
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![
+                ManifestEntry {
+                    sync_name: SyncName::new("data".into()).unwrap(),
+                    local_path: ClientLocalPath::new("/source/album".into()).unwrap(),
+                    staged_path: NormalizedRelativePath::new("files/data/album".into()).unwrap(),
+                    relative_path: NormalizedRelativePath::new("album".into()).unwrap(),
+                    kind: ManifestEntryKind::Directory,
+                    size: 0,
+                    mtime_ns: 0,
+                    sha256: None,
+                    link_target: None,
+                    mode: purgery_core::ManifestEntryMode::Postprocess,
+                    postprocess_steps: vec!["pack".into()],
+                    covered_by: None,
+                },
+                ManifestEntry {
+                    sync_name: SyncName::new("data".into()).unwrap(),
+                    local_path: ClientLocalPath::new("/source/album/song.mp3".into()).unwrap(),
+                    staged_path: NormalizedRelativePath::new("files/data/album/song.mp3".into()).unwrap(),
+                    relative_path: NormalizedRelativePath::new("album/song.mp3".into()).unwrap(),
+                    kind: ManifestEntryKind::RegularFile,
+                    size: 100,
+                    mtime_ns: 0,
+                    sha256: None,
+                    link_target: None,
+                    mode: purgery_core::ManifestEntryMode::Passthrough,
+                    postprocess_steps: Vec::new(),
+                    covered_by: None,
+                },
+            ],
+        };
+        fs::write(incoming.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+        let error = prepare_run(&config, &nickname, &run_id).unwrap_err();
+        assert!(error.to_string().contains("covered"), "must reject passthrough descendant: {error}");
+    }
+
+    #[test]
+    fn prepare_run_rejects_descendant_marked_postprocess_under_postprocessed_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&purgery_root, &server_root);
+        let config = ServerConfig {
+            postprocess: PostprocessConfig {
+                steps: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "pack".to_owned(),
+                        PostprocessStepDefinition {
+                            kind: PostprocessKind::Subprocess,
+                            program: "true".into(),
+                            args: vec![],
+                            expected_outputs: vec![],
+                            keep_original: true,
+                        },
+                    );
+                    m
+                },
+            },
+            ..config
+        };
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("descendant-postprocess".into()).unwrap();
+        let incoming = config.purgery_root.run_dir(&nickname, &run_id, RunPhase::Incoming);
+        fs::create_dir_all(&incoming).unwrap();
+        fs::write(incoming.join("run.toml"), r#"
+nickname = "laptop"
+
+[[sync]]
+name = "data"
+to = "data"
+
+[[postprocess.rules]]
+match = "album"
+steps = ["pack"]
+"#).unwrap();
+        let manifest = Manifest {
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![
+                ManifestEntry {
+                    sync_name: SyncName::new("data".into()).unwrap(),
+                    local_path: ClientLocalPath::new("/source/album".into()).unwrap(),
+                    staged_path: NormalizedRelativePath::new("files/data/album".into()).unwrap(),
+                    relative_path: NormalizedRelativePath::new("album".into()).unwrap(),
+                    kind: ManifestEntryKind::Directory,
+                    size: 0,
+                    mtime_ns: 0,
+                    sha256: None,
+                    link_target: None,
+                    mode: purgery_core::ManifestEntryMode::Postprocess,
+                    postprocess_steps: vec!["pack".into()],
+                    covered_by: None,
+                },
+                ManifestEntry {
+                    sync_name: SyncName::new("data".into()).unwrap(),
+                    local_path: ClientLocalPath::new("/source/album/song.mp3".into()).unwrap(),
+                    staged_path: NormalizedRelativePath::new("files/data/album/song.mp3".into()).unwrap(),
+                    relative_path: NormalizedRelativePath::new("album/song.mp3".into()).unwrap(),
+                    kind: ManifestEntryKind::RegularFile,
+                    size: 100,
+                    mtime_ns: 0,
+                    sha256: None,
+                    link_target: None,
+                    mode: purgery_core::ManifestEntryMode::Postprocess,
+                    postprocess_steps: vec!["pack".into()],
+                    covered_by: None,
+                },
+            ],
+        };
+        fs::write(incoming.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+        let error = prepare_run(&config, &nickname, &run_id).unwrap_err();
+        assert!(error.to_string().contains("covered"), "must reject postprocess descendant: {error}");
+    }
 }

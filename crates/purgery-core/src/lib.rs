@@ -3352,4 +3352,65 @@ color = "never"
     fn validate_expected_output_rejects_path_separator() {
         assert!(validate_expected_output_name("sub/out.webm").is_err());
     }
+
+    // ── Transfer filter generation tests ──
+
+    #[ignore = "expected to fail until subtree transfer roots are implemented"]
+    #[test]
+    fn transfer_filter_includes_subtree_for_postprocessed_directory() {
+        let filter = transfer_set_filter(&["album".to_string()]);
+        assert!(
+            filter.contains("+ album/**"),
+            "subtree root must include descendants: {filter}"
+        );
+    }
+
+    #[test]
+    fn transfer_filter_includes_ancestors_and_exact_roots() {
+        let filter = transfer_set_filter(&["sub/outside.txt".to_string()]);
+        assert!(filter.contains("+ sub/"), "ancestor dir must be included: {filter}");
+        assert!(filter.contains("+ sub/outside.txt"), "exact root must be included: {filter}");
+        assert!(!filter.contains("+ sub/**"), "exact root must not have subtree pattern: {filter}");
+    }
+
+    #[ignore = "expected to fail until subtree transfer roots are implemented"]
+    #[test]
+    fn transfer_filter_for_directory_root_includes_both_dir_and_descendants() {
+        let filter = transfer_set_filter(&["album".to_string(), "outside.txt".to_string()]);
+        assert!(
+            filter.contains("+ album/"),
+            "directory root must include dir/: {filter}"
+        );
+        assert!(
+            filter.contains("+ album/**"),
+            "subtree root must include descendants: {filter}"
+        );
+        assert!(filter.contains("+ outside.txt"), "exact root must be included: {filter}");
+    }
+
+    #[test]
+    fn transfer_filter_excludes_everything_else() {
+        let filter = transfer_set_filter(&["a.txt".to_string()]);
+        assert!(filter.ends_with("- *\n") || filter.ends_with("- *"), "filter must end with exclude all: {filter}");
+    }
+
+    #[ignore = "expected to fail until subtree transfer roots are implemented"]
+    #[test]
+    fn transfer_filter_nested_subtree_includes_all_ancestors() {
+        let filter = transfer_set_filter(&["a/b/album".to_string()]);
+        assert!(filter.contains("+ a/"), "must include ancestor a/: {filter}");
+        assert!(filter.contains("+ a/b/"), "must include ancestor a/b/: {filter}");
+        assert!(filter.contains("+ a/b/album/**"), "subtree root must include descendants: {filter}");
+    }
+
+    #[ignore = "expected to fail until subtree transfer roots are implemented"]
+    #[test]
+    fn transfer_filter_excludes_covered_descendants_from_independent_roots() {
+        // Covered descendants must not appear as independent transfer roots.
+        let filter = transfer_set_filter(&["album".to_string(), "album/song.mp3".to_string()]);
+        assert!(
+            !filter.contains("song.mp3"),
+            "covered descendants must not be independent roots: {filter}"
+        );
+    }
 }
