@@ -1802,6 +1802,66 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
         anyhow::bail!("envelope validation failed: {e}");
     }
 
+    // Validate manifest classification
+    {
+        let sync_map = run_config.sync_map();
+        for entry in &manifest.entries {
+            let _sync = sync_map.get(entry.sync_name.as_str());
+            let rp = entry.relative_path.as_str();
+            let matched = run_config.postprocess.rules.iter().find(|r| {
+                purgery_core::rsync_pattern_match(&r.pattern, rp)
+            });
+            let expected_mode = match matched {
+                Some(_) => purgery_core::ManifestEntryMode::Postprocess,
+                None => purgery_core::ManifestEntryMode::Passthrough,
+            };
+
+            // Check for covered entries
+            let is_postprocessed_dir = manifest.entries.iter().any(|de| {
+                de.kind == purgery_core::ManifestEntryKind::Directory
+                    && de.mode == purgery_core::ManifestEntryMode::Postprocess
+                    && de.sync_name.as_str() == entry.sync_name.as_str()
+                    && rp.starts_with(de.relative_path.as_str())
+                    && rp.as_bytes().get(de.relative_path.as_str().len()) == Some(&b'/')
+            });
+
+            if is_postprocessed_dir {
+                if entry.mode != purgery_core::ManifestEntryMode::Covered {
+                    anyhow::bail!(
+                        "classification mismatch: '{}' is a descendant of postprocessed \
+                         directory but has mode '{:?}' instead of 'covered'",
+                        rp, entry.mode
+                    );
+                }
+                continue;
+            }
+
+            if entry.mode != expected_mode {
+                anyhow::bail!(
+                    "classification mismatch for '{}': manifest says '{:?}' but \
+                     pattern classification says '{:?}'",
+                    rp, entry.mode, expected_mode
+                );
+            }
+
+            if entry.mode == purgery_core::ManifestEntryMode::Postprocess {
+                let Some(rule) = matched else {
+                    anyhow::bail!(
+                        "classification mismatch for '{}': postprocess mode but no matching rule",
+                        rp
+                    );
+                };
+                if entry.postprocess_steps != rule.steps {
+                    anyhow::bail!(
+                        "classification mismatch for '{}': postprocess_steps {:?} do not \
+                         match rule steps {:?}",
+                        rp, entry.postprocess_steps, rule.steps
+                    );
+                }
+            }
+        }
+    }
+
     // Build run plan (validates patterns, step references, expected outputs)
     let run_plan = RunPlan::build(config, &run_config)
         .map_err(|e| anyhow::anyhow!("run plan validation failed: {e}"))?;

@@ -68,11 +68,19 @@ If a directory entry matches a postprocess rule, descendant manifest entries und
 protocol_version = 1
 nickname = "laptop"
 run_id = "01ARZ..."
-final_root = "/universe/synced/laptop"
-purgatory_root = "/tmp/purgery/laptop/incoming/01ARZ.../files"
+
+[[destinations]]
+sync_name = "videos"
+passthrough_dest = "/universe/synced/laptop/videos"
+purgatory_dest = "/tmp/purgery/laptop/incoming/01ARZ.../files/videos"
+
+[[destinations]]
+sync_name = "pictures"
+passthrough_dest = "/universe/synced/laptop/pictures"
+purgatory_dest = "/tmp/purgery/laptop/incoming/01ARZ.../files/pictures"
 ```
 
-The client appends `/<sync.to>/` to `final_root` for the passthrough rsync destination, and `/<sync.to>/` to `purgatory_root` for the purgatory rsync destination.
+The client uses the per-sync destinations as rsync targets. For passthrough, it constructs `host:<passthrough_dest>/`. For purgatory, it constructs `host:<purgatory_dest>/`.
 
 ## Manifest entry classification
 

@@ -736,6 +736,32 @@ fn build_manifest(config: &ClientConfig, run_id: &RunId) -> Result<Manifest> {
         }
     }
 
+    // Second pass: identify covered entries under postprocessed directories.
+    let covering_dirs: Vec<String> = entries
+        .iter()
+        .filter(|e| {
+            e.kind == purgery_core::ManifestEntryKind::Directory
+                && e.mode == purgery_core::ManifestEntryMode::Postprocess
+        })
+        .map(|e| e.relative_path.as_str().to_owned())
+        .collect();
+    for entry in entries.iter_mut() {
+        let rp = entry.relative_path.as_str();
+        for dir_path in &covering_dirs {
+            if rp == dir_path.as_str() {
+                continue;
+            }
+            if rp.starts_with(dir_path.as_str())
+                && rp.as_bytes().get(dir_path.len()) == Some(&b'/')
+            {
+                entry.mode = purgery_core::ManifestEntryMode::Covered;
+                entry.covered_by = Some(dir_path.clone());
+                entry.postprocess_steps = Vec::new();
+                break;
+            }
+        }
+    }
+
     entries.sort_by(|left, right| {
         let left_depth = left.relative_path.as_path().components().count();
         let right_depth = right.relative_path.as_path().components().count();
