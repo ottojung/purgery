@@ -1679,6 +1679,22 @@ pub enum TransferRoot {
     Subtree(String),
 }
 
+/// Lightweight transfer/classification plan entry.
+///
+/// Used for rsync filter generation and path classification.
+/// Does not carry identity-bearing fields (size, mtime, sha256).
+/// Identity-bearing entries are created separately only for entries
+/// that need cleanup bookkeeping or server processing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferPlanEntry {
+    pub sync_name: SyncName,
+    pub relative_path: NormalizedRelativePath,
+    pub kind: ManifestEntryKind,
+    pub mode: ManifestEntryMode,
+    pub covered_by: Option<String>,
+    pub postprocess_steps: Vec<String>,
+}
+
 /// Generate rsync filter file content from a set of transfer roots.
 ///
 /// For exact roots: include ancestor directories and the exact path.
