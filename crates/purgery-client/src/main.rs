@@ -345,7 +345,37 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
     let manifest_toml = manifest.to_toml()?;
     write_remote_file(host, &begin_resp.manifest_path, &manifest_toml)?;
 
-    // 4. Start heartbeat guard thread for periodic heartbeats during long rsync
+    // 4. Prepare-run: validate plan and get transfer destinations
+    info!("validating run plan");
+    let prepare_out = server_cmd(
+        host,
+        server_command,
+        &[
+            "prepare-run",
+            "--nickname",
+            config.nickname.as_str(),
+            "--run-id",
+            run_id.as_str(),
+        ],
+    )
+    .context("prepare-run failed")?;
+    let prepare_resp: purgery_core::PrepareRunResponse =
+        toml::from_str(&prepare_out).context("failed to parse prepare-run response")?;
+    if prepare_resp.protocol_version != 1 {
+        anyhow::bail!(
+            "unsupported prepare-run protocol version: {}",
+            prepare_resp.protocol_version
+        );
+    }
+
+    // Build a destination lookup map
+    let dest_map: std::collections::HashMap<&str, &purgery_core::SyncDestination> = prepare_resp
+        .destinations
+        .iter()
+        .map(|d| (d.sync_name.as_str(), d))
+        .collect();
+
+    // 5. Start heartbeat guard thread
     let heartbeat_interval = Duration::from_secs(begin_resp.heartbeat_interval_secs);
     let stop_hb = Arc::new(AtomicBool::new(false));
     let hb_error = Arc::new(Mutex::new(None::<String>));
@@ -375,25 +405,25 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
         }
     });
 
-    // 5. Rsync files per sync mapping — split into passthrough and purgatory calls
+    // 6. Transfer: passthrough then purgatory per sync group
     let sync_result = (|| -> Result<()> {
         for sync in &config.sync {
             let sync_name = sync.name.as_str();
             let from_path = sync.from_path.as_str();
-            let to_path = sync.to_path.as_str();
+            let dest = dest_map
+                .get(sync_name)
+                .ok_or_else(|| anyhow::anyhow!("no destination for sync mapping '{sync_name}'"))?;
 
-            // Collect match patterns for this sync group
+            // Collect match patterns
             let match_patterns: Vec<String> = config
                 .postprocess
                 .rules
                 .iter()
                 .map(|r| r.pattern.clone())
                 .collect();
-
             let purgatory_filter = purgery_core::purgatory_filter_content(&match_patterns);
             let passthrough_filter = purgery_core::passthrough_filter_content(&match_patterns);
 
-            // Write filter files
             let tmp_dir = std::env::temp_dir().join("purgery-filters");
             fs::create_dir_all(&tmp_dir).ok();
             let purgatory_file = tmp_dir.join(format!("purgatory-{sync_name}"));
@@ -403,76 +433,41 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
             fs::write(&passthrough_file, &passthrough_filter)
                 .with_context(|| "failed to write passthrough filter")?;
 
-            // Purgatory rsync: transfer selected entries to staging
-            let remote_staging_dir = format!("{}/{to_path}/", begin_resp.files_dir);
+            // --- Passthrough rsync: direct to final storage ---
+            let passthrough_rsync_dest = format!("{}:{}/", host, dest.passthrough_dest);
             info!(
                 sync = sync_name,
                 from = from_path,
-                to = to_path,
-                mode = "purgatory",
-                "upload started"
-            );
-            let staging_dest = format!("{}:{}", host, remote_staging_dir);
-            let mut args = build_rsync_args(from_path, &staging_dest);
-            // Insert filter args before source/destination
-            let filter_arg = format!("--include-from={}", purgatory_file.to_string_lossy());
-            args.insert(5, filter_arg);
-            // Remove the --protect-args that build_rsync_args adds, or keep both
-            let status = std::process::Command::new("rsync")
-                .args(&args)
-                .status()
-                .with_context(|| format!("failed to execute purgatory rsync for {from_path}"))?;
-            if !status.success() {
-                anyhow::bail!("purgatory rsync failed for sync mapping '{sync_name}'");
-            }
-            info!(sync = sync_name, mode = "purgatory", "upload finished");
-
-            // Check for heartbeat failure after each mapping
-            if let Some(err) = hb_error.lock().unwrap().take() {
-                anyhow::bail!("{err}");
-            }
-
-            // Passthrough rsync: transfer non-selected entries to staging
-            // NOTE: In a full implementation, the server would provide a
-            // passthrough destination path. For now, upload to the incoming
-            // dir with a passthrough filter applied, keeping the existing
-            // architecture.
-            // But this requires knowing the server root path, which the client
-            // should not construct. Instead, we use a scheme where passthrough
-            // entries are uploaded to the server's final destination directly
-            // via SSH. For now, we upload everything to incoming directory
-            // (current behavior) but with a passthrough filter applied.
-            //
-            // NOTE: In a full implementation, the server would provide a
-            // passthrough destination path in the begin-run response.
-            // For now, we simulate by uploading to the incoming dir with
-            // the passthrough filter, keeping the existing architecture.
-            let remote_files_dir = format!("{}/{to_path}/", begin_resp.files_dir);
-            info!(
-                sync = sync_name,
-                from = from_path,
-                to = to_path,
+                dest = %dest.passthrough_dest,
                 mode = "passthrough",
-                "upload started"
+                "passthrough rsync started"
             );
-            let rsync_dest = format!("{}:{}", host, remote_files_dir);
-            let mut args = build_rsync_args(from_path, &rsync_dest);
-            let filter_arg = format!("--exclude-from={}", purgatory_file.to_string_lossy());
-            args.insert(5, filter_arg);
-            let status = std::process::Command::new("rsync")
-                .args(&args)
+            let mut pt_args = build_rsync_args(from_path, &passthrough_rsync_dest);
+            let pt_filter_arg = format!("--filter=merge {}", passthrough_file.to_string_lossy());
+            pt_args.insert(5, pt_filter_arg);
+            let pt_status = std::process::Command::new("rsync")
+                .args(&pt_args)
                 .status()
                 .with_context(|| format!("failed to execute passthrough rsync for {from_path}"))?;
-            if !status.success() {
+            if !pt_status.success() {
                 anyhow::bail!("passthrough rsync failed for sync mapping '{sync_name}'");
             }
-            info!(sync = sync_name, mode = "passthrough", "upload finished");
+            info!(sync = sync_name, mode = "passthrough", "rsync complete");
 
-            // Early cleanup: delete passthrough regular files after successful transfer
+            // Write passthrough receipt
+            let receipt = purgery_core::PassthroughReceipt {
+                sync_name: sync_name.to_owned(),
+                status: "imported".into(),
+            };
+            let receipt_content = toml::to_string(&receipt)
+                .map_err(|e| anyhow::anyhow!("failed to serialize receipt: {e}"))?;
+            let receipt_remote =
+                format!("{}/passthrough.{sync_name}.toml", begin_resp.incoming_dir);
+            write_remote_file(host, &receipt_remote, &receipt_content)?;
+
+            // Early cleanup for passthrough regular files
             if sync.delete_after_import {
-                // The manifest entries for this sync that have no postprocess_steps
-                // are passthrough. We can clean them up immediately.
-                let passthrough_entries: Vec<&ManifestEntry> = manifest
+                let pt_entries: Vec<&ManifestEntry> = manifest
                     .entries
                     .iter()
                     .filter(|e| {
@@ -482,9 +477,8 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
                     })
                     .collect();
                 let mut early_count = 0usize;
-                for entry in &passthrough_entries {
+                for entry in &pt_entries {
                     let local_path = Path::new(entry.local_path.as_str());
-                    // Check identity via symlink_metadata (no symlink replacements)
                     let symmeta = match fs::symlink_metadata(local_path) {
                         Ok(m) => m,
                         Err(_) => continue,
@@ -511,20 +505,42 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
                 }
             }
 
-            // Check for heartbeat failure
+            // Check heartbeat
+            if let Some(err) = hb_error.lock().unwrap().take() {
+                anyhow::bail!("{err}");
+            }
+
+            // --- Purgatory rsync: selected entries to staging ---
+            let purgatory_rsync_dest = format!("{}:{}/", host, dest.purgatory_dest);
+            info!(
+                sync = sync_name,
+                from = from_path,
+                dest = %dest.purgatory_dest,
+                mode = "purgatory",
+                "purgatory rsync started"
+            );
+            let mut pg_args = build_rsync_args(from_path, &purgatory_rsync_dest);
+            let pg_filter_arg = format!("--filter=merge {}", purgatory_file.to_string_lossy());
+            pg_args.insert(5, pg_filter_arg);
+            let pg_status = std::process::Command::new("rsync")
+                .args(&pg_args)
+                .status()
+                .with_context(|| format!("failed to execute purgatory rsync for {from_path}"))?;
+            if !pg_status.success() {
+                anyhow::bail!("purgatory rsync failed for sync mapping '{sync_name}'");
+            }
+            info!(sync = sync_name, mode = "purgatory", "rsync complete");
+
+            // Check heartbeat
             if let Some(err) = hb_error.lock().unwrap().take() {
                 anyhow::bail!("{err}");
             }
         }
 
-        // 6. Finish run: move from incoming to ready.
-        // Check heartbeat right before the call — no output or logic between
-        // the check and the command, so there is no window for finish-run to
-        // proceed after the lease has already been lost.
+        // 7. Finish run
         if let Some(err) = hb_error.lock().unwrap().take() {
             anyhow::bail!("{err}");
         }
-
         info!("finishing run");
         server_cmd(
             host,

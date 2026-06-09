@@ -1821,16 +1821,28 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
     )
     .map_err(|e| anyhow::anyhow!("destination validation failed: {e}"))?;
 
-    // Build response with transfer destinations
+    // Build response with per-sync transfer destinations
     let final_root = config.root.as_path().join(nickname.as_str());
     let purgatory_root = incoming_path.join("files");
+    let destinations: Vec<purgery_core::SyncDestination> = run_config
+        .sync
+        .iter()
+        .map(|sync| {
+            let passthrough_dest = final_root.join(sync.to_path.as_str());
+            let purgatory_dest = purgatory_root.join(sync.to_path.as_str());
+            purgery_core::SyncDestination {
+                sync_name: sync.name.as_str().to_owned(),
+                passthrough_dest: passthrough_dest.as_str().to_owned(),
+                purgatory_dest: purgatory_dest.as_str().to_owned(),
+            }
+        })
+        .collect();
 
     let response = purgery_core::PrepareRunResponse {
         protocol_version: 1,
         nickname: nickname.as_str().to_owned(),
         run_id: run_id.as_str().to_owned(),
-        final_root: final_root.as_str().to_owned(),
-        purgatory_root: purgatory_root.as_str().to_owned(),
+        destinations,
     };
 
     toml::to_string(&response)

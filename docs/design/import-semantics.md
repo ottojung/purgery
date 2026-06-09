@@ -30,7 +30,7 @@ For a failed entry, `final_paths` is empty and the `error` field contains a desc
 
 ## Per-entry errors
 
-Per-entry failures produce individual `EntryStatusEntry` records with `status = "failed"` and a descriptive `error` field. The server continues processing remaining entries. Only truly catastrophic errors (unreadable run config, invalid pattern, missing step reference, unparseable manifest, envelope mismatch) abort the entire run.
+Per-entry failures produce individual `EntryStatusEntry` records with `status = "failed"` and a descriptive `error` field. The server continues processing remaining entries. Only truly catastrophic errors (unreadable run config, invalid match pattern, missing step reference, unparseable manifest, envelope mismatch) abort the entire run.
 
 ## Work area
 
@@ -46,7 +46,7 @@ Cleanup policy:
 
 ## Run plan validation
 
-Before processing any entries, the server builds a `RunPlan` that collects all postprocess `match` patterns, resolves every referenced step against the server config, and validates expected-output patterns. If any pattern is invalid, any step is missing on the server, or any expected-output pattern is malformed, the run is rejected with a run-level `Failed` status before any entry is imported.
+Before processing any entries, the server validates the run plan via `prepare-run`. This validates the manifest classification, match patterns, step references, expected-output names, and planned final paths. If anything is invalid, the run is rejected before any passthrough rsync mutates final storage.
 
 ## Postprocessing applies to all entry kinds
 

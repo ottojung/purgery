@@ -4,17 +4,22 @@
 
 ```
 client: local checks (config, executables)
-client: generate run ID, build manifest
-client: begin-run over SSH → server creates incoming directory, returns paths
-client: validate response envelope
+client: generate run ID, build manifest with entry classification
+client: begin-run over SSH -> server creates incoming directory, returns paths
+client: validate begin-run response envelope
 client: write run.toml + manifest.toml to incoming dir
-client: rsync trees into incoming/files/ without delete
-client: finish-run over SSH → server moves incoming → ready
-server: recover interrupted processing runs, then claim ready → processing
-server: validate config, manifest, envelope
-server: for each entry, validate kind; overlay directories/symlinks; postprocess regular files
-server: atomically write status.toml, move processing to done or failed
-client: poll server status, verify envelope, clean up confirmed local files
+client: prepare-run over SSH -> server validates plan, returns transfer destinations
+client: for each sync group:
+          run passthrough rsync directly to final storage (non-postprocess entries)
+          write passthrough receipt after successful passthrough rsync
+          immediately cleanup eligible passthrough regular files
+          run purgatory rsync to incoming/files (postprocess entries)
+client: finish-run over SSH -> server moves incoming -> ready
+server: claim run by renaming ready -> processing
+server: process postprocess entries (verify staged content, prepare work area, run subprocesses, commit outputs)
+server: publish status for all entries (passthrough via receipt, postprocess via processing, covered as skipped)
+server: write status.toml, move to done or failed
+client: poll status, verify envelope, cleanup postprocessed regular files as soon as imported
 ```
 
 ## Server subcommands
@@ -22,134 +27,88 @@ client: poll server status, verify envelope, clean up confirmed local files
 | Subcommand | Purpose |
 |------------|---------|
 | `begin-run --nickname <n> --run-id <id>` | Create incoming directory, write lease file, print TOML response with server paths |
+| `prepare-run --nickname <n> --run-id <id>` | Validate run config and manifest, return passthrough and purgatory transfer destinations |
 | `finish-run --nickname <n> --run-id <id>` | Move run from `incoming` to `ready` |
 | `status --nickname <n> --run-id <id>` | Return `status.toml` from `done` or `failed` |
 | `heartbeat-run --nickname <n> --run-id <id>` | Update lease file for an incoming run |
-| `check` | Validate config and postprocess dependencies (side-effect-free) |
+| `check` | Validate config and dependencies (side-effect-free) |
 | `bootstrap` | Create `root` and `purgery_root` directories |
 | `gc` | Run garbage collection on expired incoming runs |
-| `process-once` | Validate config, run GC, recover processing runs, then process ready runs |
+| `process-once` | Validate config, run GC, then process one batch of ready runs |
 
-## Run phases
+## Entry modes
 
-Runs move through these phases during their lifecycle:
+Each manifest entry is classified as one of:
 
-```text
-incoming → ready → processing → done
-                                 failed
-```
+- **passthrough**: transferred directly to final storage by client rsync. Not staged-verified. Import authority is successful passthrough rsync.
+- **postprocess**: transferred to purgatory/staging area, verified by server, processed via subprocesses, committed to final storage after processing succeeds.
+- **covered**: descendant of a postprocessed directory. Not transferred independently. Skipped status.
 
-| Phase | Description |
-|-------|-------------|
-| `incoming` | Client is uploading files |
-| `ready` | Upload complete, waiting for server processing |
-| `processing` | Server is actively processing the run |
-| `done` | Processing completed (all or partial success) |
-| `failed` | Processing completed with no entries imported, or run-level error |
+## Import modes
 
-## Run states
+### Passthrough entries
 
-The `state` field in `status.toml`:
+Passthrough entries are transferred directly from the client source tree to final server storage by a bulk rsync call. They do not enter the incoming staging area. A successful passthrough rsync is the import authority. Passthrough cleanup happens immediately after successful rsync, without waiting for server status.
 
-| State | Meaning |
-|-------|---------|
-| `done` | All filesystem entries imported successfully |
-| `partial` | Some entries imported, some failed or skipped |
-| `failed` | No entries imported (all failed/skipped, or run-level error) |
+The client writes a passthrough receipt (`passthrough.toml`) after each successful passthrough rsync call. The server uses this receipt to include passthrough entries in the run status.
 
-## Status format
+### Postprocess entries
 
-```toml
-run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
-nickname = "laptop"
-state = "done"
+Postprocess entries are transferred by a separate bulk rsync call into the run's purgatory/staging area (`incoming/files/<sync.to>/`). The server prepares work-area input roots, runs subprocesses there, then commits selected output entry roots to final storage.
 
-[[entries]]
-kind = "regular_file"
-sync_name = "videos"
-local_path = "/home/user/Videos/video.mp4"
-relative_path = "video.mp4"
-status = "imported"
-final_paths = ["laptop/videos/video.mp4"]
-postprocess = ["compress-video"]
+Both modes use the same final overlay rules after commit.
 
-[[entries]]
-kind = "regular_file"
-sync_name = "videos"
-local_path = "/home/user/Videos/broken.mp4"
-relative_path = "broken.mp4"
-status = "failed"
-error = "staged file not found"
-```
+### Covered entries
 
-Per-entry status values: `imported`, `failed`, `skipped`. Status records are serialized under `[[entries]]`.
+If a directory entry matches a postprocess rule, descendant manifest entries under that directory are covered. Covered entries produce skipped status with `"covered by postprocessed ancestor directory"`.
 
-## Manifest format
-
-```toml
-run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
-nickname = "laptop"
-
-[[entries]]
-kind = "regular_file"
-sync_name = "videos"
-local_path = "/home/user/Videos/a.mp4"
-staged_path = "files/videos/a.mp4"
-relative_path = "a.mp4"
-size = 123456789
-mtime_ns = 1780944312000000000
-sha256 = "abc123..."
-```
-
-The server rejects a manifest before import if multiple entries resolve to the same final path. Manifest `kind` is `directory`, `regular_file`, or `symlink`. Regular files carry `size`, `mtime_ns`, and optional `sha256`; symlinks carry a literal `link_target`; directories need no identity payload. Parent directories precede descendants. Staged validation uses `symlink_metadata` and never follows symlinks.
-
-## `begin-run` response
+## `prepare-run` response
 
 ```toml
 protocol_version = 1
 nickname = "laptop"
-run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
-incoming_dir = "/tmp/purgery/laptop/incoming/01ARZ..."
-files_dir = "/tmp/purgery/laptop/incoming/01ARZ.../files"
-run_config_path = "/tmp/purgery/laptop/incoming/01ARZ.../run.toml"
-manifest_path = "/tmp/purgery/laptop/incoming/01ARZ.../manifest.toml"
-heartbeat_interval_secs = 60
+run_id = "01ARZ..."
+final_root = "/universe/synced/laptop"
+purgatory_root = "/tmp/purgery/laptop/incoming/01ARZ.../files"
 ```
 
-## Postprocessing applies to all entry kinds
+The client appends `/<sync.to>/` to `final_root` for the passthrough rsync destination, and `/<sync.to>/` to `purgatory_root` for the purgatory rsync destination.
 
-Every manifest entry kind (directory, regular file, symlink) is eligible for postprocessing. If an entry's normalized path matches a postprocess rule, the entry is transformed. Outputs may be directories, regular files, or symlinks — the kind is detected at commit time via `symlink_metadata`.
+## Manifest entry classification
 
-Directory entries that match a postprocess rule become **transformation boundaries**. Their descendant manifest entries are marked as covered and skipped, producing a status of `"covered by postprocessed ancestor directory"`.
+```toml
+[[entries]]
+sync_name = "videos"
+relative_path = "a.mp4"
+kind = "regular_file"
+mode = "postprocess"
+postprocess_steps = ["compress-video"]
 
-## Expected output restrictions
+[[entries]]
+sync_name = "videos"
+relative_path = "notes.txt"
+kind = "regular_file"
+mode = "passthrough"
 
-Expected output names in postprocess step definitions are limited to file-name patterns. The following placeholders are allowed:
+[[entries]]
+sync_name = "videos"
+relative_path = "album/cover.jpg"
+kind = "regular_file"
+mode = "covered"
+covered_by = "videos/album"
+```
 
-- `{file_name}` — input file name with extension
-- `{file_stem}` — input file name without extension
-- `{stem}` — deprecated alias for `{file_stem}`
+## Run phases
 
-The following are **forbidden** in expected outputs (but remain allowed in `args`):
+```
+incoming -> ready -> processing -> done
+                                 failed
+```
 
-- `{input}` — full work-area input path
-- `{parent}` — work-area parent directory
+## Run states
 
-Additional restrictions: non-empty, not `.`, not `..`, not absolute, no `/` or `\`.
-
-The server validates expected output names at boot time (`purgery-server check`) and at pattern resolution time.
-
-## Lease validation on `finish-run`
-
-When `finish-run` is called, the server reads `lease.toml` from the incoming directory and validates:
-
-- `protocol_version == 1`
-- `lease.nickname` matches the command nickname
-- `lease.run_id` matches the command run ID
-- The lease has not expired
-
-If any check fails, `finish-run` rejects the transition with a clear error message.
-
-## Crash recovery and repeated imports
-
-`process-once` scans `processing/` as well as `ready/`. Missing processing status is replayed from staged files; valid processing status completes its pending terminal move; malformed processing status becomes a clear failure. The staged tree is replayed through idempotent per-entry directory, regular-file, and symlink commits. Existing directories merge without deleting unrelated descendants, final-storage symlinks are never followed as directories, and terminal success is published only after every entry completes. This provides replayable convergence rather than an all-or-nothing tree transaction. See [Crash Safety and Idempotent Imports](design/crash-safety-and-idempotence.md).
+| State | Meaning |
+|-------|---------|
+| `done` | All entries imported or skipped successfully |
+| `partial` | Some entries imported, some failed or skipped |
+| `failed` | No entries imported |

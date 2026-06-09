@@ -1438,6 +1438,13 @@ pub enum ManifestEntryMode {
     Covered,
 }
 
+/// Passthrough receipt written by the client after a successful passthrough rsync.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PassthroughReceipt {
+    pub sync_name: String,
+    pub status: String,
+}
+
 /// Response from `purgery-server begin-run`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BeginRunResponse {
@@ -1451,21 +1458,27 @@ pub struct BeginRunResponse {
     pub heartbeat_interval_secs: u64,
 }
 
+/// A transfer destination for one sync mapping.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncDestination {
+    pub sync_name: String,
+    /// Passthrough destination (append trailing `/` for rsync source).
+    pub passthrough_dest: String,
+    /// Purgatory/staging destination (append trailing `/` for rsync source).
+    pub purgatory_dest: String,
+}
+
 /// Response from `purgery-server prepare-run`.
 /// Returned after the server validates the run config and manifest.
 /// Contains the destinations the client needs for the passthrough and
-/// purgatory rsync transfers.
+/// purgatory rsync transfers for each sync mapping.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrepareRunResponse {
     pub protocol_version: u32,
     pub nickname: String,
     pub run_id: String,
-    /// Base destination path on the server for passthrough entries
-    /// (typically `<root>/<nickname>`).
-    pub final_root: String,
-    /// Base purgatory/staging destination path for postprocess entries
-    /// (typically `<incoming_dir>/files`).
-    pub purgatory_root: String,
+    /// Per-sync transfer destinations.
+    pub destinations: Vec<SyncDestination>,
 }
 
 // ── Parsing Helpers ──────────────────────────────────────────────────
