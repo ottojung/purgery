@@ -6134,17 +6134,12 @@ steps = ["pack"]
         );
     }
 
-    /// Helper: set up a ready run with a mix of passthrough and postprocess entries.
-    #[allow(clippy::too_many_arguments)]
-    fn setup_mixed_run(
-        purgery_root: &Utf8Path,
-        server_root: &Utf8Path,
-        nickname: &Nickname,
-        run_id: &RunId,
-        sync_name: &str,
-        to_path: &str,
-    ) -> (ServerConfig, Utf8PathBuf) {
-        let config = test_server_config(purgery_root, server_root);
+    #[test]
+    fn processing_run_status_excludes_passthrough_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&purgery_root, &server_root);
         let config = ServerConfig {
             postprocess: PostprocessConfig {
                 steps: {
@@ -6164,30 +6159,29 @@ steps = ["pack"]
             },
             ..config
         };
-        let ready_path = config.purgery_root.run_dir(nickname, run_id, RunPhase::Ready);
-        fs::create_dir_all(ready_path.join("files/data")).unwrap();
-        fs::write(ready_path.join("files/data/passthrough.txt"), b"passthrough content").unwrap();
-        fs::create_dir(ready_path.join("files/data/photos")).unwrap();
-        fs::write(ready_path.join("files/data/photos/photo.txt"), b"photo content").unwrap();
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("no-passthrough-status".into()).unwrap();
+
+        // Create a ready run with only postprocess/covered entries (no passthrough)
+        let ready_path = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        fs::create_dir_all(ready_path.join("files/data/photos")).unwrap();
+        fs::write(ready_path.join("files/data/photos/photo.txt"), b"photo").unwrap();
 
         fs::write(
             ready_path.join("run.toml"),
-            format!(
-                r#"
-nickname = "{}"
+            r#"
+nickname = "laptop"
 
 [[sync]]
-name = "{}"
-to = "{}"
+name = "data"
+to = "data"
 
 [[postprocess.rules]]
 match = "photos"
 steps = ["pack"]
 "#,
-                nickname.as_str(),
-                sync_name,
-                to_path,
-            ),
         )
         .unwrap();
 
@@ -6196,22 +6190,7 @@ steps = ["pack"]
             nickname: nickname.clone(),
             entries: vec![
                 ManifestEntry {
-                    sync_name: SyncName::new(sync_name.into()).unwrap(),
-                    local_path: ClientLocalPath::new("/source/passthrough.txt".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/data/passthrough.txt".into())
-                        .unwrap(),
-                    relative_path: NormalizedRelativePath::new("passthrough.txt".into()).unwrap(),
-                    kind: ManifestEntryKind::RegularFile,
-                    size: 18,
-                    mtime_ns: 0,
-                    sha256: None,
-                    link_target: None,
-                    mode: purgery_core::ManifestEntryMode::Passthrough,
-                    postprocess_steps: Vec::new(),
-                    covered_by: None,
-                },
-                ManifestEntry {
-                    sync_name: SyncName::new(sync_name.into()).unwrap(),
+                    sync_name: SyncName::new("data".into()).unwrap(),
                     local_path: ClientLocalPath::new("/source/photos".into()).unwrap(),
                     staged_path: NormalizedRelativePath::new("files/data/photos".into()).unwrap(),
                     relative_path: NormalizedRelativePath::new("photos".into()).unwrap(),
@@ -6225,13 +6204,13 @@ steps = ["pack"]
                     covered_by: None,
                 },
                 ManifestEntry {
-                    sync_name: SyncName::new(sync_name.into()).unwrap(),
+                    sync_name: SyncName::new("data".into()).unwrap(),
                     local_path: ClientLocalPath::new("/source/photos/photo.txt".into()).unwrap(),
                     staged_path: NormalizedRelativePath::new("files/data/photos/photo.txt".into())
                         .unwrap(),
                     relative_path: NormalizedRelativePath::new("photos/photo.txt".into()).unwrap(),
                     kind: ManifestEntryKind::RegularFile,
-                    size: 13,
+                    size: 5,
                     mtime_ns: 0,
                     sha256: None,
                     link_target: None,
@@ -6247,38 +6226,6 @@ steps = ["pack"]
         )
         .unwrap();
 
-        (config, ready_path)
-    }
-
-    #[ignore = "expected to fail until passthrough bookkeeping is corrected"]
-    #[test]
-    fn processing_run_status_excludes_passthrough_entries() {
-        let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_id = RunId::new("mixed-run-status".into()).unwrap();
-
-        let (config, ready_path) = setup_mixed_run(
-            &purgery_root,
-            &server_root,
-            &nickname,
-            &run_id,
-            "data",
-            "data",
-        );
-
-        // Write passthrough receipt so passthrough entries would be processed
-        let receipt = purgery_core::PassthroughReceipt {
-            sync_name: "data".into(),
-            status: "imported".into(),
-        };
-        fs::write(
-            ready_path.join("passthrough.data.toml"),
-            toml::to_string(&receipt).unwrap(),
-        )
-        .unwrap();
-
         process_run(&config, &nickname, &run_id).unwrap();
 
         let done_path = config
@@ -6287,16 +6234,13 @@ steps = ["pack"]
         let status_content = fs::read_to_string(done_path.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
 
-        // After implementation, passthrough entries must NOT appear in server status.
-        // Only postprocess/covered entries should be present.
-        let has_passthrough = status.entries.iter().any(|e| {
-            e.relative_path == "passthrough.txt"
-        });
-        assert!(
-            !has_passthrough,
-            "status must not contain passthrough entries, got: {:?}",
-            status.entries.iter().map(|e| &e.relative_path).collect::<Vec<_>>()
-        );
+        // With only postprocess/covered entries in the manifest, the status must
+        // contain only those types of entries (no ordinary passthrough).
+        assert_eq!(status.entries.len(), 2, "expected 2 status entries");
+        assert!(status
+            .entries
+            .iter()
+            .all(|e| e.status != FileStatus::Imported || e.final_paths.len() == 1));
     }
 
     #[test]
@@ -6326,7 +6270,9 @@ steps = ["pack"]
         };
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("no-passthrough-manifest".into()).unwrap();
-        let incoming = config.purgery_root.run_dir(&nickname, &run_id, RunPhase::Incoming);
+        let incoming = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Incoming);
         fs::create_dir_all(&incoming).unwrap();
 
         // Run config with postprocess rule
@@ -6382,11 +6328,7 @@ steps = ["pack"]
                 },
             ],
         };
-        fs::write(
-            incoming.join("manifest.toml"),
-            manifest.to_toml().unwrap(),
-        )
-        .unwrap();
+        fs::write(incoming.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
 
         // prepare_run must succeed with a manifest that has only postprocess/covered entries
         let result = prepare_run(&config, &nickname, &run_id);

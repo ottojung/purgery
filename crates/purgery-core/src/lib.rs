@@ -1438,13 +1438,6 @@ pub enum ManifestEntryMode {
     Covered,
 }
 
-/// Passthrough receipt written by the client after a successful passthrough rsync.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PassthroughReceipt {
-    pub sync_name: String,
-    pub status: String,
-}
-
 /// Durable cleanup state for passthrough regular files with `delete_after_import = true`.
 ///
 /// Written atomically to a local file after successful rsync.

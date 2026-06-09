@@ -355,9 +355,9 @@ fn run_passthrough_path(
     for sync in &config.sync {
         let sync_name = sync.name.as_str();
         let from_path = sync.from_path.as_str();
-        let dest = dest_map.get(sync_name).ok_or_else(|| {
-            anyhow::anyhow!("no destination for sync mapping '{sync_name}'")
-        })?;
+        let dest = dest_map
+            .get(sync_name)
+            .ok_or_else(|| anyhow::anyhow!("no destination for sync mapping '{sync_name}'"))?;
 
         // Build passthrough transfer roots for this sync
         let passthrough_roots: Vec<purgery_core::TransferRoot> = manifest
@@ -929,7 +929,7 @@ fn run_postprocess_path(
     }
 
     // 9. Delete confirmed postprocess files from status
-    let deletion_count = delete_confirmed_files(config, &manifest, &status)?;
+    let deletion_count = delete_confirmed_files(config, manifest, &status)?;
     info!(deleted = deletion_count, "cleanup complete");
 
     info!(state = %status.state.as_str(), "run finished");
