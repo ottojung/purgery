@@ -10,13 +10,15 @@ work output → final parent dir / .purgery-commit.<run_id>.<filename>.tmp → r
 
 The temp file is on the same filesystem as the final path, so the rename is atomic against readers. Temp files are cleaned up after a successful commit.
 
-## Conflict policy: fail-if-exists
+## Conflict policy: atomic regular-file replacement
 
-Purgery does not overwrite existing final files. If any final output path already exists before commit, the file is marked as `failed` in the status. This is a conservative default, not a defense against hostile concurrent writers.
+A missing final path is created, and an existing regular final file is atomically replaced. Existing directories, symlinks, parent-path symlinks, and other non-regular filesystem objects block the output and fail that file.
 
-## Multi-output preflight and rollback
+## Multi-output preflight and replay
 
-Before committing any output for a file, all final output paths are derived and prechecked (none exists, no symlinks in path, parent directories creatable). Commits proceed in order. If a later output commit fails, outputs already committed during this file's import are rolled back (removed).
+Before committing any output for a file, all final output paths are derived and prechecked for root containment, symlinks, and replaceable destination types. Commits proceed in order. Already committed outputs are not removed or restored if a later commit fails. If processing stops before status publication, `process-once` replays the run from staged files and converges through atomic replacement.
+
+See [Crash Safety and Idempotent Imports](crash-safety-and-idempotence.md) for the durable recovery and replacement invariants.
 
 ## `final_paths` (plural)
 
@@ -30,7 +32,7 @@ Per-file failures produce individual `FileStatusEntry` records with `status = "f
 
 ## Work area
 
-The server creates a hidden work area at `<root>/.purgery-work/<nickname>/<run_id>/`. Files are copied into subdirectories mirroring the destination structure: `<work_area>/<to_path>/<relative_path>`.
+The server rebuilds a hidden work area for each processing attempt at `<root>/.purgery-work/<nickname>/<run_id>/`. Files are copied into subdirectories mirroring the destination structure: `<work_area>/<to_path>/<relative_path>`.
 
 Cleanup policy:
 

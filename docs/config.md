@@ -85,6 +85,8 @@ keep_original = true
 | `{file_stem}` | Input file name without extension |
 | `{stem}` | Deprecated alias for `{file_stem}` |
 
+`args` may use `{input}`, `{parent}`, `{file_name}`, `{file_stem}`, and `{stem}`. `expected_outputs` may use only `{file_name}`, `{file_stem}`, and `{stem}`, and each resolved expected output must be a plain file name without directory components.
+
 A subprocess step must produce at least one committed output. If `keep_original = false`, then `expected_outputs` must be non-empty. This is validated at server boot time.
 
 ## Client config

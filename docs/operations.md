@@ -59,7 +59,7 @@ If server directories do not exist, `check` reports an error and suggests runnin
 ## Normal operation
 
 ```sh
-# Server: process one batch of ready runs
+# Server: recover processing runs and process ready runs
 purgery-server process-once --config server.toml
 
 # Client: sync files and clean up confirmed imports
@@ -69,7 +69,7 @@ purgery-client sync-and-cleanup --config client.toml
 purgery-server gc --config server.toml
 ```
 
-`process-once` runs side-effect-free server validation first, then GC opportunistically, then processes ready runs.
+`process-once` runs side-effect-free server validation first, then GC opportunistically, then recovers processing runs and processes ready runs.
 
 `sync-and-cleanup` runs local checks first, then uploads, waits for processing, and cleans up confirmed local files.
 
@@ -133,3 +133,7 @@ Executable resolution follows these rules:
 - **Directories** are rejected. **Broken symlinks** are rejected.
 
 This is used for client `ssh`, `rsync`, and server postprocess `program` values.
+
+## Restart recovery
+
+`process-once` recovers runs already in `processing/` before claiming runs from `ready/`. Operators do not need to move phase directories manually after a crash. Recovery uses staged files and filesystem status only; see [Crash Safety and Idempotent Imports](design/crash-safety-and-idempotence.md).

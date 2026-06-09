@@ -10,10 +10,10 @@ client: validate response envelope
 client: write run.toml + manifest.toml to incoming dir
 client: rsync files into incoming/files/
 client: finish-run over SSH → server moves incoming → ready
-server: claim run by renaming ready → processing
+server: recover interrupted processing runs, then claim ready → processing
 server: validate config, manifest, envelope
 server: for each file, copy to work area, apply postprocessing, commit outputs
-server: write status.toml, move to done or failed
+server: atomically write status.toml, move processing to done or failed
 client: poll server status, verify envelope, clean up confirmed local files
 ```
 
@@ -28,7 +28,7 @@ client: poll server status, verify envelope, clean up confirmed local files
 | `check` | Validate config and postprocess dependencies (side-effect-free) |
 | `bootstrap` | Create `root` and `purgery_root` directories |
 | `gc` | Run garbage collection on expired incoming runs |
-| `process-once` | Validate config, run GC, then process one batch of ready runs |
+| `process-once` | Validate config, run GC, recover processing runs, then process ready runs |
 
 ## Run phases
 
@@ -138,4 +138,7 @@ When `finish-run` is called, the server reads `lease.toml` from the incoming dir
 - The lease has not expired
 
 If any check fails, `finish-run` rejects the transition with a clear error message.
-```
+
+## Crash recovery and repeated imports
+
+`process-once` scans `processing/` as well as `ready/`. Missing processing status is replayed from staged files; valid processing status completes its pending terminal move; malformed processing status becomes a clear failure. Existing regular final files are atomically replaced, making repeated uploads and replay safe. See [Crash Safety and Idempotent Imports](design/crash-safety-and-idempotence.md).
