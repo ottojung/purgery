@@ -1306,6 +1306,25 @@ delete_after_import = true
         .unwrap()
     }
 
+    fn config_no_delete_for(source: &Path) -> ClientConfig {
+        ClientConfig::from_toml(&format!(
+            r#"
+nickname = "laptop"
+
+[server]
+host = "example.invalid"
+
+[[sync]]
+name = "data"
+from = "{}"
+to = "data"
+delete_after_import = false
+"#,
+            source.display()
+        ))
+        .unwrap()
+    }
+
     #[test]
     fn cli_rejects_verbose_with_log_level() {
         let result = Cli::try_parse_from([
@@ -1442,5 +1461,54 @@ delete_after_import = true
             fs::symlink_metadata(source.join("file.txt")).is_ok(),
             "symlink must still exist"
         );
+    }
+
+    #[ignore = "expected to fail until identity bookkeeping is corrected"]
+    #[test]
+    fn passthrough_no_delete_entries_have_no_sha256() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("file.txt"), b"hello").unwrap();
+        let config = config_no_delete_for(&source);
+        let run_id = RunId::new("no-delete-identity".into()).unwrap();
+        let manifest = build_manifest(&config, &run_id).unwrap();
+        let entry = manifest.entries.iter().find(|e| {
+            e.kind == ManifestEntryKind::RegularFile
+        }).expect("must have a regular file entry");
+        // For delete_after_import=false passthrough, identity fields must be empty
+        assert_eq!(entry.mtime_ns, 0, "no-delete passthrough must not track mtime");
+        assert!(
+            entry.sha256.is_none(),
+            "no-delete passthrough must not compute sha256, got {:?}",
+            entry.sha256
+        );
+    }
+
+    #[test]
+    fn passthrough_no_delete_entries_still_have_relative_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("file.txt"), b"hello").unwrap();
+        let config = config_no_delete_for(&source);
+        let run_id = RunId::new("no-delete-path".into()).unwrap();
+        let manifest = build_manifest(&config, &run_id).unwrap();
+        // Path planning must still work even without identity fields
+        let entry = manifest.entries.iter().find(|e| {
+            e.relative_path.as_str() == "file.txt"
+        }).expect("must find file.txt entry");
+        assert_eq!(entry.mode, purgery_core::ManifestEntryMode::Passthrough);
+        assert!(
+            filter_contains_path(&entry),
+            "entry must be usable for filter generation"
+        );
+    }
+
+    /// Helper: check that a manifest entry can be used for filter generation.
+    fn filter_contains_path(entry: &ManifestEntry) -> bool {
+        let root = purgery_core::TransferRoot::Exact(entry.relative_path.as_str().to_owned());
+        let filter = purgery_core::transfer_set_filter(&[root]);
+        filter.contains(entry.relative_path.as_str())
     }
 }
