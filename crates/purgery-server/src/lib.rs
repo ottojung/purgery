@@ -574,7 +574,7 @@ fn planned_entry_outputs(
     // Every manifest entry kind uses the same postprocess-dispatch logic.
     // If no rule matches, the only planned output is the entry's own final
     // path.  If a rule matches, include keep_original and expected_outputs.
-    let normalized_path = format!("{}/{}", sync.to_path.as_str(), entry.relative_path.as_str());
+    let normalized_path = entry.relative_path.as_str().to_owned();
 
     let synthetic_work_path = Utf8Path::new(entry.relative_path.as_str());
 
@@ -670,8 +670,8 @@ fn validate_unique_final_paths(
         .filter(|(_, e)| {
             sync_map
                 .get(e.sync_name.as_str())
-                .map(|sync| {
-                    let np = format!("{}/{}", sync.to_path.as_str(), e.relative_path.as_str());
+                .map(|_sync| {
+                    let np = e.relative_path.as_str().to_owned();
                     run_plan.rules.iter().any(|r| r.is_match(&np))
                 })
                 .unwrap_or(false)
@@ -817,7 +817,7 @@ fn process_manifest_entry(
         .strip_prefix(server_config.root.as_path())
         .unwrap_or(&final_path)
         .to_string();
-    let normalized_path = format!("{}/{}", sync.to_path.as_str(), entry.relative_path.as_str());
+    let normalized_path = entry.relative_path.as_str().to_owned();
 
     // Check whether any postprocess rule matches this entry.  If not, commit
     // directly using the kind-specific path (no work-area overhead).
@@ -1070,12 +1070,8 @@ pub fn process_processing_run(
         .iter()
         .filter(|e| e.kind == ManifestEntryKind::Directory)
         .filter_map(|dir_entry| {
-            let sync = sync_map.get(dir_entry.sync_name.as_str())?;
-            let np = format!(
-                "{}/{}",
-                sync.to_path.as_str(),
-                dir_entry.relative_path.as_str()
-            );
+            let _sync = sync_map.get(dir_entry.sync_name.as_str())?;
+            let np = dir_entry.relative_path.as_str().to_owned();
             let matched = run_plan.rules.iter().any(|rule| rule.is_match(&np));
             if matched {
                 Some(np)
@@ -1091,10 +1087,10 @@ pub fn process_processing_run(
         .iter()
         .enumerate()
         .filter(|(_, entry)| {
-            let Some(sync) = sync_map.get(entry.sync_name.as_str()) else {
+            let Some(_sync) = sync_map.get(entry.sync_name.as_str()) else {
                 return false;
             };
-            let np = format!("{}/{}", sync.to_path.as_str(), entry.relative_path.as_str());
+            let np = entry.relative_path.as_str().to_owned();
             covered_by_dir
                 .iter()
                 .any(|prefix| match np.as_str().strip_prefix(prefix.as_str()) {
@@ -1185,7 +1181,7 @@ pub fn process_processing_run(
         }
 
         // Check if this entry is covered by a postprocessed ancestor directory.
-        let np = format!("{}/{}", sync.to_path.as_str(), entry.relative_path.as_str());
+        let np = entry.relative_path.as_str().to_owned();
         let covered = covered_by_dir.iter().any(|prefix| {
             let tail = match np.as_str().strip_prefix(prefix.as_str()) {
                 Some(t) => t,
@@ -1820,12 +1816,8 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
         .iter()
         .filter(|e| e.kind == purgery_core::ManifestEntryKind::Directory)
         .filter_map(|dir_entry| {
-            let sync = sync_map.get(dir_entry.sync_name.as_str())?;
-            let np = format!(
-                "{}/{}",
-                sync.to_path.as_str(),
-                dir_entry.relative_path.as_str()
-            );
+            let _sync = sync_map.get(dir_entry.sync_name.as_str())?;
+            let np = dir_entry.relative_path.as_str().to_owned();
             let matched = run_plan.rules.iter().any(|rule| rule.is_match(&np));
             if matched {
                 Some(np)
@@ -1842,10 +1834,10 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
         .iter()
         .enumerate()
         .filter(|(_, entry)| {
-            let Some(sync) = sync_map2.get(entry.sync_name.as_str()) else {
+            let Some(_sync) = sync_map2.get(entry.sync_name.as_str()) else {
                 return false;
             };
-            let np2 = format!("{}/{}", sync.to_path.as_str(), entry.relative_path.as_str());
+            let np2 = entry.relative_path.as_str().to_owned();
             covered_by_dir
                 .iter()
                 .any(|prefix| match np2.as_str().strip_prefix(prefix.as_str()) {
@@ -5210,7 +5202,7 @@ name = "data"
 to = "data"
 
 [[postprocess.rules]]
-match = "data/photos"
+match = "photos"
 steps = ["pack"]
 "#;
         fs::write(ready.join("run.toml"), run_config_src).unwrap();
@@ -5310,7 +5302,7 @@ name = "data"
 to = "data"
 
 [[postprocess.rules]]
-match = "data/*.txt"
+match = "*.txt"
 steps = ["compress"]
 "#,
         )
@@ -5320,7 +5312,7 @@ steps = ["compress"]
     fn postprocess_collision_run_plan() -> RunPlan {
         RunPlan {
             rules: vec![CompiledRule {
-                pattern: "data/*.txt".into(),
+                pattern: "*.txt".into(),
                 steps: vec![ResolvedStep {
                     step_name: "compress".into(),
                     step_def: PostprocessStepDefinition {
@@ -5421,7 +5413,7 @@ name = "data"
 to = "data"
 
 [[postprocess.rules]]
-match = "data/*.txt"
+match = "*.txt"
 steps = ["compress"]
 "#,
         )
@@ -5429,7 +5421,7 @@ steps = ["compress"]
 
         let pp_plan = RunPlan {
             rules: vec![CompiledRule {
-                pattern: "data/*.txt".into(),
+                pattern: "*.txt".into(),
                 steps: vec![ResolvedStep {
                     step_name: "generate".into(),
                     step_def: PostprocessStepDefinition {
@@ -5510,14 +5502,14 @@ name = "data"
 to = "data"
 
 [[postprocess.rules]]
-match = "data/*.txt"
+match = "*.txt"
 steps = ["compress"]
 "#,
         )
         .unwrap();
         let run_plan = RunPlan {
             rules: vec![CompiledRule {
-                pattern: "data/*.txt".into(),
+                pattern: "*.txt".into(),
                 steps: vec![ResolvedStep {
                     step_name: "compress".into(),
                     step_def: PostprocessStepDefinition {
