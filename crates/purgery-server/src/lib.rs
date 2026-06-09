@@ -9,18 +9,14 @@ use std::collections::HashMap;
 use std::fs;
 use tracing::{info, span, warn, Level};
 
-/// A run-level failure — written when the run cannot be processed at all.
+/// Persist a run-level failure and move the processing directory to `failed/`.
 fn write_run_failure(
     purgery_root: &PurgeryRoot,
     nickname: &Nickname,
     run_id: &RunId,
     error_msg: &str,
-) {
+) -> Result<()> {
     let processing_path = purgery_root.run_dir(nickname, run_id, RunPhase::Processing);
-    if let Some(parent) = processing_path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-
     let status = RunStatus {
         run_id: run_id.clone(),
         nickname: nickname.clone(),
@@ -28,20 +24,39 @@ fn write_run_failure(
         files: vec![],
         error: Some(error_msg.to_owned()),
     };
+    let status_toml = status
+        .to_toml()
+        .with_context(|| "failed to serialize run failure status")?;
+    let status_path = processing_path.join("status.toml");
+    let tmp_path = processing_path.join("status.toml.tmp");
 
-    if let Ok(toml_str) = status.to_toml() {
-        let status_path = processing_path.join("status.toml");
-        let tmp_path = processing_path.join("status.toml.tmp");
-        if fs::write(&tmp_path, &toml_str).is_ok() {
-            let _ = fs::rename(&tmp_path, &status_path);
-        }
-    }
+    fs::write(&tmp_path, &status_toml).with_context(|| {
+        format!(
+            "failed to write temporary run failure status: {}",
+            tmp_path.as_str()
+        )
+    })?;
+    fs::rename(&tmp_path, &status_path).with_context(|| {
+        format!(
+            "failed to finalize run failure status: {}",
+            status_path.as_str()
+        )
+    })?;
 
     let failed_path = purgery_root.run_dir(nickname, run_id, RunPhase::Failed);
     if let Some(parent) = failed_path.parent() {
-        let _ = fs::create_dir_all(parent);
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create failed parent: {}", parent.as_str()))?;
     }
-    let _ = fs::rename(&processing_path, &failed_path);
+    fs::rename(&processing_path, &failed_path).with_context(|| {
+        format!(
+            "failed to move run-level failure to failed: {} -> {}",
+            processing_path.as_str(),
+            failed_path.as_str()
+        )
+    })?;
+
+    Ok(())
 }
 
 /// Find all runs in one durable phase across all nicknames.
@@ -639,7 +654,7 @@ pub fn process_processing_run(
         Err(error) => {
             let msg = format!("failed to read run config: {error}");
             warn!("{}", msg);
-            write_run_failure(&config.purgery_root, nickname, run_id, &msg);
+            write_run_failure(&config.purgery_root, nickname, run_id, &msg)?;
             anyhow::bail!("{msg}");
         }
     };
@@ -648,7 +663,7 @@ pub fn process_processing_run(
         Err(error) => {
             let msg = format!("failed to parse run config: {error}");
             warn!("{}", msg);
-            write_run_failure(&config.purgery_root, nickname, run_id, &msg);
+            write_run_failure(&config.purgery_root, nickname, run_id, &msg)?;
             anyhow::bail!("{msg}");
         }
     };
@@ -658,7 +673,7 @@ pub fn process_processing_run(
         Err(error) => {
             let msg = format!("run plan validation failed: {error}");
             warn!("{}", msg);
-            write_run_failure(&config.purgery_root, nickname, run_id, &msg);
+            write_run_failure(&config.purgery_root, nickname, run_id, &msg)?;
             anyhow::bail!("{msg}");
         }
     };
@@ -669,7 +684,7 @@ pub fn process_processing_run(
         Err(error) => {
             let msg = format!("failed to read manifest: {error}");
             warn!("{}", msg);
-            write_run_failure(&config.purgery_root, nickname, run_id, &msg);
+            write_run_failure(&config.purgery_root, nickname, run_id, &msg)?;
             anyhow::bail!("{msg}");
         }
     };
@@ -678,7 +693,7 @@ pub fn process_processing_run(
         Err(error) => {
             let msg = format!("failed to parse manifest: {error}");
             warn!("{}", msg);
-            write_run_failure(&config.purgery_root, nickname, run_id, &msg);
+            write_run_failure(&config.purgery_root, nickname, run_id, &msg)?;
             anyhow::bail!("{msg}");
         }
     };
@@ -686,7 +701,7 @@ pub fn process_processing_run(
     if let Err(error) = validate_envelope(nickname, run_id, &run_config, &manifest) {
         let msg = format!("envelope validation failed: {error}");
         warn!("{}", msg);
-        write_run_failure(&config.purgery_root, nickname, run_id, &msg);
+        write_run_failure(&config.purgery_root, nickname, run_id, &msg)?;
         anyhow::bail!("{msg}");
     }
 
@@ -790,8 +805,7 @@ pub fn recover_or_process_processing_run(
                     error,
                     "processing run recovery failed"
                 );
-                write_run_failure(&config.purgery_root, nickname, run_id, error);
-                Ok(())
+                write_run_failure(&config.purgery_root, nickname, run_id, error)
             }
             Ok(status) => {
                 info!(
@@ -824,8 +838,7 @@ pub fn recover_or_process_processing_run(
                     error,
                     "processing run recovery failed"
                 );
-                write_run_failure(&config.purgery_root, nickname, run_id, error);
-                Ok(())
+                write_run_failure(&config.purgery_root, nickname, run_id, error)
             }
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1046,12 +1059,18 @@ pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
                 error = %error,
                 "processing run recovery failed"
             );
-            write_run_failure(
-                &config.purgery_root,
-                nickname,
-                run_id,
-                &format!("processing recovery failed: {error}"),
-            );
+            let processing_path =
+                config
+                    .purgery_root
+                    .run_dir(nickname, run_id, RunPhase::Processing);
+            if processing_path.exists() {
+                write_run_failure(
+                    &config.purgery_root,
+                    nickname,
+                    run_id,
+                    &format!("processing recovery failed: {error}"),
+                )?;
+            }
         }
     }
 
@@ -3609,6 +3628,78 @@ steps = ["compress-video"]
             Nickname::new("laptop".into()).unwrap(),
             RunId::new("other-run".into()).unwrap(),
             "recover-wrong-run-id",
+        );
+    }
+
+    #[test]
+    fn test_mismatched_status_recovery_propagates_terminal_move_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&purgery_root, &server_root);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("blocked-failed-move".into()).unwrap();
+        let processing = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        let failed = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        fs::create_dir_all(&processing).unwrap();
+        fs::create_dir_all(&failed).unwrap();
+        fs::write(failed.join("existing"), b"occupied").unwrap();
+        let mismatched_status = RunStatus {
+            run_id: RunId::new("other-run".into()).unwrap(),
+            nickname: nickname.clone(),
+            state: RunState::Done,
+            files: vec![],
+            error: None,
+        };
+        fs::write(
+            processing.join("status.toml"),
+            mismatched_status.to_toml().unwrap(),
+        )
+        .unwrap();
+
+        let error = recover_or_process_processing_run(&config, &nickname, &run_id).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("failed to move run-level failure to failed"));
+        assert!(processing.exists());
+        let status =
+            RunStatus::from_toml(&fs::read_to_string(processing.join("status.toml")).unwrap())
+                .unwrap();
+        assert_eq!(status.state, RunState::Failed);
+        assert_eq!(
+            status.error.as_deref(),
+            Some("interrupted processing had mismatched status envelope")
+        );
+    }
+
+    #[test]
+    fn test_malformed_status_recovery_propagates_failed_status_write_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&purgery_root, &server_root);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("blocked-status-write".into()).unwrap();
+        let processing = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        fs::create_dir_all(processing.join("status.toml.tmp")).unwrap();
+        fs::write(processing.join("status.toml"), "not valid = [toml").unwrap();
+
+        let error = recover_or_process_processing_run(&config, &nickname, &run_id).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("failed to write temporary run failure status"));
+        assert!(processing.exists());
+        assert_eq!(
+            fs::read_to_string(processing.join("status.toml")).unwrap(),
+            "not valid = [toml"
         );
     }
 

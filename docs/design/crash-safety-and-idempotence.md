@@ -44,7 +44,7 @@ A run in `processing/` is handled according to its filesystem state:
 - A malformed `status.toml` cannot establish success. The server replaces it with a failed status carrying `interrupted processing had malformed status` and moves the run to `failed/`.
 - A status whose nickname or run ID does not match the processing directory cannot establish success. The server replaces it with a failed status carrying `interrupted processing had mismatched status envelope` and moves the run to `failed/`.
 
-The staged files in the processing directory are the replay source. The work area is disposable and is rebuilt for every attempt.
+The staged files in the processing directory are the replay source. The work area is disposable and is rebuilt for every attempt. Recovery reports an error if it cannot atomically publish the failed status or move the run to `failed/`; it never reports successful recovery while the run remains non-terminal.
 
 ## Status and deletion invariant
 
