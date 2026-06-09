@@ -109,6 +109,30 @@ Identity bookkeeping is separated from path planning:
 
 Cleanup state is stored at `$XDG_STATE_HOME/purgery/` or `~/.local/state/purgery/`. It is never stored in the temporary filter directory. The state file is written atomically and updated atomically after each deletion.
 
+### Scoped postprocess rules
+
+Postprocess rules may include a `for` field listing the sync group names the rule applies to:
+
+```toml
+[[postprocess.rules]]
+match = "*.mp4"
+steps = ["compress-video"]
+for = ["videos"]
+```
+
+- Omitted `for` means the rule applies to every sync group.
+- `for = ["videos"]` applies only to the `videos` sync group.
+- Empty `for` is invalid.
+- Unknown sync names in `for` are rejected at config parse time.
+
+When classifying a manifest entry, only rules applicable to its sync group participate. A rule is applicable when its `for` is omitted or the entry's sync group name appears in the list.
+
+### No-rule groups
+
+If a sync group has no applicable postprocess rules and `delete_after_import = false`, it is handled by one direct unfiltered rsync. No walking, scanning, classification, or bookkeeping occurs.
+
+If a sync group has no applicable postprocess rules but `delete_after_import = true`, it is handled by direct rsync plus durable local cleanup state. Scanning and identity computation are performed only for cleanup.
+
 ### Empty transfer sets
 
 If a sync group has no passthrough transfer roots, the passthrough rsync is skipped. If a sync group has no purgatory transfer roots, the purgatory rsync is skipped.

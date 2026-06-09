@@ -141,10 +141,37 @@ steps = ["compress-video"]
 |-------|----------|-------------|
 | `match` | yes | Rsync include/exclude pattern matching normalized import paths (rsync syntax, not regex) |
 | `steps` | yes | List of server-defined step names to apply |
+| `for` | no | Optional list of sync group names the rule applies to. Omitted means every sync group. Empty list is invalid. Unknown sync names are rejected at parse time |
+
+### Rule scoping
+
+A `for` field scopes a rule to specific sync groups:
+
+```toml
+# Applies to all sync groups (no for)
+[[postprocess.rules]]
+match = "*.mp4"
+steps = ["compress-video"]
+
+# Applies only to the "videos" sync group
+[[postprocess.rules]]
+match = "*.mp4"
+steps = ["compress-video"]
+for = ["videos"]
+```
+
+Before a sync group is scanned, the client computes `applicable_rules(sync_name)`. A rule is applicable when its `for` is omitted or the sync group name is listed.
+
+### No-rule groups
+
+If a sync group has no applicable postprocess rules and:
+
+- `delete_after_import = false`: the group is handled by one direct unfiltered rsync to final storage. The source tree is not walked, entries are not classified, metadata is not read, and no bookkeeping is created.
+- `delete_after_import = true`: the group is handled by direct rsync plus durable local cleanup state for regular-file deletion. Scanning and identity computation are performed only for cleanup.
 
 ### Match patterns and import modes
 
-Each entry is classified as **passthrough** or **postprocessed** (purgatory).
+Each entry is classified as **passthrough** or **postprocessed** (purgatory) using only the rules applicable to its sync group.
 
 - Passthrough entries are transferred directly to final server storage by a bulk rsync call. They have no server bookkeeping: no manifest entry, no receipt, no status entry.
 - Postprocessed entries are transferred to the server's staging area, where subprocesses run before final commit. They are tracked in the server manifest and status.
