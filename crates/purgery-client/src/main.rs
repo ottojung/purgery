@@ -457,31 +457,58 @@ fn run_passthrough_path(
             .collect();
 
     // Every passthrough group uses direct unfiltered rsync — no per-entry filters.
-    // PassthroughDeleteAfterImport groups also get a cleanup scan/state after rsync.
+    // PassthroughDeleteAfterImport groups capture cleanup identity before rsync.
     for sync in passthrough_nodelete {
         run_unfiltered_rsync(config, host, sync, &dest_map)?;
     }
     for sync in passthrough_cleanup {
         let sync_name = sync.name.as_str();
-        if let Some(dest) = dest_map.get(sync_name) {
-            let rsync_dest = format!("{}:{}/", host, dest.passthrough_dest);
-            info!(
-                sync = sync_name,
-                dest = %dest.passthrough_dest,
-                "passthrough direct rsync with cleanup"
-            );
-            let rsync_args = build_rsync_args(sync.from_path.as_str(), &rsync_dest);
-            let status = std::process::Command::new("rsync")
-                .args(&rsync_args)
-                .status()
-                .with_context(|| {
-                    format!("failed to execute rsync for {}", sync.from_path.as_str())
-                })?;
-            if !status.success() {
-                anyhow::bail!("rsync failed for sync mapping '{sync_name}'");
-            }
-            scan_and_cleanup_sync(config, sync)?;
+        let Some(dest) = dest_map.get(sync_name) else {
+            anyhow::bail!("no destination for sync mapping '{sync_name}'");
+        };
+        let rsync_dest = format!("{}:{}/", host, dest.passthrough_dest);
+
+        // 1. Capture pre-rsync cleanup identity
+        let cleanup_entries = build_pre_rsync_cleanup_entries(config, sync)?;
+        if cleanup_entries.is_empty() {
+            // No regular files to clean up, just rsync
+            run_unfiltered_rsync(config, host, sync, &dest_map)?;
+            continue;
         }
+        let cleanup_state = purgery_core::DurableCleanupState {
+            nickname: config.nickname.as_str().to_owned(),
+            operation_id: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+                .to_string(),
+            entries: cleanup_entries,
+        };
+        let state_path = write_cleanup_state(&cleanup_state)
+            .with_context(|| "failed to write pre-rsync cleanup state")?;
+
+        // 2. Direct unfiltered rsync
+        info!(
+            sync = sync_name,
+            dest = %dest.passthrough_dest,
+            "passthrough direct rsync with cleanup"
+        );
+        let rsync_args = build_rsync_args(sync.from_path.as_str(), &rsync_dest);
+        let status = std::process::Command::new("rsync")
+            .args(&rsync_args)
+            .status()
+            .with_context(|| format!("failed to execute rsync for {}", sync.from_path.as_str()))?;
+        if !status.success() {
+            anyhow::bail!("rsync failed for sync mapping '{sync_name}'");
+        }
+
+        // 3. Mark rsync succeeded durably
+        mark_rsync_succeeded(&state_path, sync_name)
+            .with_context(|| "failed to mark rsync succeeded in cleanup state")?;
+
+        // 4. Delete files whose identity still matches
+        process_cleanup_state_file(&state_path)
+            .with_context(|| "failed to process cleanup state after rsync")?;
     }
 
     info!("passthrough run complete");
@@ -612,28 +639,64 @@ fn run_postprocess_path(
     }
 
     // 0c. Handle PassthroughDeleteAfterImport groups:
-    //     direct unfiltered rsync + filesystem scan for cleanup.
+    //     pre-rsync identity → rsync → mark succeeded → cleanup.
     for sync in passthrough_cleanup {
         let sync_name = sync.name.as_str();
-        if let Some(passthrough_dest) = passthrough_dest_map.get(sync_name) {
-            let rsync_dest = format!("{}:{}/", host, passthrough_dest);
-            info!(
-                sync = sync_name,
-                dest = %passthrough_dest,
-                "cleanup direct rsync (no-rule delete-after-import)"
-            );
-            let rsync_args = build_rsync_args(sync.from_path.as_str(), &rsync_dest);
-            let status = std::process::Command::new("rsync")
-                .args(&rsync_args)
+        let Some(passthrough_dest) = passthrough_dest_map.get(sync_name) else {
+            anyhow::bail!("no destination resolved for passthrough sync mapping '{sync_name}'");
+        };
+        let rsync_dest = format!("{}:{}/", host, passthrough_dest);
+
+        // 1. Capture pre-rsync cleanup identity
+        let cleanup_entries = build_pre_rsync_cleanup_entries(config, sync)?;
+        if cleanup_entries.is_empty() {
+            // No regular files to clean up, just rsync
+            let args = build_rsync_args(sync.from_path.as_str(), &rsync_dest);
+            let s = std::process::Command::new("rsync")
+                .args(&args)
                 .status()
                 .with_context(|| {
                     format!("failed to execute rsync for {}", sync.from_path.as_str())
                 })?;
-            if !status.success() {
+            if !s.success() {
                 anyhow::bail!("rsync failed for sync mapping '{sync_name}'");
             }
-            scan_and_cleanup_sync(config, sync)?;
+            continue;
         }
+        let cleanup_state = purgery_core::DurableCleanupState {
+            nickname: config.nickname.as_str().to_owned(),
+            operation_id: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+                .to_string(),
+            entries: cleanup_entries,
+        };
+        let state_path = write_cleanup_state(&cleanup_state)
+            .with_context(|| "failed to write pre-rsync cleanup state")?;
+
+        // 2. Direct unfiltered rsync
+        info!(
+            sync = sync_name,
+            dest = %passthrough_dest,
+            "passthrough direct rsync with cleanup"
+        );
+        let rsync_args = build_rsync_args(sync.from_path.as_str(), &rsync_dest);
+        let status = std::process::Command::new("rsync")
+            .args(&rsync_args)
+            .status()
+            .with_context(|| format!("failed to execute rsync for {}", sync.from_path.as_str()))?;
+        if !status.success() {
+            anyhow::bail!("rsync failed for sync mapping '{sync_name}'");
+        }
+
+        // 3. Mark rsync succeeded durably
+        mark_rsync_succeeded(&state_path, sync_name)
+            .with_context(|| "failed to mark rsync succeeded in cleanup state")?;
+
+        // 4. Delete files whose identity still matches
+        process_cleanup_state_file(&state_path)
+            .with_context(|| "failed to process cleanup state after rsync")?;
     }
 
     // 0d. The purgatory-only run config excludes passthrough-only sync groups
@@ -1383,6 +1446,27 @@ fn mark_cleaned(state_path: &Utf8Path, sync_name: &str, local_path: &str) -> Res
     Ok(())
 }
 
+/// Mark all entries for a sync group as rsync_succeeded in the cleanup state file, atomically.
+fn mark_rsync_succeeded(state_path: &Utf8Path, sync_name: &str) -> Result<()> {
+    let content = fs::read_to_string(state_path.as_std_path())
+        .with_context(|| format!("failed to read cleanup state: {state_path}"))?;
+    let mut state: purgery_core::DurableCleanupState = toml::from_str(&content)
+        .map_err(|e| anyhow::anyhow!("failed to parse cleanup state: {e}"))?;
+    for entry in &mut state.entries {
+        if entry.sync_name == sync_name && !entry.rsync_succeeded {
+            entry.rsync_succeeded = true;
+        }
+    }
+    let tmp_path = state_path.with_extension("toml.tmp");
+    let new_content = toml::to_string(&state)
+        .map_err(|e| anyhow::anyhow!("failed to serialize cleanup state: {e}"))?;
+    fs::write(&tmp_path, &new_content)
+        .with_context(|| format!("failed to write cleanup state: {tmp_path}"))?;
+    fs::rename(&tmp_path, state_path)
+        .with_context(|| format!("failed to atomically update cleanup state: {state_path}"))?;
+    Ok(())
+}
+
 /// Scan for pending cleanup state files and process them.
 /// Called at the start of sync_and_cleanup before any new transfers.
 #[allow(dead_code)]
@@ -1575,23 +1659,26 @@ fn compute_sha256(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Scan a source directory after rsync and build cleanup entries for regular files,
-/// then write durable cleanup state and delete verified files.
-/// Used for PassthroughDeleteAfterImport groups after direct unfiltered rsync.
-fn scan_and_cleanup_sync(config: &ClientConfig, sync: &purgery_core::SyncMapping) -> Result<()> {
+/// Walk a sync group's source directory and build cleanup entries for regular files.
+/// Identity is captured before rsync. rsync_succeeded is set to false so deletion
+/// is not authorized until rsync completes and the marker is updated.
+fn build_pre_rsync_cleanup_entries(
+    _config: &ClientConfig,
+    sync: &purgery_core::SyncMapping,
+) -> Result<Vec<purgery_core::CleanupEntry>> {
     let from_path = sync.from_path.as_str();
     let from = Path::new(from_path);
     if !from.exists() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
-    let mut cleanup_entries = Vec::new();
-    for entry in WalkDir::new(from).sort_by_file_name() {
-        let entry = match entry {
+    let mut entries = Vec::new();
+    for walk_entry in WalkDir::new(from).sort_by_file_name() {
+        let walk_entry = match walk_entry {
             Ok(e) => e,
             Err(_) => continue,
         };
-        let local_path = entry.path();
+        let local_path = walk_entry.path();
         let metadata = match fs::symlink_metadata(local_path) {
             Ok(m) => m,
             Err(_) => continue,
@@ -1618,40 +1705,39 @@ fn scan_and_cleanup_sync(config: &ClientConfig, sync: &purgery_core::SyncMapping
             .unwrap_or(0);
         let sha256 = compute_sha256(local_path).ok();
 
-        cleanup_entries.push(purgery_core::CleanupEntry {
+        entries.push(purgery_core::CleanupEntry {
             sync_name: sync.name.as_str().to_owned(),
             relative_path: relative_str,
             local_path: local_path.to_string_lossy().into_owned(),
             size,
             mtime_ns,
             sha256,
-            rsync_succeeded: true,
+            rsync_succeeded: false,
             cleaned: false,
         });
     }
+    Ok(entries)
+}
 
-    if cleanup_entries.is_empty() {
-        return Ok(());
-    }
+/// Process a cleanup state file: delete entries whose current local identity
+/// matches the pre-rsync captured identity. Already-cleaned and not-yet-rsynced
+/// entries are skipped. This is safe to call after rsync_succeeded has been
+/// durably set to true.
+fn process_cleanup_state_file(state_path: &Utf8Path) -> Result<()> {
+    let content = fs::read_to_string(state_path.as_std_path())
+        .with_context(|| format!("failed to read cleanup state: {state_path}"))?;
+    let state: purgery_core::DurableCleanupState = toml::from_str(&content)
+        .map_err(|e| anyhow::anyhow!("failed to parse cleanup state: {e}"))?;
 
-    let cleanup_state = purgery_core::DurableCleanupState {
-        nickname: config.nickname.as_str().to_owned(),
-        operation_id: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-            .to_string(),
-        entries: cleanup_entries,
-    };
-
-    let state_path = write_cleanup_state(&cleanup_state)?;
-
-    for entry in &cleanup_state.entries {
+    for entry in &state.entries {
+        if !entry.rsync_succeeded || entry.cleaned {
+            continue;
+        }
         let local_path = Path::new(&entry.local_path);
         let symmeta = match fs::symlink_metadata(local_path) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let _ = mark_cleaned(&state_path, &entry.sync_name, &entry.local_path);
+                let _ = mark_cleaned(state_path, &entry.sync_name, &entry.local_path);
                 continue;
             }
             Err(_) => continue,
@@ -1686,10 +1772,9 @@ fn scan_and_cleanup_sync(config: &ClientConfig, sync: &purgery_core::SyncMapping
         if let Err(e) = fs::remove_file(local_path) {
             warn!(path = %entry.local_path, error = %e, "failed to delete");
         } else {
-            let _ = mark_cleaned(&state_path, &entry.sync_name, &entry.local_path);
+            let _ = mark_cleaned(state_path, &entry.sync_name, &entry.local_path);
         }
     }
-
     Ok(())
 }
 
