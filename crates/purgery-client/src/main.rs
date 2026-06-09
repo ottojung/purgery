@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Parser, Subcommand};
 use purgery_core::{
     build_rsync_args, resolve_executable, shell_escape, BeginRunResponse, ClientConfig,
@@ -278,6 +278,11 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
     let host = config.server.host.as_str();
     let server_command = &config.server.command;
 
+    // Resume any pending cleanups from previous interrupted runs.
+    // This runs before any new transfers so that partially-completed
+    // cleanup does not accumulate.
+    resume_pending_cleanups(config)?;
+
     // 1. Build manifest for local planning
     let run_id = RunId::generate();
     let manifest = build_manifest(config, &run_id)?;
@@ -401,105 +406,7 @@ fn run_passthrough_path(
 
         // Durable cleanup state for delete_after_import=true
         if sync.delete_after_import {
-            let cleanup_entries: Vec<purgery_core::CleanupEntry> = manifest
-                .entries
-                .iter()
-                .filter(|e| {
-                    e.sync_name.as_str() == sync_name
-                        && e.kind == ManifestEntryKind::RegularFile
-                        && e.mode == purgery_core::ManifestEntryMode::Passthrough
-                })
-                .map(|e| purgery_core::CleanupEntry {
-                    sync_name: sync_name.to_owned(),
-                    relative_path: e.relative_path.as_str().to_owned(),
-                    local_path: e.local_path.as_str().to_owned(),
-                    size: e.size,
-                    mtime_ns: e.mtime_ns,
-                    sha256: e.sha256.clone(),
-                    rsync_succeeded: true,
-                    cleaned: false,
-                })
-                .collect();
-
-            if !cleanup_entries.is_empty() {
-                let cleanup_state = purgery_core::DurableCleanupState {
-                    nickname: config.nickname.as_str().to_owned(),
-                    operation_id: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos()
-                        .to_string(),
-                    entries: cleanup_entries,
-                };
-
-                // Write atomically via temp file + rename
-                let cleanup_path = tmp_dir.join(format!("cleanup-{sync_name}.toml"));
-                let cleanup_tmp = tmp_dir.join(format!("cleanup-{sync_name}.toml.tmp"));
-                let cleanup_content = toml::to_string(&cleanup_state)
-                    .map_err(|e| anyhow::anyhow!("failed to serialize cleanup state: {e}"))?;
-                fs::write(&cleanup_tmp, &cleanup_content)
-                    .with_context(|| "failed to write cleanup state")?;
-                fs::rename(&cleanup_tmp, &cleanup_path)
-                    .with_context(|| "failed to atomically publish cleanup state")?;
-
-                // Execute cleanup from the durable state
-                if let Ok(cleanup_content) = fs::read_to_string(&cleanup_path) {
-                    if let Ok(state) =
-                        toml::from_str::<purgery_core::DurableCleanupState>(&cleanup_content)
-                    {
-                        let mut deleted = 0usize;
-                        for entry in &state.entries {
-                            if !entry.rsync_succeeded || entry.cleaned {
-                                continue;
-                            }
-                            let local_path = Path::new(&entry.local_path);
-                            let symmeta = match fs::symlink_metadata(local_path) {
-                                Ok(m) => m,
-                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                                    deleted += 1;
-                                    continue;
-                                }
-                                Err(_) => continue,
-                            };
-                            if !symmeta.file_type().is_file() || symmeta.file_type().is_symlink() {
-                                continue;
-                            }
-                            let Ok(meta) = fs::metadata(local_path) else {
-                                continue;
-                            };
-                            if meta.len() != entry.size {
-                                continue;
-                            }
-                            let current_mtime = meta
-                                .modified()
-                                .ok()
-                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                                .map(|d| d.as_nanos() as i64)
-                                .unwrap_or(0);
-                            if current_mtime != entry.mtime_ns {
-                                continue;
-                            }
-                            if let Some(ref expected_sha) = entry.sha256 {
-                                if let Ok(actual_sha) = compute_sha256(local_path) {
-                                    if &actual_sha != expected_sha {
-                                        continue;
-                                    }
-                                } else {
-                                    continue;
-                                }
-                            }
-                            if let Err(e) = fs::remove_file(local_path) {
-                                warn!(path = %entry.local_path, error = %e, "failed to delete");
-                            } else {
-                                deleted += 1;
-                            }
-                        }
-                        if deleted > 0 {
-                            info!(sync = sync_name, deleted, "passthrough cleanup");
-                        }
-                    }
-                }
-            }
+            process_cleanup_entries(config, sync_name, manifest)?;
         }
     }
 
@@ -778,65 +685,9 @@ fn run_postprocess_path(
                 );
             }
 
-            // Early cleanup for passthrough regular files with delete_after_import
+            // Durable cleanup state for delete_after_import=true passthrough regular files
             if sync.delete_after_import {
-                let cleanup_entries: Vec<purgery_core::CleanupEntry> = manifest
-                    .entries
-                    .iter()
-                    .filter(|e| {
-                        e.sync_name.as_str() == sync_name
-                            && e.kind == ManifestEntryKind::RegularFile
-                            && e.mode == purgery_core::ManifestEntryMode::Passthrough
-                    })
-                    .map(|e| purgery_core::CleanupEntry {
-                        sync_name: sync_name.to_owned(),
-                        relative_path: e.relative_path.as_str().to_owned(),
-                        local_path: e.local_path.as_str().to_owned(),
-                        size: e.size,
-                        mtime_ns: e.mtime_ns,
-                        sha256: e.sha256.clone(),
-                        rsync_succeeded: true,
-                        cleaned: false,
-                    })
-                    .collect();
-
-                for entry in &cleanup_entries {
-                    let local_path = Path::new(&entry.local_path);
-                    let symmeta = match fs::symlink_metadata(local_path) {
-                        Ok(m) => m,
-                        Err(_) => continue,
-                    };
-                    if !symmeta.file_type().is_file() || symmeta.file_type().is_symlink() {
-                        continue;
-                    }
-                    let Ok(meta) = fs::metadata(local_path) else {
-                        continue;
-                    };
-                    if meta.len() != entry.size {
-                        continue;
-                    }
-                    let current_mtime = meta
-                        .modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_nanos() as i64)
-                        .unwrap_or(0);
-                    if current_mtime != entry.mtime_ns {
-                        continue;
-                    }
-                    if let Some(ref expected_sha) = entry.sha256 {
-                        if let Ok(actual_sha) = compute_sha256(local_path) {
-                            if &actual_sha != expected_sha {
-                                continue;
-                            }
-                        } else {
-                            continue;
-                        }
-                    }
-                    if let Err(e) = fs::remove_file(local_path) {
-                        warn!(path = %entry.local_path, error = %e, "failed to delete");
-                    }
-                }
+                process_cleanup_entries(config, sync_name, manifest)?;
             }
 
             // Check heartbeat
@@ -1102,6 +953,234 @@ fn build_manifest(config: &ClientConfig, run_id: &RunId) -> Result<Manifest> {
         nickname,
         entries,
     })
+}
+
+/// Return the stable client state directory for cleanup bookkeeping.
+fn cleanup_state_dir() -> Result<Utf8PathBuf> {
+    // Prefer XDG_STATE_HOME, fall back to ~/.local/state/purgery/
+    if let Ok(dir) = std::env::var("XDG_STATE_HOME") {
+        if !dir.is_empty() {
+            let path = Utf8PathBuf::from(dir).join("purgery");
+            fs::create_dir_all(path.as_std_path())
+                .with_context(|| format!("failed to create state dir: {path}"))?;
+            return Ok(path);
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let path = Utf8PathBuf::from(format!("{home}/.local/state/purgery"));
+    fs::create_dir_all(path.as_std_path())
+        .with_context(|| format!("failed to create state dir: {path}"))?;
+    Ok(path)
+}
+
+/// Write cleanup state atomically to a file in the cleanup state directory.
+fn write_cleanup_state(state: &purgery_core::DurableCleanupState) -> Result<Utf8PathBuf> {
+    let dir = cleanup_state_dir()?;
+    let filename = format!("cleanup-{}-{}.toml", state.nickname, state.operation_id);
+    let final_path = dir.join(&filename);
+    let tmp_path = dir.join(format!("{filename}.tmp"));
+    let content = toml::to_string(state)
+        .map_err(|e| anyhow::anyhow!("failed to serialize cleanup state: {e}"))?;
+    fs::write(&tmp_path, &content)
+        .with_context(|| format!("failed to write cleanup state: {tmp_path}"))?;
+    fs::rename(&tmp_path, &final_path)
+        .with_context(|| format!("failed to atomically publish cleanup state: {final_path}"))?;
+    Ok(final_path)
+}
+
+/// Mark one entry as cleaned in the cleanup state file, atomically.
+fn mark_cleaned(state_path: &Utf8Path, sync_name: &str, local_path: &str) -> Result<()> {
+    let content = fs::read_to_string(state_path.as_std_path())
+        .with_context(|| format!("failed to read cleanup state: {state_path}"))?;
+    let mut state: purgery_core::DurableCleanupState = toml::from_str(&content)
+        .map_err(|e| anyhow::anyhow!("failed to parse cleanup state: {e}"))?;
+    for entry in &mut state.entries {
+        if entry.sync_name == sync_name && entry.local_path == local_path {
+            entry.cleaned = true;
+        }
+    }
+    let tmp_path = state_path.with_extension("toml.tmp");
+    let new_content = toml::to_string(&state)
+        .map_err(|e| anyhow::anyhow!("failed to serialize cleanup state: {e}"))?;
+    fs::write(&tmp_path, &new_content)
+        .with_context(|| format!("failed to write cleanup state: {tmp_path}"))?;
+    fs::rename(&tmp_path, state_path)
+        .with_context(|| format!("failed to atomically update cleanup state: {state_path}"))?;
+    Ok(())
+}
+
+/// Scan for pending cleanup state files and process them.
+/// Called at the start of sync_and_cleanup before any new transfers.
+#[allow(dead_code)]
+fn resume_pending_cleanups(_config: &ClientConfig) -> Result<()> {
+    let dir = match cleanup_state_dir() {
+        Ok(d) => d,
+        Err(_) => return Ok(()),
+    };
+    if !dir.exists() {
+        return Ok(());
+    }
+    let mut deleted_total = 0usize;
+    for entry in fs::read_dir(dir.as_std_path())
+        .with_context(|| format!("failed to read state dir: {dir}"))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(state) = toml::from_str::<purgery_core::DurableCleanupState>(&content) else {
+            continue;
+        };
+        let state_path = match camino::Utf8PathBuf::from_path_buf(path) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        for entry in &state.entries {
+            if !entry.rsync_succeeded || entry.cleaned {
+                continue;
+            }
+            let local_path = Path::new(&entry.local_path);
+            let symmeta = match fs::symlink_metadata(local_path) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let _ = mark_cleaned(&state_path, &entry.sync_name, &entry.local_path);
+                    deleted_total += 1;
+                    continue;
+                }
+                Err(_) => continue,
+            };
+            if !symmeta.file_type().is_file() || symmeta.file_type().is_symlink() {
+                continue;
+            }
+            let Ok(meta) = fs::metadata(local_path) else {
+                continue;
+            };
+            if meta.len() != entry.size {
+                continue;
+            }
+            let current_mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(0);
+            if current_mtime != entry.mtime_ns {
+                continue;
+            }
+            if let Some(ref expected_sha) = entry.sha256 {
+                if let Ok(actual_sha) = compute_sha256(local_path) {
+                    if &actual_sha != expected_sha {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            }
+            if let Err(e) = fs::remove_file(local_path) {
+                warn!(path = %entry.local_path, error = %e, "failed to delete");
+            } else {
+                let _ = mark_cleaned(&state_path, &entry.sync_name, &entry.local_path);
+                deleted_total += 1;
+            }
+        }
+    }
+    if deleted_total > 0 {
+        info!(deleted = deleted_total, "resumed pending cleanups");
+    }
+    Ok(())
+}
+
+/// Process cleanup entries: write durable state, delete verified files with atomic progress.
+fn process_cleanup_entries(
+    config: &ClientConfig,
+    sync_name: &str,
+    manifest: &Manifest,
+) -> Result<()> {
+    let cleanup_entries: Vec<purgery_core::CleanupEntry> = manifest
+        .entries
+        .iter()
+        .filter(|e| {
+            e.sync_name.as_str() == sync_name
+                && e.kind == ManifestEntryKind::RegularFile
+                && e.mode == purgery_core::ManifestEntryMode::Passthrough
+        })
+        .map(|e| purgery_core::CleanupEntry {
+            sync_name: sync_name.to_owned(),
+            relative_path: e.relative_path.as_str().to_owned(),
+            local_path: e.local_path.as_str().to_owned(),
+            size: e.size,
+            mtime_ns: e.mtime_ns,
+            sha256: e.sha256.clone(),
+            rsync_succeeded: true,
+            cleaned: false,
+        })
+        .collect();
+
+    if cleanup_entries.is_empty() {
+        return Ok(());
+    }
+
+    let cleanup_state = purgery_core::DurableCleanupState {
+        nickname: config.nickname.as_str().to_owned(),
+        operation_id: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_string(),
+        entries: cleanup_entries,
+    };
+
+    let state_path = write_cleanup_state(&cleanup_state)?;
+
+    for entry in &cleanup_state.entries {
+        let local_path = Path::new(&entry.local_path);
+        let symmeta = match fs::symlink_metadata(local_path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let _ = mark_cleaned(&state_path, &entry.sync_name, &entry.local_path);
+                continue;
+            }
+            Err(_) => continue,
+        };
+        if !symmeta.file_type().is_file() || symmeta.file_type().is_symlink() {
+            continue;
+        }
+        let Ok(meta) = fs::metadata(local_path) else {
+            continue;
+        };
+        if meta.len() != entry.size {
+            continue;
+        }
+        let current_mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        if current_mtime != entry.mtime_ns {
+            continue;
+        }
+        if let Some(ref expected_sha) = entry.sha256 {
+            if let Ok(actual_sha) = compute_sha256(local_path) {
+                if &actual_sha != expected_sha {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+        }
+        if let Err(e) = fs::remove_file(local_path) {
+            warn!(path = %entry.local_path, error = %e, "failed to delete");
+        } else {
+            let _ = mark_cleaned(&state_path, &entry.sync_name, &entry.local_path);
+        }
+    }
+
+    Ok(())
 }
 
 /// Compute SHA-256 of a file.
@@ -1481,11 +1560,16 @@ delete_after_import = false
         let config = config_no_delete_for(&source);
         let run_id = RunId::new("no-delete-identity".into()).unwrap();
         let manifest = build_manifest(&config, &run_id).unwrap();
-        let entry = manifest.entries.iter().find(|e| {
-            e.kind == ManifestEntryKind::RegularFile
-        }).expect("must have a regular file entry");
+        let entry = manifest
+            .entries
+            .iter()
+            .find(|e| e.kind == ManifestEntryKind::RegularFile)
+            .expect("must have a regular file entry");
         // For delete_after_import=false passthrough, identity fields must be empty
-        assert_eq!(entry.mtime_ns, 0, "no-delete passthrough must not track mtime");
+        assert_eq!(
+            entry.mtime_ns, 0,
+            "no-delete passthrough must not track mtime"
+        );
         assert!(
             entry.sha256.is_none(),
             "no-delete passthrough must not compute sha256, got {:?}",
@@ -1503,9 +1587,11 @@ delete_after_import = false
         let run_id = RunId::new("no-delete-path".into()).unwrap();
         let manifest = build_manifest(&config, &run_id).unwrap();
         // Path planning must still work even without identity fields
-        let entry = manifest.entries.iter().find(|e| {
-            e.relative_path.as_str() == "file.txt"
-        }).expect("must find file.txt entry");
+        let entry = manifest
+            .entries
+            .iter()
+            .find(|e| e.relative_path.as_str() == "file.txt")
+            .expect("must find file.txt entry");
         assert_eq!(entry.mode, purgery_core::ManifestEntryMode::Passthrough);
         assert!(
             filter_contains_path(&entry),
