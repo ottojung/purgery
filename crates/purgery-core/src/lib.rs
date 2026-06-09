@@ -183,7 +183,7 @@ pub fn resolve_executable(program: &str) -> Result<ResolvedExecutable, Executabl
                 program
             )));
         }
-        let meta = std::fs::symlink_metadata(program_path.as_std_path())
+        let meta = std::fs::metadata(program_path.as_std_path())
             .map_err(|e| ExecutableError::Io(program.to_owned(), e))?;
         #[cfg(unix)]
         {
@@ -214,7 +214,7 @@ pub fn resolve_executable(program: &str) -> Result<ResolvedExecutable, Executabl
             if !is_regular_file(&candidate) {
                 continue;
             }
-            let meta = std::fs::symlink_metadata(candidate.as_std_path())
+            let meta = std::fs::metadata(candidate.as_std_path())
                 .map_err(|e| ExecutableError::Io(program.to_owned(), e))?;
             #[cfg(unix)]
             {
@@ -949,6 +949,7 @@ pub struct ServerConfig {
 
 /// Postprocessing configuration (server-side).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PostprocessConfig {
     #[serde(default = "default_max_parallel_jobs")]
     pub max_parallel_jobs: u32,
@@ -1110,6 +1111,7 @@ fn default_delete_after_import() -> bool {
 
 /// Client-side postprocessing rule configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientPostprocessConfig {
     #[serde(default)]
     pub rules: Vec<PostprocessRule>,
@@ -1117,6 +1119,7 @@ pub struct ClientPostprocessConfig {
 
 /// A postprocessing rule: files matching `match` regex get the listed steps.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PostprocessRule {
     #[serde(rename = "match")]
     pub pattern: String,

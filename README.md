@@ -209,7 +209,8 @@ Setup workflow: `bootstrap` once, then `check` to verify.
 ### Normal operation checks
 
 - `purgery-client sync-and-cleanup` calls local `client_check` before any remote operations.
-- `purgery-server process-once` and `begin-run` run GC opportunistically but do not call server check or create directories.
+- `purgery-server process-once` runs side-effect-free server validation first (config, postprocess programs), then runs GC opportunistically and processes ready runs. It does not create directories.
+- `purgery-server begin-run` runs GC opportunistically but does not call server check or create directories beyond the incoming run directory.
 - `purgery-server finish-run` validates only the specific preconditions needed for the move.
 
 ### `begin-run` single-use safety
@@ -255,7 +256,7 @@ purgery-server heartbeat-run --nickname laptop --run-id 01...
 
 The heartbeat updates `last_heartbeat_unix_secs` and extends `expires_at_unix_secs`.
 
-During `sync-and-cleanup`, the client sends a heartbeat after each rsync sync mapping at the interval specified by `begin-run`.
+During `sync-and-cleanup`, the client spawns a background thread that sends heartbeats at the interval specified by `begin-run`, covering the entire upload phase including long single rsync transfers. If the heartbeat thread fails, the client aborts before `finish-run`.
 
 Server GC configuration:
 

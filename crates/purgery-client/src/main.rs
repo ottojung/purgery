@@ -10,6 +10,9 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Read;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, SystemTime};
 use walkdir::WalkDir;
 
@@ -32,7 +35,7 @@ enum Command {
         #[arg(long)]
         config: String,
     },
-    /// Check client dependencies and server connectivity
+    /// Check client dependencies and configuration (local only, no SSH)
     Check {
         /// Path to client configuration TOML
         #[arg(long)]
@@ -289,58 +292,84 @@ fn sync_and_cleanup(config_path: &str) -> Result<()> {
     let manifest_toml = manifest.to_toml()?;
     write_remote_file(host, &begin_resp.manifest_path, &manifest_toml)?;
 
-    // 4. Rsync files per sync mapping with simple heartbeat loop
-    let heartbeat_interval = std::time::Duration::from_secs(begin_resp.heartbeat_interval_secs);
-    let mut last_heartbeat = std::time::Instant::now();
+    // 4. Start heartbeat guard thread for periodic heartbeats during long rsync
+    let heartbeat_interval = Duration::from_secs(begin_resp.heartbeat_interval_secs);
+    let stop_hb = Arc::new(AtomicBool::new(false));
+    let hb_error = Arc::new(Mutex::new(None::<String>));
+    let stop_hb_clone = stop_hb.clone();
+    let hb_error_clone = hb_error.clone();
+    let hb_host = host.to_owned();
+    let hb_cmd = server_command.to_owned();
+    let hb_nick = config.nickname.as_str().to_owned();
+    let hb_rid = run_id.as_str().to_owned();
 
-    for sync in &config.sync {
-        let from_path = sync.from_path.as_str();
-        let to_path = sync.to_path.as_str();
-        let remote_files_dir = format!("{}/{to_path}/", begin_resp.files_dir);
+    let hb_handle = thread::spawn(move || loop {
+        if stop_hb_clone.load(Ordering::Relaxed) {
+            break;
+        }
+        thread::sleep(heartbeat_interval);
+        if stop_hb_clone.load(Ordering::Relaxed) {
+            break;
+        }
+        if let Err(e) = server_cmd(
+            &hb_host,
+            &hb_cmd,
+            &["heartbeat-run", "--nickname", &hb_nick, "--run-id", &hb_rid],
+        ) {
+            let mut err = hb_error_clone.lock().unwrap();
+            *err = Some(format!("heartbeat failed: {e:#}"));
+            break;
+        }
+    });
 
-        eprintln!("syncing {from_path} -> {remote_files_dir}");
-        let rsync_dest = format!("{}:{}", host, remote_files_dir);
-        let args = build_rsync_args(from_path, &rsync_dest);
-        let status = std::process::Command::new("rsync")
-            .args(&args)
-            .status()
-            .with_context(|| format!("failed to execute rsync for {from_path}"))?;
+    // 5. Rsync files per sync mapping
+    let sync_result = (|| -> Result<()> {
+        for sync in &config.sync {
+            let from_path = sync.from_path.as_str();
+            let to_path = sync.to_path.as_str();
+            let remote_files_dir = format!("{}/{to_path}/", begin_resp.files_dir);
 
-        if !status.success() {
-            anyhow::bail!("rsync failed for sync mapping '{}'", sync.name);
+            eprintln!("syncing {from_path} -> {remote_files_dir}");
+            let rsync_dest = format!("{}:{}", host, remote_files_dir);
+            let args = build_rsync_args(from_path, &rsync_dest);
+            let status = std::process::Command::new("rsync")
+                .args(&args)
+                .status()
+                .with_context(|| format!("failed to execute rsync for {from_path}"))?;
+
+            if !status.success() {
+                anyhow::bail!("rsync failed for sync mapping '{}'", sync.name);
+            }
         }
 
-        // Send heartbeat after each sync mapping
-        if last_heartbeat.elapsed() >= heartbeat_interval {
-            let _ = server_cmd(
-                host,
-                server_command,
-                &[
-                    "heartbeat-run",
-                    "--nickname",
-                    config.nickname.as_str(),
-                    "--run-id",
-                    run_id.as_str(),
-                ],
-            );
-            last_heartbeat = std::time::Instant::now();
-        }
+        // 6. Finish run: move from incoming to ready
+        eprintln!("finishing run...");
+        server_cmd(
+            host,
+            server_command,
+            &[
+                "finish-run",
+                "--nickname",
+                config.nickname.as_str(),
+                "--run-id",
+                run_id.as_str(),
+            ],
+        )?;
+        eprintln!("run moved to ready");
+        Ok(())
+    })();
+
+    // Stop heartbeat thread regardless of sync/finish outcome
+    stop_hb.store(true, Ordering::Relaxed);
+    let _ = hb_handle.join();
+
+    // Propagate sync/finish error first
+    sync_result?;
+
+    // Then check for heartbeat failure
+    if let Some(err) = hb_error.lock().unwrap().take() {
+        anyhow::bail!("{err}");
     }
-
-    // 5. Finish run: move from incoming to ready
-    eprintln!("finishing run...");
-    server_cmd(
-        host,
-        server_command,
-        &[
-            "finish-run",
-            "--nickname",
-            config.nickname.as_str(),
-            "--run-id",
-            run_id.as_str(),
-        ],
-    )?;
-    eprintln!("run moved to ready");
 
     // 6. Poll for status via server command
     let status = poll_for_status(host, server_command, &config.nickname, &run_id)?;

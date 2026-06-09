@@ -413,10 +413,12 @@ fn process_one_file(
             }
 
             // 10. Determine postprocess step names that were applied (from run plan)
+            // Match against normalized_path, not work_path, because rules are
+            // designed for logical paths like "videos/video.mp4".
             let applied_steps: Vec<String> = run_plan
                 .rules
                 .iter()
-                .filter(|cr| cr.regex.is_match(work_path.as_str()))
+                .filter(|cr| cr.regex.is_match(&normalized_path))
                 .flat_map(|cr| cr.steps.iter().map(|s| s.step_name.clone()))
                 .collect();
 
@@ -705,7 +707,7 @@ impl RunPlan {
 ///
 /// `normalized_path` is the logical path used for rule matching (e.g. `videos/video.mp4`).
 /// `work_path` is the absolute work area path used for subprocess execution.
-/// Returns the list of work area paths to commit.
+/// Returns the list of work area paths to commit, deduplicated and ordered.
 pub fn apply_postprocessing(
     run_plan: &RunPlan,
     normalized_path: &str,
@@ -713,6 +715,10 @@ pub fn apply_postprocessing(
 ) -> Result<Vec<Utf8PathBuf>, String> {
     let mut results: Vec<Utf8PathBuf> = Vec::new();
     let mut any_rule_matched = false;
+
+    let work_parent = work_path
+        .parent()
+        .ok_or_else(|| "work path has no parent directory".to_string())?;
 
     for compiled in &run_plan.rules {
         if !compiled.regex.is_match(normalized_path) {
@@ -746,9 +752,16 @@ pub fn apply_postprocessing(
                         ));
                     }
 
-                    // Check expected outputs
+                    // Check expected outputs exist and are within the work area
                     let expected = step_def.resolve_expected_outputs(work_path);
                     for exp in &expected {
+                        if !exp.starts_with(work_parent) {
+                            return Err(format!(
+                                "expected output '{}' is outside work area '{}'",
+                                exp.as_str(),
+                                work_parent.as_str()
+                            ));
+                        }
                         if !exp.exists() {
                             return Err(format!("expected output not found: {}", exp.as_str()));
                         }
@@ -766,6 +779,12 @@ pub fn apply_postprocessing(
     if !any_rule_matched {
         // No matching rules, just commit the original
         results.push(work_path.to_owned());
+    }
+
+    // Deduplicate while preserving order
+    {
+        let mut seen = std::collections::HashSet::new();
+        results.retain(|p| seen.insert(p.as_str().to_owned()));
     }
 
     if results.is_empty() {
@@ -804,7 +823,9 @@ pub fn move_to_failed(
 /// Process once: run GC, then scan ready runs and process each one.
 pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
     // Run GC opportunistically
-    let _ = run_gc(config);
+    if let Err(e) = run_gc(config) {
+        eprintln!("warning: opportunistic GC failed: {e:#}");
+    }
 
     let ready_runs = find_ready_runs(&config.purgery_root)?;
     if ready_runs.is_empty() {
@@ -834,7 +855,9 @@ pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
 /// response with server-derived paths.
 pub fn begin_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> Result<String> {
     // Run GC opportunistically before creating the run
-    let _ = run_gc(config);
+    if let Err(e) = run_gc(config) {
+        eprintln!("warning: opportunistic GC failed: {e:#}");
+    }
 
     // Check run does not already exist in any phase
     let phases = [
@@ -1160,7 +1183,7 @@ pub fn run_gc(config: &ServerConfig) -> Result<()> {
                 .purgery_root
                 .run_dir(&nickname, &run_id, RunPhase::Failed);
             if failed_path.exists() {
-                // GC quarantine path
+                // GC quarantine path — apply same cleanup as normal collection
                 let quarantine_name = format!("gc-quarantine-{}-{}", run_id.as_str(), now);
                 let quarantine_path = config.purgery_root.run_dir(
                     &nickname,
@@ -1170,7 +1193,26 @@ pub fn run_gc(config: &ServerConfig) -> Result<()> {
                 if let Some(parent) = quarantine_path.parent() {
                     let _ = fs::create_dir_all(parent);
                 }
-                let _ = fs::rename(&run_path, quarantine_path.as_std_path());
+                if fs::rename(&run_path, quarantine_path.as_std_path()).is_ok() {
+                    let status = RunStatus {
+                        run_id: run_id.clone(),
+                        nickname: nickname.clone(),
+                        state: RunState::Failed,
+                        files: vec![],
+                        error: Some("abandoned upload expired (quarantined)".into()),
+                    };
+                    if let Ok(toml_str) = status.to_toml() {
+                        let status_path = quarantine_path.join("status.toml");
+                        let tmp_path = quarantine_path.join("status.toml.tmp");
+                        if fs::write(&tmp_path, &toml_str).is_ok() {
+                            let _ = fs::rename(&tmp_path, &status_path);
+                        }
+                    }
+                    let files_dir = quarantine_path.join("files");
+                    if files_dir.exists() {
+                        let _ = fs::remove_dir_all(files_dir.as_std_path());
+                    }
+                }
                 continue;
             }
 
