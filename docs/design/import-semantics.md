@@ -48,6 +48,32 @@ Cleanup policy:
 
 Before processing any entries, the server validates the run plan via `prepare-run`. This validates the manifest classification, match patterns, step references, expected-output names, and planned final paths. If anything is invalid, the run is rejected before any passthrough rsync mutates final storage.
 
+## Transfer model
+
+Manifest entries are transferred from the client source tree to the server by rsync. The client generates two transfer sets per sync group:
+
+1. **Passthrough transfer set**: exact-path roots for entries with mode `passthrough` (regular files, symlinks, empty directories). Transferred directly to final storage.
+2. **Purgatory transfer set**: exact-path roots for ordinary postprocess entries plus subtree roots for postprocessed directories. Transferred to the staging area.
+
+If a transfer set is empty, the corresponding rsync call is skipped entirely.
+
+### Exact path roots
+
+For ordinary entries (passthrough or postprocess but not covered):
+- Regular files and symlinks transfer as independent entries.
+- Empty directories transfer as independent entries.
+- Non-empty directories are traversal containers unless selected as postprocess roots.
+
+### Subtree roots
+
+A directory selected for postprocessing is a subtree transformation root:
+- The directory entry has mode `postprocess`.
+- All descendants have mode `covered`.
+- Covered descendants are not independent transfer roots.
+- The purgatory rsync filter includes the entire directory subtree.
+- The server processes the directory root as one postprocess input.
+- Covered descendants are skipped in status and never cleaned locally.
+
 ## Postprocessing applies to all entry kinds
 
 Every manifest entry kind (directory, regular file, symlink) is eligible for postprocessing. If an entry's normalized path matches a postprocess rule, the entry is transformed by the subprocess. If it does not match any rule, the entry is imported directly.

@@ -184,6 +184,16 @@ match = "videos/**/*.mp4"          # any .mp4 under videos/ and its subdirectori
 match = "/photos"                  # exactly the photos directory at source root
 ```
 
+### Transfer roots
+
+Each transfer set contains either **exact path roots** (regular files, symlinks, empty directories — each transferred as one independent entry) or **subtree path roots** (postprocessed directories whose entire subtree is transferred as a unit).
+
+A postprocessed directory root generates an rsync filter that includes the directory and all its descendants (`dir/**`). Covered descendants are excluded from independent transfer roots because they are already included under the postprocessed directory subtree root.
+
+### Empty transfer sets
+
+If a sync group has no passthrough transfer roots, the passthrough rsync is skipped and no passthrough receipt is written. If a sync group has no purgatory transfer roots, the purgatory rsync is skipped.
+
 ### Rsync filter generation
 
 For each `[[sync]]` group, the client generates at most two rsync calls:
@@ -193,7 +203,7 @@ For each `[[sync]]` group, the client generates at most two rsync calls:
 
 Both calls use `rsync --archive --no-inc-recursive --protect-args --no-delete` with include/exclude filters.
 
-The purgatory filter includes directory traversal entries needed to reach selected files. The passthrough filter excludes entries selected for postprocessing.
+The purgatory filter includes ancestor traversal directories needed to reach selected roots, then the roots themselves (exact or subtree), then excludes everything else.
 
 ### Import modes and cleanup
 

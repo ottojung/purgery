@@ -62,6 +62,29 @@ Both modes use the same final overlay rules after commit.
 
 If a directory entry matches a postprocess rule, descendant manifest entries under that directory are covered. Covered entries produce skipped status with `"covered by postprocessed ancestor directory"`.
 
+## Transfer roots
+
+The client generates transfer roots from the classified manifest. Each transfer root is either:
+
+- **Exact path root**: a regular file, symlink, or empty directory transferred as one independent entry. The rsync filter includes the path exactly.
+- **Subtree path root**: a postprocessed directory whose entire subtree is transferred as a unit. The rsync filter includes the directory and all its descendants (`dir/**`).
+
+Covered descendants are excluded from independent transfer roots. They are transferred only as part of the postprocessed directory subtree root.
+
+### Empty transfer sets
+
+If a sync group has no passthrough transfer roots, the client skips the passthrough rsync and does not write a successful passthrough receipt for that sync. If a sync group has no purgatory transfer roots, the client skips the purgatory rsync.
+
+### `prepare-run` validation
+
+`prepare-run` validates the full classification contract for every manifest entry:
+
+- **mode**: must match the pattern classification (postprocess, passthrough, or covered)
+- **covered_by**: for covered entries, must equal the source-relative path of the nearest postprocessed directory ancestor
+- **postprocess_steps**: for covered entries, must be empty
+
+If any covered entry has the wrong `covered_by` or non-empty `postprocess_steps`, the run is rejected.
+
 ## `prepare-run` response
 
 ```toml
@@ -103,7 +126,7 @@ sync_name = "videos"
 relative_path = "album/cover.jpg"
 kind = "regular_file"
 mode = "covered"
-covered_by = "videos/album"
+covered_by = "album"
 ```
 
 ## Run phases
