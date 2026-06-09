@@ -478,7 +478,7 @@ fn process_one_file(
             for (output, output_final) in &preflight_checks {
                 match commit_output(output, output_final, run_id) {
                     Ok(disposition) => {
-                        let status = match disposition {
+                        let commit_disposition = match disposition {
                             CommitDisposition::Created => "created",
                             CommitDisposition::Replaced => "replaced",
                         };
@@ -488,8 +488,8 @@ fn process_one_file(
                             phase = "processing",
                             relative_path = %relative_path,
                             final_path = %output_final.as_str(),
-                            status,
-                            "final output {status}"
+                            commit_disposition,
+                            "final output {commit_disposition}"
                         );
                         let rel = output_final
                             .strip_prefix(root_path)
@@ -777,12 +777,28 @@ pub fn recover_or_process_processing_run(
 
     match fs::read_to_string(&status_path) {
         Ok(content) => match RunStatus::from_toml(&content) {
-            Ok(status) if status.nickname == *nickname && status.run_id == *run_id => {
+            Ok(status) if status.nickname != *nickname || status.run_id != *run_id => {
+                let error = "interrupted processing had mismatched status envelope";
+                warn!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    status_nickname = %status.nickname.as_str(),
+                    status_run_id = %status.run_id.as_str(),
+                    phase = "processing",
+                    run_status = "failed",
+                    recovery_action = "replace_mismatched_status",
+                    error,
+                    "processing run recovery failed"
+                );
+                write_run_failure(&config.purgery_root, nickname, run_id, error);
+                Ok(())
+            }
+            Ok(status) => {
                 info!(
                     nickname = %nickname.as_str(),
                     run_id = %run_id.as_str(),
                     phase = "processing",
-                    status = %status.state.as_str(),
+                    run_status = %status.state.as_str(),
                     recovery_action = "finalize_terminal_move",
                     "processing run had valid status, finalizing terminal move"
                 );
@@ -791,19 +807,19 @@ pub fn recover_or_process_processing_run(
                     nickname = %nickname.as_str(),
                     run_id = %run_id.as_str(),
                     phase = "processing",
-                    status = %status.state.as_str(),
+                    run_status = %status.state.as_str(),
                     recovery_action = "terminal_move_complete",
                     "processing run recovered"
                 );
                 Ok(())
             }
-            Ok(_) | Err(_) => {
+            Err(_) => {
                 let error = "interrupted processing had malformed status";
                 warn!(
                     nickname = %nickname.as_str(),
                     run_id = %run_id.as_str(),
                     phase = "processing",
-                    status = "failed",
+                    run_status = "failed",
                     recovery_action = "replace_malformed_status",
                     error,
                     "processing run recovery failed"
@@ -3531,6 +3547,69 @@ steps = ["compress-video"]
             .purgery_root
             .run_dir(&nickname, &run_id, RunPhase::Done)
             .exists());
+    }
+
+    fn assert_mismatched_processing_status_fails(
+        status_nickname: Nickname,
+        status_run_id: RunId,
+        directory_run_id: &str,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&purgery_root, &server_root);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new(directory_run_id.into()).unwrap();
+        let processing = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        fs::create_dir_all(&processing).unwrap();
+        let status = RunStatus {
+            run_id: status_run_id,
+            nickname: status_nickname,
+            state: RunState::Done,
+            files: vec![],
+            error: None,
+        };
+        fs::write(processing.join("status.toml"), status.to_toml().unwrap()).unwrap();
+
+        process_once_raw(&config).unwrap();
+
+        assert!(!processing.exists());
+        assert!(!config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Done)
+            .exists());
+        let failed = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        let failed_status =
+            RunStatus::from_toml(&fs::read_to_string(failed.join("status.toml")).unwrap()).unwrap();
+        assert_eq!(failed_status.nickname, nickname);
+        assert_eq!(failed_status.run_id, run_id);
+        assert_eq!(failed_status.state, RunState::Failed);
+        assert_eq!(
+            failed_status.error.as_deref(),
+            Some("interrupted processing had mismatched status envelope")
+        );
+    }
+
+    #[test]
+    fn test_process_once_fails_processing_run_with_mismatched_status_nickname() {
+        assert_mismatched_processing_status_fails(
+            Nickname::new("other-machine".into()).unwrap(),
+            RunId::new("recover-wrong-nickname".into()).unwrap(),
+            "recover-wrong-nickname",
+        );
+    }
+
+    #[test]
+    fn test_process_once_fails_processing_run_with_mismatched_status_run_id() {
+        assert_mismatched_processing_status_fails(
+            Nickname::new("laptop".into()).unwrap(),
+            RunId::new("other-run".into()).unwrap(),
+            "recover-wrong-run-id",
+        );
     }
 
     #[test]
