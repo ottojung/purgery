@@ -414,69 +414,100 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
                 .get(sync_name)
                 .ok_or_else(|| anyhow::anyhow!("no destination for sync mapping '{sync_name}'"))?;
 
-            // Collect classified paths from manifest for this sync
-            let passthrough_paths: Vec<String> = manifest
+            // Build transfer roots from classified manifest entries for this sync.
+            // Passthrough entries are always exact roots. Postprocess directories
+            // are subtree roots (transfer entire subtree). Postprocess files and
+            // symlinks are exact roots. Covered entries are excluded — they are
+            // transferred as part of the postprocessed directory subtree root.
+            let passthrough_roots: Vec<purgery_core::TransferRoot> = manifest
                 .entries
                 .iter()
                 .filter(|e| {
                     e.sync_name.as_str() == sync_name
                         && e.mode == purgery_core::ManifestEntryMode::Passthrough
                 })
-                .map(|e| e.relative_path.as_str().to_owned())
+                .map(|e| purgery_core::TransferRoot::Exact(e.relative_path.as_str().to_owned()))
                 .collect();
-            let purgatory_paths: Vec<String> = manifest
+            let mut purgatory_roots: Vec<purgery_core::TransferRoot> = manifest
                 .entries
                 .iter()
                 .filter(|e| {
                     e.sync_name.as_str() == sync_name
                         && e.mode == purgery_core::ManifestEntryMode::Postprocess
                 })
-                .map(|e| e.relative_path.as_str().to_owned())
+                .map(|e| {
+                    if e.kind == purgery_core::ManifestEntryKind::Directory {
+                        purgery_core::TransferRoot::Subtree(e.relative_path.as_str().to_owned())
+                    } else {
+                        purgery_core::TransferRoot::Exact(e.relative_path.as_str().to_owned())
+                    }
+                })
                 .collect();
+            purgatory_roots.sort_by(|a, b| {
+                let a_str = match a {
+                    purgery_core::TransferRoot::Exact(p)
+                    | purgery_core::TransferRoot::Subtree(p) => p.as_str(),
+                };
+                let b_str = match b {
+                    purgery_core::TransferRoot::Exact(p)
+                    | purgery_core::TransferRoot::Subtree(p) => p.as_str(),
+                };
+                a_str.cmp(b_str)
+            });
 
-            let passthrough_filter = purgery_core::transfer_set_filter(&passthrough_paths);
-            let purgatory_filter = purgery_core::transfer_set_filter(&purgatory_paths);
-
+            // Write filter files
             let tmp_dir = std::env::temp_dir().join("purgery-filters");
             fs::create_dir_all(&tmp_dir).ok();
             let passthrough_file = tmp_dir.join(format!("passthrough-{sync_name}"));
             let purgatory_file = tmp_dir.join(format!("purgatory-{sync_name}"));
-            fs::write(&passthrough_file, &passthrough_filter)
-                .with_context(|| "failed to write passthrough filter")?;
-            fs::write(&purgatory_file, &purgatory_filter)
-                .with_context(|| "failed to write purgatory filter")?;
 
             // --- Passthrough rsync: direct to final storage ---
-            let passthrough_rsync_dest = format!("{}:{}/", host, dest.passthrough_dest);
-            info!(
-                sync = sync_name,
-                from = from_path,
-                dest = %dest.passthrough_dest,
-                mode = "passthrough",
-                "passthrough rsync started"
-            );
-            let mut pt_args = build_rsync_args(from_path, &passthrough_rsync_dest);
-            let pt_filter_arg = format!("--filter=merge {}", passthrough_file.to_string_lossy());
-            pt_args.insert(5, pt_filter_arg);
-            let pt_status = std::process::Command::new("rsync")
-                .args(&pt_args)
-                .status()
-                .with_context(|| format!("failed to execute passthrough rsync for {from_path}"))?;
-            if !pt_status.success() {
-                anyhow::bail!("passthrough rsync failed for sync mapping '{sync_name}'");
-            }
-            info!(sync = sync_name, mode = "passthrough", "rsync complete");
+            // Skip if no passthrough transfer roots for this sync
+            if !passthrough_roots.is_empty() {
+                let passthrough_filter = purgery_core::transfer_set_filter(&passthrough_roots);
+                fs::write(&passthrough_file, &passthrough_filter)
+                    .with_context(|| "failed to write passthrough filter")?;
 
-            // Write passthrough receipt
-            let receipt = purgery_core::PassthroughReceipt {
-                sync_name: sync_name.to_owned(),
-                status: "imported".into(),
-            };
-            let receipt_content = toml::to_string(&receipt)
-                .map_err(|e| anyhow::anyhow!("failed to serialize receipt: {e}"))?;
-            let receipt_remote =
-                format!("{}/passthrough.{sync_name}.toml", begin_resp.incoming_dir);
-            write_remote_file(host, &receipt_remote, &receipt_content)?;
+                let passthrough_rsync_dest = format!("{}:{}/", host, dest.passthrough_dest);
+                info!(
+                    sync = sync_name,
+                    from = from_path,
+                    dest = %dest.passthrough_dest,
+                    mode = "passthrough",
+                    "passthrough rsync started"
+                );
+                let mut pt_args = build_rsync_args(from_path, &passthrough_rsync_dest);
+                let pt_filter_arg =
+                    format!("--filter=merge {}", passthrough_file.to_string_lossy());
+                pt_args.insert(5, pt_filter_arg);
+                let pt_status = std::process::Command::new("rsync")
+                    .args(&pt_args)
+                    .status()
+                    .with_context(|| {
+                        format!("failed to execute passthrough rsync for {from_path}")
+                    })?;
+                if !pt_status.success() {
+                    anyhow::bail!("passthrough rsync failed for sync mapping '{sync_name}'");
+                }
+                info!(sync = sync_name, mode = "passthrough", "rsync complete");
+
+                // Write passthrough receipt only after successful passthrough rsync
+                let receipt = purgery_core::PassthroughReceipt {
+                    sync_name: sync_name.to_owned(),
+                    status: "imported".into(),
+                };
+                let receipt_content = toml::to_string(&receipt)
+                    .map_err(|e| anyhow::anyhow!("failed to serialize receipt: {e}"))?;
+                let receipt_remote =
+                    format!("{}/passthrough.{sync_name}.toml", begin_resp.incoming_dir);
+                write_remote_file(host, &receipt_remote, &receipt_content)?;
+            } else {
+                info!(
+                    sync = sync_name,
+                    mode = "passthrough",
+                    "no passthrough roots, skipping rsync"
+                );
+            }
 
             // Early cleanup for passthrough regular files
             if sync.delete_after_import {
@@ -545,25 +576,40 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
             }
 
             // --- Purgatory rsync: selected entries to staging ---
-            let purgatory_rsync_dest = format!("{}:{}/", host, dest.purgatory_dest);
-            info!(
-                sync = sync_name,
-                from = from_path,
-                dest = %dest.purgatory_dest,
-                mode = "purgatory",
-                "purgatory rsync started"
-            );
-            let mut pg_args = build_rsync_args(from_path, &purgatory_rsync_dest);
-            let pg_filter_arg = format!("--filter=merge {}", purgatory_file.to_string_lossy());
-            pg_args.insert(5, pg_filter_arg);
-            let pg_status = std::process::Command::new("rsync")
-                .args(&pg_args)
-                .status()
-                .with_context(|| format!("failed to execute purgatory rsync for {from_path}"))?;
-            if !pg_status.success() {
-                anyhow::bail!("purgatory rsync failed for sync mapping '{sync_name}'");
+            // Skip if no purgatory transfer roots for this sync
+            if !purgatory_roots.is_empty() {
+                let purgatory_filter = purgery_core::transfer_set_filter(&purgatory_roots);
+                fs::write(&purgatory_file, &purgatory_filter)
+                    .with_context(|| "failed to write purgatory filter")?;
+
+                let purgatory_rsync_dest = format!("{}:{}/", host, dest.purgatory_dest);
+                info!(
+                    sync = sync_name,
+                    from = from_path,
+                    dest = %dest.purgatory_dest,
+                    mode = "purgatory",
+                    "purgatory rsync started"
+                );
+                let mut pg_args = build_rsync_args(from_path, &purgatory_rsync_dest);
+                let pg_filter_arg = format!("--filter=merge {}", purgatory_file.to_string_lossy());
+                pg_args.insert(5, pg_filter_arg);
+                let pg_status = std::process::Command::new("rsync")
+                    .args(&pg_args)
+                    .status()
+                    .with_context(|| {
+                        format!("failed to execute purgatory rsync for {from_path}")
+                    })?;
+                if !pg_status.success() {
+                    anyhow::bail!("purgatory rsync failed for sync mapping '{sync_name}'");
+                }
+                info!(sync = sync_name, mode = "purgatory", "rsync complete");
+            } else {
+                info!(
+                    sync = sync_name,
+                    mode = "purgatory",
+                    "no purgatory roots, skipping rsync"
+                );
             }
-            info!(sync = sync_name, mode = "purgatory", "rsync complete");
 
             // Check heartbeat
             if let Some(err) = hb_error.lock().unwrap().take() {

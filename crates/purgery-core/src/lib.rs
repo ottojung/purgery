@@ -1607,18 +1607,28 @@ pub fn build_rsync_args(source: &str, destination: &str) -> Vec<String> {
     ]
 }
 
-/// Generate rsync filter file content from a set of exact entry paths.
+/// A transfer root: either an exact path or a subtree directory root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransferRoot {
+    /// Exact path: regular file, symlink, or empty directory transferred as one entry.
+    Exact(String),
+    /// Subtree root: postprocessed directory whose entire subtree is transferred.
+    Subtree(String),
+}
+
+/// Generate rsync filter file content from a set of transfer roots.
 ///
-/// The filter includes directories needed for traversal to reach each path,
-/// then includes the exact paths, then excludes everything else.
-/// Used for both passthrough and purgatory transfer sets.
-pub fn transfer_set_filter(paths: &[String]) -> String {
+/// For exact roots: include ancestor directories and the exact path.
+/// For subtree roots: include ancestor directories, the directory, and all descendants (`dir/**`).
+/// Then excludes everything else.
+pub fn transfer_set_filter(roots: &[TransferRoot]) -> String {
     let mut lines: Vec<String> = Vec::new();
-    // Collect all ancestor directories needed for traversal
     let mut dirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for path in paths {
-        // Add the path itself
-        // Add all parent directories
+
+    for root in roots {
+        let path = match root {
+            TransferRoot::Exact(p) | TransferRoot::Subtree(p) => p,
+        };
         if let Some(parent) = std::path::Path::new(path).parent() {
             let mut ancestor = String::new();
             for component in parent.components() {
@@ -1633,15 +1643,21 @@ pub fn transfer_set_filter(paths: &[String]) -> String {
             }
         }
     }
-    // Include all ancestor directories for traversal
+
     for dir in &dirs {
         lines.push(format!("+ {dir}"));
     }
-    // Include exact paths
-    for path in paths {
-        lines.push(format!("+ {path}"));
+    for root in roots {
+        match root {
+            TransferRoot::Exact(path) => {
+                lines.push(format!("+ {path}"));
+            }
+            TransferRoot::Subtree(path) => {
+                lines.push(format!("+ {path}/"));
+                lines.push(format!("+ {path}/**"));
+            }
+        }
     }
-    // Exclude everything else
     lines.push("- *".to_string());
     lines.join("\n")
 }
@@ -3355,10 +3371,20 @@ color = "never"
 
     // ── Transfer filter generation tests ──
 
-    #[ignore = "expected to fail until subtree transfer roots are implemented"]
+    fn roots_exact(paths: &[&str]) -> Vec<TransferRoot> {
+        paths
+            .iter()
+            .map(|p| TransferRoot::Exact(p.to_string()))
+            .collect()
+    }
+
+    fn roots_subtree(path: &str) -> Vec<TransferRoot> {
+        vec![TransferRoot::Subtree(path.to_string())]
+    }
+
     #[test]
     fn transfer_filter_includes_subtree_for_postprocessed_directory() {
-        let filter = transfer_set_filter(&["album".to_string()]);
+        let filter = transfer_set_filter(&roots_subtree("album"));
         assert!(
             filter.contains("+ album/**"),
             "subtree root must include descendants: {filter}"
@@ -3367,16 +3393,26 @@ color = "never"
 
     #[test]
     fn transfer_filter_includes_ancestors_and_exact_roots() {
-        let filter = transfer_set_filter(&["sub/outside.txt".to_string()]);
-        assert!(filter.contains("+ sub/"), "ancestor dir must be included: {filter}");
-        assert!(filter.contains("+ sub/outside.txt"), "exact root must be included: {filter}");
-        assert!(!filter.contains("+ sub/**"), "exact root must not have subtree pattern: {filter}");
+        let filter = transfer_set_filter(&roots_exact(&["sub/outside.txt"]));
+        assert!(
+            filter.contains("+ sub/"),
+            "ancestor dir must be included: {filter}"
+        );
+        assert!(
+            filter.contains("+ sub/outside.txt"),
+            "exact root must be included: {filter}"
+        );
+        assert!(
+            !filter.contains("+ sub/**"),
+            "exact root must not have subtree pattern: {filter}"
+        );
     }
 
-    #[ignore = "expected to fail until subtree transfer roots are implemented"]
     #[test]
     fn transfer_filter_for_directory_root_includes_both_dir_and_descendants() {
-        let filter = transfer_set_filter(&["album".to_string(), "outside.txt".to_string()]);
+        let mut roots = roots_subtree("album");
+        roots.push(TransferRoot::Exact("outside.txt".to_string()));
+        let filter = transfer_set_filter(&roots);
         assert!(
             filter.contains("+ album/"),
             "directory root must include dir/: {filter}"
@@ -3385,29 +3421,41 @@ color = "never"
             filter.contains("+ album/**"),
             "subtree root must include descendants: {filter}"
         );
-        assert!(filter.contains("+ outside.txt"), "exact root must be included: {filter}");
+        assert!(
+            filter.contains("+ outside.txt"),
+            "exact root must be included: {filter}"
+        );
     }
 
     #[test]
     fn transfer_filter_excludes_everything_else() {
-        let filter = transfer_set_filter(&["a.txt".to_string()]);
-        assert!(filter.ends_with("- *\n") || filter.ends_with("- *"), "filter must end with exclude all: {filter}");
+        let filter = transfer_set_filter(&roots_exact(&["a.txt"]));
+        assert!(
+            filter.ends_with("- *\n") || filter.ends_with("- *"),
+            "filter must end with exclude all: {filter}"
+        );
     }
 
-    #[ignore = "expected to fail until subtree transfer roots are implemented"]
     #[test]
     fn transfer_filter_nested_subtree_includes_all_ancestors() {
-        let filter = transfer_set_filter(&["a/b/album".to_string()]);
-        assert!(filter.contains("+ a/"), "must include ancestor a/: {filter}");
-        assert!(filter.contains("+ a/b/"), "must include ancestor a/b/: {filter}");
-        assert!(filter.contains("+ a/b/album/**"), "subtree root must include descendants: {filter}");
+        let filter = transfer_set_filter(&roots_subtree("a/b/album"));
+        assert!(
+            filter.contains("+ a/"),
+            "must include ancestor a/: {filter}"
+        );
+        assert!(
+            filter.contains("+ a/b/"),
+            "must include ancestor a/b/: {filter}"
+        );
+        assert!(
+            filter.contains("+ a/b/album/**"),
+            "subtree root must include descendants: {filter}"
+        );
     }
 
-    #[ignore = "expected to fail until subtree transfer roots are implemented"]
     #[test]
     fn transfer_filter_excludes_covered_descendants_from_independent_roots() {
-        // Covered descendants must not appear as independent transfer roots.
-        let filter = transfer_set_filter(&["album".to_string(), "album/song.mp3".to_string()]);
+        let filter = transfer_set_filter(&roots_subtree("album"));
         assert!(
             !filter.contains("song.mp3"),
             "covered descendants must not be independent roots: {filter}"
