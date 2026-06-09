@@ -162,6 +162,40 @@ for = ["videos"]
 
 Before a sync group is scanned, the client computes `applicable_rules(sync_name)`. A rule is applicable when its `for` is omitted or the sync group name is listed.
 
+### Postprocessing requires delete_after_import
+
+If a sync group has one or more applicable postprocess rules, its `delete_after_import` must be `true`. This is a static config validation — it is checked before any filesystem walking.
+
+A sync group with applicable postprocess rules but `delete_after_import = false` is rejected at config parse time.
+
+```toml
+[[sync]]
+name = "videos"
+from = "/home/user/Videos"
+to = "videos"
+delete_after_import = false
+
+[[postprocess.rules]]
+match = "*.mp4"
+steps = ["compress-video"]
+# for omitted — applies to all sync groups, including "videos"
+```
+
+This config is invalid because the rule applies to `videos` and `videos` has `delete_after_import = false`.
+
+A sync group with no applicable postprocess rules is unaffected — whether `delete_after_import` is true or false.
+
+### Sync group classes
+
+After config validation, each sync group is one of:
+
+| Class | Applicable rules | delete_after_import |
+|-------|-----------------|---------------------|
+| Passthrough | none | true or false |
+| Purgatory | non-empty | true (guaranteed) |
+
+Passthrough groups do not participate in purgatory run config, server manifest, status, or processing. In mixed invocations, passthrough destinations are resolved separately from the purgatory run.
+
 ### No-rule groups
 
 If a sync group has no applicable postprocess rules and:
@@ -175,8 +209,18 @@ Each entry is classified as **passthrough** or **postprocessed** (purgatory) usi
 
 - Passthrough entries are transferred directly to final server storage by a bulk rsync call. They have no server bookkeeping: no manifest entry, no receipt, no status entry.
 - Postprocessed entries are transferred to the server's staging area, where subprocesses run before final commit. They are tracked in the server manifest and status.
+- Covered entries are descendants of a postprocessed directory. They are not transferred independently. They appear in the server manifest and status as skipped.
 
 The `match` value is an rsync include/exclude pattern. Rules are evaluated in order. The first matching rule selects the entry for postprocessing with that rule's steps. If no rule matches, the entry is passthrough.
+
+### Sync group classes
+
+Every sync group is one of two classes:
+
+- **Passthrough group**: no applicable postprocess rules. `delete_after_import` may be true or false. The group is handled entirely outside the purgatory run lifecycle.
+- **Purgatory group**: one or more applicable postprocess rules. `delete_after_import` must be `true`. The group participates in the purgatory run (walk, manifest, upload, server processing).
+
+Passthrough groups are not included in the uploaded `run.toml`, do not appear in the server manifest or status, and have no server-side bookkeeping of any kind.
 
 Supported rsync pattern syntax:
 
@@ -275,7 +319,9 @@ This is the only cleanup mechanism. It is used for both pure passthrough invocat
 
 ## Run config
 
-The uploaded run configuration (`run.toml`) is a subset of the client config. It includes `nickname`, sync mappings (name + `to` path only), and postprocess rules. It does **not** include server host/command, `purgery_root`, or local source `from` paths. This keeps server topology server-owned.
+The uploaded run configuration (`run.toml`) is a subset of the client config. It includes `nickname`, purgatory sync mappings (name + `to` path + `delete_after_import`), and postprocess rules. Only sync groups with applicable postprocess rules (purgatory groups) are included. Passthrough-only groups are resolved separately via `resolve-destinations`.
+
+It does **not** include server host/command, `purgery_root`, or local source `from` paths. This keeps server topology server-owned.
 
 ```toml
 nickname = "laptop"
@@ -283,11 +329,14 @@ nickname = "laptop"
 [[sync]]
 name = "videos"
 to = "videos"
+delete_after_import = true
 
 [[postprocess.rules]]
 match = "*.mp4"
 steps = ["compress-video"]
 ```
+
+The server validates that every sync in a purgatory run config has `delete_after_import = true`. If a purgatory run config includes a sync with `delete_after_import = false`, the run is rejected.
 
 ## Config strictness
 

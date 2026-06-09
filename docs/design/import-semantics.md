@@ -76,12 +76,27 @@ After each successful deletion, the cleanup state is rewritten atomically (temp 
 
 If no sync group has any postprocess roots, no server run is created. The client uses a side-effect-free `resolve-destinations` server command to obtain final storage paths, then rsyncs directly.
 
+## Sync group classes
+
+Every sync group is one of two classes determined at config validation time:
+
+- **Passthrough group**: no applicable postprocess rules. `delete_after_import` may be true or false. The group is handled entirely by direct rsync outside the purgatory lifecycle.
+- **Purgatory group**: one or more applicable postprocess rules and `delete_after_import = true`. The group participates in walking, manifest building, upload, and server processing.
+
+Passthrough groups are not included in the uploaded run config, server manifest, or status. In mixed invocations, passthrough destinations are resolved separately through the side-effect-free `resolve-destinations` command.
+
+If a sync group has applicable postprocess rules but `delete_after_import = false`, config validation rejects it before any filesystem walking.
+
 ## Transfer model
 
-The client generates two transfer sets per sync group:
+The client generates transfer sets per sync group according to its class:
+
+For purgatory groups:
 
 1. **Passthrough transfer set**: exact-path roots for entries with mode `passthrough` (regular files, symlinks, empty directories). Transferred directly to final storage.
 2. **Purgatory transfer set**: exact-path roots for ordinary postprocess entries plus subtree roots for postprocessed directories. Transferred to the staging area.
+
+For passthrough groups, the entire source tree is transferred via one direct unfiltered rsync to final storage. No transfer sets, no manifest, no server bookkeeping.
 
 If a transfer set is empty, the corresponding rsync call is skipped entirely.
 

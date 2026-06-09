@@ -127,11 +127,24 @@ for = ["videos"]
 
 When classifying a manifest entry, only rules applicable to its sync group participate. A rule is applicable when its `for` is omitted or the entry's sync group name appears in the list.
 
+### Postprocessing requires delete_after_import
+
+If a sync group has one or more applicable postprocess rules, `delete_after_import` must be `true`. This is validated statically at config parse time, before any filesystem walking or server operations. A sync group with applicable rules but `delete_after_import = false` is rejected.
+
+### Sync group classes
+
+Every sync group is one of two classes:
+
+- **Passthrough group**: no applicable postprocess rules. `delete_after_import` may be true or false. No server-side bookkeeping.
+- **Purgatory group**: one or more applicable postprocess rules. `delete_after_import` is guaranteed `true`. Participates in walk, manifest, upload, and server processing.
+
+Passthrough groups are not included in the uploaded `run.toml`, server manifest, or status. In mixed invocations, passthrough destinations are resolved separately via `resolve-destinations`.
+
 ### No-rule groups
 
-If a sync group has no applicable postprocess rules and `delete_after_import = false`, it is handled by one direct unfiltered rsync. No walking, scanning, classification, or bookkeeping occurs.
+A sync group with no applicable postprocess rules (passthrough group) and `delete_after_import = false` is handled by one direct unfiltered rsync. No walking, scanning, classification, or bookkeeping occurs.
 
-If a sync group has no applicable postprocess rules but `delete_after_import = true`, it is handled by direct rsync plus durable local cleanup state. Scanning and identity computation are performed only for cleanup.
+A sync group with no applicable postprocess rules but `delete_after_import = true` is handled by direct rsync plus durable local cleanup state. Scanning and identity computation are performed only for cleanup.
 
 ### Empty transfer sets
 
