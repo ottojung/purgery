@@ -801,8 +801,11 @@ pub fn move_to_failed(
     Ok(())
 }
 
-/// Process once: scan ready runs and process each one.
+/// Process once: run GC, then scan ready runs and process each one.
 pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
+    // Run GC opportunistically
+    let _ = run_gc(config);
+
     let ready_runs = find_ready_runs(&config.purgery_root)?;
     if ready_runs.is_empty() {
         eprintln!("no ready runs found");
@@ -830,8 +833,8 @@ pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
 /// Creates the incoming directory and prints a machine-readable TOML
 /// response with server-derived paths.
 pub fn begin_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> Result<String> {
-    // Run server checks before mutation
-    server_check(config)?;
+    // Run GC opportunistically before creating the run
+    let _ = run_gc(config);
 
     // Check run does not already exist in any phase
     let phases = [
@@ -861,8 +864,33 @@ pub fn begin_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> 
     let run_config_path = incoming_path.join("run.toml");
     let manifest_path = incoming_path.join("manifest.toml");
 
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
     fs::create_dir_all(&files_dir)
         .with_context(|| format!("failed to create files dir: {}", files_dir.as_str()))?;
+
+    // Write lease file
+    let lease = purgery_core::LeaseFile {
+        protocol_version: 1,
+        nickname: nickname.as_str().to_owned(),
+        run_id: run_id.as_str().to_owned(),
+        created_at_unix_secs: now,
+        last_heartbeat_unix_secs: now,
+        expires_at_unix_secs: now + config.gc.incoming_lease_secs,
+    };
+    let lease_content =
+        toml::to_string(&lease).map_err(|e| anyhow::anyhow!("failed to serialize lease: {e}"))?;
+    let lease_tmp = incoming_path.join("lease.toml.tmp");
+    fs::write(lease_tmp.as_std_path(), &lease_content)
+        .with_context(|| "failed to write lease file")?;
+    fs::rename(
+        lease_tmp.as_std_path(),
+        incoming_path.join("lease.toml").as_std_path(),
+    )
+    .with_context(|| "failed to commit lease file")?;
 
     let response = purgery_core::BeginRunResponse {
         protocol_version: 1,
@@ -872,6 +900,7 @@ pub fn begin_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> 
         files_dir: files_dir.as_str().to_owned(),
         run_config_path: run_config_path.as_str().to_owned(),
         manifest_path: manifest_path.as_str().to_owned(),
+        heartbeat_interval_secs: config.gc.heartbeat_interval_secs,
     };
 
     toml::to_string(&response)
@@ -880,9 +909,6 @@ pub fn begin_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> 
 
 /// Server-side subcommand: finish a run by moving from incoming to ready.
 pub fn finish_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> Result<()> {
-    // Run server checks before mutation
-    server_check(config)?;
-
     let incoming_path = config
         .purgery_root
         .run_dir(nickname, run_id, RunPhase::Incoming);
@@ -956,53 +982,41 @@ pub fn read_run_status(
     );
 }
 
-/// Boot-time server check: verify config, paths, and subprocess programs.
+/// Side-effect-free server check: verify config and programs without creating anything.
 pub fn server_check(config: &ServerConfig) -> Result<()> {
     eprintln!("checking server configuration...");
 
-    // Check root path
+    // Check root path exists and is a directory
     let root_path = config.root.as_path();
-    if root_path.exists() {
-        if !root_path.is_dir() {
-            anyhow::bail!(
-                "root path '{}' exists but is not a directory",
-                root_path.as_str()
-            );
-        }
-    } else {
-        fs::create_dir_all(root_path.as_std_path())
-            .with_context(|| format!("failed to create root: {}", root_path.as_str()))?;
-        eprintln!("  created root: {}", root_path.as_str());
+    if !root_path.exists() {
+        anyhow::bail!(
+            "root path '{}' does not exist (run `purgery-server bootstrap` to create it)",
+            root_path.as_str()
+        );
     }
-    eprintln!("  root: {} (accessible)", root_path.as_str());
+    if !root_path.is_dir() {
+        anyhow::bail!(
+            "root path '{}' exists but is not a directory",
+            root_path.as_str()
+        );
+    }
+    eprintln!("  root: {} (exists)", root_path.as_str());
 
-    // Check purgery_root path
+    // Check purgery_root path exists and is a directory
     let purgery_path = config.purgery_root.as_path();
-    if purgery_path.exists() {
-        if !purgery_path.is_dir() {
-            anyhow::bail!(
-                "purgery_root '{}' exists but is not a directory",
-                purgery_path.as_str()
-            );
-        }
-    } else {
-        fs::create_dir_all(purgery_path.as_std_path())
-            .with_context(|| format!("failed to create purgery_root: {}", purgery_path.as_str()))?;
-        eprintln!("  created purgery_root: {}", purgery_path.as_str());
+    if !purgery_path.exists() {
+        anyhow::bail!(
+            "purgery_root '{}' does not exist (run `purgery-server bootstrap` to create it)",
+            purgery_path.as_str()
+        );
     }
-    eprintln!("  purgery_root: {} (accessible)", purgery_path.as_str());
-
-    // Check phase directories
-    for phase in &[
-        RunPhase::Incoming,
-        RunPhase::Ready,
-        RunPhase::Processing,
-        RunPhase::Done,
-        RunPhase::Failed,
-    ] {
-        // Just verify the base name is valid
-        eprintln!("  phase '{}' directory: valid", phase.as_str());
+    if !purgery_path.is_dir() {
+        anyhow::bail!(
+            "purgery_root '{}' exists but is not a directory",
+            purgery_path.as_str()
+        );
     }
+    eprintln!("  purgery_root: {} (exists)", purgery_path.as_str());
 
     // Check postprocess programs
     for (name, step) in &config.postprocess.steps {
@@ -1030,6 +1044,210 @@ pub fn server_check(config: &ServerConfig) -> Result<()> {
     }
 
     eprintln!("server configuration: OK");
+    Ok(())
+}
+
+/// Bootstrap: create root and purgery_root directories.
+pub fn bootstrap(config: &ServerConfig) -> Result<()> {
+    eprintln!("bootstrapping server directories...");
+
+    let root_path = config.root.as_path();
+    fs::create_dir_all(root_path.as_std_path())
+        .with_context(|| format!("failed to create root: {}", root_path.as_str()))?;
+    eprintln!("  created root: {}", root_path.as_str());
+
+    let purgery_path = config.purgery_root.as_path();
+    fs::create_dir_all(purgery_path.as_std_path())
+        .with_context(|| format!("failed to create purgery_root: {}", purgery_path.as_str()))?;
+    eprintln!("  created purgery_root: {}", purgery_path.as_str());
+
+    eprintln!("bootstrap complete");
+    Ok(())
+}
+
+/// Run GC: collect expired incoming runs.
+pub fn run_gc(config: &ServerConfig) -> Result<()> {
+    let gc_config = &config.gc;
+    let purgery_path = config.purgery_root.as_path();
+
+    if !purgery_path.exists() {
+        return Ok(());
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    for entry in fs::read_dir(purgery_path.as_std_path())
+        .with_context(|| format!("failed to read purgery root: {}", purgery_path.as_str()))?
+    {
+        let entry = entry?;
+        let nickname_path = entry.path();
+        if !nickname_path.is_dir() {
+            continue;
+        }
+        let nickname_str = match nickname_path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_owned(),
+            None => continue,
+        };
+        let Ok(nickname) = Nickname::new(nickname_str) else {
+            continue;
+        };
+
+        let incoming_dir = nickname_path.join("incoming");
+        if !incoming_dir.exists() {
+            continue;
+        }
+
+        for run_entry in fs::read_dir(&incoming_dir)
+            .with_context(|| format!("failed to read incoming dir: {}", incoming_dir.display()))?
+        {
+            let run_entry = run_entry?;
+            let run_path = run_entry.path();
+            if !run_path.is_dir() {
+                continue;
+            }
+            let run_id_str = match run_path.file_name().and_then(|n| n.to_str()) {
+                Some(s) => s.to_owned(),
+                None => continue,
+            };
+            let Ok(run_id) = RunId::new(run_id_str) else {
+                continue;
+            };
+
+            let lease_path = Utf8PathBuf::from_path_buf(run_path.join("lease.toml"))
+                .unwrap_or_else(|p| Utf8PathBuf::from(p.to_string_lossy().as_ref()));
+
+            let expired = if lease_path.exists() {
+                match fs::read_to_string(lease_path.as_std_path()) {
+                    Ok(content) => {
+                        match toml::from_str::<purgery_core::LeaseFile>(&content) {
+                            Ok(lease) => now >= lease.expires_at_unix_secs,
+                            Err(_) => true, // malformed lease -> expire
+                        }
+                    }
+                    Err(_) => true,
+                }
+            } else {
+                // No lease file — use mtime as fallback
+                let metadata = match fs::metadata(&run_path) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                let mtime = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .unwrap_or_default()
+                    .as_secs();
+                // Treat as expired if mtime is older than lease_secs
+                now.saturating_sub(mtime) > gc_config.incoming_lease_secs * 2
+            };
+
+            if !expired {
+                continue;
+            }
+
+            eprintln!(
+                "gc: collecting expired incoming run {}/{}",
+                nickname.as_str(),
+                run_id.as_str()
+            );
+
+            // Move to failed with a status
+            let failed_path = config
+                .purgery_root
+                .run_dir(&nickname, &run_id, RunPhase::Failed);
+            if failed_path.exists() {
+                // GC quarantine path
+                let quarantine_name = format!("gc-quarantine-{}-{}", run_id.as_str(), now);
+                let quarantine_path = config.purgery_root.run_dir(
+                    &nickname,
+                    &RunId::new(quarantine_name).unwrap(),
+                    RunPhase::Failed,
+                );
+                if let Some(parent) = quarantine_path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::rename(&run_path, quarantine_path.as_std_path());
+                continue;
+            }
+
+            if let Some(parent) = failed_path.parent() {
+                let _ = fs::create_dir_all(parent.as_std_path());
+            }
+
+            // Claim the abandoned run by renaming incoming to failed
+            if let Err(e) = fs::rename(&run_path, failed_path.as_std_path()) {
+                eprintln!(
+                    "gc: failed to claim abandoned run {}/{}: {e}",
+                    nickname.as_str(),
+                    run_id.as_str()
+                );
+                continue;
+            }
+
+            // Write failed status
+            let status = RunStatus {
+                run_id: run_id.clone(),
+                nickname: nickname.clone(),
+                state: RunState::Failed,
+                files: vec![],
+                error: Some("abandoned upload expired".into()),
+            };
+            if let Ok(toml_str) = status.to_toml() {
+                let status_path = failed_path.join("status.toml");
+                let tmp_path = failed_path.join("status.toml.tmp");
+                if fs::write(&tmp_path, &toml_str).is_ok() {
+                    let _ = fs::rename(&tmp_path, &status_path);
+                }
+            }
+
+            // Remove uploaded files to reclaim disk, keep metadata
+            let files_dir = failed_path.join("files");
+            if files_dir.exists() {
+                let _ = fs::remove_dir_all(files_dir.as_std_path());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Heartbeat: update lease file for an incoming run.
+pub fn heartbeat_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> Result<()> {
+    let incoming_path = config
+        .purgery_root
+        .run_dir(nickname, run_id, RunPhase::Incoming);
+    if !incoming_path.exists() {
+        anyhow::bail!(
+            "run {}/{} is not in incoming phase",
+            nickname.as_str(),
+            run_id.as_str()
+        );
+    }
+
+    let lease_path = incoming_path.join("lease.toml");
+    let lease_content = fs::read_to_string(lease_path.as_std_path())
+        .with_context(|| "failed to read lease file")?;
+    let mut lease: purgery_core::LeaseFile =
+        toml::from_str(&lease_content).with_context(|| "failed to parse lease file")?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    lease.last_heartbeat_unix_secs = now;
+    lease.expires_at_unix_secs = now + config.gc.incoming_lease_secs;
+
+    let new_content = toml::to_string(&lease).with_context(|| "failed to serialize lease")?;
+    let tmp_path = incoming_path.join("lease.toml.tmp");
+    fs::write(tmp_path.as_std_path(), &new_content).with_context(|| "failed to write lease")?;
+    fs::rename(tmp_path.as_std_path(), lease_path.as_std_path())
+        .with_context(|| "failed to commit lease")?;
+
     Ok(())
 }
 
@@ -1063,6 +1281,7 @@ mod tests {
             root: ServerRoot::new(server_root.to_owned()).unwrap(),
             purgery_root: PurgeryRoot::new(purgery_root.to_owned()).unwrap(),
             state_dir: None,
+            gc: Default::default(),
             log_dir: None,
             postprocess: PostprocessConfig::default(),
         }
@@ -1500,6 +1719,7 @@ to = "{}"
             root: ServerRoot::new("/data".into()).unwrap(),
             purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             state_dir: None,
+            gc: Default::default(),
             log_dir: None,
             postprocess: PostprocessConfig {
                 max_parallel_jobs: 1,
@@ -1556,6 +1776,7 @@ to = "{}"
             root: ServerRoot::new(server_str.into()).unwrap(),
             purgery_root: PurgeryRoot::new(purgery_root.as_str().into()).unwrap(),
             state_dir: None,
+            gc: Default::default(),
             log_dir: None,
             postprocess: PostprocessConfig {
                 max_parallel_jobs: 1,
@@ -1648,6 +1869,7 @@ steps = ["compress-video"]
             root: ServerRoot::new("/data".into()).unwrap(),
             purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             state_dir: None,
+            gc: Default::default(),
             log_dir: None,
             postprocess: PostprocessConfig {
                 max_parallel_jobs: 1,
@@ -1702,6 +1924,7 @@ steps = ["compress-video"]
             root: ServerRoot::new("/data".into()).unwrap(),
             purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             state_dir: None,
+            gc: Default::default(),
             log_dir: None,
             postprocess: PostprocessConfig {
                 max_parallel_jobs: 1,
@@ -1760,6 +1983,7 @@ steps = ["compress-video"]
             root: ServerRoot::new("/data".into()).unwrap(),
             purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             state_dir: None,
+            gc: Default::default(),
             log_dir: None,
             postprocess: PostprocessConfig {
                 max_parallel_jobs: 1,
@@ -2222,6 +2446,7 @@ steps = ["compress-video"]
             root: ServerRoot::new(server_root.as_str().into()).unwrap(),
             purgery_root: PurgeryRoot::new(purgery_root.as_str().into()).unwrap(),
             state_dir: None,
+            gc: Default::default(),
             log_dir: None,
             postprocess: PostprocessConfig {
                 max_parallel_jobs: 1,
@@ -2319,6 +2544,7 @@ steps = ["compress-video"]
             root: ServerRoot::new(server_root.as_str().into()).unwrap(),
             purgery_root: PurgeryRoot::new(purgery_root.as_str().into()).unwrap(),
             state_dir: None,
+            gc: Default::default(),
             log_dir: None,
             postprocess: PostprocessConfig {
                 max_parallel_jobs: 1,
@@ -2418,6 +2644,7 @@ steps = ["compress-video"]
             root: ServerRoot::new(server_root.as_str().into()).unwrap(),
             purgery_root: PurgeryRoot::new(purgery_root.as_str().into()).unwrap(),
             state_dir: None,
+            gc: Default::default(),
             log_dir: None,
             postprocess: PostprocessConfig {
                 max_parallel_jobs: 1,
@@ -2507,6 +2734,7 @@ steps = ["compress-video"]
             root: ServerRoot::new("/data".into()).unwrap(),
             purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             state_dir: None,
+            gc: Default::default(),
             log_dir: None,
             postprocess: PostprocessConfig::default(),
         };
@@ -2531,6 +2759,7 @@ steps = ["compress-video"]
             root: ServerRoot::new("/data".into()).unwrap(),
             purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             state_dir: None,
+            gc: Default::default(),
             log_dir: None,
             postprocess: PostprocessConfig::default(),
         };
@@ -2562,6 +2791,7 @@ steps = ["compress-video"]
             )
             .unwrap(),
             state_dir: None,
+            gc: Default::default(),
             log_dir: None,
             postprocess: PostprocessConfig::default(),
         };
@@ -2593,6 +2823,7 @@ steps = ["compress-video"]
             )
             .unwrap(),
             state_dir: None,
+            gc: Default::default(),
             log_dir: None,
             postprocess: PostprocessConfig::default(),
         };
@@ -2659,6 +2890,7 @@ steps = ["compress-video"]
             )
             .unwrap(),
             state_dir: None,
+            gc: Default::default(),
             log_dir: None,
             postprocess: PostprocessConfig::default(),
         };

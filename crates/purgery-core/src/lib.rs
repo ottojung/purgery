@@ -144,10 +144,20 @@ pub struct ResolvedExecutable {
     pub path: Utf8PathBuf,
 }
 
+/// Check that a path is a regular file (follows symlinks).
+/// Returns true if the target is a regular file.
+fn is_regular_file(path: &Utf8Path) -> bool {
+    std::fs::metadata(path.as_std_path())
+        .map(|m| m.file_type().is_file())
+        .unwrap_or(false)
+}
+
 /// Resolve an executable program path.
 ///
-/// Absolute paths must exist and be executable.
-/// Relative names are searched in PATH.
+/// Rules:
+/// - Absolute path: follow symlinks, require target exists and is a regular file, require executable bit set.
+/// - Relative name: search PATH, follow symlinks, require target is regular file, require executable bit set.
+/// - Directories and broken symlinks are rejected.
 pub fn resolve_executable(program: &str) -> Result<ResolvedExecutable, ExecutableError> {
     if program.is_empty() {
         return Err(ExecutableError::EmptyProgram);
@@ -159,21 +169,31 @@ pub fn resolve_executable(program: &str) -> Result<ResolvedExecutable, Executabl
         if !program_path.exists() {
             return Err(ExecutableError::AbsoluteNotFound(program.to_owned()));
         }
+        // Check it's not a directory
+        if program_path.is_dir() {
+            return Err(ExecutableError::NotExecutable(format!(
+                "'{}' is a directory",
+                program
+            )));
+        }
+        // Follow symlinks to verify target is a regular file
+        if !is_regular_file(program_path) {
+            return Err(ExecutableError::NotExecutable(format!(
+                "'{}' target is not a regular file",
+                program
+            )));
+        }
         let meta = std::fs::symlink_metadata(program_path.as_std_path())
             .map_err(|e| ExecutableError::Io(program.to_owned(), e))?;
-        let is_executable = meta.file_type().is_symlink() || {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                meta.permissions().mode() & 0o111 != 0
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if meta.permissions().mode() & 0o111 == 0 {
+                return Err(ExecutableError::NotExecutable(format!(
+                    "'{}' is not executable",
+                    program
+                )));
             }
-            #[cfg(not(unix))]
-            {
-                true
-            }
-        };
-        if !is_executable {
-            return Err(ExecutableError::NotExecutable(program.to_owned()));
         }
         Ok(ResolvedExecutable {
             path: program_path.to_owned(),
@@ -181,29 +201,77 @@ pub fn resolve_executable(program: &str) -> Result<ResolvedExecutable, Executabl
     } else {
         let path_var = std::env::var("PATH").unwrap_or_default();
         for dir in path_var.split(':') {
+            if dir.is_empty() {
+                continue;
+            }
             let candidate = Utf8Path::new(dir).join(program);
             if !candidate.exists() {
                 continue;
             }
+            if candidate.is_dir() {
+                continue;
+            }
+            if !is_regular_file(&candidate) {
+                continue;
+            }
             let meta = std::fs::symlink_metadata(candidate.as_std_path())
                 .map_err(|e| ExecutableError::Io(program.to_owned(), e))?;
-            let is_executable = meta.file_type().is_symlink() || {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    meta.permissions().mode() & 0o111 != 0
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if meta.permissions().mode() & 0o111 == 0 {
+                    continue;
                 }
-                #[cfg(not(unix))]
-                {
-                    true
-                }
-            };
-            if is_executable {
-                return Ok(ResolvedExecutable { path: candidate });
             }
+            return Ok(ResolvedExecutable { path: candidate });
         }
         Err(ExecutableError::NotFound(program.to_owned()))
     }
+}
+
+// ── Lease / GC Config ────────────────────────────────────────────────
+
+/// Default incoming lease time in seconds.
+const DEFAULT_INCOMING_LEASE_SECS: u64 = 1800;
+
+/// Default heartbeat interval in seconds.
+const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 60;
+
+/// GC configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GCConfig {
+    #[serde(default = "default_incoming_lease_secs")]
+    pub incoming_lease_secs: u64,
+    #[serde(default = "default_heartbeat_interval_secs")]
+    pub heartbeat_interval_secs: u64,
+}
+
+impl Default for GCConfig {
+    fn default() -> Self {
+        GCConfig {
+            incoming_lease_secs: DEFAULT_INCOMING_LEASE_SECS,
+            heartbeat_interval_secs: DEFAULT_HEARTBEAT_INTERVAL_SECS,
+        }
+    }
+}
+
+fn default_incoming_lease_secs() -> u64 {
+    DEFAULT_INCOMING_LEASE_SECS
+}
+
+fn default_heartbeat_interval_secs() -> u64 {
+    DEFAULT_HEARTBEAT_INTERVAL_SECS
+}
+
+/// Lease file written to incoming run directories.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeaseFile {
+    pub protocol_version: u32,
+    pub nickname: String,
+    pub run_id: String,
+    pub created_at_unix_secs: u64,
+    pub last_heartbeat_unix_secs: u64,
+    pub expires_at_unix_secs: u64,
 }
 
 // ── Run Phase ────────────────────────────────────────────────────────
@@ -865,6 +933,7 @@ pub struct FileStatusEntry {
 
 /// Server configuration, loaded from a TOML file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub root: ServerRoot,
     pub purgery_root: PurgeryRoot,
@@ -874,6 +943,8 @@ pub struct ServerConfig {
     pub log_dir: Option<Utf8PathBuf>,
     #[serde(default)]
     pub postprocess: PostprocessConfig,
+    #[serde(default)]
+    pub gc: GCConfig,
 }
 
 /// Postprocessing configuration (server-side).
@@ -991,6 +1062,7 @@ impl PostprocessStepDefinition {
 
 /// Client configuration, loaded from a TOML file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientConfig {
     pub nickname: Nickname,
     pub server: ServerConnection,
@@ -1008,6 +1080,7 @@ impl ClientConfig {
 
 /// Server connection details for the client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConnection {
     pub host: RemoteHost,
     #[serde(default = "default_server_command")]
@@ -1020,6 +1093,7 @@ fn default_server_command() -> String {
 
 /// A single sync mapping from local path to server destination.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SyncMapping {
     pub name: SyncName,
     #[serde(rename = "from")]
@@ -1082,6 +1156,7 @@ pub struct BeginRunResponse {
     pub files_dir: String,
     pub run_config_path: String,
     pub manifest_path: String,
+    pub heartbeat_interval_secs: u64,
 }
 
 // ── Parsing Helpers ──────────────────────────────────────────────────

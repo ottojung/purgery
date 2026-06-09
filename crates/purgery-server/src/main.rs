@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use purgery_core::{Nickname, RunId, ServerConfig};
-use purgery_server::{begin_run, finish_run, process_once_raw, read_run_status, server_check};
+use purgery_server::{
+    begin_run, bootstrap, finish_run, heartbeat_run, process_once_raw, read_run_status, run_gc,
+    server_check,
+};
 use std::fs;
 
 fn load_server_config(config_path: &str) -> Result<ServerConfig> {
@@ -70,8 +73,19 @@ enum Command {
         #[arg(long)]
         run_id: String,
     },
-    /// Check server configuration and dependencies
+    /// Check server configuration and dependencies (side-effect-free)
     Check,
+    /// Bootstrap server directories (creates root and purgery_root)
+    Bootstrap,
+    /// Run garbage collection on expired incoming runs
+    Gc,
+    /// Send heartbeat for an incoming run
+    HeartbeatRun {
+        #[arg(long)]
+        nickname: String,
+        #[arg(long)]
+        run_id: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -120,6 +134,17 @@ fn main() -> Result<()> {
         }
         Command::Check => {
             call_with_config(&|config| server_check(config))?;
+        }
+        Command::Bootstrap => {
+            call_with_config(&|config| bootstrap(config))?;
+        }
+        Command::Gc => {
+            call_with_config(&|config| run_gc(config))?;
+        }
+        Command::HeartbeatRun { nickname, run_id } => {
+            let nickname = Nickname::new(nickname).with_context(|| "invalid nickname")?;
+            let run_id = RunId::new(run_id).with_context(|| "invalid run ID")?;
+            call_with_config(&|config| heartbeat_run(config, &nickname, &run_id))?;
         }
     }
 

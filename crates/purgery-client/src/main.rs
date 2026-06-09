@@ -137,7 +137,8 @@ fn build_run_config(config: &ClientConfig) -> RunConfig {
     }
 }
 
-/// Client boot-time check: verify ssh, rsync, and server connectivity.
+/// Client boot-time check: verify local executables and config only.
+/// Does NOT SSH into the server or mutate anything.
 fn client_check(config_path: &str) -> Result<()> {
     eprintln!("checking client configuration...");
 
@@ -151,29 +152,17 @@ fn client_check(config_path: &str) -> Result<()> {
         eprintln!("  rsync: found at {}", r.path.as_str());
     })?;
 
-    // 3. Check server connectivity
+    // 3. Validate config
     let config_content = fs::read_to_string(config_path)
         .with_context(|| format!("failed to read client config: {config_path}"))?;
     let config = ClientConfig::from_toml(&config_content)
         .with_context(|| "failed to parse client config")?;
 
-    eprintln!(
-        "  server: checking connectivity to {}...",
-        config.server.host.as_str()
-    );
-    let result = server_cmd(
-        config.server.host.as_str(),
-        &config.server.command,
-        &["check"],
-    );
-    match result {
-        Ok(_) => eprintln!("  server: reachable"),
-        Err(e) => {
-            anyhow::bail!(
-                "server at '{}' unreachable or check failed: {e}",
-                config.server.host.as_str()
-            );
-        }
+    if config.server.host.as_str().is_empty() {
+        anyhow::bail!("server host is empty");
+    }
+    if config.server.command.is_empty() {
+        anyhow::bail!("server command is empty");
     }
 
     eprintln!("client configuration: OK");
@@ -181,7 +170,7 @@ fn client_check(config_path: &str) -> Result<()> {
 }
 
 fn sync_and_cleanup(config_path: &str) -> Result<()> {
-    // 0. Run checks before any mutation
+    // 0. Run local checks before any remote operations
     client_check(config_path)?;
 
     let config_content = fs::read_to_string(config_path)
@@ -189,7 +178,7 @@ fn sync_and_cleanup(config_path: &str) -> Result<()> {
     let config = ClientConfig::from_toml(&config_content)
         .with_context(|| "failed to parse client config")?;
 
-    // 1. Generate a unique run ID
+    // 1. Generate a unique run ID and build manifest BEFORE begin-run
     let run_id = RunId::generate();
     let host = config.server.host.as_str();
     let server_command = &config.server.command;
@@ -199,6 +188,9 @@ fn sync_and_cleanup(config_path: &str) -> Result<()> {
         config.nickname.as_str(),
         run_id.as_str()
     );
+
+    let manifest = build_manifest(&config, &run_id)?;
+    eprintln!("discovered {} file(s) to sync", manifest.files.len());
 
     // 2. Begin run on server — get server-derived paths
     let begin_out = server_cmd(
@@ -250,11 +242,25 @@ fn sync_and_cleanup(config_path: &str) -> Result<()> {
             begin_resp.files_dir
         );
     }
+    if !files_path.starts_with(incoming_path) {
+        anyhow::bail!(
+            "begin-run response files_dir '{}' is not under incoming_dir '{}'",
+            begin_resp.files_dir,
+            begin_resp.incoming_dir
+        );
+    }
     let run_config_path = Utf8Path::new(&begin_resp.run_config_path);
     if !run_config_path.is_absolute() {
         anyhow::bail!(
             "begin-run response run_config_path is not absolute: {}",
             begin_resp.run_config_path
+        );
+    }
+    if !run_config_path.starts_with(incoming_path) {
+        anyhow::bail!(
+            "begin-run response run_config_path '{}' is not under incoming_dir '{}'",
+            begin_resp.run_config_path,
+            begin_resp.incoming_dir
         );
     }
     let manifest_path = Utf8Path::new(&begin_resp.manifest_path);
@@ -264,14 +270,17 @@ fn sync_and_cleanup(config_path: &str) -> Result<()> {
             begin_resp.manifest_path
         );
     }
+    if !manifest_path.starts_with(incoming_path) {
+        anyhow::bail!(
+            "begin-run response manifest_path '{}' is not under incoming_dir '{}'",
+            begin_resp.manifest_path,
+            begin_resp.incoming_dir
+        );
+    }
 
     eprintln!("  incoming dir: {}", begin_resp.incoming_dir);
 
-    // 3. Walk local files and build manifest
-    let manifest = build_manifest(&config, &run_id)?;
-    eprintln!("discovered {} file(s) to sync", manifest.files.len());
-
-    // 4. Write run.toml and manifest.toml to server
+    // 3. Write run.toml and manifest.toml to server
     let run_config = build_run_config(&config);
     let run_config_toml = run_config
         .to_toml()
@@ -280,7 +289,10 @@ fn sync_and_cleanup(config_path: &str) -> Result<()> {
     let manifest_toml = manifest.to_toml()?;
     write_remote_file(host, &begin_resp.manifest_path, &manifest_toml)?;
 
-    // 5. Rsync files per sync mapping
+    // 4. Rsync files per sync mapping with simple heartbeat loop
+    let heartbeat_interval = std::time::Duration::from_secs(begin_resp.heartbeat_interval_secs);
+    let mut last_heartbeat = std::time::Instant::now();
+
     for sync in &config.sync {
         let from_path = sync.from_path.as_str();
         let to_path = sync.to_path.as_str();
@@ -297,9 +309,25 @@ fn sync_and_cleanup(config_path: &str) -> Result<()> {
         if !status.success() {
             anyhow::bail!("rsync failed for sync mapping '{}'", sync.name);
         }
+
+        // Send heartbeat after each sync mapping
+        if last_heartbeat.elapsed() >= heartbeat_interval {
+            let _ = server_cmd(
+                host,
+                server_command,
+                &[
+                    "heartbeat-run",
+                    "--nickname",
+                    config.nickname.as_str(),
+                    "--run-id",
+                    run_id.as_str(),
+                ],
+            );
+            last_heartbeat = std::time::Instant::now();
+        }
     }
 
-    // 6. Finish run: move from incoming to ready
+    // 5. Finish run: move from incoming to ready
     eprintln!("finishing run...");
     server_cmd(
         host,
@@ -314,7 +342,7 @@ fn sync_and_cleanup(config_path: &str) -> Result<()> {
     )?;
     eprintln!("run moved to ready");
 
-    // 7. Poll for status via server command
+    // 6. Poll for status via server command
     let status = poll_for_status(host, server_command, &config.nickname, &run_id)?;
 
     // 8. Verify status envelope before deletion

@@ -6,17 +6,19 @@ Clients upload files to a server. The server validates runs, applies optional po
 
 ## Lifecycle
 
-1. Client runs local checks (ssh, rsync, server reachability), then calls `purgery-server begin-run` over SSH.
-2. Client validates the `begin-run` response envelope (protocol_version, nickname, run_id, all paths absolute).
-3. Client builds manifest and writes `run.toml` + `manifest.toml` to the server's incoming directory.
-4. Client rsyncs files into the server's files directory, namespaced by sync mapping destination.
-5. Client runs `purgery-server finish-run` to atomically move `incoming/` → `ready/`.
-6. Server runs server checks, then claims the run (atomic rename `ready/` → `processing/`).
-7. Server builds a `RunPlan`: compiles all regexes once, resolves step references. If invalid, the run is rejected before any file import.
-8. For each file, the server validates staged path identity (size/SHA-256), rejects symlinks, copies to a work area namespaced by sync mapping destination, applies postprocessing via subprocess using the precompiled plan, then commits each output via a same-directory temp file followed by atomic `rename`. Failed files produce per-file status entries; remaining files continue processing.
-9. Server writes `status.toml` atomically.
-10. Client polls `purgery-server status` until the run completes.
-11. Client verifies `status.nickname == manifest.nickname` and `status.run_id == manifest.run_id`, then deletes only unchanged, confirmed-imported local files.
+1. Client runs local checks (ssh, rsync executables, config validation). No SSH yet.
+2. Client generates a run ID and builds the manifest (discovers local files). No remote state created yet.
+3. Client calls `purgery-server begin-run` over SSH to create the incoming directory and get server-derived paths.
+4. Client validates the `begin-run` response envelope (protocol_version, nickname, run_id, all paths absolute, paths under incoming_dir).
+5. Client writes `run.toml` + `manifest.toml` to the server's incoming directory.
+6. Client rsyncs files into the server's files directory, namespaced by sync mapping destination, with periodic heartbeat calls to keep the lease alive.
+7. Client runs `purgery-server finish-run` to atomically move `incoming/` → `ready/`.
+8. Server claims the run (atomic rename `ready/` → `processing/`), runs GC opportunistically.
+9. Server builds a `RunPlan`: compiles all regexes once, resolves step references. If invalid, the run is rejected before any file import.
+10. For each file, the server validates staged path identity (size/SHA-256), rejects symlinks, copies to a work area namespaced by sync mapping destination, applies postprocessing via subprocess using the precompiled plan, then commits each output via a same-directory temp file followed by atomic `rename`. Failed files produce per-file status entries; remaining files continue processing.
+11. Server writes `status.toml` atomically.
+12. Client polls `purgery-server status` until the run completes.
+13. Client verifies `status.nickname == manifest.nickname` and `status.run_id == manifest.run_id`, then deletes only unchanged, confirmed-imported local files.
 
 ## Import / Commit Semantics
 
@@ -90,6 +92,10 @@ Before processing any files, the server builds a `RunPlan` that compiles all pos
 
 `purgery-server status` returns the status file if it exists and parses correctly. If a `status.toml` exists but is malformed (e.g., invalid TOML or missing required fields), the command returns a parse error rather than silently skipping it.
 
+### Config strictness
+
+All config structs use `#[serde(deny_unknown_fields)]`. Old configs with stale fields like `[server].purgery_root` are rejected with a clear error rather than silently ignored.
+
 ## Run states
 
 | Run state | Meaning |
@@ -104,11 +110,14 @@ The client communicates with the server over SSH by invoking `purgery-server` su
 
 | Subcommand | Purpose |
 |------------|---------|
-| `begin-run --nickname <n> --run-id <id>` | Creates incoming directory, prints machine-readable TOML with server-derived paths |
+| `begin-run --nickname <n> --run-id <id>` | Creates incoming directory, writes lease file, prints machine-readable TOML with server-derived paths |
 | `finish-run --nickname <n> --run-id <id>` | Atomically moves run from `incoming` to `ready` |
 | `status --nickname <n> --run-id <id>` | Returns `status.toml` from `done` or `failed` |
-| `check` | Validates server config and postprocess dependencies |
-| `process-once` | Processes one batch of ready runs |
+| `heartbeat-run --nickname <n> --run-id <id>` | Updates lease file for an incoming run |
+| `check` | Validates server config and postprocess dependencies (side-effect-free, no SSH, no dir creation) |
+| `bootstrap` | Creates `root` and `purgery_root` directories |
+| `gc` | Runs garbage collection on expired incoming runs |
+| `process-once` | Runs GC, then processes one batch of ready runs |
 
 Config discovery for server commands:
 
@@ -177,19 +186,37 @@ purgery-client check --config client.toml
 purgery-server check --config server.toml
 ```
 
-Client checks: `ssh` and `rsync` executables are resolved (via `resolve_executable`), server is reachable via `purgery-server check`.
+**`check` is local and side-effect-free.** It does not SSH into remote servers, create directories, or mutate anything.
 
-Server checks: `root` and `purgery_root` are accessible, all postprocess programs are resolved (absolute paths must exist and be executable; relative names found in PATH and must be executable), config is internally valid.
+Client checks: parses config, resolves `ssh` and `rsync` executables, validates config fields.
 
-Normal operations run the same checks before mutating state:
+Server checks: parses config, verifies `root` and `purgery_root` exist (but does not create them), resolves every postprocess `program`, validates step invariants.
 
-- `purgery-client sync-and-cleanup` calls `client_check` before `begin-run`.
-- `purgery-server process-once` calls `server_check` before scanning ready runs.
-- `purgery-server begin-run` and `purgery-server finish-run` call `server_check` before mutating state.
+If server directories do not exist, `check` reports an error suggesting `purgery-server bootstrap`.
+
+### Bootstrap
+
+To create required directories:
+
+```sh
+purgery-server bootstrap --config server.toml
+```
+
+This creates `root` and `purgery_root` if missing. It does not process runs or run GC.
+
+Setup workflow: `bootstrap` once, then `check` to verify.
+
+### Normal operation checks
+
+- `purgery-client sync-and-cleanup` calls local `client_check` before any remote operations.
+- `purgery-server process-once` and `begin-run` run GC opportunistically but do not call server check or create directories.
+- `purgery-server finish-run` validates only the specific preconditions needed for the move.
 
 ### `begin-run` single-use safety
 
 `begin-run` fails if the run ID already exists in any phase (incoming, ready, processing, done, failed). A run ID is single-use per nickname.
+
+`begin-run` writes a `lease.toml` file with creation time, heartbeat time, and expiry. The `heartbeat_interval_secs` is returned in the response.
 
 `finish-run` fails if the incoming directory does not exist or the ready directory already exists.
 
@@ -201,10 +228,64 @@ The client's `[server].command` value is a trusted shell command prefix executed
 
 Executable resolution (`purgery_core::resolve_executable`) follows these rules:
 
-- **Absolute path**: must exist, must be executable (file type is symlink or Unix executable bit is set).
-- **Relative name**: searched in `PATH`; first executable candidate wins.
+- **Absolute path**: follow symlinks, require target exists and is a regular file, require executable bit set on Unix.
+- **Relative name**: searched in `PATH`; follow symlinks, require target is regular file, require executable bit set.
+- **Directories** are rejected. **Broken symlinks** are rejected.
 
 This is used for client `ssh`, `rsync`, and server postprocess `program` values.
+
+## Heartbeat and Leases
+
+When `begin-run` creates an incoming directory, it writes a `lease.toml` file:
+
+```toml
+protocol_version = 1
+nickname = "laptop"
+run_id = "01..."
+created_at_unix_secs = 1234567890
+last_heartbeat_unix_secs = 1234567890
+expires_at_unix_secs = 1234569690
+```
+
+The client should call `heartbeat-run` periodically during upload:
+
+```sh
+purgery-server heartbeat-run --nickname laptop --run-id 01...
+```
+
+The heartbeat updates `last_heartbeat_unix_secs` and extends `expires_at_unix_secs`.
+
+During `sync-and-cleanup`, the client sends a heartbeat after each rsync sync mapping at the interval specified by `begin-run`.
+
+Server GC configuration:
+
+```toml
+[gc]
+incoming_lease_secs = 1800
+heartbeat_interval_secs = 60
+```
+
+## Server-side GC
+
+```sh
+purgery-server gc --config server.toml
+```
+
+GC scans `<purgery_root>/<nickname>/incoming/` for expired runs. A run is expired if:
+
+1. Its `lease.toml` exists and `expires_at_unix_secs` is in the past.
+2. No lease exists and the directory mtime is more than `2 × incoming_lease_secs` old.
+
+Collection:
+
+1. Rename `incoming/<run_id>` → `failed/<run_id>` (atomic claim).
+2. Write `status.toml` with `state = "failed"` and `error = "abandoned upload expired"`.
+3. Remove `failed/<run_id>/files` to reclaim disk.
+4. Keep metadata: `lease.toml`, `run.toml`, `manifest.toml`, `status.toml`.
+
+If `failed/<run_id>` already exists, the abandoned run is moved to a GC quarantine path instead of merging directories.
+
+GC is run opportunistically at the start of `process-once` and `begin-run`. It is **never** run from `check`. Expose separately for cron/systemd timers.
 
 ## Status envelope verification
 
@@ -217,8 +298,8 @@ If either mismatches, cleanup is aborted and nothing is deleted.
 
 ## Binaries
 
-- **purgery-client** — runs on user machines; syncs files and cleans up on confirmation. Supports `sync-and-cleanup` and `check`.
-- **purgery-server** — runs on the server. Supports `process-once`, `begin-run`, `finish-run`, `status`, and `check`.
+- **purgery-client** — runs on user machines; syncs files and cleans up on confirmation. Supports `sync-and-cleanup` (builds manifest before begin-run, sends heartbeats during upload) and `check` (local-only, no SSH).
+- **purgery-server** — runs on the server. Supports `process-once`, `begin-run`, `finish-run`, `status`, `heartbeat-run`, `check` (side-effect-free), `bootstrap`, and `gc`.
 
 ## Example Config
 
