@@ -1,14 +1,20 @@
 # Import Semantics
 
-## Temp-file commit
+## Commit path by output kind
 
-Outputs are never copied directly to their final user-visible path. Each committed output goes through:
+### Regular files and symlinks
+
+Committed through a same-directory temp entry followed by atomic rename:
 
 ```
 work output → final parent dir / .purgery-commit.<run_id>.<filename>.tmp → rename → final path
 ```
 
-The temp file is on the same filesystem as the final path, so the rename is atomic against readers. Temp files are cleaned up after a successful commit.
+The temp entry is on the same filesystem as the final path, so the rename is atomic against readers. Temp entries are cleaned up after a successful commit.
+
+### Directory roots
+
+Directory output roots are created, kept, or replaced directly via `commit_directory_entry`. Their descendants are then recursively overlaid using no-delete semantics. Subdirectories are created/kept directly; regular-file and symlink descendants use temp-entry + rename.
 
 ## Directory overlay semantics
 

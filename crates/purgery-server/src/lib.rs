@@ -1179,7 +1179,7 @@ pub fn process_processing_run(
                 sync_name: entry.sync_name.clone(),
                 local_path: entry.local_path.as_str().to_owned(),
                 relative_path: entry.relative_path.as_str().to_owned(),
-                error: "sync root setup failed".into(),
+                error: format!("sync root setup failed for '{}'", sync.to_path.as_str()),
             });
             continue;
         }
