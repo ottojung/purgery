@@ -437,11 +437,9 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
     // After finish-run succeeds, the run is no longer incoming.
     // A concurrent final heartbeat from the background thread may fail
     // harmlessly because the incoming directory no longer exists.
-    // Those errors are consumed by the thread itself (it breaks out of
-    // its loop on failure) and the outer hb_error is not set by a
-    // post-finish heartbeat failure.  Even if a race left an error,
-    // the sync_result above already checked before finish-run, so we
-    // ignore heartbeat errors after this point.
+    // The heartbeat thread records failures in hb_error before exiting.
+    // The sync result was checked immediately before finish-run, and
+    // post-finish heartbeat errors are intentionally ignored.
 
     // Stop heartbeat thread regardless of sync/finish outcome
     stop_hb.store(true, Ordering::Relaxed);

@@ -9,18 +9,14 @@ use std::collections::HashMap;
 use std::fs;
 use tracing::{info, span, warn, Level};
 
-/// A run-level failure — written when the run cannot be processed at all.
+/// Persist a run-level failure and move the processing directory to `failed/`.
 fn write_run_failure(
     purgery_root: &PurgeryRoot,
     nickname: &Nickname,
     run_id: &RunId,
     error_msg: &str,
-) {
+) -> Result<()> {
     let processing_path = purgery_root.run_dir(nickname, run_id, RunPhase::Processing);
-    if let Some(parent) = processing_path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-
     let status = RunStatus {
         run_id: run_id.clone(),
         nickname: nickname.clone(),
@@ -28,24 +24,46 @@ fn write_run_failure(
         files: vec![],
         error: Some(error_msg.to_owned()),
     };
+    let status_toml = status
+        .to_toml()
+        .with_context(|| "failed to serialize run failure status")?;
+    let status_path = processing_path.join("status.toml");
+    let tmp_path = processing_path.join("status.toml.tmp");
 
-    if let Ok(toml_str) = status.to_toml() {
-        let status_path = processing_path.join("status.toml");
-        let tmp_path = processing_path.join("status.toml.tmp");
-        if fs::write(&tmp_path, &toml_str).is_ok() {
-            let _ = fs::rename(&tmp_path, &status_path);
-        }
-    }
+    fs::write(&tmp_path, &status_toml).with_context(|| {
+        format!(
+            "failed to write temporary run failure status: {}",
+            tmp_path.as_str()
+        )
+    })?;
+    fs::rename(&tmp_path, &status_path).with_context(|| {
+        format!(
+            "failed to finalize run failure status: {}",
+            status_path.as_str()
+        )
+    })?;
 
     let failed_path = purgery_root.run_dir(nickname, run_id, RunPhase::Failed);
     if let Some(parent) = failed_path.parent() {
-        let _ = fs::create_dir_all(parent);
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create failed parent: {}", parent.as_str()))?;
     }
-    let _ = fs::rename(&processing_path, &failed_path);
+    fs::rename(&processing_path, &failed_path).with_context(|| {
+        format!(
+            "failed to move run-level failure to failed: {} -> {}",
+            processing_path.as_str(),
+            failed_path.as_str()
+        )
+    })?;
+
+    Ok(())
 }
 
-/// Find all ready runs across all nicknames.
-pub fn find_ready_runs(purgery_root: &PurgeryRoot) -> Result<Vec<(Nickname, RunId)>> {
+/// Find all runs in one durable phase across all nicknames.
+fn find_runs_in_phase(
+    purgery_root: &PurgeryRoot,
+    phase: RunPhase,
+) -> Result<Vec<(Nickname, RunId)>> {
     let mut runs = Vec::new();
     let purgery_path = purgery_root.as_path();
 
@@ -69,14 +87,18 @@ pub fn find_ready_runs(purgery_root: &PurgeryRoot) -> Result<Vec<(Nickname, RunI
             continue;
         };
 
-        let ready_path = nickname_path.join("ready");
-        if !ready_path.exists() {
+        let phase_path = nickname_path.join(phase.as_str());
+        if !phase_path.exists() {
             continue;
         }
 
-        for run_entry in fs::read_dir(&ready_path)
-            .with_context(|| format!("failed to read ready dir: {}", ready_path.display()))?
-        {
+        for run_entry in fs::read_dir(&phase_path).with_context(|| {
+            format!(
+                "failed to read {} dir: {}",
+                phase.as_str(),
+                phase_path.display()
+            )
+        })? {
             let run_entry = run_entry?;
             let run_path = run_entry.path();
             if !run_path.is_dir() {
@@ -91,6 +113,16 @@ pub fn find_ready_runs(purgery_root: &PurgeryRoot) -> Result<Vec<(Nickname, RunI
     }
 
     Ok(runs)
+}
+
+/// Find all ready runs across all nicknames.
+pub fn find_ready_runs(purgery_root: &PurgeryRoot) -> Result<Vec<(Nickname, RunId)>> {
+    find_runs_in_phase(purgery_root, RunPhase::Ready)
+}
+
+/// Find all interrupted or terminal-pending processing runs across all nicknames.
+pub fn find_processing_runs(purgery_root: &PurgeryRoot) -> Result<Vec<(Nickname, RunId)>> {
+    find_runs_in_phase(purgery_root, RunPhase::Processing)
 }
 
 /// Per-file outcome.
@@ -166,16 +198,43 @@ impl FileOutcome {
     }
 }
 
-/// Commit a work-area output to its final path via temp-file then atomic rename.
-///
-/// Checks that the final path does not already exist (fail-if-exists).
-fn commit_output(source: &Utf8Path, final_path: &Utf8Path, run_id: &RunId) -> Result<(), String> {
-    if final_path.exists() {
-        return Err(format!(
-            "final path already exists: {}",
+/// Result of atomically committing one final output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitDisposition {
+    Created,
+    Replaced,
+}
+
+/// Validate that a final output can be created or atomically replaced.
+fn preflight_output(final_path: &Utf8Path) -> Result<CommitDisposition, String> {
+    match fs::symlink_metadata(final_path.as_std_path()) {
+        Ok(metadata) if metadata.is_file() => Ok(CommitDisposition::Replaced),
+        Ok(metadata) if metadata.is_dir() => Err(format!(
+            "final output is blocked by a directory: {}",
             final_path.as_str()
-        ));
+        )),
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "final output is blocked by a symlink: {}",
+            final_path.as_str()
+        )),
+        Ok(_) => Err(format!(
+            "final output is blocked by a non-regular file: {}",
+            final_path.as_str()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(CommitDisposition::Created)
+        }
+        Err(error) => Err(format!("failed to inspect final output: {error}")),
     }
+}
+
+/// Commit a work-area output via a same-directory temporary file and atomic rename.
+fn commit_output(
+    source: &Utf8Path,
+    final_path: &Utf8Path,
+    run_id: &RunId,
+) -> Result<CommitDisposition, String> {
+    let disposition = preflight_output(final_path)?;
 
     if let Some(parent) = final_path.parent() {
         fs::create_dir_all(parent.as_std_path())
@@ -183,14 +242,30 @@ fn commit_output(source: &Utf8Path, final_path: &Utf8Path, run_id: &RunId) -> Re
     }
 
     let tmp_path = purgery_core::commit_temp_path(final_path, run_id);
+    match fs::symlink_metadata(tmp_path.as_std_path()) {
+        Ok(metadata) if metadata.is_file() => fs::remove_file(tmp_path.as_std_path())
+            .map_err(|e| format!("failed to remove stale commit temp file: {e}"))?,
+        Ok(_) => {
+            return Err(format!(
+                "commit temp path is not a regular file: {}",
+                tmp_path.as_str()
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("failed to inspect commit temp path: {error}")),
+    }
 
-    fs::copy(source.as_std_path(), tmp_path.as_std_path())
-        .map_err(|e| format!("failed to copy to temp path: {e}"))?;
+    if let Err(error) = fs::copy(source.as_std_path(), tmp_path.as_std_path()) {
+        let _ = fs::remove_file(tmp_path.as_std_path());
+        return Err(format!("failed to copy to temp path: {error}"));
+    }
 
-    fs::rename(&tmp_path, final_path)
-        .map_err(|e| format!("failed to rename temp to final path: {e}"))?;
+    if let Err(error) = fs::rename(&tmp_path, final_path) {
+        let _ = fs::remove_file(tmp_path.as_std_path());
+        return Err(format!("failed to rename temp to final path: {error}"));
+    }
 
-    Ok(())
+    Ok(disposition)
 }
 
 /// Process a single file entry: validate, copy to work area, postprocess, commit.
@@ -337,7 +412,8 @@ fn process_one_file(
 
     match postprocess_result {
         Ok(outputs) => {
-            // Preflight: derive final paths and check none exist
+            // Preflight every output before committing any of them. A crash between
+            // commits is recovered by replaying the run from its staged files.
             let mut preflight_checks: Vec<(Utf8PathBuf, Utf8PathBuf)> = Vec::new();
             let root_path = server_config.root.as_path();
 
@@ -351,33 +427,60 @@ fn process_one_file(
                         .map_or_else(|| Utf8PathBuf::from(filename), |p| p.join(filename))
                 };
 
-                // Symlink check on destination path component for each output
-                if let Err(e) = check_symlink_in_path(&output_final, server_config.root.as_path()) {
+                if !path_is_within_root(&output_final, root_path) {
                     return FileOutcome::Failure {
                         sync_name,
                         local_path,
                         relative_path,
-                        error: format!("symlink check failed for output: {e}"),
+                        error: format!("final output escapes root: {}", output_final.as_str()),
                     };
                 }
 
-                if output_final.exists() {
+                if let Err(error) = check_symlink_in_path(&output_final, root_path) {
+                    warn!(
+                        nickname = %nickname.as_str(),
+                        run_id = %run_id.as_str(),
+                        phase = "processing",
+                        relative_path = %relative_path,
+                        final_path = %output_final.as_str(),
+                        status = "blocked",
+                        error = %error,
+                        "final output blocked by directory/symlink"
+                    );
                     return FileOutcome::Failure {
                         sync_name,
                         local_path,
                         relative_path,
-                        error: format!("final path already exists: {}", output_final.as_str()),
+                        error: format!("symlink check failed for output: {error}"),
                     };
                 }
 
-                // Ensure parent directory can be created
+                if let Err(error) = preflight_output(&output_final) {
+                    warn!(
+                        nickname = %nickname.as_str(),
+                        run_id = %run_id.as_str(),
+                        phase = "processing",
+                        relative_path = %relative_path,
+                        final_path = %output_final.as_str(),
+                        status = "blocked",
+                        error = %error,
+                        "final output blocked by directory/symlink"
+                    );
+                    return FileOutcome::Failure {
+                        sync_name,
+                        local_path,
+                        relative_path,
+                        error,
+                    };
+                }
+
                 if let Some(parent) = output_final.parent() {
-                    if let Err(e) = fs::create_dir_all(parent) {
+                    if let Err(error) = fs::create_dir_all(parent) {
                         return FileOutcome::Failure {
                             sync_name,
                             local_path,
                             relative_path,
-                            error: format!("failed to create parent directory: {e}"),
+                            error: format!("failed to create parent directory: {error}"),
                         };
                     }
                 }
@@ -385,29 +488,36 @@ fn process_one_file(
                 preflight_checks.push((output.clone(), output_final));
             }
 
-            // Commit each output via temp-file atomic rename
             let mut committed_rel_paths: Vec<String> = Vec::new();
 
             for (output, output_final) in &preflight_checks {
                 match commit_output(output, output_final, run_id) {
-                    Ok(()) => {
+                    Ok(disposition) => {
+                        let commit_disposition = match disposition {
+                            CommitDisposition::Created => "created",
+                            CommitDisposition::Replaced => "replaced",
+                        };
+                        info!(
+                            nickname = %nickname.as_str(),
+                            run_id = %run_id.as_str(),
+                            phase = "processing",
+                            relative_path = %relative_path,
+                            final_path = %output_final.as_str(),
+                            commit_disposition,
+                            "final output {commit_disposition}"
+                        );
                         let rel = output_final
                             .strip_prefix(root_path)
                             .unwrap_or(output_final)
                             .to_string();
                         committed_rel_paths.push(rel);
                     }
-                    Err(e) => {
-                        // Rollback: remove outputs already committed for this file
-                        for committed in &committed_rel_paths {
-                            let full_path = root_path.join(committed);
-                            let _ = fs::remove_file(&full_path);
-                        }
+                    Err(error) => {
                         return FileOutcome::Failure {
                             sync_name,
                             local_path,
                             relative_path,
-                            error: format!("commit failed, rolled back: {e}"),
+                            error: format!("commit failed: {error}"),
                         };
                     }
                 }
@@ -449,12 +559,43 @@ fn process_one_file(
     }
 }
 
-/// Process a single run: claim, move files, postprocess, write status.
-///
-/// Returns `Ok(())` on success. On error the run should be moved to failed.
-pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> Result<()> {
-    let _span = span!(Level::INFO, "run", nickname = %nickname.as_str(), run_id = %run_id.as_str())
-        .entered();
+/// Move a processing run to the terminal phase represented by its status.
+fn finalize_processing_run(
+    config: &ServerConfig,
+    nickname: &Nickname,
+    run_id: &RunId,
+    state: &RunState,
+) -> Result<()> {
+    let processing_path = config
+        .purgery_root
+        .run_dir(nickname, run_id, RunPhase::Processing);
+    let dest_phase = match state {
+        RunState::Done | RunState::Partial => RunPhase::Done,
+        RunState::Failed => RunPhase::Failed,
+    };
+    let dest_path = config.purgery_root.run_dir(nickname, run_id, dest_phase);
+    if let Some(parent) = dest_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create {} parent: {}",
+                dest_phase.as_str(),
+                parent.as_str()
+            )
+        })?;
+    }
+    fs::rename(&processing_path, &dest_path).with_context(|| {
+        format!(
+            "failed to move run to {}: {} -> {}",
+            dest_phase.as_str(),
+            processing_path.as_str(),
+            dest_path.as_str()
+        )
+    })?;
+    Ok(())
+}
+
+/// Claim a ready run and process it from its durable processing directory.
+pub fn process_ready_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> Result<()> {
     let ready_path = config
         .purgery_root
         .run_dir(nickname, run_id, RunPhase::Ready);
@@ -475,74 +616,96 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
         )
     })?;
 
-    // Read run config
+    process_processing_run(config, nickname, run_id)
+}
+
+/// Process a claimed run entirely from filesystem state in `processing/`.
+pub fn process_processing_run(
+    config: &ServerConfig,
+    nickname: &Nickname,
+    run_id: &RunId,
+) -> Result<()> {
+    let _span = span!(Level::INFO, "run", nickname = %nickname.as_str(), run_id = %run_id.as_str())
+        .entered();
+    let processing_path = config
+        .purgery_root
+        .run_dir(nickname, run_id, RunPhase::Processing);
+
+    // Every attempt rebuilds the work area from immutable staged files. This
+    // makes an interrupted attempt replayable without hidden process state.
+    let work_area = work_dir(config.root.as_path(), nickname, run_id);
+    if let Err(error) = fs::remove_dir_all(&work_area) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            warn!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                phase = "processing",
+                error = %error,
+                "failed to clean stale work area"
+            );
+        }
+    }
+    fs::create_dir_all(&work_area)
+        .with_context(|| format!("failed to create work area: {}", work_area.as_str()))?;
+
     let run_config_path = processing_path.join("run.toml");
     let run_config_content = match fs::read_to_string(&run_config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            let msg = format!("failed to read run config: {e}");
+        Ok(content) => content,
+        Err(error) => {
+            let msg = format!("failed to read run config: {error}");
             warn!("{}", msg);
-            write_run_failure(&config.purgery_root, nickname, run_id, &msg);
+            write_run_failure(&config.purgery_root, nickname, run_id, &msg)?;
             anyhow::bail!("{msg}");
         }
     };
     let run_config = match RunConfig::from_toml(&run_config_content) {
-        Ok(c) => c,
-        Err(e) => {
-            let msg = format!("failed to parse run config: {e}");
+        Ok(run_config) => run_config,
+        Err(error) => {
+            let msg = format!("failed to parse run config: {error}");
             warn!("{}", msg);
-            write_run_failure(&config.purgery_root, nickname, run_id, &msg);
+            write_run_failure(&config.purgery_root, nickname, run_id, &msg)?;
             anyhow::bail!("{msg}");
         }
     };
 
-    // Build and validate run plan (compiles all regexes, validates step references)
     let run_plan = match RunPlan::build(config, &run_config) {
-        Ok(p) => p,
-        Err(e) => {
-            let msg = format!("run plan validation failed: {e}");
+        Ok(plan) => plan,
+        Err(error) => {
+            let msg = format!("run plan validation failed: {error}");
             warn!("{}", msg);
-            write_run_failure(&config.purgery_root, nickname, run_id, &msg);
+            write_run_failure(&config.purgery_root, nickname, run_id, &msg)?;
             anyhow::bail!("{msg}");
         }
     };
 
-    // Read manifest
     let manifest_path = processing_path.join("manifest.toml");
     let manifest_content = match fs::read_to_string(&manifest_path) {
-        Ok(c) => c,
-        Err(e) => {
-            let msg = format!("failed to read manifest: {e}");
+        Ok(content) => content,
+        Err(error) => {
+            let msg = format!("failed to read manifest: {error}");
             warn!("{}", msg);
-            write_run_failure(&config.purgery_root, nickname, run_id, &msg);
+            write_run_failure(&config.purgery_root, nickname, run_id, &msg)?;
             anyhow::bail!("{msg}");
         }
     };
     let manifest = match Manifest::from_toml(&manifest_content) {
-        Ok(m) => m,
-        Err(e) => {
-            let msg = format!("failed to parse manifest: {e}");
+        Ok(manifest) => manifest,
+        Err(error) => {
+            let msg = format!("failed to parse manifest: {error}");
             warn!("{}", msg);
-            write_run_failure(&config.purgery_root, nickname, run_id, &msg);
+            write_run_failure(&config.purgery_root, nickname, run_id, &msg)?;
             anyhow::bail!("{msg}");
         }
     };
 
-    // Envelope validation: directory nickname/run_config/manifest must agree
-    if let Err(e) = validate_envelope(nickname, run_id, &run_config, &manifest) {
-        let msg = format!("envelope validation failed: {e}");
+    if let Err(error) = validate_envelope(nickname, run_id, &run_config, &manifest) {
+        let msg = format!("envelope validation failed: {error}");
         warn!("{}", msg);
-        write_run_failure(&config.purgery_root, nickname, run_id, &msg);
+        write_run_failure(&config.purgery_root, nickname, run_id, &msg)?;
         anyhow::bail!("{msg}");
     }
 
-    // Create work area
-    let work_area = work_dir(config.root.as_path(), nickname, run_id);
-    fs::create_dir_all(&work_area)
-        .with_context(|| format!("failed to create work area: {}", work_area.as_str()))?;
-
     let sync_map: HashMap<&str, &RunConfigSync> = run_config.sync_map().into_iter().collect();
-
     let mut outcomes: Vec<FileOutcome> = Vec::new();
 
     for file_entry in &manifest.files {
@@ -561,7 +724,7 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
             continue;
         };
 
-        let outcome = process_one_file(
+        outcomes.push(process_one_file(
             config,
             &run_plan,
             sync,
@@ -570,18 +733,15 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
             run_id,
             &processing_path,
             &work_area,
-        );
-        outcomes.push(outcome);
+        ));
     }
 
-    // Determine run state
     let all_imported = outcomes
         .iter()
-        .all(|o| matches!(o, FileOutcome::Success { .. }));
+        .all(|outcome| matches!(outcome, FileOutcome::Success { .. }));
     let any_imported = outcomes
         .iter()
-        .any(|o| matches!(o, FileOutcome::Success { .. }));
-
+        .any(|outcome| matches!(outcome, FileOutcome::Success { .. }));
     let run_state = if all_imported {
         RunState::Done
     } else if any_imported {
@@ -590,24 +750,18 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
         RunState::Failed
     };
 
-    // Work area cleanup policy:
-    //   Done    -> remove work area
-    //   Partial -> keep for debugging
-    //   Failed  -> keep for debugging
     if run_state == RunState::Done {
         let _ = fs::remove_dir_all(&work_area);
     }
 
     info!(state = %run_state.as_str(), "run complete");
-
     let run_status = RunStatus {
         run_id: run_id.clone(),
         nickname: nickname.clone(),
         state: run_state.clone(),
-        files: outcomes.into_iter().map(|o| o.into_entry()).collect(),
+        files: outcomes.into_iter().map(FileOutcome::into_entry).collect(),
         error: None,
     };
-
     let status_toml = run_status
         .to_toml()
         .with_context(|| "failed to serialize status")?;
@@ -622,32 +776,97 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
     fs::rename(&status_tmp_path, &status_path)
         .with_context(|| format!("failed to finalize status: {}", status_path.as_str()))?;
 
-    let dest_phase = match run_state {
-        RunState::Done => RunPhase::Done,
-        RunState::Partial => RunPhase::Done,
-        RunState::Failed => RunPhase::Failed,
-    };
+    finalize_processing_run(config, nickname, run_id, &run_state)
+}
 
-    let dest_path = config.purgery_root.run_dir(nickname, run_id, dest_phase);
-    if let Some(parent) = dest_path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "failed to create {} parent: {}",
-                dest_phase.as_str(),
-                parent.as_str()
-            )
-        })?;
+/// Recover a processing run or finalize its pending terminal transition.
+pub fn recover_or_process_processing_run(
+    config: &ServerConfig,
+    nickname: &Nickname,
+    run_id: &RunId,
+) -> Result<()> {
+    let processing_path = config
+        .purgery_root
+        .run_dir(nickname, run_id, RunPhase::Processing);
+    let status_path = processing_path.join("status.toml");
+
+    match fs::read_to_string(&status_path) {
+        Ok(content) => match RunStatus::from_toml(&content) {
+            Ok(status) if status.nickname != *nickname || status.run_id != *run_id => {
+                let error = "interrupted processing had mismatched status envelope";
+                warn!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    status_nickname = %status.nickname.as_str(),
+                    status_run_id = %status.run_id.as_str(),
+                    phase = "processing",
+                    run_status = "failed",
+                    recovery_action = "replace_mismatched_status",
+                    error,
+                    "processing run recovery failed"
+                );
+                write_run_failure(&config.purgery_root, nickname, run_id, error)
+            }
+            Ok(status) => {
+                info!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    phase = "processing",
+                    run_status = %status.state.as_str(),
+                    recovery_action = "finalize_terminal_move",
+                    "processing run had valid status, finalizing terminal move"
+                );
+                finalize_processing_run(config, nickname, run_id, &status.state)?;
+                info!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    phase = "processing",
+                    run_status = %status.state.as_str(),
+                    recovery_action = "terminal_move_complete",
+                    "processing run recovered"
+                );
+                Ok(())
+            }
+            Err(_) => {
+                let error = "interrupted processing had malformed status";
+                warn!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    phase = "processing",
+                    run_status = "failed",
+                    recovery_action = "replace_malformed_status",
+                    error,
+                    "processing run recovery failed"
+                );
+                write_run_failure(&config.purgery_root, nickname, run_id, error)
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            info!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                phase = "processing",
+                recovery_action = "replay_staged_files",
+                "processing run interrupted, replaying from staged files"
+            );
+            process_processing_run(config, nickname, run_id)?;
+            info!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                phase = "processing",
+                recovery_action = "replay_complete",
+                "processing run recovered"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to read processing status: {}", status_path.as_str())),
     }
-    fs::rename(&processing_path, &dest_path).with_context(|| {
-        format!(
-            "failed to move run to {}: {} -> {}",
-            dest_phase.as_str(),
-            processing_path.as_str(),
-            dest_path.as_str()
-        )
-    })?;
+}
 
-    Ok(())
+/// Process a ready run. Kept as the public single-run entry point.
+pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> Result<()> {
+    process_ready_run(config, nickname, run_id)
 }
 
 /// A compiled postprocess rule with resolved step definitions.
@@ -818,23 +1037,58 @@ pub fn move_to_failed(
     Ok(())
 }
 
-/// Process once: run GC, then scan ready runs and process each one.
+/// Process once: run GC, recover processing runs, then claim ready runs.
 pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
-    // Run GC opportunistically
-    if let Err(e) = run_gc(config) {
-        warn!(error = %e, "opportunistic GC failed");
+    if let Err(error) = run_gc(config) {
+        warn!(error = %error, "opportunistic GC failed");
     }
 
+    let processing_runs = find_processing_runs(&config.purgery_root)?;
     let ready_runs = find_ready_runs(&config.purgery_root)?;
-    if ready_runs.is_empty() {
-        info!("no ready runs found");
+    if processing_runs.is_empty() && ready_runs.is_empty() {
+        info!("no ready or processing runs found");
         return Ok(());
     }
 
+    for (nickname, run_id) in &processing_runs {
+        if let Err(error) = recover_or_process_processing_run(config, nickname, run_id) {
+            warn!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                phase = "processing",
+                error = %error,
+                "processing run recovery failed"
+            );
+            let processing_path =
+                config
+                    .purgery_root
+                    .run_dir(nickname, run_id, RunPhase::Processing);
+            if processing_path.exists() {
+                write_run_failure(
+                    &config.purgery_root,
+                    nickname,
+                    run_id,
+                    &format!("processing recovery failed: {error}"),
+                )?;
+            }
+        }
+    }
+
     for (nickname, run_id) in &ready_runs {
-        info!(nickname = %nickname.as_str(), run_id = %run_id.as_str(), "processing run");
-        if let Err(e) = process_run(config, nickname, run_id) {
-            warn!(nickname = %nickname.as_str(), run_id = %run_id.as_str(), error = %e, "run failed");
+        info!(
+            nickname = %nickname.as_str(),
+            run_id = %run_id.as_str(),
+            phase = "ready",
+            "processing run"
+        );
+        if let Err(error) = process_ready_run(config, nickname, run_id) {
+            warn!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                phase = "processing",
+                error = %error,
+                "run failed"
+            );
             move_to_failed(&config.purgery_root, nickname, run_id)?;
         }
     }
@@ -2223,15 +2477,15 @@ steps = ["compress-video"]
         );
     }
 
-    // ── Fail-if-exists test ──
+    // ── Atomic replacement tests ──
 
     #[test]
-    fn test_final_output_exists_causes_failure() {
+    fn test_existing_regular_final_output_is_replaced() {
         let tmp = tempfile::tempdir().unwrap();
         let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_id = RunId::new("test-exists".into()).unwrap();
+        let run_id = RunId::new("test-replace".into()).unwrap();
 
         let (config, _) = setup_single_file_ready(
             &purgery_root,
@@ -2241,32 +2495,100 @@ steps = ["compress-video"]
             "videos",
             "videos",
             "files/videos/test.mp4",
-            b"hello",
+            b"new content",
         );
 
         let final_path = server_root.join("laptop/videos/test.mp4");
         fs::create_dir_all(final_path.parent().unwrap()).unwrap();
-        fs::write(&final_path, b"pre-existing content").unwrap();
+        fs::write(&final_path, b"old content").unwrap();
 
         process_run(&config, &nickname, &run_id).unwrap();
 
-        assert_eq!(
-            fs::read_to_string(&final_path).unwrap(),
-            "pre-existing content"
-        );
+        assert_eq!(fs::read_to_string(&final_path).unwrap(), "new content");
+        let done_path = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let status =
+            RunStatus::from_toml(&fs::read_to_string(done_path.join("status.toml")).unwrap())
+                .unwrap();
+        assert_eq!(status.state, RunState::Done);
+        assert_eq!(status.files[0].status, FileStatus::Imported);
+    }
 
+    #[test]
+    fn test_existing_final_directory_blocks_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("test-directory-block".into()).unwrap();
+        let (config, _) = setup_single_file_ready(
+            &purgery_root,
+            &server_root,
+            &nickname,
+            &run_id,
+            "videos",
+            "videos",
+            "files/videos/test.mp4",
+            b"content",
+        );
+        let final_path = server_root.join("laptop/videos/test.mp4");
+        fs::create_dir_all(&final_path).unwrap();
+
+        process_run(&config, &nickname, &run_id).unwrap();
+
+        assert!(final_path.is_dir());
         let failed_path = config
             .purgery_root
             .run_dir(&nickname, &run_id, RunPhase::Failed);
-        let status_content = fs::read_to_string(failed_path.join("status.toml")).unwrap();
-        let status = RunStatus::from_toml(&status_content).unwrap();
-        assert_eq!(status.state, RunState::Failed);
+        let status =
+            RunStatus::from_toml(&fs::read_to_string(failed_path.join("status.toml")).unwrap())
+                .unwrap();
         assert_eq!(status.files[0].status, FileStatus::Failed);
         assert!(status.files[0]
             .error
-            .as_ref()
+            .as_deref()
             .unwrap()
-            .contains("already exists"));
+            .contains("directory"));
+    }
+
+    #[test]
+    fn test_existing_final_symlink_blocks_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("test-final-symlink".into()).unwrap();
+        let (config, _) = setup_single_file_ready(
+            &purgery_root,
+            &server_root,
+            &nickname,
+            &run_id,
+            "documents",
+            "documents",
+            "files/documents/a.txt",
+            b"content",
+        );
+        let final_path = server_root.join("laptop/documents/a.txt");
+        fs::create_dir_all(final_path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("missing-target", &final_path).unwrap();
+
+        process_run(&config, &nickname, &run_id).unwrap();
+
+        assert!(fs::symlink_metadata(&final_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let failed = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        let status =
+            RunStatus::from_toml(&fs::read_to_string(failed.join("status.toml")).unwrap()).unwrap();
+        assert!(status.files[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("symlink"));
     }
 
     // ── Work area namespacing test ──
@@ -3141,6 +3463,404 @@ steps = ["compress-video"]
         );
         let err = result.unwrap_err().to_string();
         assert!(err.contains("nickname"), "error: {err}");
+    }
+
+    #[test]
+    fn test_process_once_processes_ready_run_after_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("ready-after-restart".into()).unwrap();
+        let (config, _) = setup_single_file_ready(
+            &purgery_root,
+            &server_root,
+            &nickname,
+            &run_id,
+            "documents",
+            "documents",
+            "files/documents/a.txt",
+            b"ready",
+        );
+
+        process_once_raw(&config).unwrap();
+
+        assert!(config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Done)
+            .exists());
+        assert_eq!(
+            fs::read_to_string(server_root.join("laptop/documents/a.txt")).unwrap(),
+            "ready"
+        );
+    }
+
+    #[test]
+    fn test_process_once_recovers_processing_run_without_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("recover-interrupted".into()).unwrap();
+        let (config, _) = setup_single_file_ready(
+            &purgery_root,
+            &server_root,
+            &nickname,
+            &run_id,
+            "documents",
+            "documents",
+            "files/documents/a.txt",
+            b"hello",
+        );
+        let ready = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let processing = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        fs::create_dir_all(processing.parent().unwrap()).unwrap();
+        fs::rename(&ready, &processing).unwrap();
+        let stale_work = work_dir(config.root.as_path(), &nickname, &run_id);
+        fs::create_dir_all(&stale_work).unwrap();
+        fs::write(stale_work.join("stale"), b"stale").unwrap();
+
+        process_once_raw(&config).unwrap();
+
+        assert!(!processing.exists());
+        let done = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Done);
+        assert!(done.join("status.toml").exists());
+        assert_eq!(
+            fs::read_to_string(server_root.join("laptop/documents/a.txt")).unwrap(),
+            "hello"
+        );
+        assert!(!stale_work.exists());
+    }
+
+    #[test]
+    fn test_process_once_finalizes_processing_run_with_valid_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&purgery_root, &server_root);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("recover-status".into()).unwrap();
+        let processing = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        fs::create_dir_all(&processing).unwrap();
+        let status = RunStatus {
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            state: RunState::Partial,
+            files: vec![],
+            error: None,
+        };
+        fs::write(processing.join("status.toml"), status.to_toml().unwrap()).unwrap();
+
+        process_once_raw(&config).unwrap();
+
+        assert!(!processing.exists());
+        assert!(config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Done)
+            .exists());
+    }
+
+    fn assert_mismatched_processing_status_fails(
+        status_nickname: Nickname,
+        status_run_id: RunId,
+        directory_run_id: &str,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&purgery_root, &server_root);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new(directory_run_id.into()).unwrap();
+        let processing = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        fs::create_dir_all(&processing).unwrap();
+        let status = RunStatus {
+            run_id: status_run_id,
+            nickname: status_nickname,
+            state: RunState::Done,
+            files: vec![],
+            error: None,
+        };
+        fs::write(processing.join("status.toml"), status.to_toml().unwrap()).unwrap();
+
+        process_once_raw(&config).unwrap();
+
+        assert!(!processing.exists());
+        assert!(!config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Done)
+            .exists());
+        let failed = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        let failed_status =
+            RunStatus::from_toml(&fs::read_to_string(failed.join("status.toml")).unwrap()).unwrap();
+        assert_eq!(failed_status.nickname, nickname);
+        assert_eq!(failed_status.run_id, run_id);
+        assert_eq!(failed_status.state, RunState::Failed);
+        assert_eq!(
+            failed_status.error.as_deref(),
+            Some("interrupted processing had mismatched status envelope")
+        );
+    }
+
+    #[test]
+    fn test_process_once_fails_processing_run_with_mismatched_status_nickname() {
+        assert_mismatched_processing_status_fails(
+            Nickname::new("other-machine".into()).unwrap(),
+            RunId::new("recover-wrong-nickname".into()).unwrap(),
+            "recover-wrong-nickname",
+        );
+    }
+
+    #[test]
+    fn test_process_once_fails_processing_run_with_mismatched_status_run_id() {
+        assert_mismatched_processing_status_fails(
+            Nickname::new("laptop".into()).unwrap(),
+            RunId::new("other-run".into()).unwrap(),
+            "recover-wrong-run-id",
+        );
+    }
+
+    #[test]
+    fn test_mismatched_status_recovery_propagates_terminal_move_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&purgery_root, &server_root);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("blocked-failed-move".into()).unwrap();
+        let processing = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        let failed = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        fs::create_dir_all(&processing).unwrap();
+        fs::create_dir_all(&failed).unwrap();
+        fs::write(failed.join("existing"), b"occupied").unwrap();
+        let mismatched_status = RunStatus {
+            run_id: RunId::new("other-run".into()).unwrap(),
+            nickname: nickname.clone(),
+            state: RunState::Done,
+            files: vec![],
+            error: None,
+        };
+        fs::write(
+            processing.join("status.toml"),
+            mismatched_status.to_toml().unwrap(),
+        )
+        .unwrap();
+
+        let error = recover_or_process_processing_run(&config, &nickname, &run_id).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("failed to move run-level failure to failed"));
+        assert!(processing.exists());
+        let status =
+            RunStatus::from_toml(&fs::read_to_string(processing.join("status.toml")).unwrap())
+                .unwrap();
+        assert_eq!(status.state, RunState::Failed);
+        assert_eq!(
+            status.error.as_deref(),
+            Some("interrupted processing had mismatched status envelope")
+        );
+    }
+
+    #[test]
+    fn test_malformed_status_recovery_propagates_failed_status_write_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&purgery_root, &server_root);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("blocked-status-write".into()).unwrap();
+        let processing = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        fs::create_dir_all(processing.join("status.toml.tmp")).unwrap();
+        fs::write(processing.join("status.toml"), "not valid = [toml").unwrap();
+
+        let error = recover_or_process_processing_run(&config, &nickname, &run_id).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("failed to write temporary run failure status"));
+        assert!(processing.exists());
+        assert_eq!(
+            fs::read_to_string(processing.join("status.toml")).unwrap(),
+            "not valid = [toml"
+        );
+    }
+
+    #[test]
+    fn test_process_once_fails_processing_run_with_malformed_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&purgery_root, &server_root);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("recover-malformed".into()).unwrap();
+        let processing = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        fs::create_dir_all(&processing).unwrap();
+        fs::write(processing.join("status.toml"), "not valid = [toml").unwrap();
+
+        process_once_raw(&config).unwrap();
+
+        assert!(!processing.exists());
+        let failed = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        let status =
+            RunStatus::from_toml(&fs::read_to_string(failed.join("status.toml")).unwrap()).unwrap();
+        assert_eq!(status.state, RunState::Failed);
+        assert_eq!(
+            status.error.as_deref(),
+            Some("interrupted processing had malformed status")
+        );
+    }
+
+    #[test]
+    fn test_replay_after_final_replacement_without_status_converges() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("recover-committed-output".into()).unwrap();
+        let (config, _) = setup_single_file_ready(
+            &purgery_root,
+            &server_root,
+            &nickname,
+            &run_id,
+            "documents",
+            "documents",
+            "files/documents/a.txt",
+            b"new",
+        );
+        let ready = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let processing = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        fs::create_dir_all(processing.parent().unwrap()).unwrap();
+        fs::rename(&ready, &processing).unwrap();
+        let final_path = server_root.join("laptop/documents/a.txt");
+        fs::create_dir_all(final_path.parent().unwrap()).unwrap();
+        fs::write(&final_path, b"new").unwrap();
+        assert!(!processing.join("status.toml").exists());
+
+        process_once_raw(&config).unwrap();
+
+        assert_eq!(fs::read_to_string(&final_path).unwrap(), "new");
+        let done = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let status =
+            RunStatus::from_toml(&fs::read_to_string(done.join("status.toml")).unwrap()).unwrap();
+        assert_eq!(status.state, RunState::Done);
+    }
+
+    #[test]
+    fn test_repeated_imports_same_destination_are_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let nickname = Nickname::new("laptop".into()).unwrap();
+
+        for (run, content) in [("repeat-1", b"hello".as_slice()), ("repeat-2", b"hello")] {
+            let run_id = RunId::new(run.into()).unwrap();
+            let (config, _) = setup_single_file_ready(
+                &purgery_root,
+                &server_root,
+                &nickname,
+                &run_id,
+                "documents",
+                "documents",
+                "files/documents/a.txt",
+                content,
+            );
+            process_run(&config, &nickname, &run_id).unwrap();
+            assert!(config
+                .purgery_root
+                .run_dir(&nickname, &run_id, RunPhase::Done)
+                .exists());
+        }
+
+        assert_eq!(
+            fs::read_to_string(server_root.join("laptop/documents/a.txt")).unwrap(),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn test_repeated_import_replaces_changed_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let nickname = Nickname::new("laptop".into()).unwrap();
+
+        for (run, content) in [("version-1", b"v1".as_slice()), ("version-2", b"v2")] {
+            let run_id = RunId::new(run.into()).unwrap();
+            let (config, _) = setup_single_file_ready(
+                &purgery_root,
+                &server_root,
+                &nickname,
+                &run_id,
+                "documents",
+                "documents",
+                "files/documents/a.txt",
+                content,
+            );
+            process_run(&config, &nickname, &run_id).unwrap();
+        }
+
+        assert_eq!(
+            fs::read_to_string(server_root.join("laptop/documents/a.txt")).unwrap(),
+            "v2"
+        );
+    }
+
+    #[test]
+    fn test_gc_collects_abandoned_incoming_upload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&purgery_root, &server_root);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("abandoned-upload".into()).unwrap();
+        begin_run(&config, &nickname, &run_id).unwrap();
+        let incoming = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Incoming);
+        fs::write(incoming.join("files/partial.txt"), b"partial").unwrap();
+        let lease_path = incoming.join("lease.toml");
+        let mut lease: purgery_core::LeaseFile =
+            toml::from_str(&fs::read_to_string(&lease_path).unwrap()).unwrap();
+        lease.expires_at_unix_secs = 0;
+        fs::write(&lease_path, toml::to_string(&lease).unwrap()).unwrap();
+
+        run_gc(&config).unwrap();
+
+        let failed = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        assert!(!failed.join("files").exists());
+        let status =
+            RunStatus::from_toml(&fs::read_to_string(failed.join("status.toml")).unwrap()).unwrap();
+        assert_eq!(status.state, RunState::Failed);
     }
 
     /// begin-run output must be parseable as BeginRunResponse TOML.

@@ -96,11 +96,12 @@ Purgery is conservative about data loss:
 - Cleanup is opt-in per sync mapping (`delete_after_import = true`).
 - The client deletes local files only after the server confirms the import in a valid status file whose nickname and run ID match the original upload.
 - Before deleting, the client verifies the local file still matches its uploaded identity (size, mtime, optional SHA-256).
-- The server never overwrites existing files. If a final output path exists, the file is marked failed.
+- The server atomically replaces existing regular final files. Directories, symlinks, unsafe paths, and other non-regular destinations are never replaced.
 
 ## More documentation
 
 - [Config reference](docs/config.md) — server, client, postprocess, run config
 - [Protocol](docs/protocol.md) — lifecycle, subcommands, run states, status format
 - [Operations](docs/operations.md) — bootstrap, check, GC, heartbeat, leases
-- [Import semantics](docs/design/import-semantics.md) — commit model, work areas, rollback, safety rules
+- [Import semantics](docs/design/import-semantics.md) — commit model, work areas, and per-file safety rules
+- [Crash safety and idempotence](docs/design/crash-safety-and-idempotence.md) — durable phases, replay recovery, atomic replacement, and deletion authority

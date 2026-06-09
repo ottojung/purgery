@@ -54,10 +54,10 @@ struct Cli {
     #[arg(long, global = true)]
     color: Option<String>,
     /// Suppress all logs except errors (conflicts with --verbose and --log-level)
-    #[arg(long, global = true, conflicts_with_all = &["verbose", "log-level"])]
+    #[arg(long, global = true, conflicts_with_all = &["verbose", "log_level"])]
     quiet: bool,
     /// Enable verbose (debug) logging
-    #[arg(long, global = true, conflicts_with = "quiet")]
+    #[arg(long, global = true, conflicts_with_all = &["quiet", "log_level"])]
     verbose: bool,
 
     #[command(subcommand)]
@@ -66,7 +66,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Process one batch of ready runs and exit
+    /// Recover processing runs, process ready runs, and exit
     ProcessOnce,
     /// Begin a new run: create incoming directory and print paths
     BeginRun {

@@ -1402,11 +1402,17 @@ pub fn check_symlink_in_path(final_path: &Utf8Path, server_root: &Utf8Path) -> R
     let mut current = server_root.to_owned();
     for component in relative.components() {
         current = current.join(component.as_str());
-        if current.exists() {
-            let metadata = std::fs::symlink_metadata(current.as_std_path())
-                .map_err(|e| format!("failed to read metadata for '{}': {e}", current.as_str()))?;
-            if metadata.file_type().is_symlink() {
+        match std::fs::symlink_metadata(current.as_std_path()) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(format!("symlink detected in path: {}", current.as_str()));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed to read metadata for '{}': {error}",
+                    current.as_str()
+                ));
             }
         }
     }
@@ -2669,6 +2675,18 @@ files = []
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let final_path = link.join("file.txt");
         std::fs::write(&final_path, b"hello").unwrap();
+
+        let result = check_symlink_in_path(&final_path, &root);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("symlink detected"));
+    }
+
+    #[test]
+    fn check_symlink_in_path_rejects_dangling_final_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let final_path = root.join("dangling");
+        std::os::unix::fs::symlink("missing-target", &final_path).unwrap();
 
         let result = check_symlink_in_path(&final_path, &root);
         assert!(result.is_err());
