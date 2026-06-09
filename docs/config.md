@@ -1,0 +1,159 @@
+# Purgery Configuration
+
+## Server config
+
+The server reads a TOML configuration from one of these locations (checked in order):
+
+1. `--config PATH` (explicit)
+2. `$PURGERY_CONFIG` environment variable
+3. `~/.config/purgery/server.toml`
+4. `/etc/purgery/server.toml`
+
+Example:
+
+```toml
+root = "/universe/synced"
+purgery_root = "/universe/tmp/purgery"
+state_dir = "/var/lib/purgery"
+log_dir = "/var/log/purgery"
+
+[gc]
+incoming_lease_secs = 1800
+heartbeat_interval_secs = 60
+
+[postprocess]
+max_parallel_jobs = 1
+
+[postprocess.steps.compress-video]
+kind = "subprocess"
+program = "/usr/local/bin/compress-video"
+args = ["--input", "{input}"]
+expected_outputs = ["{file_stem}.Z.webm"]
+keep_original = true
+```
+
+### Fields
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `root` | yes | Absolute path to final storage root |
+| `purgery_root` | yes | Absolute path to staging area for incoming uploads |
+| `state_dir` | no | Path for server state |
+| `log_dir` | no | Path for logs |
+| `gc` | no | GC configuration (see below) |
+| `postprocess` | no | Postprocessing configuration (see below) |
+
+### GC config
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `incoming_lease_secs` | `1800` | Lease duration for incoming runs |
+| `heartbeat_interval_secs` | `60` | Recommended heartbeat interval |
+
+### Postprocess config
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `max_parallel_jobs` | `1` | Maximum concurrent postprocess jobs |
+| `steps` | `{}` | Map of named postprocess step definitions |
+
+## Postprocess step definition
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `kind` | yes | Must be `"subprocess"` |
+| `program` | yes | Executable path or name (resolved via `PATH`) |
+| `args` | `[]` | Arguments with placeholders |
+| `expected_outputs` | `[]` | Output file patterns with placeholders |
+| `keep_original` | `true` | Whether to keep the original input file |
+
+### Placeholders
+
+| Placeholder | Resolves to |
+|-------------|-------------|
+| `{input}` | Absolute work-area input path |
+| `{parent}` | Work-area parent directory |
+| `{file_name}` | Input file name with extension |
+| `{file_stem}` | Input file name without extension |
+| `{stem}` | Deprecated alias for `{file_stem}` |
+
+A subprocess step must produce at least one committed output. If `keep_original = false`, then `expected_outputs` must be non-empty. This is validated at server boot time.
+
+## Client config
+
+Example:
+
+```toml
+nickname = "laptop"
+
+[server]
+host = "example.com"
+
+[[sync]]
+name = "videos"
+from = "/home/user/Videos"
+to = "videos"
+delete_after_import = true
+
+[[sync]]
+name = "pictures"
+from = "/home/user/Pictures"
+to = "pictures"
+delete_after_import = true
+
+[[postprocess.rules]]
+match = '^videos/.*\.(mp4|mov|mkv|webm)$'
+steps = ["compress-video"]
+```
+
+### Fields
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `nickname` | yes | Machine identifier (alphanumeric, hyphens, underscores) |
+| `server` | yes | Server connection details |
+| `sync` | `[]` | List of sync mappings |
+| `postprocess` | | Postprocess rule configuration |
+
+### Server connection
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `host` | — | SSH hostname |
+| `command` | `"purgery-server"` | Remote server command prefix |
+
+### Sync mapping
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `name` | — | Unique sync name |
+| `from` | — | Local source path |
+| `to` | — | Relative destination under `root / nickname` |
+| `delete_after_import` | `false` | Delete local originals after confirmed import |
+
+### Postprocess rule
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `match` | yes | Regex matching normalized import paths |
+| `steps` | yes | List of server-defined step names to apply |
+
+## Run config
+
+The uploaded run configuration (`run.toml`) is a subset of the client config. It includes `nickname`, sync mappings (name + `to` path only), and postprocess rules. It does **not** include server host/command, `purgery_root`, or local source `from` paths. This keeps server topology server-owned.
+
+```toml
+nickname = "laptop"
+
+[[sync]]
+name = "videos"
+to = "videos"
+
+[[postprocess.rules]]
+match = '^videos/.*\.(mp4|mov|mkv|webm)$'
+steps = ["compress-video"]
+```
+
+## Config strictness
+
+All config structs reject unknown fields. Old configs with stale or misspelled fields produce clear errors rather than being silently ignored.
