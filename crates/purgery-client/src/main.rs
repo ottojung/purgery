@@ -403,13 +403,15 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
 
 /// Run a pure passthrough invocation (no postprocess entries in any sync group).
 ///
-/// Uses resolve-destinations to get final storage paths, rsyncs directly,
-/// and optionally writes durable cleanup state for delete_after_import syncs.
+/// Every passthrough group uses direct unfiltered rsync.
+/// PassthroughDeleteAfterImport groups additionally get a cleanup scan.
+/// There is no per-entry filtered transfer loop — pure passthrough
+/// does not use transfer_plan or transfer filters.
 fn run_passthrough_path(
     config: &ClientConfig,
     host: &str,
     server_command: &str,
-    manifest: &Manifest,
+    _manifest: &Manifest,
     _transfer_plan: &[purgery_core::TransferPlanEntry],
     passthrough_nodelete: &[&purgery_core::SyncMapping],
     passthrough_cleanup: &[&purgery_core::SyncMapping],
@@ -421,16 +423,12 @@ fn run_passthrough_path(
     )
     .entered();
 
-    // Resolve destinations for all sync groups (side-effect-free, run config sent via stdin)
+    info!("resolving destinations");
     let run_config_all = build_run_config(config, false);
     let run_config_all_toml = run_config_all
         .to_toml()
         .with_context(|| "failed to serialize run config")?;
 
-    let tmp_dir = std::env::temp_dir().join("purgery-filters");
-    fs::create_dir_all(&tmp_dir).ok();
-
-    info!("resolving destinations");
     let resolve_out = server_cmd_with_stdin(
         host,
         server_command,
@@ -451,7 +449,6 @@ fn run_passthrough_path(
         );
     }
 
-    // Build destination lookup
     let dest_map: std::collections::HashMap<&str, &purgery_core::SyncPassthroughDestination> =
         resolve_resp
             .destinations
@@ -459,73 +456,11 @@ fn run_passthrough_path(
             .map(|d| (d.sync_name.as_str(), d))
             .collect();
 
-    // Handle PassthroughNoDelete groups first (unfiltered, no manifest entries)
+    // Every passthrough group uses direct unfiltered rsync — no per-entry filters.
+    // PassthroughDeleteAfterImport groups also get a cleanup scan/state after rsync.
     for sync in passthrough_nodelete {
         run_unfiltered_rsync(config, host, sync, &dest_map)?;
     }
-
-    // Transfer per sync group that was walked
-    for sync in &config.sync {
-        // Skip PassthroughNoDelete groups (already handled above)
-        if passthrough_nodelete
-            .iter()
-            .any(|s| s.name.as_str() == sync.name.as_str())
-        {
-            continue;
-        }
-        let sync_name = sync.name.as_str();
-        let from_path = sync.from_path.as_str();
-        let dest = dest_map
-            .get(sync_name)
-            .ok_or_else(|| anyhow::anyhow!("no destination for sync mapping '{sync_name}'"))?;
-
-        // Build passthrough transfer roots from the lightweight transfer plan
-        let passthrough_roots: Vec<purgery_core::TransferRoot> = _transfer_plan
-            .iter()
-            .filter(|e| {
-                e.sync_name.as_str() == sync_name
-                    && e.mode == purgery_core::ManifestEntryMode::Passthrough
-            })
-            .map(|e| purgery_core::TransferRoot::Exact(e.relative_path.as_str().to_owned()))
-            .collect();
-
-        if passthrough_roots.is_empty() {
-            continue;
-        }
-
-        // --- Passthrough rsync ---
-        let passthrough_filter = purgery_core::transfer_set_filter(&passthrough_roots);
-        let filter_file = tmp_dir.join(format!("passthrough-{sync_name}"));
-        fs::write(&filter_file, &passthrough_filter)
-            .with_context(|| "failed to write passthrough filter")?;
-
-        let rsync_dest = format!("{}:{}/", host, dest.passthrough_dest);
-        info!(
-            sync = sync_name,
-            from = from_path,
-            dest = %dest.passthrough_dest,
-            "passthrough rsync started"
-        );
-        let mut rsync_args = build_rsync_args(from_path, &rsync_dest);
-        let filter_arg = format!("--filter=merge {}", filter_file.to_string_lossy());
-        rsync_args.insert(5, filter_arg);
-        let status = std::process::Command::new("rsync")
-            .args(&rsync_args)
-            .status()
-            .with_context(|| format!("failed to execute rsync for {from_path}"))?;
-        if !status.success() {
-            anyhow::bail!("rsync failed for sync mapping '{sync_name}'");
-        }
-        info!(sync = sync_name, mode = "passthrough", "rsync complete");
-
-        // Durable cleanup state for delete_after_import=true
-        if sync.delete_after_import {
-            process_cleanup_entries(config, sync_name, manifest)?;
-        }
-    }
-
-    // Handle PassthroughDeleteAfterImport groups:
-    // direct unfiltered rsync + filesystem scan for cleanup.
     for sync in passthrough_cleanup {
         let sync_name = sync.name.as_str();
         if let Some(dest) = dest_map.get(sync_name) {
@@ -533,7 +468,7 @@ fn run_passthrough_path(
             info!(
                 sync = sync_name,
                 dest = %dest.passthrough_dest,
-                "cleanup direct rsync (no-rule delete-after-import)"
+                "passthrough direct rsync with cleanup"
             );
             let rsync_args = build_rsync_args(sync.from_path.as_str(), &rsync_dest);
             let status = std::process::Command::new("rsync")
