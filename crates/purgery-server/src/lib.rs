@@ -672,7 +672,11 @@ fn validate_unique_final_paths(
                 .get(e.sync_name.as_str())
                 .map(|_sync| {
                     let np = e.relative_path.as_str().to_owned();
-                    run_plan.rules.iter().any(|r| r.is_match(&np))
+                    let sync = e.sync_name.as_str();
+                    run_plan
+                        .rules
+                        .iter()
+                        .any(|r| r.applies_to(sync) && r.is_match(&np))
                 })
                 .unwrap_or(false)
         })
@@ -1065,16 +1069,20 @@ pub fn process_processing_run(
     // Identify directories whose normalized path matches a postprocess rule.
     // Those directories become transformation boundaries — their descendants
     // are covered/skipped.
-    let covered_by_dir: std::collections::HashSet<String> = manifest
+    // Stores (sync_name, relative_path) so the sync group is respected.
+    let covered_by_dir: std::collections::HashSet<(String, String)> = manifest
         .entries
         .iter()
         .filter(|e| e.kind == ManifestEntryKind::Directory)
         .filter_map(|dir_entry| {
             let _sync = sync_map.get(dir_entry.sync_name.as_str())?;
             let np = dir_entry.relative_path.as_str().to_owned();
-            let matched = run_plan.rules.iter().any(|rule| rule.is_match(&np));
+            let matched = run_plan
+                .rules
+                .iter()
+                .any(|rule| rule.applies_to(dir_entry.sync_name.as_str()) && rule.is_match(&np));
             if matched {
-                Some(np)
+                Some((dir_entry.sync_name.as_str().to_owned(), np))
             } else {
                 None
             }
@@ -1091,12 +1099,14 @@ pub fn process_processing_run(
                 return false;
             };
             let np = entry.relative_path.as_str().to_owned();
-            covered_by_dir
-                .iter()
-                .any(|prefix| match np.as_str().strip_prefix(prefix.as_str()) {
-                    Some(tail) => tail.starts_with('/'),
-                    None => false,
-                })
+            let entry_sync = entry.sync_name.as_str();
+            covered_by_dir.iter().any(|(sync_name, prefix)| {
+                sync_name.as_str() == entry_sync
+                    && match np.as_str().strip_prefix(prefix.as_str()) {
+                        Some(tail) => tail.starts_with('/'),
+                        None => false,
+                    }
+            })
         })
         .map(|(i, _)| i)
         .collect();
@@ -1182,12 +1192,13 @@ pub fn process_processing_run(
 
         // Check if this entry is covered by a postprocessed ancestor directory.
         let np = entry.relative_path.as_str().to_owned();
-        let covered = covered_by_dir.iter().any(|prefix| {
-            let tail = match np.as_str().strip_prefix(prefix.as_str()) {
-                Some(t) => t,
-                None => return false,
-            };
-            tail.starts_with('/')
+        let entry_sync = entry.sync_name.as_str();
+        let covered = covered_by_dir.iter().any(|(sync_name, prefix)| {
+            sync_name.as_str() == entry_sync
+                && match np.as_str().strip_prefix(prefix.as_str()) {
+                    Some(tail) => tail.starts_with('/'),
+                    None => false,
+                }
         });
         if covered {
             debug!(sync_name = sync_name, path = %np, "entry covered by postprocessed ancestor directory, skipping");
@@ -1863,16 +1874,19 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
 
     // Compute covered descendants
     let sync_map = run_config.sync_map();
-    let covered_by_dir: std::collections::HashSet<String> = manifest
+    let covered_by_dir: std::collections::HashSet<(String, String)> = manifest
         .entries
         .iter()
         .filter(|e| e.kind == purgery_core::ManifestEntryKind::Directory)
         .filter_map(|dir_entry| {
             let _sync = sync_map.get(dir_entry.sync_name.as_str())?;
             let np = dir_entry.relative_path.as_str().to_owned();
-            let matched = run_plan.rules.iter().any(|rule| rule.is_match(&np));
+            let matched = run_plan
+                .rules
+                .iter()
+                .any(|rule| rule.applies_to(dir_entry.sync_name.as_str()) && rule.is_match(&np));
             if matched {
-                Some(np)
+                Some((dir_entry.sync_name.as_str().to_owned(), np))
             } else {
                 None
             }
@@ -1890,12 +1904,14 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
                 return false;
             };
             let np2 = entry.relative_path.as_str().to_owned();
-            covered_by_dir
-                .iter()
-                .any(|prefix| match np2.as_str().strip_prefix(prefix.as_str()) {
-                    Some(tail) => tail.starts_with('/'),
-                    None => false,
-                })
+            let entry_sync = entry.sync_name.as_str();
+            covered_by_dir.iter().any(|(sync_name, prefix)| {
+                sync_name.as_str() == entry_sync
+                    && match np2.as_str().strip_prefix(prefix.as_str()) {
+                        Some(tail) => tail.starts_with('/'),
+                        None => false,
+                    }
+            })
         })
         .map(|(i, _)| i)
         .collect();
@@ -6363,7 +6379,6 @@ steps = ["pack"]
         );
     }
 
-    #[ignore = "expected to fail until scoped rules are used in server coverage detection"]
     #[test]
     fn scoped_rule_does_not_cover_directory_in_other_sync_group() {
         // A postprocess rule scoped to "videos" must not cause a directory
@@ -6393,7 +6408,9 @@ steps = ["pack"]
         };
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("scoped-coverage".into()).unwrap();
-        let ready = config.purgery_root.run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Ready);
 
         // Set up two sync groups: "videos" (with album dir) and "docs" (with album dir)
         fs::create_dir_all(ready.join("files/videos/album")).unwrap();
@@ -6491,16 +6508,14 @@ for = ["videos"]
                 },
             ],
         };
-        fs::write(
-            ready.join("manifest.toml"),
-            manifest.to_toml().unwrap(),
-        )
-        .unwrap();
+        fs::write(ready.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
 
         // Processing must succeed — the docs entries are valid passthrough
         process_run(&config, &nickname, &run_id).unwrap();
 
-        let done = config.purgery_root.run_dir(&nickname, &run_id, RunPhase::Done);
+        let done = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Done);
         let status_content = fs::read_to_string(done.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
 

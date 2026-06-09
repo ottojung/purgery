@@ -71,6 +71,8 @@ pub enum ConfigError {
     Path(#[from] PathValidationError),
     #[error("invalid run ID: {0}")]
     RunId(#[from] RunIdError),
+    #[error("postprocess config: {0}")]
+    PostprocessConfig(String),
 }
 
 #[derive(Error, Debug)]
@@ -1586,6 +1588,12 @@ impl ServerConfig {
 impl ClientConfig {
     pub fn from_toml(input: &str) -> Result<Self, ConfigError> {
         let config: ClientConfig = toml::from_str(input)?;
+        // Validate postprocess rules against sync names
+        let sync_names: Vec<SyncName> = config.sync.iter().map(|s| s.name.clone()).collect();
+        config
+            .postprocess
+            .validate(&sync_names)
+            .map_err(ConfigError::PostprocessConfig)?;
         Ok(config)
     }
 }
@@ -1879,6 +1887,12 @@ pub fn validate_envelope(
 impl RunConfig {
     pub fn from_toml(input: &str) -> Result<Self, ConfigError> {
         let config: RunConfig = toml::from_str(input)?;
+        // Validate postprocess rules against sync names
+        let sync_names: Vec<SyncName> = config.sync.iter().map(|s| s.name.clone()).collect();
+        config
+            .postprocess
+            .validate(&sync_names)
+            .map_err(ConfigError::PostprocessConfig)?;
         Ok(config)
     }
 
@@ -3616,7 +3630,6 @@ color = "never"
 
     // ── PostprocessRule `for` field tests ──
 
-    #[ignore = "expected to fail until validation is wired into config parsing"]
     #[test]
     fn client_config_rejects_empty_for_at_parse_time() {
         let toml = r#"
@@ -3639,7 +3652,6 @@ for = []
         assert!(result.is_err(), "empty for must be rejected at parse time");
     }
 
-    #[ignore = "expected to fail until validation is wired into config parsing"]
     #[test]
     fn client_config_rejects_unknown_sync_in_for_at_parse_time() {
         let toml = r#"
@@ -3708,12 +3720,8 @@ match = "*.mp4"
 steps = ["compress-video"]
 for = []
 "#;
-        let config = ClientConfig::from_toml(toml).unwrap();
-        // Validation must reject empty for
-        let result = config
-            .postprocess
-            .validate(&[SyncName::new("videos".into()).unwrap()]);
-        assert!(result.is_err(), "empty for must be rejected");
+        let result = ClientConfig::from_toml(toml);
+        assert!(result.is_err(), "empty for must be rejected at parse time");
     }
 
     #[test]
@@ -3734,12 +3742,11 @@ match = "*.mp4"
 steps = ["compress-video"]
 for = ["missing-sync"]
 "#;
-        let config = ClientConfig::from_toml(toml).unwrap();
-        // Validation must reject unknown sync names
-        let result = config
-            .postprocess
-            .validate(&[SyncName::new("videos".into()).unwrap()]);
-        assert!(result.is_err(), "unknown sync in for must be rejected");
+        let result = ClientConfig::from_toml(toml);
+        assert!(
+            result.is_err(),
+            "unknown sync in for must be rejected at parse time"
+        );
     }
 
     #[test]
