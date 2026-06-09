@@ -201,7 +201,7 @@ Passthrough groups do not participate in purgatory run config, server manifest, 
 If a sync group has no applicable postprocess rules and:
 
 - `delete_after_import = false`: the group is handled by one direct unfiltered rsync to final storage. The source tree is not walked, entries are not classified, metadata is not read, and no bookkeeping is created.
-- `delete_after_import = true`: the group is handled by direct rsync plus durable local cleanup state for regular-file deletion. Scanning and identity computation are performed only for cleanup.
+- `delete_after_import = true`: the group is handled by direct unfiltered rsync plus a separate filesystem scan for cleanup. After rsync, the client scans the source directory for regular files, records their identity, and deletes verified files. No per-entry transfer filters are used.
 
 ### Match patterns and import modes
 

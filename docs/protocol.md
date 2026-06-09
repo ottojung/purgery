@@ -14,21 +14,30 @@ client: for each sync group:
              delete confirmed passthrough regular files
 ```
 
-### Path B: Postprocess run (one or more postprocess roots)
+### Path B: Mixed invocation (purgatory groups + passthrough groups)
 
 ```
 client: local checks (config, executables)
-client: generate run ID, build manifest with entry classification
+client: partition sync groups:
+         purgatory: groups with applicable postprocess rules
+         passthrough: groups without applicable postprocess rules
+client: for each passthrough group:
+         resolve destination via resolve-destinations (side-effect-free)
+         direct unfiltered rsync to final storage
+         if delete_after_import=true:
+           scan for cleanup state, write durable cleanup state atomically
+           delete confirmed regular files
+client: generate run ID, build manifest with entry classification (purgatory groups only)
 client: begin-run over SSH -> server creates incoming directory, returns paths
 client: validate begin-run response envelope
-client: write run.toml + manifest.toml to incoming dir (manifest contains only postprocess roots and covered descendants)
-client: prepare-run over SSH -> server validates plan, returns transfer destinations
-client: for each sync group:
-           run passthrough rsync to final storage (non-postprocess entries)
-           if delete_after_import=true:
-             write durable cleanup state atomically
-             delete confirmed passthrough regular files
-           run purgatory rsync to incoming/files (postprocess entries)
+client: write purgatory-only run.toml + filtered manifest.toml to incoming dir
+client: prepare-run over SSH -> server validates plan, returns purgatory destinations
+client: for each purgatory group:
+            run passthrough rsync to final storage (non-postprocess entries)
+            if delete_after_import=true:
+              write durable cleanup state atomically
+              delete confirmed passthrough regular files
+            run purgatory rsync to incoming/files (postprocess entries)
 client: finish-run over SSH -> server moves incoming -> ready
 server: claim run by renaming ready -> processing
 server: process postprocess entries (verify staged content, prepare work area, run subprocesses, commit outputs)
@@ -37,13 +46,17 @@ server: write status.toml, move to done or failed
 client: poll status, verify envelope, cleanup postprocessed regular files as soon as imported
 ```
 
+Passthrough groups are handled entirely outside the purgatory run lifecycle.
+The purgatory transfer loop operates only on purgatory groups.
+No-rule passthrough groups with `delete_after_import=true` use direct unfiltered rsync plus separate cleanup scanning — not per-entry transfer filters.
+
 ## Server subcommands
 
 | Subcommand | Purpose |
 |------------|---------|
 | `resolve-destinations --nickname <n>` | Side-effect-free destination resolution for pure passthrough groups |
 | `begin-run --nickname <n> --run-id <id>` | Create incoming directory, write lease file, print TOML response with server paths |
-| `prepare-run --nickname <n> --run-id <id>` | Validate run config and manifest (postprocess/covered entries only), return transfer destinations |
+| `prepare-run --nickname <n> --run-id <id>` | Validate purgatory run config and manifest (postprocess/covered entries only), return transfer destinations |
 | `finish-run --nickname <n> --run-id <id>` | Move run from `incoming` to `ready` |
 | `status --nickname <n> --run-id <id>` | Return `status.toml` from `done` or `failed` |
 | `heartbeat-run --nickname <n> --run-id <id>` | Update lease file for an incoming run |

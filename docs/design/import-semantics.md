@@ -48,6 +48,8 @@ Cleanup policy:
 
 Before processing any entries, the server validates the run plan via `prepare-run`. This validates the manifest classification, match patterns, step references, expected-output names, and planned final paths. If anything is invalid, the run is rejected before any passthrough rsync mutates final storage.
 
+All server-side rule matching is sync-scoped. Every check that tests whether a rule matches an entry also verifies that the rule applies to the entry's sync group via `rule.applies_to(entry_sync_name)`. A rule scoped to sync group A never affects entries from sync group B, even if the pattern matches.
+
 ## Passthrough architecture
 
 Ordinary passthrough entries have no server bookkeeping. They are transferred directly to final server storage by bulk rsync. The uploaded server manifest contains only postprocess roots and covered descendants — ordinary passthrough entries are excluded.
@@ -80,10 +82,12 @@ If no sync group has any postprocess roots, no server run is created. The client
 
 Every sync group is one of two classes determined at config validation time:
 
-- **Passthrough group**: no applicable postprocess rules. `delete_after_import` may be true or false. The group is handled entirely by direct rsync outside the purgatory lifecycle.
+- **Passthrough group**: no applicable postprocess rules. `delete_after_import` may be true or false. The group is handled entirely outside the purgatory lifecycle.
+  - `delete_after_import = false`: one direct unfiltered rsync, no walk, no cleanup state.
+  - `delete_after_import = true`: one direct unfiltered rsync plus a separate durable cleanup scan for regular files. No per-entry transfer filters, no server manifest entries.
 - **Purgatory group**: one or more applicable postprocess rules and `delete_after_import = true`. The group participates in walking, manifest building, upload, and server processing.
 
-Passthrough groups are not included in the uploaded run config, server manifest, or status. In mixed invocations, passthrough destinations are resolved separately through the side-effect-free `resolve-destinations` command.
+Passthrough groups are not included in the uploaded run config, server manifest, or status. In mixed invocations, passthrough destinations are resolved separately through the side-effect-free `resolve-destinations` command. The purgatory transfer loop iterates only purgatory groups.
 
 If a sync group has applicable postprocess rules but `delete_after_import = false`, config validation rejects it before any filesystem walking.
 

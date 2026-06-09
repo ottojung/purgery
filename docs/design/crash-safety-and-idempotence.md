@@ -12,6 +12,8 @@ $XDG_STATE_HOME/purgery/  or  ~/.local/state/purgery/
 
 This is the only cleanup mechanism. It is used for both pure passthrough invocations and mixed invocations.
 
+For no-rule passthrough groups with `delete_after_import = true`, cleanup is based on a separate filesystem scan after the direct unfiltered rsync, not on walk-generated manifest entries. The client scans the source directory for regular files, records their identity (size, mtime, optional SHA-256) in the cleanup state, and deletes verified files. This avoids per-entry transfer filters for no-rule groups.
+
 ### Atomicity
 
 The cleanup state is written atomically via temporary file + rename. After each successful local deletion, the cleanup state is rewritten atomically so that a crash during cleanup does not make progress ambiguous.
