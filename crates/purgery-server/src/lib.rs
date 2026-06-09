@@ -1022,6 +1022,15 @@ pub fn process_processing_run(
         }
     };
 
+    // Validate the uploaded purgatory run config defensively before any
+    // processing, even though prepare_run should have already validated it.
+    if let Err(error) = run_config.validate_uploaded_purgatory_run() {
+        let msg = format!("uploaded run config validation failed: {error}");
+        warn!("{}", msg);
+        write_run_failure(&config.purgery_root, nickname, run_id, &msg)?;
+        anyhow::bail!("{msg}");
+    }
+
     let run_plan = match RunPlan::build(config, &run_config) {
         Ok(plan) => plan,
         Err(error) => {
@@ -1441,6 +1450,13 @@ impl RunPlan {
         server_config: &ServerConfig,
         run_config: &purgery_core::RunConfig,
     ) -> Result<Self, String> {
+        // Defensively validate the uploaded purgatory run config so that
+        // invalid for lists or delete_after_import=false do not silently
+        // reach final-storage mutation.
+        run_config
+            .validate_uploaded_purgatory_run()
+            .map_err(|e| format!("uploaded run config validation failed: {e}"))?;
+
         let mut rules = Vec::new();
 
         for rule in &run_config.postprocess.rules {
@@ -3082,6 +3098,7 @@ delete_after_import = true
 [[sync]]
 name = "videos"
 to = "videos"
+delete_after_import = true
 
 [[postprocess.rules]]
 match = "*.mp4"
@@ -3462,10 +3479,12 @@ nickname = "laptop"
 [[sync]]
 name = "videos"
 to = "videos"
+delete_after_import = true
 
 [[sync]]
 name = "pictures"
 to = "pictures"
+delete_after_import = true
 "#;
         fs::write(ready_path.join("run.toml"), run_config_content).unwrap();
 
@@ -3714,6 +3733,7 @@ nickname = "laptop"
 [[sync]]
 name = "videos"
 to = "videos"
+delete_after_import = true
 
 [[postprocess.rules]]
 match = ""
@@ -3810,6 +3830,7 @@ nickname = "laptop"
 [[sync]]
 name = "videos"
 to = "videos"
+delete_after_import = true
 
 [[postprocess.rules]]
 match = "*.mp4"
@@ -3911,6 +3932,7 @@ nickname = "laptop"
 [[sync]]
 name = "videos"
 to = "videos"
+delete_after_import = true
 
 [[postprocess.rules]]
 match = "*.mp4"
@@ -4014,6 +4036,7 @@ nickname = "laptop"
 [[sync]]
 name = "videos"
 to = "videos"
+delete_after_import = true
 
 [[postprocess.rules]]
 match = "*.mp4"
@@ -5288,10 +5311,12 @@ nickname = "laptop"
 [[sync]]
 name = "first"
 to = "shared"
+delete_after_import = true
 
 [[sync]]
 name = "second"
 to = "shared"
+delete_after_import = true
 "#,
         )
         .unwrap();
@@ -5376,6 +5401,7 @@ nickname = "laptop"
 [[sync]]
 name = "data"
 to = "data"
+delete_after_import = true
 
 [[postprocess.rules]]
 match = "photos"
@@ -6290,6 +6316,7 @@ nickname = "laptop"
 [[sync]]
 name = "data"
 to = "data"
+delete_after_import = true
 
 [[postprocess.rules]]
 match = "photos"
@@ -6584,10 +6611,12 @@ nickname = "laptop"
 [[sync]]
 name = "videos"
 to = "videos"
+delete_after_import = true
 
 [[sync]]
 name = "docs"
 to = "docs"
+delete_after_import = true
 
 [[postprocess.rules]]
 match = "album"
@@ -7005,5 +7034,89 @@ for = ["videos"]
             1,
             "pictures/album should have only its own final path, got: {pictures_outputs:?}"
         );
+    }
+
+    #[test]
+    fn process_processing_run_rejects_delete_after_import_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&purgery_root, &server_root);
+        let config = ServerConfig {
+            postprocess: PostprocessConfig {
+                steps: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "pack".to_owned(),
+                        PostprocessStepDefinition {
+                            kind: PostprocessKind::Subprocess,
+                            program: "true".into(),
+                            args: vec![],
+                            expected_outputs: vec![],
+                            keep_original: true,
+                        },
+                    );
+                    m
+                },
+            },
+            ..config
+        };
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("processing-no-delete".into()).unwrap();
+        let ready = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        fs::create_dir_all(ready.join("files/videos")).unwrap();
+        fs::write(ready.join("files/videos/a.mp4"), b"content").unwrap();
+
+        // Run config with delete_after_import = false but a postprocess rule
+        fs::write(
+            ready.join("run.toml"),
+            r#"
+nickname = "laptop"
+
+[[sync]]
+name = "videos"
+to = "videos"
+delete_after_import = false
+
+[[postprocess.rules]]
+match = "*.mp4"
+steps = ["pack"]
+"#,
+        )
+        .unwrap();
+
+        let manifest = Manifest {
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![ManifestEntry {
+                sync_name: SyncName::new("videos".into()).unwrap(),
+                local_path: ClientLocalPath::new("/source/a.mp4".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/videos/a.mp4".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
+                size: 7,
+                mtime_ns: 100,
+                sha256: None,
+                link_target: None,
+                mode: purgery_core::ManifestEntryMode::Postprocess,
+                postprocess_steps: vec!["pack".into()],
+                covered_by: None,
+            }],
+        };
+        fs::write(ready.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+
+        // process_run goes through ready -> claim -> processing
+        let result = process_run(&config, &nickname, &run_id);
+        assert!(
+            result.is_err(),
+            "process_run must fail when run config has delete_after_import=false"
+        );
+        // The run should be in failed state
+        let failed = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        assert!(failed.exists(), "failed run dir must exist");
     }
 }
