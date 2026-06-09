@@ -2,7 +2,6 @@ nickname = "laptop"
 
 [server]
 host = "example.com"
-purgery_root = "/universe/tmp/purgery"
 
 [[sync]]
 name = "videos"

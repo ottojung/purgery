@@ -1,5 +1,6 @@
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::io;
 use std::str::FromStr;
 use thiserror::Error;
@@ -817,16 +818,16 @@ fn default_max_parallel_jobs() -> u32 {
 }
 
 /// The kind of postprocessing step.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PostprocessKind {
-    CompressVideo,
+    Subprocess,
 }
 
 impl<'de> Deserialize<'de> for PostprocessKind {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
         match s.as_str() {
-            "compress-video" => Ok(PostprocessKind::CompressVideo),
+            "subprocess" => Ok(PostprocessKind::Subprocess),
             other => Err(serde::de::Error::custom(format!(
                 "unknown postprocess kind: {other}"
             ))),
@@ -837,7 +838,7 @@ impl<'de> Deserialize<'de> for PostprocessKind {
 impl Serialize for PostprocessKind {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let s = match self {
-            PostprocessKind::CompressVideo => "compress-video",
+            PostprocessKind::Subprocess => "subprocess",
         };
         s.serialize(serializer)
     }
@@ -847,19 +848,62 @@ fn default_true() -> bool {
     true
 }
 
-fn default_compress_video_program() -> String {
-    "my-compress-video".to_string()
-}
-
 /// Definition of a postprocessing step on the server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PostprocessStepDefinition {
     pub kind: PostprocessKind,
-    #[serde(default = "default_compress_video_program")]
     pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub expected_outputs: Vec<String>,
     #[serde(default = "default_true")]
     pub keep_original: bool,
+}
+
+impl PostprocessStepDefinition {
+    /// Resolve `{input}`, `{parent}`, `{file_name}`, `{stem}` placeholders
+    /// in a string using the given work path.
+    pub fn resolve_placeholders(&self, work_path: &Utf8Path, s: &str) -> String {
+        let input = work_path.as_str();
+        let parent = work_path.parent().map(|p| p.as_str()).unwrap_or("");
+        let file_name = work_path.file_name().unwrap_or("");
+        let stem = work_path.file_stem().unwrap_or("");
+        s.replace("{input}", input)
+            .replace("{parent}", parent)
+            .replace("{file_name}", file_name)
+            .replace("{stem}", stem)
+    }
+
+    /// Build the command arguments for this step given the work path.
+    pub fn build_args(&self, work_path: &Utf8Path) -> Vec<String> {
+        self.args
+            .iter()
+            .map(|a| self.resolve_placeholders(work_path, a))
+            .collect()
+    }
+
+    /// Resolve expected output paths relative to the work parent directory.
+    pub fn resolve_expected_outputs(&self, work_path: &Utf8Path) -> Vec<Utf8PathBuf> {
+        let parent = work_path
+            .parent()
+            .map(|p| p.to_owned())
+            .unwrap_or_else(|| Utf8PathBuf::from("."));
+        self.expected_outputs
+            .iter()
+            .map(|pat| {
+                let resolved = self.resolve_placeholders(work_path, pat);
+                // If resolved is absolute, use as-is; otherwise join with parent
+                let p = Utf8Path::new(&resolved);
+                if p.is_absolute() {
+                    p.to_owned()
+                } else {
+                    parent.join(p)
+                }
+            })
+            .collect()
+    }
 }
 
 /// Client configuration, loaded from a TOML file.
@@ -883,7 +927,12 @@ impl ClientConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConnection {
     pub host: RemoteHost,
-    pub purgery_root: PurgeryRoot,
+    #[serde(default = "default_server_command")]
+    pub command: String,
+}
+
+fn default_server_command() -> String {
+    "purgery-server".to_string()
 }
 
 /// A single sync mapping from local path to server destination.
@@ -915,6 +964,41 @@ pub struct PostprocessRule {
     #[serde(rename = "match")]
     pub pattern: String,
     pub steps: Vec<String>,
+}
+
+/// Server-relevant per-run configuration uploaded alongside files.
+///
+/// Unlike `ClientConfig`, this does not include server transport
+/// details or local source paths.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunConfig {
+    pub nickname: Nickname,
+    #[serde(default)]
+    pub sync: Vec<RunConfigSync>,
+    #[serde(default)]
+    pub postprocess: ClientPostprocessConfig,
+}
+
+/// A sync mapping within a `RunConfig`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunConfigSync {
+    pub name: SyncName,
+    #[serde(rename = "to")]
+    pub to_path: RelativeDestinationPath,
+}
+
+/// Response from `purgery-server begin-run`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BeginRunResponse {
+    pub protocol_version: u32,
+    pub nickname: String,
+    pub run_id: String,
+    pub incoming_dir: String,
+    pub files_dir: String,
+    pub run_config_path: String,
+    pub manifest_path: String,
 }
 
 // ── Parsing Helpers ──────────────────────────────────────────────────
@@ -1043,20 +1127,20 @@ pub fn commit_temp_path(final_path: &Utf8Path, run_id: &RunId) -> Utf8PathBuf {
 /// Validate that the directory envelope matches the run's metadata.
 ///
 /// Checks:
-/// * `dir_nickname` == `config.nickname`
-/// * `dir_nickname` == `manifest.nickname`
-/// * `dir_run_id` == `manifest.run_id`
+/// * `run_config.nickname` == `dir_nickname`
+/// * `manifest.nickname` == `dir_nickname`
+/// * `manifest.run_id` == `dir_run_id`
 pub fn validate_envelope(
     dir_nickname: &Nickname,
     dir_run_id: &RunId,
-    config: &ClientConfig,
+    run_config: &RunConfig,
     manifest: &Manifest,
 ) -> Result<(), String> {
-    if config.nickname != *dir_nickname {
+    if run_config.nickname != *dir_nickname {
         return Err(format!(
-            "directory nickname '{}' does not match config nickname '{}'",
+            "directory nickname '{}' does not match run config nickname '{}'",
             dir_nickname.as_str(),
-            config.nickname.as_str()
+            run_config.nickname.as_str()
         ));
     }
     if manifest.nickname != *dir_nickname {
@@ -1074,6 +1158,24 @@ pub fn validate_envelope(
         ));
     }
     Ok(())
+}
+
+/// Parse a `RunConfig` from TOML.
+impl RunConfig {
+    pub fn from_toml(input: &str) -> Result<Self, ConfigError> {
+        let config: RunConfig = toml::from_str(input)?;
+        Ok(config)
+    }
+
+    pub fn to_toml(&self) -> Result<String, ConfigError> {
+        toml::to_string(self)
+            .map_err(|e| ConfigError::MissingField(Box::leak(e.to_string().into_boxed_str())))
+    }
+
+    /// Build a lookup map from sync name to sync.
+    pub fn sync_map(&self) -> BTreeMap<&str, &RunConfigSync> {
+        self.sync.iter().map(|s| (s.name.as_str(), s)).collect()
+    }
 }
 
 // ── Shell Escaping (shared by client and server) ─────────────────────
@@ -1389,7 +1491,6 @@ nickname = "laptop"
 
 [server]
 host = "example.com"
-purgery_root = "/tmp/purgery"
 
 [[sync]]
 name = "videos"
@@ -1538,8 +1639,10 @@ log_dir = "/var/log/purgery"
 max_parallel_jobs = 2
 
 [postprocess.steps.compress-video]
-kind = "compress-video"
+kind = "subprocess"
 program = "my-compress-video"
+args = ["--input", "{input}"]
+expected_outputs = ["{stem}.Z.webm"]
 keep_original = true
 "#;
         let config = ServerConfig::from_toml(toml).unwrap();
@@ -1547,24 +1650,26 @@ keep_original = true
         assert_eq!(config.state_dir.unwrap().as_str(), "/var/lib/purgery");
         assert_eq!(config.postprocess.max_parallel_jobs, 2);
         let step = config.postprocess.steps.get("compress-video").unwrap();
-        assert_eq!(step.kind, PostprocessKind::CompressVideo);
+        assert_eq!(step.kind, PostprocessKind::Subprocess);
         assert_eq!(step.program, "my-compress-video");
         assert!(step.keep_original);
     }
 
     #[test]
-    fn parse_server_config_new_kind_format() {
+    fn parse_server_config_subprocess_kind() {
         let toml = r#"
 root = "/universe/synced"
 purgery_root = "/universe/tmp/purgery"
 
 [postprocess.steps.compress-video]
-kind = "compress-video"
+kind = "subprocess"
+program = "my-compress-video"
+args = ["--input", "{input}"]
+expected_outputs = ["{stem}.Z.webm"]
 "#;
         let config = ServerConfig::from_toml(toml).unwrap();
         let step = config.postprocess.steps.get("compress-video").unwrap();
-        assert_eq!(step.kind, PostprocessKind::CompressVideo);
-        // Should use defaults
+        assert_eq!(step.kind, PostprocessKind::Subprocess);
         assert_eq!(step.program, "my-compress-video");
         assert!(step.keep_original);
     }
@@ -1572,7 +1677,7 @@ kind = "compress-video"
     #[test]
     fn postprocess_step_rejects_old_command_format() {
         let toml = r#"
-kind = "compress-video"
+kind = "subprocess"
 command = "my-compress-video"
 "#;
         let result: Result<PostprocessStepDefinition, _> = toml::from_str(toml);
@@ -1580,14 +1685,16 @@ command = "my-compress-video"
     }
 
     #[test]
-    fn postprocess_step_rejects_old_args_format() {
+    fn postprocess_step_rejects_old_compress_video_kind() {
         let toml = r#"
 kind = "compress-video"
 program = "my-compress-video"
-args = ["--input", "{path}"]
 "#;
         let result: Result<PostprocessStepDefinition, _> = toml::from_str(toml);
-        assert!(result.is_err(), "old 'args' field must be rejected");
+        assert!(
+            result.is_err(),
+            "old 'compress-video' kind must be rejected"
+        );
     }
 
     #[test]
@@ -1606,11 +1713,11 @@ nickname = "laptop"
 
 [server]
 host = "example.com"
-purgery_root = "/universe/tmp/purgery"
 "#;
         let config = ClientConfig::from_toml(toml).unwrap();
         assert_eq!(config.nickname.as_str(), "laptop");
         assert_eq!(config.server.host.as_str(), "example.com");
+        assert_eq!(config.server.command, "purgery-server");
         assert!(config.sync.is_empty());
     }
 
@@ -1621,7 +1728,7 @@ nickname = "laptop"
 
 [server]
 host = "example.com"
-purgery_root = "/universe/tmp/purgery"
+command = "purgery-server --config /etc/purgery/server.toml"
 
 [[sync]]
 name = "videos"
@@ -1645,6 +1752,10 @@ steps = ["compress-video"]
         assert!(!config.sync[1].delete_after_import);
         assert_eq!(config.postprocess.rules.len(), 1);
         assert_eq!(config.postprocess.rules[0].steps, vec!["compress-video"]);
+        assert_eq!(
+            config.server.command,
+            "purgery-server --config /etc/purgery/server.toml"
+        );
     }
 
     #[test]
@@ -1670,7 +1781,6 @@ nickname = ""
 
 [server]
 host = "example.com"
-purgery_root = "/universe/tmp/purgery"
 "#;
         let result = ClientConfig::from_toml(toml);
         assert!(result.is_err());
@@ -1943,12 +2053,8 @@ files = []
     fn validate_envelope_ok() {
         let nick = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("run-1".into()).unwrap();
-        let config = ClientConfig {
+        let run_config = RunConfig {
             nickname: nick.clone(),
-            server: ServerConnection {
-                host: RemoteHost::new("example.com".into()).unwrap(),
-                purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
-            },
             sync: vec![],
             postprocess: ClientPostprocessConfig::default(),
         };
@@ -1965,7 +2071,7 @@ files = []
                 sha256: None,
             }],
         };
-        assert!(validate_envelope(&nick, &run_id, &config, &manifest).is_ok());
+        assert!(validate_envelope(&nick, &run_id, &run_config, &manifest).is_ok());
     }
 
     #[test]
@@ -1973,12 +2079,8 @@ files = []
         let dir_nick = Nickname::new("laptop".into()).unwrap();
         let other_nick = Nickname::new("desktop".into()).unwrap();
         let run_id = RunId::new("run-1".into()).unwrap();
-        let config = ClientConfig {
+        let run_config = RunConfig {
             nickname: other_nick.clone(),
-            server: ServerConnection {
-                host: RemoteHost::new("example.com".into()).unwrap(),
-                purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
-            },
             sync: vec![],
             postprocess: ClientPostprocessConfig::default(),
         };
@@ -1995,7 +2097,7 @@ files = []
                 sha256: None,
             }],
         };
-        assert!(validate_envelope(&dir_nick, &run_id, &config, &manifest).is_err());
+        assert!(validate_envelope(&dir_nick, &run_id, &run_config, &manifest).is_err());
     }
 
     #[test]
@@ -2003,12 +2105,8 @@ files = []
         let nick = Nickname::new("laptop".into()).unwrap();
         let other = Nickname::new("server".into()).unwrap();
         let run_id = RunId::new("run-1".into()).unwrap();
-        let config = ClientConfig {
+        let run_config = RunConfig {
             nickname: nick.clone(),
-            server: ServerConnection {
-                host: RemoteHost::new("example.com".into()).unwrap(),
-                purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
-            },
             sync: vec![],
             postprocess: ClientPostprocessConfig::default(),
         };
@@ -2025,7 +2123,7 @@ files = []
                 sha256: None,
             }],
         };
-        assert!(validate_envelope(&nick, &run_id, &config, &manifest).is_err());
+        assert!(validate_envelope(&nick, &run_id, &run_config, &manifest).is_err());
     }
 
     #[test]
@@ -2033,12 +2131,8 @@ files = []
         let nick = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("run-1".into()).unwrap();
         let wrong_run_id = RunId::new("run-2".into()).unwrap();
-        let config = ClientConfig {
+        let run_config = RunConfig {
             nickname: nick.clone(),
-            server: ServerConnection {
-                host: RemoteHost::new("example.com".into()).unwrap(),
-                purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
-            },
             sync: vec![],
             postprocess: ClientPostprocessConfig::default(),
         };
@@ -2055,7 +2149,7 @@ files = []
                 sha256: None,
             }],
         };
-        assert!(validate_envelope(&nick, &run_id, &config, &manifest).is_err());
+        assert!(validate_envelope(&nick, &run_id, &run_config, &manifest).is_err());
     }
 
     // ── verify_staged tests ──
@@ -2300,14 +2394,20 @@ files = []
     // ── PostprocessKind serde tests ──
 
     #[test]
-    fn postprocess_kind_compress_video() {
-        let kind: PostprocessKind = serde_json::from_str("\"compress-video\"").unwrap();
-        assert_eq!(kind, PostprocessKind::CompressVideo);
+    fn postprocess_kind_subprocess() {
+        let kind: PostprocessKind = serde_json::from_str("\"subprocess\"").unwrap();
+        assert_eq!(kind, PostprocessKind::Subprocess);
     }
 
     #[test]
     fn postprocess_kind_rejects_unknown() {
         let result: Result<PostprocessKind, _> = serde_json::from_str("\"builtin\"");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn postprocess_kind_rejects_old_compress_video() {
+        let result: Result<PostprocessKind, _> = serde_json::from_str("\"compress-video\"");
         assert!(result.is_err());
     }
 
@@ -2327,7 +2427,7 @@ files = []
         let config = ServerConfig::from_toml(toml).unwrap();
         assert_eq!(config.root.as_str(), "/universe/synced");
         let step = config.postprocess.steps.get("compress-video").unwrap();
-        assert_eq!(step.kind, PostprocessKind::CompressVideo);
+        assert_eq!(step.kind, PostprocessKind::Subprocess);
         assert_eq!(step.program, "my-compress-video");
         assert!(step.keep_original);
     }
@@ -2353,5 +2453,140 @@ files = []
             assert!(RunId::new(id.as_str().to_owned()).is_ok());
             assert_eq!(id.as_str().len(), 26);
         }
+    }
+
+    // ── RunConfig tests ──
+
+    #[test]
+    fn parse_run_config() {
+        let toml = r#"
+nickname = "laptop"
+
+[[sync]]
+name = "videos"
+to = "videos"
+
+[[postprocess.rules]]
+match = '^videos/.*\.(mp4|mov|mkv|webm)$'
+steps = ["compress-video"]
+"#;
+        let config = RunConfig::from_toml(toml).unwrap();
+        assert_eq!(config.nickname.as_str(), "laptop");
+        assert_eq!(config.sync.len(), 1);
+        assert_eq!(config.sync[0].name.as_str(), "videos");
+        assert_eq!(config.postprocess.rules.len(), 1);
+    }
+
+    #[test]
+    fn run_config_roundtrip() {
+        let config = RunConfig {
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            sync: vec![RunConfigSync {
+                name: SyncName::new("videos".into()).unwrap(),
+                to_path: RelativeDestinationPath::new("videos".into()).unwrap(),
+            }],
+            postprocess: ClientPostprocessConfig::default(),
+        };
+        let toml = config.to_toml().unwrap();
+        let parsed = RunConfig::from_toml(&toml).unwrap();
+        assert_eq!(parsed.nickname.as_str(), "laptop");
+        assert_eq!(parsed.sync.len(), 1);
+    }
+
+    #[test]
+    fn run_config_rejects_server_section() {
+        let toml = r#"
+nickname = "laptop"
+
+[server]
+host = "example.com"
+"#;
+        let result = RunConfig::from_toml(toml);
+        assert!(result.is_err(), "RunConfig must reject [server] section");
+    }
+
+    #[test]
+    fn run_config_rejects_from_path() {
+        let toml = r#"
+nickname = "laptop"
+
+[[sync]]
+name = "videos"
+from = "/home/user/Videos"
+to = "videos"
+"#;
+        let result = RunConfig::from_toml(toml);
+        assert!(
+            result.is_err(),
+            "RunConfig must reject 'from' field in sync"
+        );
+    }
+
+    // ── Placeholder resolution tests ──
+
+    #[test]
+    fn resolve_input_placeholder() {
+        let step = PostprocessStepDefinition {
+            kind: PostprocessKind::Subprocess,
+            program: "ffmpeg".into(),
+            args: vec!["--input".into(), "{input}".into()],
+            expected_outputs: vec!["{stem}.Z.webm".into()],
+            keep_original: true,
+        };
+        let work_path = Utf8Path::new("/work/videos/video.mp4");
+        let args = step.build_args(work_path);
+        assert_eq!(args, vec!["--input", "/work/videos/video.mp4"]);
+    }
+
+    #[test]
+    fn resolve_stem_placeholder() {
+        let step = PostprocessStepDefinition {
+            kind: PostprocessKind::Subprocess,
+            program: "ffmpeg".into(),
+            args: vec![],
+            expected_outputs: vec!["{stem}.Z.webm".into()],
+            keep_original: false,
+        };
+        let work_path = Utf8Path::new("/work/videos/video.mp4");
+        let outputs = step.resolve_expected_outputs(work_path);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].as_str(), "/work/videos/video.Z.webm");
+    }
+
+    #[test]
+    fn resolve_parent_placeholder() {
+        let step = PostprocessStepDefinition {
+            kind: PostprocessKind::Subprocess,
+            program: "ffmpeg".into(),
+            args: vec!["--output-dir".into(), "{parent}".into()],
+            expected_outputs: vec![],
+            keep_original: false,
+        };
+        let work_path = Utf8Path::new("/work/videos/video.mp4");
+        let args = step.build_args(work_path);
+        assert_eq!(args, vec!["--output-dir", "/work/videos"]);
+    }
+
+    #[test]
+    fn run_config_sync_map() {
+        let config = RunConfig {
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            sync: vec![
+                RunConfigSync {
+                    name: SyncName::new("videos".into()).unwrap(),
+                    to_path: RelativeDestinationPath::new("videos".into()).unwrap(),
+                },
+                RunConfigSync {
+                    name: SyncName::new("pictures".into()).unwrap(),
+                    to_path: RelativeDestinationPath::new("pictures".into()).unwrap(),
+                },
+            ],
+            postprocess: ClientPostprocessConfig::default(),
+        };
+        let map = config.sync_map();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("videos").unwrap().to_path.as_str(), "videos");
+        assert_eq!(map.get("pictures").unwrap().to_path.as_str(), "pictures");
+        assert!(!map.contains_key("music"));
     }
 }

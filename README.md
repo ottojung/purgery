@@ -6,19 +6,22 @@ Clients upload files to a server. The server validates runs, applies optional po
 
 ## Lifecycle
 
-1. Client syncs local files into a per-run server staging directory via `rsync --recursive --partial --archive`.
-2. Client atomically moves the run from `incoming/` to `ready/`.
-3. Server claims the run (atomic rename `ready/` → `processing/`).
-4. Server validates the run's config (including postprocess regexes), manifest, and envelope.
-5. For each file, the server validates staged path identity (size/SHA-256), rejects symlinks, copies to a work area namespaced by sync mapping destination (`<work> / <to_path> / <relative_path>`), applies postprocessing, then commits each output via a same-directory temp file (`.purgery-commit.<run_id>.<filename>.tmp`) followed by atomic `rename`.
-6. Server writes `status.toml` atomically.
-7. Client reads status and deletes only unchanged, confirmed-imported local files.
+1. Client runs `purgery-server begin-run` over SSH to get server-derived staging paths.
+2. Client builds manifest and writes `run.toml` + `manifest.toml` to the server's incoming directory.
+3. Client rsyncs files into the server's files directory, namespaced by sync mapping destination.
+4. Client runs `purgery-server finish-run` to atomically move `incoming/` → `ready/`.
+5. Server claims the run (atomic rename `ready/` → `processing/`).
+6. Server validates the run's plan (regexes, step references), manifest, and envelope.
+7. For each file, the server validates staged path identity (size/SHA-256), rejects symlinks, copies to a work area namespaced by sync mapping destination, applies postprocessing via subprocess, then commits each output via a same-directory temp file followed by atomic `rename`. Failed files produce per-file status entries; remaining files continue processing.
+8. Server writes `status.toml` atomically.
+9. Client polls `purgery-server status` until the run completes.
+10. Client verifies `status.nickname == manifest.nickname` and `status.run_id == manifest.run_id`, then deletes only unchanged, confirmed-imported local files.
 
 ## Import / Commit Semantics
 
 ### Temp-file commit
 
-Outputs are never copied directly to their final user-visible path. Instead each committed output goes through:
+Outputs are never copied directly to their final user-visible path. Each committed output goes through:
 
 ```
 work output → final parent dir / .purgery-commit.<run_id>.<filename>.tmp → rename → final path
@@ -30,9 +33,13 @@ The temp file is on the same filesystem as the final path, so the rename is atom
 
 Purgery does not overwrite existing final files. If any final output path already exists before commit, the file is marked as `failed` in the status. This is not intended as a defense against hostile concurrent writers; it is a conservative default.
 
+### Multi-output preflight and rollback
+
+Before committing any output for a file, all final output paths are derived and prechecked (none exists, no symlinks in path, parent directories creatable). Commits proceed in order. If a later output commit fails, outputs already committed during this file's import are rolled back (removed).
+
 ### `final_paths` (plural)
 
-Status entries use `final_paths` — a list of all committed paths. A single-output import produces one entry. Postprocessing (e.g., `compress-video`) may produce multiple outputs (original + compressed). Example:
+Status entries use `final_paths` — a list of all committed paths relative to the server root. A single-output import produces one entry. Postprocessing (e.g., `compress-video`) may produce multiple outputs (original + compressed). Example:
 
 ```toml
 [[files]]
@@ -60,17 +67,7 @@ error = "staged file not found"
 
 ### Per-file errors
 
-Per-file failures produce individual `FileStatusEntry` records with `status = "failed"` and a descriptive `error` field. The server continues processing remaining files. Only truly catastrophic errors (unreadable config, invalid regex, unparseable manifest, envelope mismatch) abort the entire run with a single run-level error.
-
-Examples of per-file failures:
-- final output already exists
-- staged path mismatch (manifest `staged_path` does not match `files / <to_path> / <relative_path>`)
-- staged file missing
-- staged file is a symlink
-- staged file size/SHA mismatch
-- postprocessing command fails
-- expected compressed output missing
-- temp-file commit fails
+Per-file failures produce individual `FileStatusEntry` records with `status = "failed"` and a descriptive `error` field. The server continues processing remaining files. Only truly catastrophic errors (unreadable run config, invalid regex, missing step reference, unparseable manifest, envelope mismatch) abort the entire run.
 
 ### Work area
 
@@ -84,26 +81,6 @@ Cleanup policy:
 | `partial` | kept            |
 | `failed`  | kept            |
 
-### Staged path validation
-
-The server derives the expected staged path as `files / <sync.to_path> / <relative_path>` and requires `manifest.staged_path == expected`. A mismatch marks the file as failed. This prevents a manifest from claiming a file belongs to one sync mapping while pointing to a different staged file.
-
-### Staged symlink rejection
-
-Before copying a staged file into the work area, the server checks the staged path with `symlink_metadata`. If it is a symlink, the file is marked as failed. Purgery imports regular files listed in the manifest, not symlinks.
-
-### Postprocess regex validation
-
-All client postprocess regexes are validated before any file processing. If any regex is invalid, the run is aborted with a run-level `Failed` status. Originals are not imported when a compression regex fails to compile.
-
-### Compress-video commit
-
-For `keep_original = true`: commit both the original and the compressed output (`video.Z.webm`). Status records two `final_paths`.
-
-For `keep_original = false`: commit only the compressed output. Status records one `final_path`.
-
-If any required output is missing or cannot be committed, the file is marked as failed and the client local source is not deleted.
-
 ### Run states
 
 | Run state | Meaning |
@@ -112,10 +89,101 @@ If any required output is missing or cannot be committed, the file is marked as 
 | `partial` | some files imported, some failed or skipped |
 | `failed`  | no files imported (all failed or skipped, or run-level error) |
 
+## Client/Server Protocol
+
+The client communicates with the server over SSH by invoking `purgery-server` subcommands:
+
+| Subcommand | Purpose |
+|------------|---------|
+| `begin-run --nickname <n> --run-id <id>` | Creates incoming directory, prints machine-readable TOML with server-derived paths |
+| `finish-run --nickname <n> --run-id <id>` | Atomically moves run from `incoming` to `ready` |
+| `status --nickname <n> --run-id <id>` | Returns `status.toml` from `done` or `failed` |
+| `check` | Validates server config and postprocess dependencies |
+| `process-once` | Processes one batch of ready runs |
+
+Config discovery for server commands:
+
+1. `--config PATH` (explicit)
+2. `$PURGERY_CONFIG` environment variable
+3. `~/.config/purgery/server.toml`
+4. `/etc/purgery/server.toml`
+
+The client never constructs server paths from local configuration.
+
+## Run config vs Client config
+
+The uploaded run configuration (`run.toml`) is a subset of the local client config. It includes:
+
+- `nickname`
+- sync mappings (name + `to` path only)
+- postprocess rules
+
+It does **not** include:
+
+- server host or command
+- server `purgery_root`
+- local source `from` paths
+
+This separation keeps server topology server-owned.
+
+## Postprocess steps
+
+Server-side postprocess step kind is `"subprocess"`. Steps are defined with:
+
+```toml
+[postprocess.steps.compress-video]
+kind = "subprocess"
+program = "my-compress-video"
+args = ["--input", "{input}"]
+expected_outputs = ["{stem}.Z.webm"]
+keep_original = true
+```
+
+Supported placeholders in `args` and `expected_outputs`:
+
+| Placeholder | Resolves to |
+|-------------|-------------|
+| `{input}` | Absolute work-area input path |
+| `{parent}` | Work-area parent directory |
+| `{file_name}` | Input file name |
+| `{stem}` | Input path without extension |
+
+The client references steps by name only:
+
+```toml
+[[postprocess.rules]]
+match = '^videos/.*\.mp4$'
+steps = ["compress-video"]
+```
+
+## Boot-time checks
+
+Both binaries support a `check` subcommand:
+
+```sh
+purgery-client check --config client.toml
+purgery-server check --config server.toml
+```
+
+Client checks: `ssh` and `rsync` executables are accessible, server is reachable.
+
+Server checks: `root` and `purgery_root` are accessible, all postprocess programs exist and are executable, config is internally valid.
+
+Normal operations (`process-once`, `sync-and-cleanup`) run the same checks before mutating state.
+
+## Status envelope verification
+
+Before deleting any local file, the client verifies:
+
+- `status.nickname == manifest.nickname`
+- `status.run_id == manifest.run_id`
+
+If either mismatches, cleanup is aborted and nothing is deleted.
+
 ## Binaries
 
-- **purgery-client** — runs on user machines; syncs files and cleans up on confirmation.
-- **purgery-server** — runs on the server; processes ready runs, postprocesses, and writes status.
+- **purgery-client** — runs on user machines; syncs files and cleans up on confirmation. Supports `sync-and-cleanup` and `check`.
+- **purgery-server** — runs on the server. Supports `process-once`, `begin-run`, `finish-run`, `status`, and `check`.
 
 ## Example Config
 
@@ -126,7 +194,6 @@ nickname = "laptop"
 
 [server]
 host = "example.com"
-purgery_root = "/universe/tmp/purgery"
 
 [[sync]]
 name = "videos"
@@ -151,8 +218,10 @@ log_dir = "/var/log/purgery"
 max_parallel_jobs = 1
 
 [postprocess.steps.compress-video]
-kind = "compress-video"
+kind = "subprocess"
 program = "my-compress-video"
+args = ["--input", "{input}"]
+expected_outputs = ["{stem}.Z.webm"]
 keep_original = true
 ```
 
@@ -161,9 +230,10 @@ keep_original = true
 Local files are deleted only after:
 
 1. The server's `status.toml` is valid.
-2. The file's status is `imported`.
-3. The local file still matches the uploaded identity (size, mtime, and optional SHA-256).
-4. The sync mapping has `delete_after_import = true`.
+2. `status.nickname == manifest.nickname` and `status.run_id == manifest.run_id`.
+3. The file's status is `imported`.
+4. The local file still matches the uploaded identity (size, mtime, and optional SHA-256).
+5. The sync mapping has `delete_after_import = true`.
 
 ## Non-Goals (Initial Version)
 

@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use purgery_core::{
-    build_rsync_args, shell_escape, ClientConfig, ClientLocalPath, Manifest, ManifestFileEntry,
-    NormalizedRelativePath, RunId, RunStatus,
+    build_rsync_args, shell_escape, BeginRunResponse, ClientConfig, ClientLocalPath, Manifest,
+    ManifestFileEntry, NormalizedRelativePath, RunConfig, RunConfigSync, RunId, RunStatus,
 };
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -30,6 +30,12 @@ enum Command {
         #[arg(long)]
         config: String,
     },
+    /// Check client dependencies and server connectivity
+    Check {
+        /// Path to client configuration TOML
+        #[arg(long)]
+        config: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -38,7 +44,147 @@ fn main() -> Result<()> {
         Command::SyncAndCleanup { config } => {
             sync_and_cleanup(&config)?;
         }
+        Command::Check { config } => {
+            client_check(&config)?;
+        }
     }
+    Ok(())
+}
+
+/// Run a command via SSH.
+fn ssh_run(host: &str, cmd: &str) -> Result<String> {
+    let output = std::process::Command::new("ssh")
+        .arg(host)
+        .arg(cmd)
+        .output()
+        .with_context(|| format!("failed to execute SSH command on {host}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("SSH command on {host} failed: {stderr}");
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Run the server command over SSH and return stdout.
+fn server_cmd(host: &str, server_command: &str, args: &[&str]) -> Result<String> {
+    let full_cmd = {
+        let mut cmd = server_command.to_owned();
+        for a in args {
+            cmd.push(' ');
+            cmd.push_str(&shell_escape(a));
+        }
+        cmd
+    };
+    ssh_run(host, &full_cmd)
+}
+
+/// Read a remote file via SSH.
+#[allow(dead_code)]
+fn read_remote_file(host: &str, path: &str) -> Result<String> {
+    ssh_run(host, &format!("cat {}", shell_escape(path)))
+}
+
+/// Write content to a remote file via SSH.
+fn write_remote_file(host: &str, path: &str, content: &str) -> Result<()> {
+    let remote_cmd = format!("cat > {}", purgery_core::shell_escape(path));
+    let mut child = std::process::Command::new("ssh")
+        .arg(host)
+        .arg(&remote_cmd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn SSH write to {host}:{path}"))?;
+
+    use std::io::Write;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(content.as_bytes())
+            .with_context(|| "failed to write content to SSH stdin")?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .with_context(|| "failed to wait for SSH write")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("failed to write remote file {path} on {host}: {stderr}");
+    }
+
+    Ok(())
+}
+
+/// Build a RunConfig from a ClientConfig — strips server-local fields.
+fn build_run_config(config: &ClientConfig) -> RunConfig {
+    let sync: Vec<RunConfigSync> = config
+        .sync
+        .iter()
+        .map(|s| RunConfigSync {
+            name: s.name.clone(),
+            to_path: s.to_path.clone(),
+        })
+        .collect();
+
+    RunConfig {
+        nickname: config.nickname.clone(),
+        sync,
+        postprocess: config.postprocess.clone(),
+    }
+}
+
+/// Client boot-time check: verify ssh, rsync, and server connectivity.
+fn client_check(config_path: &str) -> Result<()> {
+    eprintln!("checking client configuration...");
+
+    // 1. Check ssh is accessible
+    let ssh_check = std::process::Command::new("ssh").arg("-V").output();
+    match ssh_check {
+        Ok(output) if output.status.success() => {
+            eprintln!("  ssh: found");
+        }
+        _ => anyhow::bail!("ssh executable not found or not accessible"),
+    }
+
+    // 2. Check rsync is accessible
+    let rsync_check = std::process::Command::new("rsync")
+        .arg("--version")
+        .output();
+    match rsync_check {
+        Ok(output) if output.status.success() => {
+            eprintln!("  rsync: found");
+        }
+        _ => anyhow::bail!("rsync executable not found or not accessible"),
+    }
+
+    // 3. Check server connectivity
+    let config_content = fs::read_to_string(config_path)
+        .with_context(|| format!("failed to read client config: {config_path}"))?;
+    let config = ClientConfig::from_toml(&config_content)
+        .with_context(|| "failed to parse client config")?;
+
+    eprintln!(
+        "  server: checking connectivity to {}...",
+        config.server.host.as_str()
+    );
+    let result = server_cmd(
+        config.server.host.as_str(),
+        &config.server.command,
+        &["check"],
+    );
+    match result {
+        Ok(_) => eprintln!("  server: reachable"),
+        Err(e) => {
+            anyhow::bail!(
+                "server at '{}' unreachable or check failed: {e}",
+                config.server.host.as_str()
+            );
+        }
+    }
+
+    eprintln!("client configuration: OK");
     Ok(())
 }
 
@@ -50,54 +196,53 @@ fn sync_and_cleanup(config_path: &str) -> Result<()> {
 
     // 1. Generate a unique run ID
     let run_id = RunId::generate();
+    let host = config.server.host.as_str();
+    let server_command = &config.server.command;
+
     eprintln!(
         "starting run {}/{}",
         config.nickname.as_str(),
         run_id.as_str()
     );
 
-    // 2. Walk local files and build manifest
+    // 2. Begin run on server — get server-derived paths
+    let begin_out = server_cmd(
+        host,
+        server_command,
+        &[
+            "begin-run",
+            "--nickname",
+            config.nickname.as_str(),
+            "--run-id",
+            run_id.as_str(),
+        ],
+    )?;
+    let begin_resp: BeginRunResponse =
+        toml::from_str(&begin_out).with_context(|| "failed to parse begin-run response")?;
+
+    eprintln!("  incoming dir: {}", begin_resp.incoming_dir);
+
+    // 3. Walk local files and build manifest
     let manifest = build_manifest(&config, &run_id)?;
     eprintln!("discovered {} file(s) to sync", manifest.files.len());
 
-    // 3. Create run directory on server
-    let remote_incoming_dir = format!(
-        "{}/{}/incoming/{}",
-        config.server.purgery_root.as_str(),
-        config.nickname.as_str(),
-        run_id.as_str()
-    );
-
-    // 4. Create directories on server via SSH
-    let mkdir_cmd = format!(
-        "mkdir -p {}",
-        purgery_core::shell_escape(&format!("{remote_incoming_dir}/files"))
-    );
-    ssh_run(config.server.host.as_str(), &mkdir_cmd)?;
-
-    // 5. Write config and manifest to server
-    let config_toml = fs::read_to_string(config_path)
-        .with_context(|| format!("failed to read config: {config_path}"))?;
-    write_remote_file(
-        config.server.host.as_str(),
-        &format!("{remote_incoming_dir}/config.toml"),
-        &config_toml,
-    )?;
+    // 4. Write run.toml and manifest.toml to server
+    let run_config = build_run_config(&config);
+    let run_config_toml = run_config
+        .to_toml()
+        .with_context(|| "failed to serialize run config")?;
+    write_remote_file(host, &begin_resp.run_config_path, &run_config_toml)?;
     let manifest_toml = manifest.to_toml()?;
-    write_remote_file(
-        config.server.host.as_str(),
-        &format!("{remote_incoming_dir}/manifest.toml"),
-        &manifest_toml,
-    )?;
+    write_remote_file(host, &begin_resp.manifest_path, &manifest_toml)?;
 
-    // 6. Rsync files per sync mapping
+    // 5. Rsync files per sync mapping
     for sync in &config.sync {
         let from_path = sync.from_path.as_str();
         let to_path = sync.to_path.as_str();
-        let remote_files_dir = format!("{remote_incoming_dir}/files/{to_path}/");
+        let remote_files_dir = format!("{}/{to_path}/", begin_resp.files_dir);
 
         eprintln!("syncing {from_path} -> {remote_files_dir}");
-        let rsync_dest = format!("{}:{}", config.server.host.as_str(), remote_files_dir);
+        let rsync_dest = format!("{}:{}", host, remote_files_dir);
         let args = build_rsync_args(from_path, &rsync_dest);
         let status = std::process::Command::new("rsync")
             .args(&args)
@@ -109,36 +254,39 @@ fn sync_and_cleanup(config_path: &str) -> Result<()> {
         }
     }
 
-    // 7. Atomically move from incoming to ready
-    let remote_ready_dir = format!(
-        "{}/{}/ready/{}",
-        config.server.purgery_root.as_str(),
-        config.nickname.as_str(),
-        run_id.as_str()
-    );
-    let ready_cmd = format!(
-        "mv {} {}",
-        purgery_core::shell_escape(&remote_incoming_dir),
-        purgery_core::shell_escape(&remote_ready_dir),
-    );
-    ssh_run(config.server.host.as_str(), &ready_cmd)?;
+    // 6. Finish run: move from incoming to ready
+    eprintln!("finishing run...");
+    server_cmd(
+        host,
+        server_command,
+        &[
+            "finish-run",
+            "--nickname",
+            config.nickname.as_str(),
+            "--run-id",
+            run_id.as_str(),
+        ],
+    )?;
     eprintln!("run moved to ready");
 
-    // 8. Poll for status in done or failed directory
-    let done_dir = format!(
-        "{}/{}/done/{}",
-        config.server.purgery_root.as_str(),
-        config.nickname.as_str(),
-        run_id.as_str()
-    );
-    let failed_dir = format!(
-        "{}/{}/failed/{}",
-        config.server.purgery_root.as_str(),
-        config.nickname.as_str(),
-        run_id.as_str()
-    );
+    // 7. Poll for status via server command
+    let status = poll_for_status(host, server_command, &config.nickname, &run_id)?;
 
-    let status = poll_for_status(config.server.host.as_str(), &done_dir, &failed_dir)?;
+    // 8. Verify status envelope before deletion
+    if status.nickname != manifest.nickname {
+        anyhow::bail!(
+            "status nickname '{}' does not match manifest nickname '{}'; aborting deletion",
+            status.nickname.as_str(),
+            manifest.nickname.as_str()
+        );
+    }
+    if status.run_id != manifest.run_id {
+        anyhow::bail!(
+            "status run_id '{}' does not match manifest run_id '{}'; aborting deletion",
+            status.run_id.as_str(),
+            manifest.run_id.as_str()
+        );
+    }
 
     // 9. Delete confirmed local files
     let deletion_count = delete_confirmed_files(&config, &manifest, &status)?;
@@ -240,82 +388,37 @@ fn compute_sha256(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Run a command via SSH.
-fn ssh_run(host: &str, cmd: &str) -> Result<String> {
-    let output = std::process::Command::new("ssh")
-        .arg(host)
-        .arg(cmd)
-        .output()
-        .with_context(|| format!("failed to execute SSH command on {host}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("SSH command on {host} failed: {stderr}");
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-/// Write content to a remote file via SSH.
-fn write_remote_file(host: &str, path: &str, content: &str) -> Result<()> {
-    let remote_cmd = format!("cat > {}", purgery_core::shell_escape(path));
-    let mut child = std::process::Command::new("ssh")
-        .arg(host)
-        .arg(&remote_cmd)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed to spawn SSH write to {host}:{path}"))?;
-
-    use std::io::Write;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(content.as_bytes())
-            .with_context(|| "failed to write content to SSH stdin")?;
-    }
-
-    let output = child
-        .wait_with_output()
-        .with_context(|| "failed to wait for SSH write")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("failed to write remote file {path} on {host}: {stderr}");
-    }
-
-    Ok(())
-}
-
-/// Poll for status.toml in done or failed directories.
-fn poll_for_status(host: &str, done_dir: &str, failed_dir: &str) -> Result<RunStatus> {
+/// Poll for status via the server's status command.
+fn poll_for_status(
+    host: &str,
+    server_command: &str,
+    nickname: &purgery_core::Nickname,
+    run_id: &RunId,
+) -> Result<RunStatus> {
     let max_attempts = 60;
     let poll_interval = Duration::from_secs(2);
 
     for attempt in 1..=max_attempts {
-        // Check done directory
-        let status_path = format!("{done_dir}/status.toml");
-        let output = ssh_run(host, &format!("cat {}", shell_escape(&status_path)));
+        let output = server_cmd(
+            host,
+            server_command,
+            &[
+                "status",
+                "--nickname",
+                nickname.as_str(),
+                "--run-id",
+                run_id.as_str(),
+            ],
+        );
 
         if let Ok(content) = output {
             if !content.trim().is_empty() {
-                return RunStatus::from_toml(content.trim())
-                    .with_context(|| "failed to parse status from done");
+                let status = RunStatus::from_toml(content.trim())
+                    .with_context(|| "failed to parse status from server")?;
+                return Ok(status);
             }
         }
 
-        // Check failed directory
-        let failed_status_path = format!("{failed_dir}/status.toml");
-        let output = ssh_run(host, &format!("cat {}", shell_escape(&failed_status_path)));
-
-        if let Ok(content) = output {
-            if !content.trim().is_empty() {
-                return RunStatus::from_toml(content.trim())
-                    .with_context(|| "failed to parse status from failed");
-            }
-        }
-
-        // Check if the ready directory still exists (run not yet claimed)
         if attempt % 10 == 0 {
             eprintln!("waiting for server to process run (attempt {attempt}/{max_attempts})...");
         }

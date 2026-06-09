@@ -10,3 +10,4 @@ purgery-core = { path = "../purgery-core" }
 anyhow = "1"
 walkdir = "2"
 sha2 = "0.10"
+toml = "1.1"
