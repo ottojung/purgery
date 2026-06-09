@@ -581,10 +581,7 @@ fn planned_entry_outputs(
     let mut any_rule_matched = false;
     let mut outputs: Vec<String> = Vec::new();
 
-    for rule in &run_plan.rules {
-        if !rule.is_match(&normalized_path) {
-            continue;
-        }
+    for rule in run_plan.matching_rules(entry.sync_name.as_str(), &normalized_path) {
         any_rule_matched = true;
         for step in &rule.steps {
             if step.step_def.keep_original {
@@ -823,12 +820,10 @@ fn process_manifest_entry(
         .to_string();
     let normalized_path = entry.relative_path.as_str().to_owned();
 
-    // Check whether any postprocess rule matches this entry.  If not, commit
-    // directly using the kind-specific path (no work-area overhead).
-    let matched = run_plan
-        .rules
-        .iter()
-        .any(|rule| rule.is_match(&normalized_path));
+    // Check whether any postprocess rule matching this entry's sync group
+    // matches this entry.  If not, commit directly using the kind-specific
+    // path (no work-area overhead).
+    let matched = run_plan.entry_is_postprocess(entry.sync_name.as_str(), &normalized_path);
 
     let result = if !matched {
         // Direct commit — no postprocessing.
@@ -861,7 +856,7 @@ fn process_manifest_entry(
             Ok(p) => p,
             Err(error) => return failed_entry(entry, error),
         };
-        match apply_postprocessing(run_plan, &normalized_path, &work_path) {
+        match apply_postprocessing(run_plan, entry.sync_name.as_str(), &normalized_path, &work_path) {
             Ok(outputs) => {
                 let mut final_paths = Vec::new();
                 for output in outputs {
@@ -892,12 +887,8 @@ fn process_manifest_entry(
                             .to_string(),
                     );
                 }
-                let steps: Vec<String> = run_plan
-                    .rules
-                    .iter()
-                    .filter(|rule| rule.is_match(&normalized_path))
-                    .flat_map(|rule| rule.steps.iter().map(|step| step.step_name.clone()))
-                    .collect();
+                let steps: Vec<String> =
+                    run_plan.postprocess_steps_for(entry.sync_name.as_str(), &normalized_path);
                 Ok((final_paths, (!steps.is_empty()).then_some(steps)))
             }
             Err(error) => Err(error),
@@ -1394,6 +1385,49 @@ pub struct RunPlan {
 }
 
 impl RunPlan {
+    /// Return all compiled rules that both apply to the given sync group
+    /// AND match the given normalized relative path.
+    pub fn matching_rules<'a>(
+        &'a self,
+        sync_name: &str,
+        normalized_path: &str,
+    ) -> Vec<&'a CompiledRule> {
+        self.rules
+            .iter()
+            .filter(|r| r.applies_to(sync_name) && r.is_match(normalized_path))
+            .collect()
+    }
+
+    /// Return the first compiled rule that both applies to the given sync
+    /// group AND matches the given normalized relative path, or None.
+    pub fn first_matching_rule<'a>(
+        &'a self,
+        sync_name: &str,
+        normalized_path: &str,
+    ) -> Option<&'a CompiledRule> {
+        self.rules
+            .iter()
+            .find(|r| r.applies_to(sync_name) && r.is_match(normalized_path))
+    }
+
+    /// Returns true if any rule applies to the given sync group and matches
+    /// the given normalized relative path.
+    pub fn entry_is_postprocess(&self, sync_name: &str, normalized_path: &str) -> bool {
+        self.rules
+            .iter()
+            .any(|r| r.applies_to(sync_name) && r.is_match(normalized_path))
+    }
+
+    /// Collect postprocess step names from all rules that apply to the given
+    /// sync group and match the given normalized relative path.
+    pub fn postprocess_steps_for(&self, sync_name: &str, normalized_path: &str) -> Vec<String> {
+        self.rules
+            .iter()
+            .filter(|r| r.applies_to(sync_name) && r.is_match(normalized_path))
+            .flat_map(|r| r.steps.iter().map(|s| s.step_name.clone()))
+            .collect()
+    }
+
     /// Build a run plan from server config and run config.
     ///
     /// Validates all patterns and step references. Returns an error
@@ -1453,10 +1487,12 @@ impl RunPlan {
 /// Apply postprocessing rules to an entry root in the work area using a precompiled RunPlan.
 ///
 /// `normalized_path` is the logical path used for rule matching (e.g. `videos/video.mp4`).
+/// `sync_name` is the entry's sync group name, used for scoped rule matching.
 /// `work_path` is the absolute work area path used for subprocess execution.
 /// Returns the list of work area paths to commit, deduplicated and ordered.
 pub fn apply_postprocessing(
     run_plan: &RunPlan,
+    sync_name: &str,
     normalized_path: &str,
     work_path: &Utf8Path,
 ) -> Result<Vec<Utf8PathBuf>, String> {
@@ -1467,10 +1503,7 @@ pub fn apply_postprocessing(
         .parent()
         .ok_or_else(|| "work path has no parent directory".to_string())?;
 
-    for compiled in &run_plan.rules {
-        if !compiled.is_match(normalized_path) {
-            continue;
-        }
+    for compiled in run_plan.matching_rules(sync_name, normalized_path) {
         any_rule_matched = true;
 
         for step in &compiled.steps {
@@ -3004,7 +3037,7 @@ delete_after_import = true
         fs::write(&work_path, b"test data").unwrap();
 
         let run_plan = RunPlan::build(&server_config, &run_config).unwrap();
-        let results = apply_postprocessing(&run_plan, "videos/some file.mp4", &work_path);
+        let results = apply_postprocessing(&run_plan, "videos", "videos/some file.mp4", &work_path);
         assert!(results.is_ok(), "postprocess with spaces should succeed");
         let outputs = results.unwrap();
         assert!(!outputs.is_empty());
@@ -3148,7 +3181,7 @@ steps = ["compress-video"]
         };
 
         let pp_run_plan = RunPlan::build(&server_config, &run_config).unwrap();
-        let result = apply_postprocessing(&pp_run_plan, "videos/video.mp4", &work_path);
+        let result = apply_postprocessing(&pp_run_plan, "videos", "videos/video.mp4", &work_path);
         assert!(result.is_ok());
         let outputs = result.unwrap();
         assert!(outputs.contains(&work_path));
@@ -3199,7 +3232,7 @@ steps = ["compress-video"]
         };
 
         let pp_run_plan = RunPlan::build(&server_config, &run_config).unwrap();
-        let result = apply_postprocessing(&pp_run_plan, "videos/video.mp4", &work_path);
+        let result = apply_postprocessing(&pp_run_plan, "videos", "videos/video.mp4", &work_path);
         assert!(result.is_ok());
         let outputs = result.unwrap();
         assert!(
@@ -3257,7 +3290,7 @@ steps = ["compress-video"]
         };
 
         let pp_run_plan = RunPlan::build(&server_config, &run_config).unwrap();
-        let result = apply_postprocessing(&pp_run_plan, "videos/video.mp4", &work_path);
+        let result = apply_postprocessing(&pp_run_plan, "videos", "videos/video.mp4", &work_path);
         assert!(result.is_ok());
         let outputs = result.unwrap();
         assert!(
@@ -4995,7 +5028,7 @@ steps = ["compress-video"]
         fs::write(work_path.with_file_name("input.out"), "output").unwrap();
 
         let outputs =
-            apply_postprocessing(&expected_output_test_plan(), "data/input.txt", &work_path)
+            apply_postprocessing(&expected_output_test_plan(), "data", "data/input.txt", &work_path)
                 .unwrap();
         assert_eq!(outputs, vec![work_path.with_file_name("input.out")]);
     }
@@ -5007,7 +5040,7 @@ steps = ["compress-video"]
         fs::write(&work_path, "input").unwrap();
 
         let error =
-            apply_postprocessing(&expected_output_test_plan(), "data/input.txt", &work_path)
+            apply_postprocessing(&expected_output_test_plan(), "data", "data/input.txt", &work_path)
                 .unwrap_err();
         assert!(error.contains("expected output not found"));
     }
@@ -5024,7 +5057,7 @@ steps = ["compress-video"]
         std::os::unix::fs::symlink(&target, work_path.with_file_name("input.out")).unwrap();
 
         let outputs =
-            apply_postprocessing(&expected_output_test_plan(), "data/input.txt", &work_path)
+            apply_postprocessing(&expected_output_test_plan(), "data", "data/input.txt", &work_path)
                 .unwrap();
         assert!(
             outputs.contains(&work_path.with_file_name("input.out")),
@@ -5048,7 +5081,7 @@ steps = ["compress-video"]
         fs::create_dir(work_path.with_file_name("input.out")).unwrap();
 
         let outputs =
-            apply_postprocessing(&expected_output_test_plan(), "data/input.txt", &work_path)
+            apply_postprocessing(&expected_output_test_plan(), "data", "data/input.txt", &work_path)
                 .unwrap();
         assert!(outputs.contains(&work_path.with_file_name("input.out")));
     }
@@ -5061,7 +5094,7 @@ steps = ["compress-video"]
         std::os::unix::fs::symlink("some-target", work_path.with_file_name("input.out")).unwrap();
 
         let outputs =
-            apply_postprocessing(&expected_output_test_plan(), "data/input.txt", &work_path)
+            apply_postprocessing(&expected_output_test_plan(), "data", "data/input.txt", &work_path)
                 .unwrap();
         assert!(outputs.contains(&work_path.with_file_name("input.out")));
     }
@@ -5078,7 +5111,7 @@ steps = ["compress-video"]
             .unwrap();
 
         let error =
-            apply_postprocessing(&expected_output_test_plan(), "data/input.txt", &work_path)
+            apply_postprocessing(&expected_output_test_plan(), "data", "data/input.txt", &work_path)
                 .unwrap_err();
         assert!(error.contains("expected output is not a supported entry type"));
     }
@@ -6642,7 +6675,6 @@ for = ["videos"]
         );
     }
 
-    #[ignore = "expected to fail until scoped matching is used in process_manifest_entry"]
     #[test]
     fn out_of_scope_rule_does_not_process_entry() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6726,7 +6758,6 @@ for = ["pictures"]
         assert!(status.entries[0].postprocess.is_none() || status.entries[0].postprocess.as_deref() == Some(&[]));
     }
 
-    #[ignore = "expected to fail until scoped matching is used in planned_entry_outputs"]
     #[test]
     fn out_of_scope_rule_does_not_affect_planned_outputs() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6743,8 +6774,8 @@ for = ["pictures"]
                             kind: PostprocessKind::Subprocess,
                             program: "true".into(),
                             args: vec![],
-                            expected_outputs: vec![],
-                            keep_original: false,
+                            expected_outputs: vec!["{file_stem}.out".into()],
+                            keep_original: true,
                         },
                     );
                     m
@@ -6754,16 +6785,13 @@ for = ["pictures"]
         };
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("scoped-outputs".into()).unwrap();
-        let ready = config
+        let incoming = config
             .purgery_root
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
-
-        // Two sync groups with the same file name, but rule only matches one
-        fs::create_dir_all(ready.join("files/videos")).unwrap();
-        fs::write(ready.join("files/videos/album"), b"video-data").unwrap();
-        fs::create_dir_all(ready.join("files/pictures")).unwrap();
-        fs::write(ready.join("files/pictures/album"), b"picture-data").unwrap();
-        fs::write(ready.join("run.toml"),
+            .run_dir(&nickname, &run_id, RunPhase::Incoming);
+        fs::create_dir_all(&incoming).unwrap();
+        fs::create_dir_all(incoming.join("files/videos")).unwrap();
+        fs::write(incoming.join("files/videos/album"), b"video-data").unwrap();
+        fs::write(incoming.join("run.toml"),
             br#"nickname = "laptop"
 [[sync]]
 name = "videos"
@@ -6781,51 +6809,58 @@ steps = ["pack"]
 for = ["videos"]
 "#).unwrap();
 
-        // Both entries are postprocess, but the rule only applies to videos
-        let manifest = Manifest {
-            run_id: run_id.clone(),
-            nickname: nickname.clone(),
-            entries: vec![
-                ManifestEntry {
-                    sync_name: SyncName::new("videos".into()).unwrap(),
-                    local_path: ClientLocalPath::new("/src/videos/album".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/videos/album".into()).unwrap(),
-                    relative_path: NormalizedRelativePath::new("album".into()).unwrap(),
-                    kind: ManifestEntryKind::RegularFile,
-                    size: 9,
-                    mtime_ns: 100,
-                    sha256: None,
-                    link_target: None,
-                    mode: purgery_core::ManifestEntryMode::Postprocess,
-                    postprocess_steps: vec!["pack".into()],
-                    covered_by: None,
-                },
-                ManifestEntry {
-                    sync_name: SyncName::new("pictures".into()).unwrap(),
-                    local_path: ClientLocalPath::new("/src/pictures/album".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/pictures/album".into()).unwrap(),
-                    relative_path: NormalizedRelativePath::new("album".into()).unwrap(),
-                    kind: ManifestEntryKind::RegularFile,
-                    size: 12,
-                    mtime_ns: 200,
-                    sha256: None,
-                    link_target: None,
-                    mode: purgery_core::ManifestEntryMode::Postprocess,
-                    postprocess_steps: vec!["pack".into()],
-                    covered_by: None,
-                },
-            ],
-        };
-        fs::write(ready.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+        // Build the run config and run plan
+        let run_config_content = fs::read_to_string(incoming.join("run.toml")).unwrap();
+        let run_config = purgery_core::RunConfig::from_toml(&run_config_content).unwrap();
+        let run_plan = RunPlan::build(&config, &run_config).unwrap();
+        let sync_map = run_config.sync_map();
 
-        process_run(&config, &nickname, &run_id).unwrap();
-        let done = config.purgery_root.run_dir(&nickname, &run_id, RunPhase::Done);
-        let status_content = fs::read_to_string(done.join("status.toml")).unwrap();
-        let status = RunStatus::from_toml(&status_content).unwrap();
-        // Both should succeed
-        assert_eq!(status.entries.len(), 2);
-        for e in &status.entries {
-            assert_eq!(e.status, FileStatus::Imported, "entry {:?} should be imported", e.relative_path);
-        }
+        // Create entries with the same relative path but different sync groups
+        let videos_entry = ManifestEntry {
+            sync_name: SyncName::new("videos".into()).unwrap(),
+            local_path: ClientLocalPath::new("/src/videos/album".into()).unwrap(),
+            staged_path: NormalizedRelativePath::new("files/videos/album".into()).unwrap(),
+            relative_path: NormalizedRelativePath::new("album".into()).unwrap(),
+            kind: ManifestEntryKind::RegularFile,
+            size: 9,
+            mtime_ns: 100,
+            sha256: None,
+            link_target: None,
+            mode: purgery_core::ManifestEntryMode::Postprocess,
+            postprocess_steps: vec!["pack".into()],
+            covered_by: None,
+        };
+        let pictures_entry = ManifestEntry {
+            sync_name: SyncName::new("pictures".into()).unwrap(),
+            local_path: ClientLocalPath::new("/src/pictures/album".into()).unwrap(),
+            staged_path: NormalizedRelativePath::new("files/pictures/album".into()).unwrap(),
+            relative_path: NormalizedRelativePath::new("album".into()).unwrap(),
+            kind: ManifestEntryKind::RegularFile,
+            size: 12,
+            mtime_ns: 200,
+            sha256: None,
+            link_target: None,
+            mode: purgery_core::ManifestEntryMode::Postprocess,
+            postprocess_steps: vec!["pack".into()],
+            covered_by: None,
+        };
+
+        let videos_sync = sync_map.get("videos").unwrap();
+        let pictures_sync = sync_map.get("pictures").unwrap();
+
+        let videos_outputs = planned_entry_outputs(&config, &nickname, videos_sync, &videos_entry, &run_plan);
+        let pictures_outputs = planned_entry_outputs(&config, &nickname, pictures_sync, &pictures_entry, &run_plan);
+
+        // videos/album should have postprocess outputs (keep_original + .out)
+        assert!(
+            videos_outputs.len() >= 2,
+            "videos/album should have postprocess outputs, got: {videos_outputs:?}"
+        );
+        // pictures/album should have only its own final path (no rule applies)
+        assert_eq!(
+            pictures_outputs.len(),
+            1,
+            "pictures/album should have only its own final path, got: {pictures_outputs:?}"
+        );
     }
 }
