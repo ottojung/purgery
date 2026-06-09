@@ -969,20 +969,44 @@ fn build_manifest(config: &ClientConfig, run_id: &RunId) -> Result<Manifest> {
                 .with_context(|| format!("failed to read metadata: {}", path.display()))?;
             let file_type = metadata.file_type();
 
+            // Classify entry as passthrough or postprocessed before computing identity.
+            let normalized_path = relative_path.as_str().to_owned();
+            let matched_rule = config
+                .postprocess
+                .rules
+                .iter()
+                .find(|r| purgery_core::rsync_pattern_match(&r.pattern, &normalized_path));
+            let mode = if matched_rule.is_some() {
+                purgery_core::ManifestEntryMode::Postprocess
+            } else {
+                purgery_core::ManifestEntryMode::Passthrough
+            };
+            let postprocess_steps: Vec<String> =
+                matched_rule.map(|r| r.steps.clone()).unwrap_or_default();
+
+            // Identity bookkeeping is needed for postprocess entries (server verification)
+            // and for passthrough entries with delete_after_import=true (local cleanup).
+            let needs_bookkeeping = matched_rule.is_some() || sync.delete_after_import;
+
             let (kind, size, mtime_ns, sha256, link_target) = if file_type.is_dir() {
                 (purgery_core::ManifestEntryKind::Directory, 0, 0, None, None)
             } else if file_type.is_file() {
-                let mtime_ns = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
-                    .map(|duration| duration.as_nanos() as i64)
-                    .unwrap_or(0);
+                let (mtime_ns, sha256) = if needs_bookkeeping {
+                    let mtime_ns = metadata
+                        .modified()
+                        .ok()
+                        .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+                        .map(|duration| duration.as_nanos() as i64)
+                        .unwrap_or(0);
+                    (mtime_ns, compute_sha256(path).ok())
+                } else {
+                    (0, None)
+                };
                 (
                     purgery_core::ManifestEntryKind::RegularFile,
                     metadata.len(),
                     mtime_ns,
-                    compute_sha256(path).ok(),
+                    sha256,
                     None,
                 )
             } else if file_type.is_symlink() {
@@ -1004,21 +1028,6 @@ fn build_manifest(config: &ClientConfig, run_id: &RunId) -> Result<Manifest> {
             } else {
                 anyhow::bail!("unsupported filesystem object: {}", path.display());
             };
-
-            // Classify entry as passthrough or postprocessed
-            let normalized_path = relative_path.as_str().to_owned();
-            let matched_rule = config
-                .postprocess
-                .rules
-                .iter()
-                .find(|r| purgery_core::rsync_pattern_match(&r.pattern, &normalized_path));
-            let mode = if matched_rule.is_some() {
-                purgery_core::ManifestEntryMode::Postprocess
-            } else {
-                purgery_core::ManifestEntryMode::Passthrough
-            };
-            let postprocess_steps: Vec<String> =
-                matched_rule.map(|r| r.steps.clone()).unwrap_or_default();
 
             entries.push(ManifestEntry {
                 sync_name: sync.name.clone(),
@@ -1463,7 +1472,6 @@ delete_after_import = false
         );
     }
 
-    #[ignore = "expected to fail until identity bookkeeping is corrected"]
     #[test]
     fn passthrough_no_delete_entries_have_no_sha256() {
         let tmp = tempfile::tempdir().unwrap();
