@@ -204,10 +204,13 @@ For postprocess entries, cleanup authority is the server's `status.toml`:
 
 For passthrough entries, cleanup authority is the durable local cleanup state:
 
-1. A valid cleanup state file exists on disk with a recorded rsync success marker.
-2. The local file still matches the recorded identity (size, mtime, optional SHA-256).
-3. The local file is still a regular file (not a symlink replacement).
-4. The sync mapping has `delete_after_import = true`.
+1. A valid cleanup state file exists on disk with a recorded rsync success marker (i.e. `rsync_succeeded = true`).
+2. The cleanup identity was captured **before** rsync — either from a pre-rsync source walk (PassthroughDeleteAfterImport) or from the pre-rsync manifest (purgatory passthrough remainder).
+3. The local file still matches the recorded identity (size, mtime, optional SHA-256).
+4. The local file is still a regular file (not a symlink replacement).
+5. The sync mapping has `delete_after_import = true`.
+
+The cleanup state is always written before the passthrough rsync, with `rsync_succeeded = false`. Deletion is authorized only after rsync succeeds and the success marker is durably recorded.
 
 Passthrough entries with `delete_after_import = false` are never cleaned.
 

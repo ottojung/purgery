@@ -10,9 +10,24 @@ For passthrough entries with `delete_after_import = true`, the client writes a d
 $XDG_STATE_HOME/purgery/  or  ~/.local/state/purgery/
 ```
 
-This is the only cleanup mechanism. It is used for both pure passthrough invocations and mixed invocations.
+This is the only cleanup mechanism. It is used for all delete-after-import cleanup: pure passthrough invocations, mixed invocations, and purgatory passthrough remainder.
 
-For no-rule passthrough groups with `delete_after_import = true`, cleanup identity is captured before rsync. The client walks the source directory for regular files, records their identity (size, mtime, optional SHA-256) in a cleanup state file with `rsync_succeeded = false`, runs the direct unfiltered rsync, then marks `rsync_succeeded = true` on success. Deletion only proceeds against entries whose pre-rsync identity still matches. Files created after the pre-rsync scan are not eligible for deletion. This avoids per-entry transfer filters for no-rule groups while ensuring only files that were actually transferred can be deleted.
+The cleanup ledger protocol is the same everywhere:
+
+1. Capture cleanup identity **before** rsync — either by walking the source (PassthroughDeleteAfterImport) or from the pre-rsync manifest (purgatory passthrough remainder).
+2. Write cleanup state atomically with `rsync_succeeded = false`.
+3. Run the passthrough rsync.
+4. If rsync succeeds, atomically mark `rsync_succeeded = true`.
+5. Delete only entries whose current local identity still matches the pre-rsync capture.
+6. Atomically mark each successfully deleted entry as cleaned.
+
+If rsync fails, deletion is not authorized. The `rsync_succeeded` flag remains `false` and resume does not delete.
+
+If the client crashes before `rsync_succeeded = true` is durably recorded, cleanup must not run.
+
+If the client crashes after `rsync_succeeded = true`, the next invocation may resume cleanup safely.
+
+For purgatory passthrough remainder, the pre-rsync identity comes from the manifest entries (built during the pre-transfer walk). The cleanup state is written before the passthrough rsync, not after.
 
 ### Atomicity
 
