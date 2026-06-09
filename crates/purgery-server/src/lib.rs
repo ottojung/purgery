@@ -378,11 +378,91 @@ fn failed_entry(entry: &ManifestEntry, error: impl Into<String>) -> EntryOutcome
     }
 }
 
+/// Compute all planned final paths for a manifest entry, including
+/// postprocess-derived outputs. This is used by `validate_unique_final_paths`
+/// to detect collisions between direct entry paths and postprocess outputs
+/// before any files are processed.
+fn planned_entry_outputs(
+    server_config: &ServerConfig,
+    nickname: &Nickname,
+    sync: &RunConfigSync,
+    entry: &ManifestEntry,
+    run_plan: &RunPlan,
+) -> Vec<String> {
+    let entry_final_path =
+        server_config
+            .root
+            .final_path(nickname, &sync.to_path, &entry.relative_path);
+
+    match entry.kind {
+        ManifestEntryKind::Directory | ManifestEntryKind::Symlink => {
+            vec![entry_final_path.as_str().to_owned()]
+        }
+        ManifestEntryKind::RegularFile => {
+            let normalized_path =
+                format!("{}/{}", sync.to_path.as_str(), entry.relative_path.as_str());
+
+            // A synthetic path for placeholder resolution.  Only `{file_name}`,
+            // `{file_stem}`, and `{stem}` are allowed in expected_outputs, so
+            // the path's parent and absolute location are irrelevant.
+            let synthetic_work_path = Utf8Path::new(entry.relative_path.as_str());
+
+            let mut any_rule_matched = false;
+            let mut outputs: Vec<String> = Vec::new();
+
+            for rule in &run_plan.rules {
+                if !rule.regex.is_match(&normalized_path) {
+                    continue;
+                }
+                any_rule_matched = true;
+                for step in &rule.steps {
+                    if step.step_def.keep_original {
+                        outputs.push(entry_final_path.as_str().to_owned());
+                    }
+                    for pat in &step.step_def.expected_outputs {
+                        if purgery_core::validate_expected_output_name(pat).is_err() {
+                            // Invalid patterns are rejected later during
+                            // processing; skip them here to avoid false
+                            // negatives in duplicate detection.
+                            continue;
+                        }
+                        let resolved = step.step_def.resolve_placeholders(synthetic_work_path, pat);
+                        let p = Utf8Path::new(&resolved);
+                        let fname = p.file_name().unwrap_or(resolved.as_str());
+                        let output_path = entry_final_path
+                            .parent()
+                            .map(|parent| parent.join(fname))
+                            .unwrap_or_else(|| Utf8PathBuf::from(fname));
+                        outputs.push(output_path.as_str().to_owned());
+                    }
+                }
+            }
+
+            if !any_rule_matched {
+                outputs.push(entry_final_path.as_str().to_owned());
+            }
+
+            // Deduplicate the outputs for this single entry (e.g., if two
+            // rules have keep_original the entry final path appears once).
+            let mut seen = std::collections::HashSet::new();
+            outputs.retain(|p| seen.insert(p.clone()));
+            outputs
+        }
+    }
+}
+
+/// Validate that no two manifest entries or their postprocess outputs
+/// resolve to the same final path on disk.
+///
+/// This must be called after `RunPlan::build` and before any entry
+/// processing, so that collisions are caught before any filesystem
+/// mutations.
 fn validate_unique_final_paths(
     server_config: &ServerConfig,
     nickname: &Nickname,
     run_config: &RunConfig,
     manifest: &Manifest,
+    run_plan: &RunPlan,
 ) -> Result<(), String> {
     let sync_map: HashMap<&str, &RunConfigSync> = run_config.sync_map().into_iter().collect();
     let mut destinations: HashMap<String, &ManifestEntry> = HashMap::new();
@@ -391,20 +471,19 @@ fn validate_unique_final_paths(
         let Some(sync) = sync_map.get(entry.sync_name.as_str()) else {
             continue;
         };
-        let final_path =
-            server_config
-                .root
-                .final_path(nickname, &sync.to_path, &entry.relative_path);
-        let destination = final_path.as_str().to_owned();
-        if let Some(previous) = destinations.insert(destination.clone(), entry) {
-            return Err(format!(
-                "duplicate final path '{}' from '{}:{}' and '{}:{}'",
-                destination,
-                previous.sync_name.as_str(),
-                previous.relative_path.as_str(),
-                entry.sync_name.as_str(),
-                entry.relative_path.as_str()
-            ));
+
+        let planned = planned_entry_outputs(server_config, nickname, sync, entry, run_plan);
+        for destination in &planned {
+            if let Some(previous) = destinations.insert(destination.clone(), entry) {
+                return Err(format!(
+                    "duplicate final path '{}' from '{}:{}' and '{}:{}'",
+                    destination,
+                    previous.sync_name.as_str(),
+                    previous.relative_path.as_str(),
+                    entry.sync_name.as_str(),
+                    entry.relative_path.as_str()
+                ));
+            }
         }
     }
 
@@ -726,7 +805,9 @@ pub fn process_processing_run(
         anyhow::bail!("{msg}");
     }
 
-    if let Err(error) = validate_unique_final_paths(config, nickname, &run_config, &manifest) {
+    if let Err(error) =
+        validate_unique_final_paths(config, nickname, &run_config, &manifest, &run_plan)
+    {
         let msg = format!("manifest destination validation failed: {error}");
         warn!("{}", msg);
         write_run_failure(&config.purgery_root, nickname, run_id, &msg)?;
@@ -4302,8 +4383,10 @@ to = "{second_to}"
             ],
         };
 
+        let empty_plan = RunPlan { rules: vec![] };
         let error =
-            validate_unique_final_paths(&config, &nickname, &run_config, &manifest).unwrap_err();
+            validate_unique_final_paths(&config, &nickname, &run_config, &manifest, &empty_plan)
+                .unwrap_err();
         assert!(error.contains("duplicate final path"));
     }
 
@@ -4315,6 +4398,7 @@ to = "{second_to}"
         let config = test_server_config(&purgery, &root);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_config = duplicate_path_run_config("first-dest", "second-dest");
+        let empty_plan = RunPlan { rules: vec![] };
         let manifest = Manifest {
             run_id: RunId::new("distinct-files".into()).unwrap(),
             nickname: nickname.clone(),
@@ -4324,7 +4408,8 @@ to = "{second_to}"
             ],
         };
 
-        validate_unique_final_paths(&config, &nickname, &run_config, &manifest).unwrap();
+        validate_unique_final_paths(&config, &nickname, &run_config, &manifest, &empty_plan)
+            .unwrap();
     }
 
     #[test]
@@ -4335,6 +4420,7 @@ to = "{second_to}"
         let config = test_server_config(&purgery, &root);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_config = duplicate_path_run_config("shared", "shared");
+        let empty_plan = RunPlan { rules: vec![] };
         let manifest = Manifest {
             run_id: RunId::new("duplicate-directories".into()).unwrap(),
             nickname: nickname.clone(),
@@ -4345,7 +4431,8 @@ to = "{second_to}"
         };
 
         let error =
-            validate_unique_final_paths(&config, &nickname, &run_config, &manifest).unwrap_err();
+            validate_unique_final_paths(&config, &nickname, &run_config, &manifest, &empty_plan)
+                .unwrap_err();
         assert!(error.contains("duplicate final path"));
     }
 
@@ -4422,5 +4509,270 @@ to = "shared"
             .as_deref()
             .unwrap()
             .contains("duplicate final path"));
+    }
+
+    // ── Postprocess-derived duplicate final path tests ──
+
+    fn postprocess_collision_run_config() -> RunConfig {
+        RunConfig::from_toml(
+            r#"
+nickname = "laptop"
+
+[[sync]]
+name = "data"
+to = "data"
+
+[[postprocess.rules]]
+match = '^data/.*\.txt$'
+steps = ["compress"]
+"#,
+        )
+        .unwrap()
+    }
+
+    fn postprocess_collision_run_plan() -> RunPlan {
+        RunPlan {
+            rules: vec![CompiledRule {
+                regex: regex::Regex::new(r"^data/.*\.txt$").unwrap(),
+                steps: vec![ResolvedStep {
+                    step_name: "compress".into(),
+                    step_def: PostprocessStepDefinition {
+                        kind: PostprocessKind::Subprocess,
+                        program: "true".into(),
+                        args: vec![],
+                        expected_outputs: vec!["{stem}.Z.webm".into()],
+                        keep_original: true,
+                    },
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn postprocess_output_collides_with_manifest_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let purgery = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let config = test_server_config(&purgery, &root);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_config = postprocess_collision_run_config();
+        let run_plan = postprocess_collision_run_plan();
+
+        let manifest = Manifest {
+            run_id: RunId::new("pp-collision".into()).unwrap(),
+            nickname: nickname.clone(),
+            entries: vec![
+                // document.txt → postprocess (keep_original) produces document.txt + document.Z.webm
+                ManifestEntry {
+                    sync_name: SyncName::new("data".into()).unwrap(),
+                    local_path: ClientLocalPath::new("/source/data/document.txt".into()).unwrap(),
+                    staged_path: NormalizedRelativePath::new("files/data/document.txt".into())
+                        .unwrap(),
+                    relative_path: NormalizedRelativePath::new("document.txt".into()).unwrap(),
+                    kind: ManifestEntryKind::RegularFile,
+                    size: 100,
+                    mtime_ns: 0,
+                    sha256: None,
+                    link_target: None,
+                },
+                // document.Z.webm — would collide with the postprocess output above
+                ManifestEntry {
+                    sync_name: SyncName::new("data".into()).unwrap(),
+                    local_path: ClientLocalPath::new("/source/data/document.Z.webm".into())
+                        .unwrap(),
+                    staged_path: NormalizedRelativePath::new("files/data/document.Z.webm".into())
+                        .unwrap(),
+                    relative_path: NormalizedRelativePath::new("document.Z.webm".into()).unwrap(),
+                    kind: ManifestEntryKind::RegularFile,
+                    size: 200,
+                    mtime_ns: 0,
+                    sha256: None,
+                    link_target: None,
+                },
+            ],
+        };
+
+        let error =
+            validate_unique_final_paths(&config, &nickname, &run_config, &manifest, &run_plan)
+                .unwrap_err();
+        assert!(
+            error.contains("duplicate final path"),
+            "error must mention duplicate final path: {error}"
+        );
+        assert!(
+            error.contains("document.Z.webm"),
+            "error must mention the colliding filename: {error}"
+        );
+    }
+
+    #[test]
+    fn postprocess_output_from_two_entries_collides() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let purgery = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let config = test_server_config(&purgery, &root);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_config = RunConfig::from_toml(
+            r#"
+nickname = "laptop"
+
+[[sync]]
+name = "data"
+to = "data"
+
+[[postprocess.rules]]
+match = '^data/.*\.txt$'
+steps = ["compress"]
+"#,
+        )
+        .unwrap();
+        // Two different source files whose postprocess outputs resolve to
+        // the same final path: a.txt → a.out, b.txt → b.out? No, both
+        // produce {stem}.out which is unique per source.  But if both
+        // produce an output named "collision.out" via a static pattern:
+        //
+        // a.txt with step {stem}.out → a.out  (unique)
+        // b.txt with step {stem}.out → b.out  (different)
+        //
+        // Those don't collide.  Use an entry that explicitly names a
+        // static output that another entry also produces.
+        //
+        // Simpler: two entries with different relative paths whose
+        // postprocess outputs happen to land on the same filename.
+        // This happens when expected_outputs is a static name:
+        //
+        //   expected_outputs = ["result.bin"]
+        //
+        // Both a.txt and b.txt would produce data/result.bin.
+        let pp_plan = RunPlan {
+            rules: vec![CompiledRule {
+                regex: regex::Regex::new(r"^data/.*\.txt$").unwrap(),
+                steps: vec![ResolvedStep {
+                    step_name: "generate".into(),
+                    step_def: PostprocessStepDefinition {
+                        kind: PostprocessKind::Subprocess,
+                        program: "true".into(),
+                        args: vec![],
+                        expected_outputs: vec!["result.bin".into()],
+                        keep_original: false,
+                    },
+                }],
+            }],
+        };
+
+        let manifest = Manifest {
+            run_id: RunId::new("pp-cross-entry".into()).unwrap(),
+            nickname: nickname.clone(),
+            entries: vec![
+                ManifestEntry {
+                    sync_name: SyncName::new("data".into()).unwrap(),
+                    local_path: ClientLocalPath::new("/source/data/a.txt".into()).unwrap(),
+                    staged_path: NormalizedRelativePath::new("files/data/a.txt".into()).unwrap(),
+                    relative_path: NormalizedRelativePath::new("a.txt".into()).unwrap(),
+                    kind: ManifestEntryKind::RegularFile,
+                    size: 50,
+                    mtime_ns: 0,
+                    sha256: None,
+                    link_target: None,
+                },
+                ManifestEntry {
+                    sync_name: SyncName::new("data".into()).unwrap(),
+                    local_path: ClientLocalPath::new("/source/data/b.txt".into()).unwrap(),
+                    staged_path: NormalizedRelativePath::new("files/data/b.txt".into()).unwrap(),
+                    relative_path: NormalizedRelativePath::new("b.txt".into()).unwrap(),
+                    kind: ManifestEntryKind::RegularFile,
+                    size: 60,
+                    mtime_ns: 0,
+                    sha256: None,
+                    link_target: None,
+                },
+            ],
+        };
+
+        let error =
+            validate_unique_final_paths(&config, &nickname, &run_config, &manifest, &pp_plan)
+                .unwrap_err();
+        assert!(
+            error.contains("duplicate final path"),
+            "error must mention duplicate final path: {error}"
+        );
+    }
+
+    #[test]
+    fn postprocess_output_collides_with_directory_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let purgery = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let config = test_server_config(&purgery, &root);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_config = RunConfig::from_toml(
+            r#"
+nickname = "laptop"
+
+[[sync]]
+name = "data"
+to = "data"
+
+[[postprocess.rules]]
+match = '^data/.*\.txt$'
+steps = ["compress"]
+"#,
+        )
+        .unwrap();
+        let run_plan = RunPlan {
+            rules: vec![CompiledRule {
+                regex: regex::Regex::new(r"^data/.*\.txt$").unwrap(),
+                steps: vec![ResolvedStep {
+                    step_name: "compress".into(),
+                    step_def: PostprocessStepDefinition {
+                        kind: PostprocessKind::Subprocess,
+                        program: "true".into(),
+                        args: vec![],
+                        expected_outputs: vec!["output_dir".into()],
+                        keep_original: true,
+                    },
+                }],
+            }],
+        };
+
+        let manifest = Manifest {
+            run_id: RunId::new("pp-dir-collision".into()).unwrap(),
+            nickname: nickname.clone(),
+            entries: vec![
+                ManifestEntry {
+                    sync_name: SyncName::new("data".into()).unwrap(),
+                    local_path: ClientLocalPath::new("/source/data/input.txt".into()).unwrap(),
+                    staged_path: NormalizedRelativePath::new("files/data/input.txt".into())
+                        .unwrap(),
+                    relative_path: NormalizedRelativePath::new("input.txt".into()).unwrap(),
+                    kind: ManifestEntryKind::RegularFile,
+                    size: 50,
+                    mtime_ns: 0,
+                    sha256: None,
+                    link_target: None,
+                },
+                // Directory with the same name as the postprocess output
+                ManifestEntry {
+                    sync_name: SyncName::new("data".into()).unwrap(),
+                    local_path: ClientLocalPath::new("/source/data/output_dir".into()).unwrap(),
+                    staged_path: NormalizedRelativePath::new("files/data/output_dir".into())
+                        .unwrap(),
+                    relative_path: NormalizedRelativePath::new("output_dir".into()).unwrap(),
+                    kind: ManifestEntryKind::Directory,
+                    size: 0,
+                    mtime_ns: 0,
+                    sha256: None,
+                    link_target: None,
+                },
+            ],
+        };
+
+        let error =
+            validate_unique_final_paths(&config, &nickname, &run_config, &manifest, &run_plan)
+                .unwrap_err();
+        assert!(
+            error.contains("duplicate final path"),
+            "error must mention duplicate final path: {error}"
+        );
     }
 }
