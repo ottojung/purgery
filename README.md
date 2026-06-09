@@ -99,7 +99,7 @@ Purgery targets Unix/POSIX filesystem semantics and is conservative about data l
 - The server performs a recursive rsync-like no-delete overlay: directories merge, regular files replace, symlinks remain symlinks, and absent source entries never delete final entries.
 - Symlink targets are literal data. The server never follows staged or final-storage symlinks as directories.
 - Tree imports provide replayable convergence through crash-safe per-entry commits, not an all-or-nothing filesystem transaction.
-- Postprocessing and client cleanup currently apply only to regular files; local directories and symlinks are retained.
+- Postprocessing applies to directories, regular files, and symlinks. Client cleanup remains conservative and deletes only confirmed unchanged local regular files.
 - Overlapping sync mappings that produce the same final path are rejected rather than resolved by ordering.
 
 ## More documentation

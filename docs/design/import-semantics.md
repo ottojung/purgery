@@ -10,15 +10,11 @@ work output → final parent dir / .purgery-commit.<run_id>.<filename>.tmp → r
 
 The temp file is on the same filesystem as the final path, so the rename is atomic against readers. Temp files are cleaned up after a successful commit.
 
-## Conflict policy: fail-if-exists (regular files and symlinks)
+## Directory overlay semantics
 
-Purgery does not overwrite existing final files or symlinks. If any final output path already exists before commit, the file is marked as `failed` in the status. This is a conservative default, not a defense against hostile concurrent writers.
+Purgery uses recursive no-delete overlay semantics for commits. Existing directories are kept and merged. Regular files and symlinks replace conflicting existing entries of the same type. Conflicting non-empty directories are not replaced — the operator must resolve them.
 
-Directory entries use overlay semantics: existing directories are kept and merged.
-
-## Multi-output preflight and rollback
-
-Before committing any output for a file, all final output paths are derived and prechecked (none exists, no symlinks in path, parent directories creatable). Commits proceed in order. If a later output commit fails, outputs already committed during this file's import are rolled back (removed).
+Commits are not all-or-nothing. A crash during commit may leave some outputs already written to final storage. This is acceptable because `status.toml` has not been published yet, `processing/` still exists, and `process-once` replays from staged files with idempotent commits.
 
 ## `final_paths` (plural)
 

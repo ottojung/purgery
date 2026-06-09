@@ -770,58 +770,15 @@ fn process_manifest_entry(
                     .map(|_| (vec![final_relative], None))
             }
             ManifestEntryKind::RegularFile => {
-                let work_path = work_area
-                    .join(sync.to_path.as_str())
-                    .join(entry.relative_path.as_str());
-                if let Some(parent) = work_path.parent() {
-                    if let Err(error) = fs::create_dir_all(parent) {
-                        return failed_entry(entry, format!("failed to create work dir: {error}"));
-                    }
-                }
-                if let Err(error) = fs::copy(source_path.as_std_path(), work_path.as_std_path()) {
-                    return failed_entry(entry, format!("failed to copy to work area: {error}"));
-                }
-                match apply_postprocessing(run_plan, &normalized_path, &work_path) {
-                    Ok(outputs) => {
-                        let mut final_paths = Vec::new();
-                        for output in outputs {
-                            let output_final = if output == work_path {
-                                final_path.clone()
-                            } else {
-                                let filename = output.file_name().unwrap_or("");
-                                final_path.parent().map_or_else(
-                                    || Utf8PathBuf::from(filename),
-                                    |parent| parent.join(filename),
-                                )
-                            };
-                            if !path_is_within_root(&output_final, server_config.root.as_path()) {
-                                return failed_entry(entry, "output escapes root");
-                            }
-                            if let Err(error) = commit_output_entry(
-                                &output,
-                                &output_final,
-                                server_config.root.as_path(),
-                                run_id,
-                            ) {
-                                return failed_entry(entry, format!("commit failed: {error}"));
-                            }
-                            final_paths.push(
-                                output_final
-                                    .strip_prefix(server_config.root.as_path())
-                                    .unwrap_or(&output_final)
-                                    .to_string(),
-                            );
-                        }
-                        let steps: Vec<String> = run_plan
-                            .rules
-                            .iter()
-                            .filter(|rule| rule.regex.is_match(&normalized_path))
-                            .flat_map(|rule| rule.steps.iter().map(|step| step.step_name.clone()))
-                            .collect();
-                        Ok((final_paths, (!steps.is_empty()).then_some(steps)))
-                    }
-                    Err(error) => Err(error),
-                }
+                // Commit directly from staged source to final — no
+                // work-area copy needed when no rule matched.
+                commit_regular_file_entry(
+                    &source_path,
+                    &final_path,
+                    server_config.root.as_path(),
+                    run_id,
+                )
+                .map(|_| (vec![final_relative], None))
             }
         }
     } else {
@@ -1112,10 +1069,17 @@ pub fn process_processing_run(
         };
 
         // Check if this entry is covered by a postprocessed ancestor directory.
+        // The match must be path-component-aware: "data/foo" covers "data/foo/a.txt"
+        // but not "data/foobar.txt" or "data/foo2/bar.txt".
         let np = format!("{}/{}", sync.to_path.as_str(), entry.relative_path.as_str());
-        let covered = covered_by_dir
-            .iter()
-            .any(|prefix| np.starts_with(prefix) && np.len() > prefix.len());
+        let covered = covered_by_dir.iter().any(|prefix| {
+            let tail = match np.as_str().strip_prefix(prefix.as_str()) {
+                Some(t) => t,
+                None => return false,
+            };
+            // Only descendants require a "/" after the prefix (not the directory itself).
+            tail.starts_with('/')
+        });
         if covered {
             debug!(sync_name = sync_name, path = %np, "entry covered by postprocessed ancestor directory, skipping");
             outcomes.push(EntryOutcome::Skipped {
@@ -1412,9 +1376,12 @@ pub fn apply_postprocessing(
                                 }
                             })?;
                         let file_type = metadata.file_type();
-                        if !file_type.is_file() || file_type.is_symlink() {
+                        let ok = file_type.is_dir() && !file_type.is_symlink()
+                            || file_type.is_file()
+                            || file_type.is_symlink();
+                        if !ok {
                             return Err(format!(
-                                "expected output is not a regular file: {}",
+                                "expected output is not a supported entry type: {}",
                                 exp.as_str()
                             ));
                         }
@@ -4611,31 +4578,74 @@ steps = ["compress-video"]
     }
 
     #[test]
-    fn postprocess_symlink_expected_output_fails_without_following_target() {
+    fn postprocess_symlink_expected_output_is_not_followed() {
         let tmp = tempfile::tempdir().unwrap();
         let work_path = Utf8PathBuf::from_path_buf(tmp.path().join("input.txt")).unwrap();
         fs::write(&work_path, "input").unwrap();
         let target = work_path.with_file_name("target.txt");
         fs::write(&target, "secret target contents").unwrap();
+        // Place a symlink to the target as the expected output.  The symlink
+        // itself must be accepted — Purgery must not follow or reject it.
         std::os::unix::fs::symlink(&target, work_path.with_file_name("input.out")).unwrap();
 
-        let error =
+        let outputs =
             apply_postprocessing(&expected_output_test_plan(), "data/input.txt", &work_path)
-                .unwrap_err();
-        assert!(error.contains("expected output is not a regular file"));
+                .unwrap();
+        assert!(
+            outputs.contains(&work_path.with_file_name("input.out")),
+            "symlink expected output must be accepted"
+        );
+        // The symlink must still point to the original target (not be
+        // replaced by the target's content).
+        let link = fs::read_link(work_path.with_file_name("input.out")).unwrap();
+        assert_eq!(
+            link,
+            target.as_std_path(),
+            "symlink target must be preserved"
+        );
     }
 
     #[test]
-    fn postprocess_directory_expected_output_fails() {
+    fn postprocess_directory_expected_output_succeeds() {
         let tmp = tempfile::tempdir().unwrap();
         let work_path = Utf8PathBuf::from_path_buf(tmp.path().join("input.txt")).unwrap();
         fs::write(&work_path, "input").unwrap();
         fs::create_dir(work_path.with_file_name("input.out")).unwrap();
 
+        let outputs =
+            apply_postprocessing(&expected_output_test_plan(), "data/input.txt", &work_path)
+                .unwrap();
+        assert!(outputs.contains(&work_path.with_file_name("input.out")));
+    }
+
+    #[test]
+    fn postprocess_symlink_expected_output_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_path = Utf8PathBuf::from_path_buf(tmp.path().join("input.txt")).unwrap();
+        fs::write(&work_path, "input").unwrap();
+        std::os::unix::fs::symlink("some-target", work_path.with_file_name("input.out")).unwrap();
+
+        let outputs =
+            apply_postprocessing(&expected_output_test_plan(), "data/input.txt", &work_path)
+                .unwrap();
+        assert!(outputs.contains(&work_path.with_file_name("input.out")));
+    }
+
+    #[test]
+    fn postprocess_fifo_expected_output_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_path = Utf8PathBuf::from_path_buf(tmp.path().join("input.txt")).unwrap();
+        fs::write(&work_path, "input").unwrap();
+        // Create a FIFO (named pipe)
+        std::process::Command::new("mkfifo")
+            .arg(work_path.with_file_name("input.out").as_std_path())
+            .status()
+            .unwrap();
+
         let error =
             apply_postprocessing(&expected_output_test_plan(), "data/input.txt", &work_path)
                 .unwrap_err();
-        assert!(error.contains("expected output is not a regular file"));
+        assert!(error.contains("expected output is not a supported entry type"));
     }
 
     fn duplicate_path_test_entry(
