@@ -1,6 +1,6 @@
 # Crash Safety and Idempotent Imports
 
-This document defines the filesystem invariants that make Purgery restart-safe. The [import semantics](import-semantics.md) describe per-file processing details; this document describes the durable state machine around them.
+This document defines the filesystem invariants that make Purgery restart-safe. The [import semantics](import-semantics.md) describe per-entry tree-overlay details; this document describes the durable state machine around them.
 
 ## Statelessness invariant
 
@@ -55,39 +55,34 @@ status.nickname == manifest.nickname
 status.run_id == manifest.run_id
 ```
 
-No status means no deletion. A file is recorded as `imported` only after all outputs for that file have been committed. Run states mean:
+No status means no deletion. An entry is recorded as `imported` only after all of its outputs have been committed. Run states mean:
 
-- `done`: every file was imported;
-- `partial`: at least one file was imported and at least one failed or was skipped;
-- `failed`: no files were imported.
+- `done`: every entry was imported;
+- `partial`: at least one entry was imported and at least one failed or was skipped;
+- `failed`: no entries were imported.
 
-The server commits final outputs before atomically publishing successful status. A crash before status publication therefore cannot authorize client deletion.
+The server commits final outputs before atomically publishing successful status. A crash before status publication therefore cannot authorize client deletion of local regular files.
 
-## Idempotent import invariant
+## Idempotent tree-overlay invariant
 
-Uploading the same logical destination again replaces the existing regular final file. The server does not remember whether it has seen a file and has no deduplication database.
+Uploading the same logical tree again replays the same directory, regular-file, and symlink entries. The server keeps no deduplication database. Existing directories are retained and merged, regular files and symlinks are replaced according to the characterized rsync rules, and unrelated final descendants remain.
 
-With deterministic postprocessing, importing the same input and destination repeatedly converges to the same final content and is a semantic no-op. Non-deterministic postprocessing may produce different content on a later import; replacing the prior regular file with that output is allowed.
+With deterministic postprocessing, importing the same input tree repeatedly converges to the same final tree and is a semantic no-op. Non-deterministic postprocessing may produce different regular-file content on a later import; replacing the prior output is allowed.
 
-This property also makes crash recovery replay-based. A crash may occur after some final outputs have been replaced but before `status.toml` is written. The client retains its local files because no success status exists. On restart, the server replays the processing run and atomically replaces those outputs again, converging on the run's result.
+This property makes crash recovery replay-based. A crash may occur after some entries have committed but before `status.toml` is written. The client retains local regular files because no success status exists. On restart, the server replays the processing run from staged entries and converges on the run's result.
 
-## Replacement invariant
+## Per-entry replacement invariant
 
-Each output is copied to a temporary file in its final directory and then renamed to the final path:
+Regular-file outputs are copied to a temporary file in their final directory and renamed into place. Symlinks are created at a temporary name in their final directory and renamed into place. Directories are created or retained directly:
 
 ```text
-work output -> final parent/.purgery-commit.<run_id>.<filename>.tmp -> final path
+regular work output -> final parent/.purgery-commit.<run_id>.<filename>.tmp -> final path
+literal link target -> final parent/.purgery-commit.<run_id>.<filename>.tmp -> final symlink
 ```
 
-On Unix, the final rename atomically creates a missing destination or replaces an existing regular file. Purgery does not restore old final contents when a later output in the same file fails; the run remains recoverable and is replayed if it did not publish status.
+A present source directory replaces a conflicting final file or symlink and then allows descendants to merge. A present source regular file or symlink replaces a final file, symlink, or empty directory, but fails rather than deleting a non-empty final directory. Existing ancestors must be real directories; final-storage symlinks are never followed as directory components. Every derived path must remain inside the configured storage root.
 
-Purgery refuses an output when the final path:
-
-- is an existing directory;
-- is a symlink, including a dangling symlink;
-- crosses a symlink in a parent component;
-- is another non-regular filesystem object; or
-- escapes the configured storage root.
+A later failure does not restore entries already committed by the same run. The run remains recoverable and is replayed if it did not publish terminal status.
 
 ## No implicit delete invariant
 
@@ -99,8 +94,14 @@ A run affects only outputs it explicitly commits. Purgery does not use `rsync --
 |---|---|
 | Before `begin-run` | No server state exists. |
 | During upload | The run remains in `incoming/`; its lease and garbage collection handle abandonment. |
-| After `finish-run`, before status | The run is durable in `ready/` or `processing/`. Rerunning the client may upload the same files again, which is safe. |
+| After `finish-run`, before status | The run is durable in `ready/` or `processing/`. Rerunning the client may upload the same tree again, which is safe. |
 | After server import, before cleanup | A valid server status exists, but the client may upload again after restart. Atomic replacement makes the repeated import safe. |
-| After cleanup | Confirmed local files are gone. If a file is later re-created at the same local path, importing it again safely replaces the regular final file. |
+| After cleanup | Confirmed local regular files are gone. If a file is later re-created at the same local path, importing it again safely replaces the regular final file. |
 
 The client keeps no local run database. Verified server status remains the sole authority for local deletion.
+
+## Tree-overlay recovery guarantee
+
+Purgery provides replayable convergence, not an all-or-nothing tree transaction. A crash may leave some directories, regular files, or symlinks committed while later entries remain pending. Until every manifest entry completes, `status.toml` is not published and the run remains recoverable in `processing/`. `process-once` rebuilds regular-file work outputs from immutable staged data and replays every entry. Directory merge, same-directory regular-file replacement, and same-directory symlink replacement are idempotent, so replay converges while preserving unrelated final descendants.
+
+Per-entry commits are crash-safe and replay-safe. A terminal success status is published only after the complete manifest has been processed.

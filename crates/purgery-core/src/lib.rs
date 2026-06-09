@@ -89,8 +89,10 @@ pub enum ManifestError {
     SyncName(#[from] SyncNameError),
     #[error("invalid local path: {0}")]
     LocalPath(#[from] LocalSourcePathError),
-    #[error("manifest has no files")]
-    NoFiles,
+    #[error("manifest has no filesystem entries")]
+    NoEntries,
+    #[error("invalid manifest entry: {0}")]
+    InvalidEntry(String),
 }
 
 #[derive(Error, Debug)]
@@ -703,13 +705,14 @@ impl<'de> Deserialize<'de> for NormalizedRelativePath {
     }
 }
 
-// ── Manifest File Identity ───────────────────────────────────────────
+// ── Manifest Regular-File Identity ───────────────────────────────────────────
 
 /// Identity of a local file at upload time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestFileIdentity {
     pub local_path: Utf8PathBuf,
     pub size: u64,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub mtime_ns: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
@@ -717,29 +720,53 @@ pub struct ManifestFileIdentity {
 
 // ── Manifest Types ───────────────────────────────────────────────────
 
-/// A run manifest describing uploaded files and their metadata.
+/// A run manifest describing uploaded filesystem entries and their metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
     pub run_id: RunId,
     pub nickname: Nickname,
     #[serde(default)]
-    pub files: Vec<ManifestFileEntry>,
+    pub entries: Vec<ManifestEntry>,
 }
 
-/// A single file entry within a manifest.
+/// The filesystem object represented by a manifest entry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManifestEntryKind {
+    Directory,
+    #[default]
+    RegularFile,
+    Symlink,
+}
+
+/// A single filesystem entry within a manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ManifestFileEntry {
+pub struct ManifestEntry {
     pub sync_name: SyncName,
     pub local_path: ClientLocalPath,
     pub staged_path: NormalizedRelativePath,
     pub relative_path: NormalizedRelativePath,
+    #[serde(default)]
+    pub kind: ManifestEntryKind,
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub size: u64,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub mtime_ns: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_target: Option<Utf8PathBuf>,
 }
 
-impl ManifestFileEntry {
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+fn is_zero_i64(value: &i64) -> bool {
+    *value == 0
+}
+
+impl ManifestEntry {
     pub fn identity(&self) -> ManifestFileIdentity {
         ManifestFileIdentity {
             local_path: Utf8PathBuf::from(self.local_path.as_str()),
@@ -796,7 +823,7 @@ pub fn compute_sha256(path: &Utf8Path) -> Result<String, io::Error> {
 
 // ── Status Types ─────────────────────────────────────────────────────
 
-/// Processing status of an individual file.
+/// Processing status of an individual filesystem entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileStatus {
     Imported,
@@ -889,14 +916,16 @@ pub struct RunStatus {
     pub nickname: Nickname,
     pub state: RunState,
     #[serde(default)]
-    pub files: Vec<FileStatusEntry>,
+    pub entries: Vec<EntryStatusEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
-/// Per-file status entry.
+/// Per-entry status record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FileStatusEntry {
+pub struct EntryStatusEntry {
+    #[serde(default)]
+    pub kind: ManifestEntryKind,
     pub sync_name: SyncName,
     pub local_path: String,
     pub relative_path: String,
@@ -1072,10 +1101,6 @@ pub fn init_logging(
 pub struct ServerConfig {
     pub root: ServerRoot,
     pub purgery_root: PurgeryRoot,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub state_dir: Option<Utf8PathBuf>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub log_dir: Option<Utf8PathBuf>,
     #[serde(default)]
     pub postprocess: PostprocessConfig,
     #[serde(default)]
@@ -1085,26 +1110,11 @@ pub struct ServerConfig {
 }
 
 /// Postprocessing configuration (server-side).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PostprocessConfig {
-    #[serde(default = "default_max_parallel_jobs")]
-    pub max_parallel_jobs: u32,
     #[serde(default)]
     pub steps: std::collections::BTreeMap<String, PostprocessStepDefinition>,
-}
-
-impl Default for PostprocessConfig {
-    fn default() -> Self {
-        PostprocessConfig {
-            max_parallel_jobs: 1,
-            steps: std::collections::BTreeMap::new(),
-        }
-    }
-}
-
-fn default_max_parallel_jobs() -> u32 {
-    1
 }
 
 /// The kind of postprocessing step.
@@ -1354,8 +1364,32 @@ impl ClientConfig {
 impl Manifest {
     pub fn from_toml(input: &str) -> Result<Self, ManifestError> {
         let manifest: Manifest = toml::from_str(input)?;
-        if manifest.files.is_empty() {
-            return Err(ManifestError::NoFiles);
+        if manifest.entries.is_empty() {
+            return Err(ManifestError::NoEntries);
+        }
+        for entry in &manifest.entries {
+            let invalid = match entry.kind {
+                ManifestEntryKind::Directory => {
+                    entry.size != 0
+                        || entry.mtime_ns != 0
+                        || entry.sha256.is_some()
+                        || entry.link_target.is_some()
+                }
+                ManifestEntryKind::RegularFile => entry.link_target.is_some(),
+                ManifestEntryKind::Symlink => {
+                    entry.link_target.is_none()
+                        || entry.size != 0
+                        || entry.mtime_ns != 0
+                        || entry.sha256.is_some()
+                }
+            };
+            if invalid {
+                return Err(ManifestError::InvalidEntry(format!(
+                    "{} has fields incompatible with {:?}",
+                    entry.relative_path.as_str(),
+                    entry.kind
+                )));
+            }
         }
         Ok(manifest)
     }
@@ -1961,9 +1995,6 @@ purgery_root = "/universe/tmp/purgery"
         let config = ServerConfig::from_toml(toml).unwrap();
         assert_eq!(config.root.as_str(), "/universe/synced");
         assert_eq!(config.purgery_root.as_str(), "/universe/tmp/purgery");
-        assert_eq!(config.postprocess.max_parallel_jobs, 1);
-        assert!(config.state_dir.is_none());
-        assert!(config.log_dir.is_none());
     }
 
     #[test]
@@ -1971,11 +2002,7 @@ purgery_root = "/universe/tmp/purgery"
         let toml = r#"
 root = "/universe/synced"
 purgery_root = "/universe/tmp/purgery"
-state_dir = "/var/lib/purgery"
-log_dir = "/var/log/purgery"
-
 [postprocess]
-max_parallel_jobs = 2
 
 [postprocess.steps.compress-video]
 kind = "subprocess"
@@ -1986,8 +2013,6 @@ keep_original = true
 "#;
         let config = ServerConfig::from_toml(toml).unwrap();
         assert_eq!(config.root.as_str(), "/universe/synced");
-        assert_eq!(config.state_dir.unwrap().as_str(), "/var/lib/purgery");
-        assert_eq!(config.postprocess.max_parallel_jobs, 2);
         let step = config.postprocess.steps.get("compress-video").unwrap();
         assert_eq!(step.kind, PostprocessKind::Subprocess);
         assert_eq!(step.program, "my-compress-video");
@@ -2133,7 +2158,7 @@ host = "example.com"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 
-[[files]]
+[[entries]]
 sync_name = "videos"
 local_path = "/home/vitalik/Videos/a.mp4"
 staged_path = "files/videos/a.mp4"
@@ -2144,13 +2169,13 @@ sha256 = "abcd1234"
 "#;
         let manifest = Manifest::from_toml(toml).unwrap();
         assert_eq!(manifest.run_id.as_str(), "01ARZ3NDEKTSV4RRFFQ69G5FAV");
-        assert_eq!(manifest.files.len(), 1);
-        assert_eq!(manifest.files[0].sync_name.as_str(), "videos");
+        assert_eq!(manifest.entries.len(), 1);
+        assert_eq!(manifest.entries[0].sync_name.as_str(), "videos");
         assert_eq!(
-            manifest.files[0].local_path.as_str(),
+            manifest.entries[0].local_path.as_str(),
             "/home/vitalik/Videos/a.mp4"
         );
-        assert_eq!(manifest.files[0].sha256.as_deref(), Some("abcd1234"));
+        assert_eq!(manifest.entries[0].sha256.as_deref(), Some("abcd1234"));
     }
 
     #[test]
@@ -2159,7 +2184,7 @@ sha256 = "abcd1234"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 
-[[files]]
+[[entries]]
 sync_name = ""
 local_path = "/home/user/file.mp4"
 staged_path = "files/file.mp4"
@@ -2177,7 +2202,7 @@ mtime_ns = 0
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 
-[[files]]
+[[entries]]
 sync_name = "videos"
 local_path = ""
 staged_path = "files/file.mp4"
@@ -2195,7 +2220,7 @@ mtime_ns = 0
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 
-[[files]]
+[[entries]]
 sync_name = "videos"
 local_path = "/home/vitalik/Videos/a.mp4"
 staged_path = "files/videos/a.mp4"
@@ -2204,17 +2229,71 @@ size = 123456789
 mtime_ns = 1780944312000000000
 "#;
         let manifest = Manifest::from_toml(toml).unwrap();
-        assert!(manifest.files[0].sha256.is_none());
+        assert!(manifest.entries[0].sha256.is_none());
     }
 
     #[test]
-    fn manifest_empty_files_is_error() {
+    fn manifest_empty_entries_is_error() {
         let toml = r#"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 "#;
         let result = Manifest::from_toml(toml);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn directory_manifest_entry_rejects_regular_file_identity_fields() {
+        let toml = r#"
+run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+nickname = "laptop"
+
+[[entries]]
+sync_name = "data"
+local_path = "/source/dir"
+staged_path = "files/data/dir"
+relative_path = "dir"
+kind = "directory"
+mtime_ns = 1
+"#;
+        let error = Manifest::from_toml(toml).unwrap_err();
+        assert!(error.to_string().contains("fields incompatible"));
+    }
+
+    #[test]
+    fn symlink_manifest_entry_rejects_regular_file_identity_fields() {
+        let toml = r#"
+run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+nickname = "laptop"
+
+[[entries]]
+sync_name = "data"
+local_path = "/source/link"
+staged_path = "files/data/link"
+relative_path = "link"
+kind = "symlink"
+mtime_ns = 1
+link_target = "target"
+"#;
+        let error = Manifest::from_toml(toml).unwrap_err();
+        assert!(error.to_string().contains("fields incompatible"));
+    }
+
+    #[test]
+    fn symlink_manifest_entry_requires_link_target() {
+        let toml = r#"
+run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+nickname = "laptop"
+
+[[entries]]
+sync_name = "data"
+local_path = "/source/link"
+staged_path = "files/data/link"
+relative_path = "link"
+kind = "symlink"
+"#;
+        let error = Manifest::from_toml(toml).unwrap_err();
+        assert!(error.to_string().contains("fields incompatible"));
     }
 
     // ── Status tests ──
@@ -2226,15 +2305,15 @@ run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 state = "done"
 
-[[files]]
+[[entries]]
 sync_name = "videos"
 local_path = "/home/vitalik/Videos/a.mp4"
 relative_path = "a.mp4"
 status = "imported"
 "#;
         let status = RunStatus::from_toml(toml).unwrap();
-        assert_eq!(status.files[0].sync_name.as_str(), "videos");
-        assert_eq!(status.files[0].local_path, "/home/vitalik/Videos/a.mp4");
+        assert_eq!(status.entries[0].sync_name.as_str(), "videos");
+        assert_eq!(status.entries[0].local_path, "/home/vitalik/Videos/a.mp4");
     }
 
     #[test]
@@ -2244,7 +2323,7 @@ run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 state = "done"
 
-[[files]]
+[[entries]]
 sync_name = "videos"
 local_path = "/home/vitalik/Videos/a.mp4"
 relative_path = "a.mp4"
@@ -2252,7 +2331,7 @@ status = "imported"
 final_paths = ["laptop/videos/a.mp4"]
 postprocess = ["compress-video"]
 
-[[files]]
+[[entries]]
 sync_name = "videos"
 local_path = "/home/vitalik/Videos/b.mp4"
 relative_path = "b.mp4"
@@ -2261,13 +2340,13 @@ error = "compress-video failed"
 "#;
         let status = RunStatus::from_toml(toml).unwrap();
         assert_eq!(status.state, RunState::Done);
-        assert_eq!(status.files.len(), 2);
-        assert_eq!(status.files[0].status, FileStatus::Imported);
-        assert_eq!(status.files[0].final_paths, vec!["laptop/videos/a.mp4"]);
-        assert_eq!(status.files[0].sync_name.as_str(), "videos");
-        assert_eq!(status.files[1].status, FileStatus::Failed);
+        assert_eq!(status.entries.len(), 2);
+        assert_eq!(status.entries[0].status, FileStatus::Imported);
+        assert_eq!(status.entries[0].final_paths, vec!["laptop/videos/a.mp4"]);
+        assert_eq!(status.entries[0].sync_name.as_str(), "videos");
+        assert_eq!(status.entries[1].status, FileStatus::Failed);
         assert_eq!(
-            status.files[1].error.as_deref(),
+            status.entries[1].error.as_deref(),
             Some("compress-video failed")
         );
     }
@@ -2287,21 +2366,23 @@ files = []
             status.error.as_deref(),
             Some("failed to parse manifest.toml")
         );
-        assert!(status.files.is_empty());
+        assert!(status.entries.is_empty());
     }
 
     // ── Identity tests ──
 
     #[test]
     fn identity_from_entry() {
-        let entry = ManifestFileEntry {
+        let entry = ManifestEntry {
             sync_name: SyncName::new("videos".into()).unwrap(),
             local_path: ClientLocalPath::new("/home/vitalik/Videos/a.mp4".into()).unwrap(),
             staged_path: NormalizedRelativePath::new("files/videos/a.mp4".into()).unwrap(),
             relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
+            kind: ManifestEntryKind::RegularFile,
             size: 100,
             mtime_ns: 200,
             sha256: Some("abc".into()),
+            link_target: None,
         };
         let identity = entry.identity();
         assert_eq!(identity.size, 100);
@@ -2341,23 +2422,25 @@ files = []
         let manifest = Manifest {
             run_id: RunId::new("test-123".into()).unwrap(),
             nickname: Nickname::new("testbox".into()).unwrap(),
-            files: vec![ManifestFileEntry {
+            entries: vec![ManifestEntry {
                 sync_name: SyncName::new("videos".into()).unwrap(),
                 local_path: ClientLocalPath::new("/tmp/test.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/videos/test.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("test.mp4".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
                 size: 100,
                 mtime_ns: 200,
                 sha256: Some("abcdef".into()),
+                link_target: None,
             }],
         };
         let toml = manifest.to_toml().unwrap();
         let parsed = Manifest::from_toml(&toml).unwrap();
         assert_eq!(parsed.run_id, manifest.run_id);
         assert_eq!(parsed.nickname, manifest.nickname);
-        assert_eq!(parsed.files.len(), 1);
-        assert_eq!(parsed.files[0].sha256, Some("abcdef".into()));
-        assert_eq!(parsed.files[0].sync_name.as_str(), "videos");
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.entries[0].sha256, Some("abcdef".into()));
+        assert_eq!(parsed.entries[0].sync_name.as_str(), "videos");
     }
 
     #[test]
@@ -2366,7 +2449,8 @@ files = []
             run_id: RunId::new("test-123".into()).unwrap(),
             nickname: Nickname::new("testbox".into()).unwrap(),
             state: RunState::Done,
-            files: vec![FileStatusEntry {
+            entries: vec![EntryStatusEntry {
+                kind: ManifestEntryKind::RegularFile,
                 sync_name: SyncName::new("videos".into()).unwrap(),
                 local_path: "/tmp/test.mp4".into(),
                 relative_path: "test.mp4".into(),
@@ -2380,10 +2464,13 @@ files = []
         let toml = status.to_toml().unwrap();
         let parsed = RunStatus::from_toml(&toml).unwrap();
         assert_eq!(parsed.state, RunState::Done);
-        assert_eq!(parsed.files.len(), 1);
-        assert_eq!(parsed.files[0].status, FileStatus::Imported);
-        assert_eq!(parsed.files[0].sync_name.as_str(), "videos");
-        assert_eq!(parsed.files[0].final_paths, vec!["laptop/videos/test.mp4"]);
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.entries[0].status, FileStatus::Imported);
+        assert_eq!(parsed.entries[0].sync_name.as_str(), "videos");
+        assert_eq!(
+            parsed.entries[0].final_paths,
+            vec!["laptop/videos/test.mp4"]
+        );
     }
 
     // ── Envelope validation tests ──
@@ -2400,14 +2487,16 @@ files = []
         let manifest = Manifest {
             run_id: run_id.clone(),
             nickname: nick.clone(),
-            files: vec![ManifestFileEntry {
+            entries: vec![ManifestEntry {
                 sync_name: SyncName::new("videos".into()).unwrap(),
                 local_path: ClientLocalPath::new("/tmp/a.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/a.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
                 size: 10,
                 mtime_ns: 100,
                 sha256: None,
+                link_target: None,
             }],
         };
         assert!(validate_envelope(&nick, &run_id, &run_config, &manifest).is_ok());
@@ -2426,14 +2515,16 @@ files = []
         let manifest = Manifest {
             run_id: run_id.clone(),
             nickname: other_nick,
-            files: vec![ManifestFileEntry {
+            entries: vec![ManifestEntry {
                 sync_name: SyncName::new("videos".into()).unwrap(),
                 local_path: ClientLocalPath::new("/tmp/a.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/a.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
                 size: 10,
                 mtime_ns: 100,
                 sha256: None,
+                link_target: None,
             }],
         };
         assert!(validate_envelope(&dir_nick, &run_id, &run_config, &manifest).is_err());
@@ -2452,14 +2543,16 @@ files = []
         let manifest = Manifest {
             run_id: run_id.clone(),
             nickname: other,
-            files: vec![ManifestFileEntry {
+            entries: vec![ManifestEntry {
                 sync_name: SyncName::new("videos".into()).unwrap(),
                 local_path: ClientLocalPath::new("/tmp/a.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/a.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
                 size: 10,
                 mtime_ns: 100,
                 sha256: None,
+                link_target: None,
             }],
         };
         assert!(validate_envelope(&nick, &run_id, &run_config, &manifest).is_err());
@@ -2478,14 +2571,16 @@ files = []
         let manifest = Manifest {
             run_id: wrong_run_id,
             nickname: nick.clone(),
-            files: vec![ManifestFileEntry {
+            entries: vec![ManifestEntry {
                 sync_name: SyncName::new("videos".into()).unwrap(),
                 local_path: ClientLocalPath::new("/tmp/a.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/a.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
                 size: 10,
                 mtime_ns: 100,
                 sha256: None,
+                link_target: None,
             }],
         };
         assert!(validate_envelope(&nick, &run_id, &run_config, &manifest).is_err());
@@ -2499,14 +2594,16 @@ files = []
         let staged = Utf8PathBuf::from_path_buf(dir.path().join("f.bin")).unwrap();
         std::fs::write(staged.as_std_path(), b"hello").unwrap();
 
-        let entry = ManifestFileEntry {
+        let entry = ManifestEntry {
             sync_name: SyncName::new("videos".into()).unwrap(),
             local_path: ClientLocalPath::new("/x".into()).unwrap(),
             staged_path: NormalizedRelativePath::new("f.bin".into()).unwrap(),
             relative_path: NormalizedRelativePath::new("f.bin".into()).unwrap(),
+            kind: ManifestEntryKind::RegularFile,
             size: 999,
             mtime_ns: 0,
             sha256: None,
+            link_target: None,
         };
 
         let result = entry.verify_staged(&staged);
@@ -2522,14 +2619,16 @@ files = []
         let staged = Utf8PathBuf::from_path_buf(dir.path().join("f.bin")).unwrap();
         std::fs::write(staged.as_std_path(), b"hello").unwrap();
 
-        let entry = ManifestFileEntry {
+        let entry = ManifestEntry {
             sync_name: SyncName::new("videos".into()).unwrap(),
             local_path: ClientLocalPath::new("/x".into()).unwrap(),
             staged_path: NormalizedRelativePath::new("f.bin".into()).unwrap(),
             relative_path: NormalizedRelativePath::new("f.bin".into()).unwrap(),
+            kind: ManifestEntryKind::RegularFile,
             size: 5,
             mtime_ns: 0,
             sha256: Some("badbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbad1".into()),
+            link_target: None,
         };
 
         let result = entry.verify_staged(&staged);
@@ -2545,14 +2644,16 @@ files = []
         let staged = Utf8PathBuf::from_path_buf(dir.path().join("f.bin")).unwrap();
         std::fs::write(staged.as_std_path(), b"hello").unwrap();
 
-        let entry = ManifestFileEntry {
+        let entry = ManifestEntry {
             sync_name: SyncName::new("videos".into()).unwrap(),
             local_path: ClientLocalPath::new("/x".into()).unwrap(),
             staged_path: NormalizedRelativePath::new("f.bin".into()).unwrap(),
             relative_path: NormalizedRelativePath::new("f.bin".into()).unwrap(),
+            kind: ManifestEntryKind::RegularFile,
             size: 5,
             mtime_ns: 0,
             sha256: None,
+            link_target: None,
         };
 
         assert!(entry.verify_staged(&staged).is_ok());
@@ -2563,14 +2664,16 @@ files = []
         let dir = tempfile::tempdir().unwrap();
         let staged = Utf8PathBuf::from_path_buf(dir.path().join("nonexistent")).unwrap();
 
-        let entry = ManifestFileEntry {
+        let entry = ManifestEntry {
             sync_name: SyncName::new("videos".into()).unwrap(),
             local_path: ClientLocalPath::new("/x".into()).unwrap(),
             staged_path: NormalizedRelativePath::new("nonexistent".into()).unwrap(),
             relative_path: NormalizedRelativePath::new("nonexistent".into()).unwrap(),
+            kind: ManifestEntryKind::RegularFile,
             size: 5,
             mtime_ns: 0,
             sha256: None,
+            link_target: None,
         };
 
         let result = entry.verify_staged(&staged);

@@ -8,11 +8,11 @@ client: generate run ID, build manifest
 client: begin-run over SSH → server creates incoming directory, returns paths
 client: validate response envelope
 client: write run.toml + manifest.toml to incoming dir
-client: rsync files into incoming/files/
+client: rsync trees into incoming/files/ without delete
 client: finish-run over SSH → server moves incoming → ready
 server: recover interrupted processing runs, then claim ready → processing
 server: validate config, manifest, envelope
-server: for each file, copy to work area, apply postprocessing, commit outputs
+server: for each entry, validate kind; overlay directories/symlinks; postprocess regular files
 server: atomically write status.toml, move processing to done or failed
 client: poll server status, verify envelope, clean up confirmed local files
 ```
@@ -45,7 +45,7 @@ incoming → ready → processing → done
 | `ready` | Upload complete, waiting for server processing |
 | `processing` | Server is actively processing the run |
 | `done` | Processing completed (all or partial success) |
-| `failed` | Processing completed with no files imported, or run-level error |
+| `failed` | Processing completed with no entries imported, or run-level error |
 
 ## Run states
 
@@ -53,9 +53,9 @@ The `state` field in `status.toml`:
 
 | State | Meaning |
 |-------|---------|
-| `done` | All files imported successfully |
-| `partial` | Some files imported, some failed or skipped |
-| `failed` | No files imported (all failed/skipped, or run-level error) |
+| `done` | All filesystem entries imported successfully |
+| `partial` | Some entries imported, some failed or skipped |
+| `failed` | No entries imported (all failed/skipped, or run-level error) |
 
 ## Status format
 
@@ -64,7 +64,8 @@ run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 state = "done"
 
-[[files]]
+[[entries]]
+kind = "regular_file"
 sync_name = "videos"
 local_path = "/home/user/Videos/video.mp4"
 relative_path = "video.mp4"
@@ -72,7 +73,8 @@ status = "imported"
 final_paths = ["laptop/videos/video.mp4"]
 postprocess = ["compress-video"]
 
-[[files]]
+[[entries]]
+kind = "regular_file"
 sync_name = "videos"
 local_path = "/home/user/Videos/broken.mp4"
 relative_path = "broken.mp4"
@@ -80,7 +82,7 @@ status = "failed"
 error = "staged file not found"
 ```
 
-Per-file status values: `imported`, `failed`, `skipped`.
+Per-entry status values: `imported`, `failed`, `skipped`. Status records are serialized under `[[entries]]`.
 
 ## Manifest format
 
@@ -88,7 +90,8 @@ Per-file status values: `imported`, `failed`, `skipped`.
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 
-[[files]]
+[[entries]]
+kind = "regular_file"
 sync_name = "videos"
 local_path = "/home/user/Videos/a.mp4"
 staged_path = "files/videos/a.mp4"
@@ -97,6 +100,8 @@ size = 123456789
 mtime_ns = 1780944312000000000
 sha256 = "abc123..."
 ```
+
+The server rejects a manifest before import if multiple entries resolve to the same final path. Manifest `kind` is `directory`, `regular_file`, or `symlink`. Regular files carry `size`, `mtime_ns`, and optional `sha256`; symlinks carry a literal `link_target`; directories need no identity payload. Parent directories precede descendants. Staged validation uses `symlink_metadata` and never follows symlinks.
 
 ## `begin-run` response
 
@@ -141,4 +146,4 @@ If any check fails, `finish-run` rejects the transition with a clear error messa
 
 ## Crash recovery and repeated imports
 
-`process-once` scans `processing/` as well as `ready/`. Missing processing status is replayed from staged files; valid processing status completes its pending terminal move; malformed processing status becomes a clear failure. Existing regular final files are atomically replaced, making repeated uploads and replay safe. See [Crash Safety and Idempotent Imports](design/crash-safety-and-idempotence.md).
+`process-once` scans `processing/` as well as `ready/`. Missing processing status is replayed from staged files; valid processing status completes its pending terminal move; malformed processing status becomes a clear failure. The staged tree is replayed through idempotent per-entry directory, regular-file, and symlink commits. Existing directories merge without deleting unrelated descendants, final-storage symlinks are never followed as directories, and terminal success is published only after every entry completes. This provides replayable convergence rather than an all-or-nothing tree transaction. See [Crash Safety and Idempotent Imports](design/crash-safety-and-idempotence.md).

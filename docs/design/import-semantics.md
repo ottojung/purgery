@@ -1,106 +1,45 @@
 # Import Semantics
 
-## Temp-file commit
+## Recursive no-delete tree overlay
 
-Outputs are never copied directly to their final user-visible path. Each committed output goes through:
+Purgery imports uploaded filesystem trees, not only regular files. For each sync mapping, the server overlays the staged tree onto `<root>/<nickname>/<sync.to>` with the same type-conflict behavior observed from `rsync --recursive --archive` when no delete option is supplied:
 
-```
-work output → final parent dir / .purgery-commit.<run_id>.<filename>.tmp → rename → final path
-```
+- directories are created or merged recursively;
+- regular files are created or replaced;
+- symlinks are preserved as symlinks, and their target strings are treated as literal data;
+- final entries absent from the upload remain untouched;
+- final-storage symlinks are never followed as directories.
 
-The temp file is on the same filesystem as the final path, so the rename is atomic against readers. Temp files are cleaned up after a successful commit.
+The checked-in [rsync overlay conflict oracle](rsync-overlay-oracle.md) records the command, exit statuses, and resulting trees; [`scripts/characterize-rsync-overlay.sh`](../../scripts/characterize-rsync-overlay.sh) reproduces it. With rsync 3.2.7, directories replace files and symlinks, files and symlinks replace files, symlinks, and empty directories, and files or symlinks fail rather than replace non-empty directories. A source directory resolves a conflicting file or symlink parent before its children are imported. Purgery follows those rules.
 
-## Conflict policy: atomic regular-file replacement
+There is no `--no-delete` rsync option: no-delete is rsync's behavior when none of the `--delete*` options are supplied. Purgery never adds a delete option.
 
-A missing final path is created, and an existing regular final file is atomically replaced. Existing directories, symlinks, parent-path symlinks, and other non-regular filesystem objects block the output and fail that file.
+## Manifest order and validation
 
-## Multi-output preflight and replay
+The manifest contains `directory`, `regular_file`, and `symlink` entries. Entries are ordered by depth, with parent directories before children and stable lexical ordering within depth/type groups. Empty directories therefore participate in imports and parent type conflicts are resolved before child entries.
 
-Before committing any output for a file, all final output paths are derived and prechecked for root containment, symlinks, and replaceable destination types. Commits proceed in order. Already committed outputs are not removed or restored if a later commit fails. If processing stops before status publication, `process-once` replays the run from staged files and converges through atomic replacement.
+The server requires every `staged_path` to equal the path derived from the run configuration and relative path. It uses `symlink_metadata` so staged symlinks are not followed. Regular files are checked by size and optional SHA-256, directories must be real directories, and symlink targets must exactly match the manifest's literal `link_target`.
 
-See [Crash Safety and Idempotent Imports](crash-safety-and-idempotence.md) for the durable recovery and replacement invariants.
+Special filesystem objects are rejected explicitly by the client manifest builder. Directory and symlink entries cannot carry regular-file identity fields; symlinks must carry a literal link target.
 
-## `final_paths` (plural)
+A run is rejected before entry processing if any two manifest entries resolve to the same final path, including duplicate directory entries from overlapping sync mappings. Purgery intentionally does not use manifest ordering to choose a winner between overlapping mappings.
 
-Status entries use `final_paths` — a list of all committed paths relative to the server root. A single-output import produces one entry. Postprocessing (e.g., `compress-video`) may produce multiple outputs (original + compressed).
+## Per-entry commits
 
-For a failed file, `final_paths` is empty and the `error` field contains a description.
+Directory commits create or retain a real directory and replace conflicting non-directories. Regular files are copied to a same-directory `.purgery-commit...tmp` file and renamed into place. Symlinks are created at a same-directory temporary name and renamed into place. Existing non-empty directories block a present source file or symlink, matching the characterized rsync behavior.
 
-## Per-file errors
+Every existing final-path ancestor must be a real directory. Purgery does not traverse final-storage symlinks. Source directory entries are responsible for replacing parent conflicts before descendants are processed.
 
-Per-file failures produce individual `FileStatusEntry` records with `status = "failed"` and a descriptive `error` field. The server continues processing remaining files. Only truly catastrophic errors (unreadable run config, invalid regex, missing step reference, unparseable manifest, envelope mismatch) abort the entire run.
+No operation removes an unrelated descendant merely because it is absent from the upload. An existing destination directory is merged, so extra final files survive.
 
-## Work area
+## Postprocessing
 
-The server rebuilds a hidden work area for each processing attempt at `<root>/.purgery-work/<nickname>/<run_id>/`. Files are copied into subdirectories mirroring the destination structure: `<work_area>/<to_path>/<relative_path>`.
+Postprocessing applies only to regular-file manifest entries. Directories and symlinks are imported directly and never passed to subprocesses. A regular staged file is copied into `<root>/.purgery-work/<nickname>/<run_id>/<sync.to>/<relative_path>`, matching rules run there, and each generated regular-file output is committed through the same final-tree regular-file mechanism.
 
-Cleanup policy:
+`expected_outputs` are file-name templates only. Generated outputs must be real regular files according to `symlink_metadata` and remain in the input's work-area directory. Missing outputs, directories, symlinks, and other filesystem objects fail the input entry without being followed. `final_paths` is plural because one regular input may produce multiple outputs; directory and symlink status entries contain their single final path.
 
-| Run state | Work area kept? |
-|-----------|-----------------|
-| `done`    | removed         |
-| `partial` | kept            |
-| `failed`  | kept            |
+## Status and cleanup
 
-## Run plan validation
+Each status record includes the manifest entry kind and an `imported`, `failed`, or `skipped` result. The server continues after per-entry failures and publishes terminal success only after all entry operations have completed.
 
-Before processing any files, the server builds a `RunPlan` that compiles all postprocess regexes once and resolves every referenced step against the server config. If any regex is invalid or any step is missing on the server, the run is rejected with a run-level `Failed` status before any file is imported. File processing uses the precompiled plan and never recompiles regexes.
-
-## Postprocess outputs
-
-Expected outputs must be plain file-name patterns (no paths, no directories). Only `{file_name}`, `{file_stem}`, and `{stem}` placeholders are allowed; `{input}` and `{parent}` are forbidden in expected outputs (they remain allowed in `args`).
-
-Expected outputs are verified to exist and to resolve inside the work area (within the same parent directory as the input). After collection, outputs are deduplicated while preserving order.
-
-The status `postprocess` field is derived by matching rules against the logical normalized path (e.g., `videos/video.mp4`), not the absolute work-area path.
-
-## Malformed status handling
-
-If a `status.toml` exists but is malformed (invalid TOML or missing required fields), the status command returns a parse error rather than silently skipping it.
-
-## Directory layout
-
-```
-<purgery_root>/                      # staging area
-  <nickname>/
-    incoming/<run_id>/               # client uploads here
-      lease.toml
-      run.toml
-      manifest.toml
-      files/                         # uploaded files by sync mapping
-    ready/<run_id>/                  # upload complete, pending processing
-    processing/<run_id>/             # actively being processed
-    done/<run_id>/                   # successfully processed
-    failed/<run_id>/                 # failed runs
-      status.toml
-      run.toml
-      manifest.toml
-      ...
-
-<root>/                              # final storage
-  .purgery-work/<nickname>/<run_id>/ # work area (temporary)
-  <nickname>/
-    <sync.to>/                       # final imported files
-      ...
-```
-
-## Status envelope verification
-
-Before deleting any local file, the client verifies:
-
-- `status.nickname == manifest.nickname`
-- `status.run_id == manifest.run_id`
-
-If either mismatches, cleanup is aborted and nothing is deleted.
-
-## Client deletion semantics
-
-Local files are deleted only after all of the following are true:
-
-1. The server's `status.toml` is valid and parseable.
-2. `status.nickname == manifest.nickname` and `status.run_id == manifest.run_id`.
-3. The file's status is `imported`.
-4. The local file still matches the uploaded identity (size, mtime, and optional SHA-256).
-5. The sync mapping has `delete_after_import = true`.
-
-Deletion is idempotent. If the local file is already gone, it is counted as a successful cleanup. If the file changed since upload, the client leaves it untouched.
+Client cleanup deletes only unchanged local regular files whose imported status and run envelope are valid and whose sync mapping enables `delete_after_import`. Local directories and symlinks are not deleted by cleanup.

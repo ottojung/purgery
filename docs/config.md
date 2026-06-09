@@ -14,15 +14,12 @@ Example:
 ```toml
 root = "/universe/synced"
 purgery_root = "/universe/tmp/purgery"
-state_dir = "/var/lib/purgery"
-log_dir = "/var/log/purgery"
 
 [gc]
 incoming_lease_secs = 1800
 heartbeat_interval_secs = 60
 
 [postprocess]
-max_parallel_jobs = 1
 
 [postprocess.steps.compress-video]
 kind = "subprocess"
@@ -38,8 +35,6 @@ keep_original = true
 |-------|----------|-------------|
 | `root` | yes | Absolute path to final storage root |
 | `purgery_root` | yes | Absolute path to staging area for incoming uploads |
-| `state_dir` | no | Path for server state |
-| `log_dir` | no | Path for logs |
 | `gc` | no | GC configuration (see below) |
 | `postprocess` | no | Postprocessing configuration (see below) |
 
@@ -62,7 +57,6 @@ keep_original = true
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `max_parallel_jobs` | `1` | Maximum concurrent postprocess jobs |
 | `steps` | `{}` | Map of named postprocess step definitions |
 
 ## Postprocess step definition
@@ -139,7 +133,7 @@ steps = ["compress-video"]
 | `name` | — | Unique sync name |
 | `from` | — | Local source path |
 | `to` | — | Relative destination under `root / nickname` |
-| `delete_after_import` | `false` | Delete local originals after confirmed import |
+| `delete_after_import` | `false` | Delete unchanged local regular files after confirmed import; directories and symlinks remain |
 
 ### Postprocess rule
 

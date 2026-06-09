@@ -24,8 +24,8 @@ Both binaries support global flags that override config file and environment:
 | `--log-level <level>` | Override log level |
 | `--log-format <format>` | Override log format |
 | `--color <mode>` | Override color mode |
-| `--quiet` | Set level to `error` (conflicts with `--verbose`) |
-| `--verbose` | Set level to `debug` (conflicts with `--quiet`) |
+| `--quiet` | Set level to `error` (conflicts with `--verbose` and `--log-level`) |
+| `--verbose` | Set level to `debug` (conflicts with `--quiet` and `--log-level`) |
 
 Precedence: CLI flags > config file > default. The `RUST_LOG` environment variable is not consulted; logging is controlled entirely through the config file and CLI flags.
 
@@ -137,3 +137,11 @@ This is used for client `ssh`, `rsync`, and server postprocess `program` values.
 ## Restart recovery
 
 `process-once` recovers runs already in `processing/` before claiming runs from `ready/`. Operators do not need to move phase directories manually after a crash. Recovery uses staged files and filesystem status only; see [Crash Safety and Idempotent Imports](design/crash-safety-and-idempotence.md).
+
+## Final-storage overlay
+
+Each run overlays its uploaded tree onto final storage with recursive archive-mode rsync semantics and no delete option. Existing directories are merged, regular files and symlinks replace compatible destination entries, and extra final descendants remain. A regular file or symlink does not replace a non-empty destination directory. Source directory entries can replace conflicting file or symlink parents before descendants are imported.
+
+Symlink targets are stored and recreated literally. Neither staged symlinks nor final-storage symlinks are traversed as directories. Postprocessing runs only for regular files. Client cleanup likewise removes only unchanged imported regular files, never directories or symlinks.
+
+A crash can expose a prefix of the entry overlay. This is expected: the run remains in `processing/` without a terminal status and `process-once` replays it until the final tree converges. The operation is not an all-or-nothing filesystem transaction.
