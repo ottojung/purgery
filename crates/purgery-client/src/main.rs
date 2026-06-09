@@ -3,7 +3,7 @@ use camino::Utf8Path;
 use clap::{Parser, Subcommand};
 use purgery_core::{
     build_rsync_args, resolve_executable, shell_escape, BeginRunResponse, ClientConfig,
-    ClientLocalPath, Manifest, ManifestFileEntry, NormalizedRelativePath, RunConfig, RunConfigSync,
+    ClientLocalPath, Manifest, ManifestEntry, NormalizedRelativePath, RunConfig, RunConfigSync,
     RunId, RunStatus,
 };
 use sha2::{Digest, Sha256};
@@ -34,10 +34,10 @@ struct Cli {
     #[arg(long, global = true)]
     color: Option<String>,
     /// Suppress all logs except errors (conflicts with --verbose and --log-level)
-    #[arg(long, global = true, conflicts_with_all = &["verbose", "log-level"])]
+    #[arg(long, global = true, conflicts_with_all = &["verbose", "log_level"])]
     quiet: bool,
     /// Enable verbose (debug) logging
-    #[arg(long, global = true, conflicts_with = "quiet")]
+    #[arg(long, global = true, conflicts_with_all = &["quiet", "log_level"])]
     verbose: bool,
 
     #[command(subcommand)]
@@ -246,7 +246,7 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
     .entered();
 
     let manifest = build_manifest(config, &run_id)?;
-    info!(files = manifest.files.len(), "manifest built");
+    info!(files = manifest.entries.len(), "manifest built");
 
     // 2. Begin run on server — get server-derived paths
     let begin_out = server_cmd(
@@ -478,7 +478,7 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
 
 /// Walk all sync directories and build the manifest.
 fn build_manifest(config: &ClientConfig, run_id: &RunId) -> Result<Manifest> {
-    let mut files = Vec::new();
+    let mut entries = Vec::new();
     let nickname = config.nickname.clone();
 
     for sync in &config.sync {
@@ -491,56 +491,103 @@ fn build_manifest(config: &ClientConfig, run_id: &RunId) -> Result<Manifest> {
             continue;
         }
 
-        for entry in WalkDir::new(from).follow_links(false) {
+        for entry in WalkDir::new(from).follow_links(false).min_depth(1) {
             let entry = entry.with_context(|| format!("error walking {from_path}"))?;
-            if !entry.file_type().is_file() {
-                continue;
-            }
-
             let path = entry.path();
-            let metadata = fs::metadata(path)
-                .with_context(|| format!("failed to read metadata: {}", path.display()))?;
-
             let relative = path.strip_prefix(from).with_context(|| {
                 format!("failed to compute relative path for: {}", path.display())
             })?;
+            let relative_path = camino::Utf8PathBuf::from_path_buf(relative.to_path_buf())
+                .map_err(|path| {
+                    anyhow::anyhow!("non-UTF-8 relative path is unsupported: {}", path.display())
+                })?;
+            let staged_path = camino::Utf8Path::new("files")
+                .join(to_path)
+                .join(&relative_path);
+            let metadata = fs::symlink_metadata(path)
+                .with_context(|| format!("failed to read metadata: {}", path.display()))?;
+            let file_type = metadata.file_type();
 
-            let relative_str = relative.to_string_lossy().to_string();
-            let staged_path_str = format!("files/{to_path}/{relative_str}");
+            let (kind, size, mtime_ns, sha256, link_target) = if file_type.is_dir() {
+                (purgery_core::ManifestEntryKind::Directory, 0, 0, None, None)
+            } else if file_type.is_file() {
+                let mtime_ns = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_nanos() as i64)
+                    .unwrap_or(0);
+                (
+                    purgery_core::ManifestEntryKind::RegularFile,
+                    metadata.len(),
+                    mtime_ns,
+                    compute_sha256(path).ok(),
+                    None,
+                )
+            } else if file_type.is_symlink() {
+                let target = fs::read_link(path)
+                    .with_context(|| format!("failed to read symlink: {}", path.display()))?;
+                let target = camino::Utf8PathBuf::from_path_buf(target).map_err(|path| {
+                    anyhow::anyhow!(
+                        "non-UTF-8 symlink target is unsupported: {}",
+                        path.display()
+                    )
+                })?;
+                (
+                    purgery_core::ManifestEntryKind::Symlink,
+                    0,
+                    0,
+                    None,
+                    Some(target),
+                )
+            } else {
+                anyhow::bail!("unsupported filesystem object: {}", path.display());
+            };
 
-            let size = metadata.len();
-            let mtime_ns = metadata
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                .map(|d| d.as_nanos() as i64)
-                .unwrap_or(0);
-
-            let sha256 = compute_sha256(path).ok();
-
-            files.push(ManifestFileEntry {
+            entries.push(ManifestEntry {
                 sync_name: sync.name.clone(),
                 local_path: ClientLocalPath::new(path.to_string_lossy().to_string())
                     .with_context(|| format!("invalid local path for: {}", path.display()))?,
-                staged_path: NormalizedRelativePath::new(staged_path_str.into())
+                staged_path: NormalizedRelativePath::new(staged_path)
                     .with_context(|| format!("invalid staged path for: {}", path.display()))?,
-                relative_path: NormalizedRelativePath::new(relative_str.into())
+                relative_path: NormalizedRelativePath::new(relative_path)
                     .with_context(|| format!("invalid relative path for: {}", path.display()))?,
+                kind,
                 size,
                 mtime_ns,
                 sha256,
+                link_target,
             });
         }
     }
 
-    if files.is_empty() {
-        anyhow::bail!("no files found to sync (all sync directories may be empty or missing)");
+    entries.sort_by(|left, right| {
+        let left_depth = left.relative_path.as_path().components().count();
+        let right_depth = right.relative_path.as_path().components().count();
+        let kind_order = |kind| match kind {
+            purgery_core::ManifestEntryKind::Directory => 0,
+            purgery_core::ManifestEntryKind::RegularFile
+            | purgery_core::ManifestEntryKind::Symlink => 1,
+        };
+        left_depth
+            .cmp(&right_depth)
+            .then_with(|| kind_order(left.kind).cmp(&kind_order(right.kind)))
+            .then_with(|| left.sync_name.as_str().cmp(right.sync_name.as_str()))
+            .then_with(|| {
+                left.relative_path
+                    .as_str()
+                    .cmp(right.relative_path.as_str())
+            })
+    });
+
+    if entries.is_empty() {
+        anyhow::bail!("no filesystem entries found to sync");
     }
 
     Ok(Manifest {
         run_id: run_id.clone(),
         nickname,
-        files,
+        entries,
     })
 }
 
@@ -616,8 +663,8 @@ fn delete_confirmed_files(
     let mut count = 0;
 
     // Build a lookup from local_path to manifest entry
-    let manifest_by_path: std::collections::HashMap<&str, &ManifestFileEntry> = manifest
-        .files
+    let manifest_by_path: std::collections::HashMap<&str, &ManifestEntry> = manifest
+        .entries
         .iter()
         .map(|f| (f.local_path.as_str(), f))
         .collect();
@@ -636,6 +683,10 @@ fn delete_confirmed_files(
             );
             continue;
         };
+
+        if manifest_entry.kind != purgery_core::ManifestEntryKind::RegularFile {
+            continue;
+        }
 
         // Find the corresponding sync mapping
         let Some(sync) = config
@@ -706,4 +757,120 @@ fn delete_confirmed_files(
     }
 
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    use purgery_core::{EntryStatusEntry, FileStatus, ManifestEntryKind, RunState};
+
+    fn config_for(source: &Path) -> ClientConfig {
+        ClientConfig::from_toml(&format!(
+            r#"
+nickname = "laptop"
+
+[server]
+host = "example.invalid"
+
+[[sync]]
+name = "data"
+from = "{}"
+to = "data"
+delete_after_import = true
+"#,
+            source.display()
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn cli_rejects_verbose_with_log_level() {
+        let result = Cli::try_parse_from([
+            "purgery-client",
+            "--verbose",
+            "--log-level",
+            "debug",
+            "check",
+            "--config",
+            "client.toml",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn manifest_includes_directories_files_and_symlinks_in_topological_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        fs::create_dir_all(source.join("empty")).unwrap();
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(source.join("nested/file.txt"), "data").unwrap();
+        std::os::unix::fs::symlink("nested/file.txt", source.join("link")).unwrap();
+        let config = config_for(&source);
+        let run_id = RunId::new("manifest-tree".into()).unwrap();
+
+        let manifest = build_manifest(&config, &run_id).unwrap();
+        let actual: Vec<_> = manifest
+            .entries
+            .iter()
+            .map(|entry| (entry.relative_path.as_str(), entry.kind))
+            .collect();
+        assert_eq!(
+            actual,
+            vec![
+                ("empty", ManifestEntryKind::Directory),
+                ("nested", ManifestEntryKind::Directory),
+                ("link", ManifestEntryKind::Symlink),
+                ("nested/file.txt", ManifestEntryKind::RegularFile),
+            ]
+        );
+        assert_eq!(
+            manifest.entries[2].link_target.as_deref(),
+            Some(Utf8Path::new("nested/file.txt"))
+        );
+    }
+
+    #[test]
+    fn cleanup_deletes_only_unchanged_regular_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        fs::create_dir_all(source.join("directory")).unwrap();
+        fs::write(source.join("file.txt"), "data").unwrap();
+        std::os::unix::fs::symlink("file.txt", source.join("link")).unwrap();
+        let config = config_for(&source);
+        let run_id = RunId::new("cleanup-tree".into()).unwrap();
+        let manifest = build_manifest(&config, &run_id).unwrap();
+        let files = manifest
+            .entries
+            .iter()
+            .map(|entry| EntryStatusEntry {
+                kind: entry.kind,
+                sync_name: entry.sync_name.clone(),
+                local_path: entry.local_path.as_str().to_owned(),
+                relative_path: entry.relative_path.as_str().to_owned(),
+                status: FileStatus::Imported,
+                final_paths: vec![],
+                postprocess: None,
+                error: None,
+            })
+            .collect();
+        let status = RunStatus {
+            run_id,
+            nickname: config.nickname.clone(),
+            state: RunState::Done,
+            files,
+            error: None,
+        };
+
+        assert_eq!(
+            delete_confirmed_files(&config, &manifest, &status).unwrap(),
+            1
+        );
+        assert!(!source.join("file.txt").exists());
+        assert!(source.join("directory").is_dir());
+        assert!(fs::symlink_metadata(source.join("link"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
 }

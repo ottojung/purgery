@@ -1,13 +1,24 @@
 use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use purgery_core::{
-    check_symlink_in_path, path_is_within_root, validate_envelope, work_dir, FileStatus,
-    FileStatusEntry, Manifest, Nickname, NormalizedRelativePath, PurgeryRoot, RunConfig,
+    path_is_within_root, validate_envelope, work_dir, EntryStatusEntry, FileStatus, Manifest,
+    ManifestEntry, ManifestEntryKind, Nickname, NormalizedRelativePath, PurgeryRoot, RunConfig,
     RunConfigSync, RunId, RunPhase, RunState, RunStatus, ServerConfig,
 };
 use std::collections::HashMap;
 use std::fs;
 use tracing::{info, span, warn, Level};
+
+fn publish_status_atomic(directory: &Utf8Path, status: &RunStatus) -> Result<()> {
+    let content = status.to_toml().context("failed to serialize status")?;
+    let temporary = directory.join("status.toml.tmp");
+    let final_path = directory.join("status.toml");
+    fs::write(&temporary, content)
+        .with_context(|| format!("failed to write temporary status: {}", temporary))?;
+    fs::rename(&temporary, &final_path)
+        .with_context(|| format!("failed to publish status: {}", final_path))?;
+    Ok(())
+}
 
 /// Persist a run-level failure and move the processing directory to `failed/`.
 fn write_run_failure(
@@ -125,9 +136,10 @@ pub fn find_processing_runs(purgery_root: &PurgeryRoot) -> Result<Vec<(Nickname,
     find_runs_in_phase(purgery_root, RunPhase::Processing)
 }
 
-/// Per-file outcome.
-enum FileOutcome {
+/// Per-entry outcome.
+enum EntryOutcome {
     Success {
+        kind: ManifestEntryKind,
         sync_name: purgery_core::SyncName,
         local_path: String,
         relative_path: String,
@@ -135,12 +147,14 @@ enum FileOutcome {
         postprocess: Option<Vec<String>>,
     },
     Failure {
+        kind: ManifestEntryKind,
         sync_name: purgery_core::SyncName,
         local_path: String,
         relative_path: String,
         error: String,
     },
     Skipped {
+        kind: ManifestEntryKind,
         sync_name: purgery_core::SyncName,
         local_path: String,
         relative_path: String,
@@ -148,16 +162,18 @@ enum FileOutcome {
     },
 }
 
-impl FileOutcome {
-    fn into_entry(self) -> FileStatusEntry {
+impl EntryOutcome {
+    fn into_entry(self) -> EntryStatusEntry {
         match self {
-            FileOutcome::Success {
+            EntryOutcome::Success {
+                kind,
                 sync_name,
                 local_path,
                 relative_path,
                 final_paths,
                 postprocess,
-            } => FileStatusEntry {
+            } => EntryStatusEntry {
+                kind,
                 sync_name,
                 local_path,
                 relative_path,
@@ -166,12 +182,14 @@ impl FileOutcome {
                 postprocess,
                 error: None,
             },
-            FileOutcome::Failure {
+            EntryOutcome::Failure {
+                kind,
                 sync_name,
                 local_path,
                 relative_path,
                 error,
-            } => FileStatusEntry {
+            } => EntryStatusEntry {
+                kind,
                 sync_name,
                 local_path,
                 relative_path,
@@ -180,12 +198,14 @@ impl FileOutcome {
                 postprocess: None,
                 error: Some(error),
             },
-            FileOutcome::Skipped {
+            EntryOutcome::Skipped {
+                kind,
                 sync_name,
                 local_path,
                 relative_path,
                 error,
-            } => FileStatusEntry {
+            } => EntryStatusEntry {
+                kind,
                 sync_name,
                 local_path,
                 relative_path,
@@ -198,364 +218,332 @@ impl FileOutcome {
     }
 }
 
-/// Result of atomically committing one final output.
+/// Result of committing one final tree entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommitDisposition {
     Created,
+    Kept,
     Replaced,
 }
 
-/// Validate that a final output can be created or atomically replaced.
-fn preflight_output(final_path: &Utf8Path) -> Result<CommitDisposition, String> {
+fn remove_destination_for_non_directory(
+    final_path: &Utf8Path,
+) -> Result<CommitDisposition, String> {
     match fs::symlink_metadata(final_path.as_std_path()) {
-        Ok(metadata) if metadata.is_file() => Ok(CommitDisposition::Replaced),
-        Ok(metadata) if metadata.is_dir() => Err(format!(
-            "final output is blocked by a directory: {}",
-            final_path.as_str()
-        )),
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
-            "final output is blocked by a symlink: {}",
-            final_path.as_str()
-        )),
-        Ok(_) => Err(format!(
-            "final output is blocked by a non-regular file: {}",
-            final_path.as_str()
-        )),
+        Ok(metadata) if metadata.is_dir() => {
+            fs::remove_dir(final_path.as_std_path()).map_err(|error| {
+                format!(
+                    "cannot replace non-empty destination directory '{}': {error}",
+                    final_path.as_str()
+                )
+            })?;
+            Ok(CommitDisposition::Replaced)
+        }
+        Ok(_) => Ok(CommitDisposition::Replaced),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             Ok(CommitDisposition::Created)
         }
-        Err(error) => Err(format!("failed to inspect final output: {error}")),
+        Err(error) => Err(format!("failed to inspect final destination: {error}")),
     }
 }
 
-/// Commit a work-area output via a same-directory temporary file and atomic rename.
-fn commit_output(
+fn remove_stale_temp(temp_path: &Utf8Path) -> Result<(), String> {
+    match fs::symlink_metadata(temp_path.as_std_path()) {
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(temp_path.as_std_path())
+            .map_err(|error| format!("failed to remove stale temporary directory: {error}")),
+        Ok(_) => fs::remove_file(temp_path.as_std_path())
+            .map_err(|error| format!("failed to remove stale temporary entry: {error}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("failed to inspect temporary entry: {error}")),
+    }
+}
+
+/// Verify that every existing final-path ancestor is a real directory.
+/// Source directory entries are processed before their descendants, so type
+/// conflicts in ancestors are resolved by those directory entries instead of
+/// following a destination symlink or treating a file as a directory.
+fn ensure_final_parent(final_path: &Utf8Path, root: &Utf8Path) -> Result<(), String> {
+    let parent = final_path
+        .parent()
+        .ok_or_else(|| format!("final path has no parent: {}", final_path.as_str()))?;
+    let relative = parent
+        .strip_prefix(root)
+        .map_err(|_| format!("final parent escapes root: {}", parent.as_str()))?;
+    let mut current = root.to_owned();
+    for component in relative.components() {
+        current.push(component.as_str());
+        match fs::symlink_metadata(current.as_std_path()) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "final parent is not a directory: {}",
+                    current.as_str()
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(current.as_std_path()).map_err(|error| {
+                    format!(
+                        "failed to create final parent '{}': {error}",
+                        current.as_str()
+                    )
+                })?;
+            }
+            Err(error) => return Err(format!("failed to inspect final parent: {error}")),
+        }
+    }
+    Ok(())
+}
+
+fn commit_directory_entry(
+    final_path: &Utf8Path,
+    root: &Utf8Path,
+) -> Result<CommitDisposition, String> {
+    ensure_final_parent(final_path, root)?;
+    match fs::symlink_metadata(final_path.as_std_path()) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            Ok(CommitDisposition::Kept)
+        }
+        Ok(metadata) => {
+            if metadata.is_dir() {
+                return Err(format!(
+                    "unsupported destination directory type: {}",
+                    final_path
+                ));
+            }
+            fs::remove_file(final_path.as_std_path())
+                .map_err(|error| format!("failed to remove conflicting destination: {error}"))?;
+            fs::create_dir(final_path.as_std_path())
+                .map_err(|error| format!("failed to create destination directory: {error}"))?;
+            Ok(CommitDisposition::Replaced)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(final_path.as_std_path())
+                .map_err(|error| format!("failed to create destination directory: {error}"))?;
+            Ok(CommitDisposition::Created)
+        }
+        Err(error) => Err(format!("failed to inspect destination directory: {error}")),
+    }
+}
+
+fn commit_regular_file_entry(
     source: &Utf8Path,
     final_path: &Utf8Path,
+    root: &Utf8Path,
     run_id: &RunId,
 ) -> Result<CommitDisposition, String> {
-    let disposition = preflight_output(final_path)?;
-
-    if let Some(parent) = final_path.parent() {
-        fs::create_dir_all(parent.as_std_path())
-            .map_err(|e| format!("failed to create parent directory: {e}"))?;
+    ensure_final_parent(final_path, root)?;
+    let disposition = remove_destination_for_non_directory(final_path)?;
+    let temp_path = purgery_core::commit_temp_path(final_path, run_id);
+    remove_stale_temp(&temp_path)?;
+    fs::copy(source.as_std_path(), temp_path.as_std_path())
+        .map_err(|error| format!("failed to copy regular file to temporary path: {error}"))?;
+    if let Err(error) = fs::rename(temp_path.as_std_path(), final_path.as_std_path()) {
+        let _ = fs::remove_file(temp_path.as_std_path());
+        return Err(format!("failed to commit regular file: {error}"));
     }
-
-    let tmp_path = purgery_core::commit_temp_path(final_path, run_id);
-    match fs::symlink_metadata(tmp_path.as_std_path()) {
-        Ok(metadata) if metadata.is_file() => fs::remove_file(tmp_path.as_std_path())
-            .map_err(|e| format!("failed to remove stale commit temp file: {e}"))?,
-        Ok(_) => {
-            return Err(format!(
-                "commit temp path is not a regular file: {}",
-                tmp_path.as_str()
-            ));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("failed to inspect commit temp path: {error}")),
-    }
-
-    if let Err(error) = fs::copy(source.as_std_path(), tmp_path.as_std_path()) {
-        let _ = fs::remove_file(tmp_path.as_std_path());
-        return Err(format!("failed to copy to temp path: {error}"));
-    }
-
-    if let Err(error) = fs::rename(&tmp_path, final_path) {
-        let _ = fs::remove_file(tmp_path.as_std_path());
-        return Err(format!("failed to rename temp to final path: {error}"));
-    }
-
     Ok(disposition)
 }
 
-/// Process a single file entry: validate, copy to work area, postprocess, commit.
+#[cfg(unix)]
+fn create_symlink(target: &Utf8Path, link: &Utf8Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target.as_std_path(), link.as_std_path())
+}
+
+fn commit_symlink_entry(
+    target: &Utf8Path,
+    final_path: &Utf8Path,
+    root: &Utf8Path,
+    run_id: &RunId,
+) -> Result<CommitDisposition, String> {
+    ensure_final_parent(final_path, root)?;
+    let disposition = remove_destination_for_non_directory(final_path)?;
+    let temp_path = purgery_core::commit_temp_path(final_path, run_id);
+    remove_stale_temp(&temp_path)?;
+    create_symlink(target, &temp_path)
+        .map_err(|error| format!("failed to create temporary symlink: {error}"))?;
+    if let Err(error) = fs::rename(temp_path.as_std_path(), final_path.as_std_path()) {
+        let _ = fs::remove_file(temp_path.as_std_path());
+        return Err(format!("failed to commit symlink: {error}"));
+    }
+    Ok(disposition)
+}
+
+fn failed_entry(entry: &ManifestEntry, error: impl Into<String>) -> EntryOutcome {
+    EntryOutcome::Failure {
+        kind: entry.kind,
+        sync_name: entry.sync_name.clone(),
+        local_path: entry.local_path.as_str().to_owned(),
+        relative_path: entry.relative_path.as_str().to_owned(),
+        error: error.into(),
+    }
+}
+
+/// Validate and import one manifest entry using recursive no-delete overlay semantics.
 #[allow(clippy::too_many_arguments)]
-fn process_one_file(
+fn process_manifest_entry(
     server_config: &ServerConfig,
     run_plan: &RunPlan,
     sync: &RunConfigSync,
-    file_entry: &purgery_core::ManifestFileEntry,
+    entry: &ManifestEntry,
     nickname: &Nickname,
     run_id: &RunId,
     processing_path: &Utf8Path,
     work_area: &Utf8Path,
-) -> FileOutcome {
-    let local_path = file_entry.local_path.as_str().to_owned();
-    let relative_path = file_entry.relative_path.as_str().to_owned();
-    let sync_name = file_entry.sync_name.clone();
-
-    // 1. Validate staged_path matches expected
+) -> EntryOutcome {
     let expected_staged = Utf8Path::new("files")
         .join(sync.to_path.as_str())
-        .join(file_entry.relative_path.as_str());
-    let Ok(expected_normalized) = NormalizedRelativePath::new(expected_staged) else {
-        return FileOutcome::Failure {
-            sync_name,
-            local_path,
-            relative_path,
-            error: "failed to normalize expected staged path".into(),
-        };
+        .join(entry.relative_path.as_str());
+    let Ok(expected_staged) = NormalizedRelativePath::new(expected_staged) else {
+        return failed_entry(entry, "failed to normalize expected staged path");
     };
-    if file_entry.staged_path.as_str() != expected_normalized.as_str() {
-        return FileOutcome::Failure {
-            sync_name,
-            local_path,
-            relative_path,
-            error: format!(
+    if entry.staged_path != expected_staged {
+        return failed_entry(
+            entry,
+            format!(
                 "staged_path mismatch: expected '{}', got '{}'",
-                expected_normalized.as_str(),
-                file_entry.staged_path.as_str()
+                expected_staged.as_str(),
+                entry.staged_path.as_str()
             ),
-        };
+        );
     }
 
-    // 2. Resolve staged source path
-    let source_path = processing_path.join(file_entry.staged_path.as_str());
-
-    if !source_path.exists() {
-        return FileOutcome::Failure {
-            sync_name,
-            local_path,
-            relative_path,
-            error: format!("staged file not found: {}", source_path.as_str()),
-        };
-    }
-
-    // 3. Reject staged symlink
+    let source_path = processing_path.join(entry.staged_path.as_str());
     let staged_metadata = match fs::symlink_metadata(source_path.as_std_path()) {
-        Ok(m) => m,
-        Err(e) => {
-            return FileOutcome::Failure {
-                sync_name,
-                local_path,
-                relative_path,
-                error: format!("failed to read staged metadata: {e}"),
-            };
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return failed_entry(entry, format!("failed to read staged metadata: {error}"))
         }
     };
-    if staged_metadata.file_type().is_symlink() {
-        return FileOutcome::Failure {
-            sync_name,
-            local_path,
-            relative_path,
-            error: format!("staged path is a symlink: {}", source_path.as_str()),
-        };
+    let staged_type = staged_metadata.file_type();
+    let kind_matches = match entry.kind {
+        ManifestEntryKind::Directory => staged_type.is_dir() && !staged_type.is_symlink(),
+        ManifestEntryKind::RegularFile => staged_type.is_file(),
+        ManifestEntryKind::Symlink => staged_type.is_symlink(),
+    };
+    if !kind_matches {
+        return failed_entry(entry, "staged filesystem kind does not match manifest kind");
+    }
+    match entry.kind {
+        ManifestEntryKind::RegularFile => {
+            if let Err(error) = entry.verify_staged(&source_path) {
+                return failed_entry(entry, format!("staged file identity check failed: {error}"));
+            }
+        }
+        ManifestEntryKind::Symlink => {
+            let Some(expected_target) = entry.link_target.as_deref() else {
+                return failed_entry(entry, "symlink manifest entry has no link_target");
+            };
+            match fs::read_link(source_path.as_std_path()) {
+                Ok(actual) if actual == expected_target.as_std_path() => {}
+                Ok(_) => {
+                    return failed_entry(entry, "staged symlink target does not match manifest")
+                }
+                Err(error) => {
+                    return failed_entry(entry, format!("failed to read staged symlink: {error}"))
+                }
+            }
+        }
+        ManifestEntryKind::Directory => {}
     }
 
-    // 4. Server-side file identity verification
-    let source_utf8 = Utf8PathBuf::from_path_buf(source_path.clone().into_std_path_buf())
-        .unwrap_or_else(|p| Utf8PathBuf::from(p.to_string_lossy().as_ref()));
-    if let Err(e) = file_entry.verify_staged(&source_utf8) {
-        return FileOutcome::Failure {
-            sync_name,
-            local_path,
-            relative_path,
-            error: format!("staged file identity check failed: {e}"),
-        };
-    }
-
-    // 5. Compute final path
-    let final_path =
-        server_config
-            .root
-            .final_path(nickname, &sync.to_path, &file_entry.relative_path);
-
+    let final_path = server_config
+        .root
+        .final_path(nickname, &sync.to_path, &entry.relative_path);
     if !path_is_within_root(&final_path, server_config.root.as_path()) {
-        return FileOutcome::Failure {
-            sync_name,
-            local_path,
-            relative_path,
-            error: format!("final path escapes root: {}", final_path.as_str()),
-        };
+        return failed_entry(
+            entry,
+            format!("final path escapes root: {}", final_path.as_str()),
+        );
     }
+    let final_relative = final_path
+        .strip_prefix(server_config.root.as_path())
+        .unwrap_or(&final_path)
+        .to_string();
 
-    // 6. Symlink check in final destination path
-    if let Err(e) = check_symlink_in_path(&final_path, server_config.root.as_path()) {
-        return FileOutcome::Failure {
-            sync_name,
-            local_path,
-            relative_path,
-            error: format!("symlink check failed: {e}"),
-        };
-    }
-
-    // 7. Copy staged file to work area (namespaced by sync.to_path)
-    let work_path = work_area
-        .join(sync.to_path.as_str())
-        .join(file_entry.relative_path.as_str());
-    if let Some(parent) = work_path.parent() {
-        if let Err(e) = fs::create_dir_all(parent) {
-            return FileOutcome::Failure {
-                sync_name,
-                local_path,
-                relative_path,
-                error: format!("failed to create work subdirectory: {e}"),
-            };
+    let result = match entry.kind {
+        ManifestEntryKind::Directory => {
+            commit_directory_entry(&final_path, server_config.root.as_path())
+                .map(|_| (vec![final_relative], None))
         }
-    }
-    if let Err(e) = fs::copy(source_path.as_std_path(), work_path.as_std_path()) {
-        return FileOutcome::Failure {
-            sync_name,
-            local_path,
-            relative_path,
-            error: format!("failed to copy to work area: {e}"),
-        };
-    }
-
-    // 8. Apply postprocessing using precompiled run plan
-    let normalized_path = format!(
-        "{}/{}",
-        sync.to_path.as_str(),
-        file_entry.relative_path.as_str()
-    );
-    let postprocess_result = apply_postprocessing(run_plan, &normalized_path, &work_path);
-
-    match postprocess_result {
-        Ok(outputs) => {
-            // Preflight every output before committing any of them. A crash between
-            // commits is recovered by replaying the run from its staged files.
-            let mut preflight_checks: Vec<(Utf8PathBuf, Utf8PathBuf)> = Vec::new();
-            let root_path = server_config.root.as_path();
-
-            for output in &outputs {
-                let output_final = if output == &work_path {
-                    final_path.clone()
-                } else {
-                    let filename = output.file_name().unwrap_or("");
-                    final_path
-                        .parent()
-                        .map_or_else(|| Utf8PathBuf::from(filename), |p| p.join(filename))
-                };
-
-                if !path_is_within_root(&output_final, root_path) {
-                    return FileOutcome::Failure {
-                        sync_name,
-                        local_path,
-                        relative_path,
-                        error: format!("final output escapes root: {}", output_final.as_str()),
-                    };
-                }
-
-                if let Err(error) = check_symlink_in_path(&output_final, root_path) {
-                    warn!(
-                        nickname = %nickname.as_str(),
-                        run_id = %run_id.as_str(),
-                        phase = "processing",
-                        relative_path = %relative_path,
-                        final_path = %output_final.as_str(),
-                        status = "blocked",
-                        error = %error,
-                        "final output blocked by directory/symlink"
+        ManifestEntryKind::Symlink => {
+            let target = entry
+                .link_target
+                .as_deref()
+                .expect("validated symlink target");
+            commit_symlink_entry(target, &final_path, server_config.root.as_path(), run_id)
+                .map(|_| (vec![final_relative], None))
+        }
+        ManifestEntryKind::RegularFile => {
+            let work_path = work_area
+                .join(sync.to_path.as_str())
+                .join(entry.relative_path.as_str());
+            if let Some(parent) = work_path.parent() {
+                if let Err(error) = fs::create_dir_all(parent) {
+                    return failed_entry(
+                        entry,
+                        format!("failed to create work directory: {error}"),
                     );
-                    return FileOutcome::Failure {
-                        sync_name,
-                        local_path,
-                        relative_path,
-                        error: format!("symlink check failed for output: {error}"),
-                    };
                 }
-
-                if let Err(error) = preflight_output(&output_final) {
-                    warn!(
-                        nickname = %nickname.as_str(),
-                        run_id = %run_id.as_str(),
-                        phase = "processing",
-                        relative_path = %relative_path,
-                        final_path = %output_final.as_str(),
-                        status = "blocked",
-                        error = %error,
-                        "final output blocked by directory/symlink"
-                    );
-                    return FileOutcome::Failure {
-                        sync_name,
-                        local_path,
-                        relative_path,
-                        error,
-                    };
-                }
-
-                if let Some(parent) = output_final.parent() {
-                    if let Err(error) = fs::create_dir_all(parent) {
-                        return FileOutcome::Failure {
-                            sync_name,
-                            local_path,
-                            relative_path,
-                            error: format!("failed to create parent directory: {error}"),
-                        };
-                    }
-                }
-
-                preflight_checks.push((output.clone(), output_final));
             }
-
-            let mut committed_rel_paths: Vec<String> = Vec::new();
-
-            for (output, output_final) in &preflight_checks {
-                match commit_output(output, output_final, run_id) {
-                    Ok(disposition) => {
-                        let commit_disposition = match disposition {
-                            CommitDisposition::Created => "created",
-                            CommitDisposition::Replaced => "replaced",
+            if let Err(error) = fs::copy(source_path.as_std_path(), work_path.as_std_path()) {
+                return failed_entry(entry, format!("failed to copy to work area: {error}"));
+            }
+            let normalized_path =
+                format!("{}/{}", sync.to_path.as_str(), entry.relative_path.as_str());
+            match apply_postprocessing(run_plan, &normalized_path, &work_path) {
+                Ok(outputs) => {
+                    let mut final_paths = Vec::new();
+                    for output in outputs {
+                        let output_final = if output == work_path {
+                            final_path.clone()
+                        } else {
+                            let filename = output.file_name().unwrap_or("");
+                            final_path.parent().map_or_else(
+                                || Utf8PathBuf::from(filename),
+                                |parent| parent.join(filename),
+                            )
                         };
-                        info!(
-                            nickname = %nickname.as_str(),
-                            run_id = %run_id.as_str(),
-                            phase = "processing",
-                            relative_path = %relative_path,
-                            final_path = %output_final.as_str(),
-                            commit_disposition,
-                            "final output {commit_disposition}"
+                        if !path_is_within_root(&output_final, server_config.root.as_path()) {
+                            return failed_entry(entry, "postprocess output escapes final root");
+                        }
+                        if let Err(error) = commit_regular_file_entry(
+                            &output,
+                            &output_final,
+                            server_config.root.as_path(),
+                            run_id,
+                        ) {
+                            return failed_entry(entry, format!("commit failed: {error}"));
+                        }
+                        final_paths.push(
+                            output_final
+                                .strip_prefix(server_config.root.as_path())
+                                .unwrap_or(&output_final)
+                                .to_string(),
                         );
-                        let rel = output_final
-                            .strip_prefix(root_path)
-                            .unwrap_or(output_final)
-                            .to_string();
-                        committed_rel_paths.push(rel);
                     }
-                    Err(error) => {
-                        return FileOutcome::Failure {
-                            sync_name,
-                            local_path,
-                            relative_path,
-                            error: format!("commit failed: {error}"),
-                        };
-                    }
+                    let steps: Vec<String> = run_plan
+                        .rules
+                        .iter()
+                        .filter(|rule| rule.regex.is_match(&normalized_path))
+                        .flat_map(|rule| rule.steps.iter().map(|step| step.step_name.clone()))
+                        .collect();
+                    Ok((final_paths, (!steps.is_empty()).then_some(steps)))
                 }
-            }
-
-            // 10. Determine postprocess step names that were applied (from run plan)
-            // Match against normalized_path, not work_path, because rules are
-            // designed for logical paths like "videos/video.mp4".
-            let applied_steps: Vec<String> = run_plan
-                .rules
-                .iter()
-                .filter(|cr| cr.regex.is_match(&normalized_path))
-                .flat_map(|cr| cr.steps.iter().map(|s| s.step_name.clone()))
-                .collect();
-
-            let steps_opt = if applied_steps.is_empty() {
-                None
-            } else {
-                Some(applied_steps)
-            };
-
-            FileOutcome::Success {
-                sync_name,
-                local_path,
-                relative_path,
-                final_paths: committed_rel_paths,
-                postprocess: steps_opt,
+                Err(error) => Err(error),
             }
         }
-        Err(e) => {
-            warn!(error = %e, "postprocessing failed");
-            FileOutcome::Failure {
-                sync_name,
-                local_path,
-                relative_path,
-                error: e,
-            }
-        }
+    };
+
+    match result {
+        Ok((final_paths, postprocess)) => EntryOutcome::Success {
+            kind: entry.kind,
+            sync_name: entry.sync_name.clone(),
+            local_path: entry.local_path.as_str().to_owned(),
+            relative_path: entry.relative_path.as_str().to_owned(),
+            final_paths,
+            postprocess,
+        },
+        Err(error) => failed_entry(entry, error),
     }
 }
 
@@ -706,29 +694,30 @@ pub fn process_processing_run(
     }
 
     let sync_map: HashMap<&str, &RunConfigSync> = run_config.sync_map().into_iter().collect();
-    let mut outcomes: Vec<FileOutcome> = Vec::new();
+    let mut outcomes: Vec<EntryOutcome> = Vec::new();
 
-    for file_entry in &manifest.files {
-        let sync_name = file_entry.sync_name.as_str();
+    for entry in &manifest.entries {
+        let sync_name = entry.sync_name.as_str();
         let Some(sync) = sync_map.get(sync_name) else {
             warn!(
                 sync_name = sync_name,
                 "sync mapping not found in run config, skipping"
             );
-            outcomes.push(FileOutcome::Skipped {
-                sync_name: file_entry.sync_name.clone(),
-                local_path: file_entry.local_path.as_str().to_owned(),
-                relative_path: file_entry.relative_path.as_str().to_owned(),
+            outcomes.push(EntryOutcome::Skipped {
+                kind: entry.kind,
+                sync_name: entry.sync_name.clone(),
+                local_path: entry.local_path.as_str().to_owned(),
+                relative_path: entry.relative_path.as_str().to_owned(),
                 error: format!("sync mapping '{sync_name}' not found"),
             });
             continue;
         };
 
-        outcomes.push(process_one_file(
+        outcomes.push(process_manifest_entry(
             config,
             &run_plan,
             sync,
-            file_entry,
+            entry,
             nickname,
             run_id,
             &processing_path,
@@ -738,10 +727,10 @@ pub fn process_processing_run(
 
     let all_imported = outcomes
         .iter()
-        .all(|outcome| matches!(outcome, FileOutcome::Success { .. }));
+        .all(|outcome| matches!(outcome, EntryOutcome::Success { .. }));
     let any_imported = outcomes
         .iter()
-        .any(|outcome| matches!(outcome, FileOutcome::Success { .. }));
+        .any(|outcome| matches!(outcome, EntryOutcome::Success { .. }));
     let run_state = if all_imported {
         RunState::Done
     } else if any_imported {
@@ -759,7 +748,7 @@ pub fn process_processing_run(
         run_id: run_id.clone(),
         nickname: nickname.clone(),
         state: run_state.clone(),
-        files: outcomes.into_iter().map(FileOutcome::into_entry).collect(),
+        files: outcomes.into_iter().map(EntryOutcome::into_entry).collect(),
         error: None,
     };
     let status_toml = run_status
@@ -1151,8 +1140,10 @@ pub fn begin_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> 
             incoming_path.as_str()
         )
     })?;
-    fs::create_dir(files_dir.as_std_path())
-        .with_context(|| format!("failed to create files dir: {}", files_dir.as_str()))?;
+    if let Err(error) = fs::create_dir(files_dir.as_std_path()) {
+        let _ = fs::remove_dir_all(&incoming_path);
+        return Err(error).with_context(|| format!("failed to create files dir: {}", files_dir));
+    }
 
     // Write lease file
     let lease = purgery_core::LeaseFile {
@@ -1300,7 +1291,19 @@ pub fn read_run_status(
         let content = fs::read_to_string(&status_path)
             .with_context(|| format!("failed to read status from '{}'", status_path.as_str()))?;
         match RunStatus::from_toml(&content) {
-            Ok(status) => return Ok(status),
+            Ok(status) => {
+                if status.nickname != *nickname || status.run_id != *run_id {
+                    anyhow::bail!(
+                        "status envelope mismatch in '{}': expected {}/{}, got {}/{}",
+                        status_path,
+                        nickname.as_str(),
+                        run_id.as_str(),
+                        status.nickname.as_str(),
+                        status.run_id.as_str()
+                    );
+                }
+                return Ok(status);
+            }
             Err(e) => {
                 anyhow::bail!("malformed status file '{}': {e}", status_path.as_str());
             }
@@ -1325,9 +1328,9 @@ pub fn server_check(config: &ServerConfig) -> Result<()> {
     if config.gc.heartbeat_interval_secs == 0 {
         anyhow::bail!("gc.heartbeat_interval_secs must be greater than 0");
     }
-    if config.gc.heartbeat_interval_secs * 2 > config.gc.incoming_lease_secs {
+    if config.gc.heartbeat_interval_secs > config.gc.incoming_lease_secs / 2 {
         anyhow::bail!(
-            "gc.heartbeat_interval_secs ({}) * 2 must be <= gc.incoming_lease_secs ({}) \
+            "gc.heartbeat_interval_secs ({}) must be <= half of gc.incoming_lease_secs ({}) \
              to provide a safety margin for lease renewal",
             config.gc.heartbeat_interval_secs,
             config.gc.incoming_lease_secs
@@ -1544,16 +1547,14 @@ pub fn run_gc(config: &ServerConfig) -> Result<()> {
                         files: vec![],
                         error: Some("abandoned upload expired (quarantined)".into()),
                     };
-                    if let Ok(toml_str) = status.to_toml() {
-                        let status_path = quarantine_path.join("status.toml");
-                        let tmp_path = quarantine_path.join("status.toml.tmp");
-                        if fs::write(&tmp_path, &toml_str).is_ok() {
-                            let _ = fs::rename(&tmp_path, &status_path);
-                        }
+                    if let Err(error) = publish_status_atomic(&quarantine_path, &status) {
+                        warn!(nickname = %nickname.as_str(), run_id = %run_id.as_str(), error = %error, "gc: failed to publish quarantine status");
                     }
                     let files_dir = quarantine_path.join("files");
                     if files_dir.exists() {
-                        let _ = fs::remove_dir_all(files_dir.as_std_path());
+                        if let Err(error) = fs::remove_dir_all(files_dir.as_std_path()) {
+                            warn!(nickname = %nickname.as_str(), run_id = %run_id.as_str(), error = %error, "gc: failed to remove quarantined files");
+                        }
                     }
                 }
                 continue;
@@ -1582,18 +1583,16 @@ pub fn run_gc(config: &ServerConfig) -> Result<()> {
                 files: vec![],
                 error: Some("abandoned upload expired".into()),
             };
-            if let Ok(toml_str) = status.to_toml() {
-                let status_path = failed_path.join("status.toml");
-                let tmp_path = failed_path.join("status.toml.tmp");
-                if fs::write(&tmp_path, &toml_str).is_ok() {
-                    let _ = fs::rename(&tmp_path, &status_path);
-                }
+            if let Err(error) = publish_status_atomic(&failed_path, &status) {
+                warn!(nickname = %nickname.as_str(), run_id = %run_id.as_str(), error = %error, "gc: failed to publish failed status");
             }
 
             // Remove uploaded files to reclaim disk, keep metadata
             let files_dir = failed_path.join("files");
             if files_dir.exists() {
-                let _ = fs::remove_dir_all(files_dir.as_std_path());
+                if let Err(error) = fs::remove_dir_all(files_dir.as_std_path()) {
+                    warn!(nickname = %nickname.as_str(), run_id = %run_id.as_str(), error = %error, "gc: failed to remove collected files");
+                }
             }
         }
     }
@@ -1680,17 +1679,15 @@ mod tests {
     use super::*;
     use camino::Utf8PathBuf;
     use purgery_core::{
-        ClientLocalPath, ManifestFileEntry, NormalizedRelativePath, PostprocessConfig,
-        PostprocessKind, PostprocessStepDefinition, ServerRoot, SyncName,
+        ClientLocalPath, ManifestEntry, NormalizedRelativePath, PostprocessConfig, PostprocessKind,
+        PostprocessStepDefinition, ServerRoot, SyncName,
     };
 
     fn test_server_config(purgery_root: &Utf8Path, server_root: &Utf8Path) -> ServerConfig {
         ServerConfig {
             root: ServerRoot::new(server_root.to_owned()).unwrap(),
             purgery_root: PurgeryRoot::new(purgery_root.to_owned()).unwrap(),
-            state_dir: None,
             gc: Default::default(),
-            log_dir: None,
             postprocess: PostprocessConfig::default(),
             logging: Default::default(),
         }
@@ -1754,7 +1751,7 @@ to = "{}"
         let manifest = Manifest {
             run_id: run_id.clone(),
             nickname: nickname.clone(),
-            files: vec![ManifestFileEntry {
+            entries: vec![ManifestEntry {
                 sync_name: SyncName::new(sync_name.into()).unwrap(),
                 local_path: ClientLocalPath::new(format!("/home/user/{sync_name}/{staged_rel}"))
                     .unwrap(),
@@ -1767,9 +1764,11 @@ to = "{}"
                         .into(),
                 )
                 .unwrap(),
+                kind: ManifestEntryKind::RegularFile,
                 size: content.len() as u64,
                 mtime_ns: 1000000,
                 sha256: None,
+                link_target: None,
             }],
         };
         fs::write(
@@ -1846,14 +1845,16 @@ to = "{}"
         let manifest = Manifest {
             run_id: run_id.clone(),
             nickname: nickname.clone(),
-            files: vec![ManifestFileEntry {
+            entries: vec![ManifestEntry {
                 sync_name: SyncName::new("unknown-sync".into()).unwrap(),
                 local_path: ClientLocalPath::new("/tmp/test.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/test.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("test.mp4".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
                 size: 11,
                 mtime_ns: 1000000,
                 sha256: None,
+                link_target: None,
             }],
         };
         fs::write(
@@ -1892,15 +1893,17 @@ to = "{}"
         let manifest = Manifest {
             run_id: run_id.clone(),
             nickname: nickname.clone(),
-            files: vec![ManifestFileEntry {
+            entries: vec![ManifestEntry {
                 sync_name: SyncName::new("videos".into()).unwrap(),
                 local_path: ClientLocalPath::new("/home/user/Videos/missing.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/videos/missing.mp4".into())
                     .unwrap(),
                 relative_path: NormalizedRelativePath::new("missing.mp4".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
                 size: 11,
                 mtime_ns: 1000000,
                 sha256: None,
+                link_target: None,
             }],
         };
         fs::write(
@@ -1922,7 +1925,7 @@ to = "{}"
             .error
             .as_ref()
             .unwrap()
-            .contains("staged file not found"));
+            .contains("failed to read staged metadata"));
     }
 
     #[test]
@@ -1995,14 +1998,16 @@ to = "{}"
         let manifest = Manifest {
             run_id: run_id.clone(),
             nickname: Nickname::new("other-machine".into()).unwrap(),
-            files: vec![ManifestFileEntry {
+            entries: vec![ManifestEntry {
                 sync_name: SyncName::new("videos".into()).unwrap(),
                 local_path: ClientLocalPath::new("/tmp/a.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/a.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
                 size: 10,
                 mtime_ns: 100,
                 sha256: None,
+                link_target: None,
             }],
         };
         fs::write(
@@ -2075,14 +2080,16 @@ to = "{}"
         let manifest = Manifest {
             run_id: run_id.clone(),
             nickname: nickname.clone(),
-            files: vec![ManifestFileEntry {
+            entries: vec![ManifestEntry {
                 sync_name: SyncName::new("videos".into()).unwrap(),
                 local_path: ClientLocalPath::new("/tmp/a.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/a.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
                 size: 10,
                 mtime_ns: 100,
                 sha256: None,
+                link_target: None,
             }],
         };
         fs::write(
@@ -2127,11 +2134,8 @@ to = "{}"
         let server_config = ServerConfig {
             root: ServerRoot::new("/data".into()).unwrap(),
             purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
-            state_dir: None,
             gc: Default::default(),
-            log_dir: None,
             postprocess: PostprocessConfig {
-                max_parallel_jobs: 1,
                 steps: {
                     let mut m = std::collections::BTreeMap::new();
                     m.insert(
@@ -2183,11 +2187,8 @@ to = "{}"
         let server_config = ServerConfig {
             root: ServerRoot::new(server_str.into()).unwrap(),
             purgery_root: PurgeryRoot::new(purgery_root.as_str().into()).unwrap(),
-            state_dir: None,
             gc: Default::default(),
-            log_dir: None,
             postprocess: PostprocessConfig {
-                max_parallel_jobs: 1,
                 steps: {
                     let mut m = std::collections::BTreeMap::new();
                     m.insert(
@@ -2232,14 +2233,16 @@ steps = ["compress-video"]
         let manifest = Manifest {
             run_id: run_id.clone(),
             nickname: nickname.clone(),
-            files: vec![ManifestFileEntry {
+            entries: vec![ManifestEntry {
                 sync_name: SyncName::new("videos".into()).unwrap(),
                 local_path: ClientLocalPath::new("/home/user/Videos/test.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/videos/test.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("test.mp4".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
                 size: 13,
                 mtime_ns: 1000000,
                 sha256: None,
+                link_target: None,
             }],
         };
         fs::write(
@@ -2276,11 +2279,8 @@ steps = ["compress-video"]
         let server_config = ServerConfig {
             root: ServerRoot::new("/data".into()).unwrap(),
             purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
-            state_dir: None,
             gc: Default::default(),
-            log_dir: None,
             postprocess: PostprocessConfig {
-                max_parallel_jobs: 1,
                 steps: {
                     let mut m = std::collections::BTreeMap::new();
                     m.insert(
@@ -2329,11 +2329,8 @@ steps = ["compress-video"]
         let server_config = ServerConfig {
             root: ServerRoot::new("/data".into()).unwrap(),
             purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
-            state_dir: None,
             gc: Default::default(),
-            log_dir: None,
             postprocess: PostprocessConfig {
-                max_parallel_jobs: 1,
                 steps: {
                     let mut m = std::collections::BTreeMap::new();
                     m.insert(
@@ -2389,11 +2386,8 @@ steps = ["compress-video"]
         let server_config = ServerConfig {
             root: ServerRoot::new("/data".into()).unwrap(),
             purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
-            state_dir: None,
             gc: Default::default(),
-            log_dir: None,
             postprocess: PostprocessConfig {
-                max_parallel_jobs: 1,
                 steps: {
                     let mut m = std::collections::BTreeMap::new();
                     m.insert(
@@ -2516,7 +2510,7 @@ steps = ["compress-video"]
     }
 
     #[test]
-    fn test_existing_final_directory_blocks_replacement() {
+    fn test_regular_file_replaces_existing_empty_directory_like_rsync() {
         let tmp = tempfile::tempdir().unwrap();
         let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
@@ -2537,23 +2531,18 @@ steps = ["compress-video"]
 
         process_run(&config, &nickname, &run_id).unwrap();
 
-        assert!(final_path.is_dir());
-        let failed_path = config
+        assert_eq!(fs::read_to_string(&final_path).unwrap(), "content");
+        let done_path = config
             .purgery_root
-            .run_dir(&nickname, &run_id, RunPhase::Failed);
+            .run_dir(&nickname, &run_id, RunPhase::Done);
         let status =
-            RunStatus::from_toml(&fs::read_to_string(failed_path.join("status.toml")).unwrap())
+            RunStatus::from_toml(&fs::read_to_string(done_path.join("status.toml")).unwrap())
                 .unwrap();
-        assert_eq!(status.files[0].status, FileStatus::Failed);
-        assert!(status.files[0]
-            .error
-            .as_deref()
-            .unwrap()
-            .contains("directory"));
+        assert_eq!(status.files[0].status, FileStatus::Imported);
     }
 
     #[test]
-    fn test_existing_final_symlink_blocks_replacement() {
+    fn test_regular_file_replaces_existing_symlink_like_rsync() {
         let tmp = tempfile::tempdir().unwrap();
         let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
@@ -2575,20 +2564,11 @@ steps = ["compress-video"]
 
         process_run(&config, &nickname, &run_id).unwrap();
 
-        assert!(fs::symlink_metadata(&final_path)
+        assert_eq!(fs::read_to_string(&final_path).unwrap(), "content");
+        assert!(!fs::symlink_metadata(&final_path)
             .unwrap()
             .file_type()
             .is_symlink());
-        let failed = config
-            .purgery_root
-            .run_dir(&nickname, &run_id, RunPhase::Failed);
-        let status =
-            RunStatus::from_toml(&fs::read_to_string(failed.join("status.toml")).unwrap()).unwrap();
-        assert!(status.files[0]
-            .error
-            .as_deref()
-            .unwrap()
-            .contains("symlink"));
     }
 
     // ── Work area namespacing test ──
@@ -2626,25 +2606,29 @@ to = "pictures"
         let manifest = Manifest {
             run_id: run_id.clone(),
             nickname: nickname.clone(),
-            files: vec![
-                ManifestFileEntry {
+            entries: vec![
+                ManifestEntry {
                     sync_name: SyncName::new("videos".into()).unwrap(),
                     local_path: ClientLocalPath::new("/home/user/Videos/a.mp4".into()).unwrap(),
                     staged_path: NormalizedRelativePath::new("files/videos/a.mp4".into()).unwrap(),
                     relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
+                    kind: ManifestEntryKind::RegularFile,
                     size: 13,
                     mtime_ns: 1000000,
                     sha256: None,
+                    link_target: None,
                 },
-                ManifestFileEntry {
+                ManifestEntry {
                     sync_name: SyncName::new("pictures".into()).unwrap(),
                     local_path: ClientLocalPath::new("/home/user/Pictures/a.mp4".into()).unwrap(),
                     staged_path: NormalizedRelativePath::new("files/pictures/a.mp4".into())
                         .unwrap(),
                     relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
+                    kind: ManifestEntryKind::RegularFile,
                     size: 15,
                     mtime_ns: 1000001,
                     sha256: None,
+                    link_target: None,
                 },
             ],
         };
@@ -2699,14 +2683,16 @@ to = "pictures"
         let manifest = Manifest {
             run_id: run_id.clone(),
             nickname: nickname.clone(),
-            files: vec![ManifestFileEntry {
+            entries: vec![ManifestEntry {
                 sync_name: SyncName::new("videos".into()).unwrap(),
                 local_path: ClientLocalPath::new("/home/user/Videos/a.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/other/a.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
                 size: 7,
                 mtime_ns: 1000000,
                 sha256: None,
+                link_target: None,
             }],
         };
         fs::write(
@@ -2787,14 +2773,16 @@ to = "pictures"
         let manifest = Manifest {
             run_id: run_id.clone(),
             nickname: nickname.clone(),
-            files: vec![ManifestFileEntry {
+            entries: vec![ManifestEntry {
                 sync_name: SyncName::new("videos".into()).unwrap(),
                 local_path: ClientLocalPath::new("/home/user/Videos/a.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/videos/a.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
                 size: 12,
                 mtime_ns: 1000000,
                 sha256: None,
+                link_target: None,
             }],
         };
         fs::write(
@@ -2818,7 +2806,11 @@ to = "pictures"
         let status = RunStatus::from_toml(&status_content).unwrap();
         assert_eq!(status.state, RunState::Failed);
         assert_eq!(status.files[0].status, FileStatus::Failed);
-        assert!(status.files[0].error.as_ref().unwrap().contains("symlink"));
+        assert!(status.files[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("kind does not match"));
     }
 
     // ── Invalid regex test ──
@@ -2854,14 +2846,16 @@ steps = ["compress-video"]
         let manifest = Manifest {
             run_id: run_id.clone(),
             nickname: nickname.clone(),
-            files: vec![ManifestFileEntry {
+            entries: vec![ManifestEntry {
                 sync_name: SyncName::new("videos".into()).unwrap(),
                 local_path: ClientLocalPath::new("/home/user/Videos/a.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/videos/a.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
                 size: 7,
                 mtime_ns: 1000000,
                 sha256: None,
+                link_target: None,
             }],
         };
         fs::write(
@@ -2921,11 +2915,8 @@ steps = ["compress-video"]
         let server_config = ServerConfig {
             root: ServerRoot::new(server_root.as_str().into()).unwrap(),
             purgery_root: PurgeryRoot::new(purgery_root.as_str().into()).unwrap(),
-            state_dir: None,
             gc: Default::default(),
-            log_dir: None,
             postprocess: PostprocessConfig {
-                max_parallel_jobs: 1,
                 steps: {
                     let mut m = std::collections::BTreeMap::new();
                     m.insert(
@@ -2969,14 +2960,16 @@ steps = ["compress-video"]
         let manifest = Manifest {
             run_id: run_id.clone(),
             nickname: nickname.clone(),
-            files: vec![ManifestFileEntry {
+            entries: vec![ManifestEntry {
                 sync_name: SyncName::new("videos".into()).unwrap(),
                 local_path: ClientLocalPath::new("/home/user/Videos/test.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/videos/test.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("test.mp4".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
                 size: 13,
                 mtime_ns: 1000000,
                 sha256: None,
+                link_target: None,
             }],
         };
         fs::write(
@@ -3020,11 +3013,8 @@ steps = ["compress-video"]
         let server_config = ServerConfig {
             root: ServerRoot::new(server_root.as_str().into()).unwrap(),
             purgery_root: PurgeryRoot::new(purgery_root.as_str().into()).unwrap(),
-            state_dir: None,
             gc: Default::default(),
-            log_dir: None,
             postprocess: PostprocessConfig {
-                max_parallel_jobs: 1,
                 steps: {
                     let mut m = std::collections::BTreeMap::new();
                     m.insert(
@@ -3068,14 +3058,16 @@ steps = ["compress-video"]
         let manifest = Manifest {
             run_id: run_id.clone(),
             nickname: nickname.clone(),
-            files: vec![ManifestFileEntry {
+            entries: vec![ManifestEntry {
                 sync_name: SyncName::new("videos".into()).unwrap(),
                 local_path: ClientLocalPath::new("/home/user/Videos/video.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/videos/video.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("video.mp4".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
                 size: 5,
                 mtime_ns: 1000000,
                 sha256: None,
+                link_target: None,
             }],
         };
         fs::write(
@@ -3121,11 +3113,8 @@ steps = ["compress-video"]
         let server_config = ServerConfig {
             root: ServerRoot::new(server_root.as_str().into()).unwrap(),
             purgery_root: PurgeryRoot::new(purgery_root.as_str().into()).unwrap(),
-            state_dir: None,
             gc: Default::default(),
-            log_dir: None,
             postprocess: PostprocessConfig {
-                max_parallel_jobs: 1,
                 steps: {
                     let mut m = std::collections::BTreeMap::new();
                     m.insert(
@@ -3169,14 +3158,16 @@ steps = ["compress-video"]
         let manifest = Manifest {
             run_id: run_id.clone(),
             nickname: nickname.clone(),
-            files: vec![ManifestFileEntry {
+            entries: vec![ManifestEntry {
                 sync_name: SyncName::new("videos".into()).unwrap(),
                 local_path: ClientLocalPath::new("/home/user/Videos/video.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/videos/video.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("video.mp4".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
                 size: 5,
                 mtime_ns: 1000000,
                 sha256: None,
+                link_target: None,
             }],
         };
         fs::write(
@@ -3212,9 +3203,7 @@ steps = ["compress-video"]
         let server_config = ServerConfig {
             root: ServerRoot::new("/data".into()).unwrap(),
             purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
-            state_dir: None,
             gc: Default::default(),
-            log_dir: None,
             postprocess: PostprocessConfig::default(),
             logging: Default::default(),
         };
@@ -3238,9 +3227,7 @@ steps = ["compress-video"]
         let server_config = ServerConfig {
             root: ServerRoot::new("/data".into()).unwrap(),
             purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
-            state_dir: None,
             gc: Default::default(),
-            log_dir: None,
             postprocess: PostprocessConfig::default(),
             logging: Default::default(),
         };
@@ -3271,9 +3258,7 @@ steps = ["compress-video"]
                 Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
             )
             .unwrap(),
-            state_dir: None,
             gc: Default::default(),
-            log_dir: None,
             postprocess: PostprocessConfig::default(),
             logging: Default::default(),
         };
@@ -3304,9 +3289,7 @@ steps = ["compress-video"]
                 Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
             )
             .unwrap(),
-            state_dir: None,
             gc: Default::default(),
-            log_dir: None,
             postprocess: PostprocessConfig::default(),
             logging: Default::default(),
         };
@@ -3372,9 +3355,7 @@ steps = ["compress-video"]
                 Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
             )
             .unwrap(),
-            state_dir: None,
             gc: Default::default(),
-            log_dir: None,
             postprocess: PostprocessConfig::default(),
             logging: Default::default(),
         };
@@ -3395,9 +3376,7 @@ steps = ["compress-video"]
                 Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
             )
             .unwrap(),
-            state_dir: None,
             gc: Default::default(),
-            log_dir: None,
             postprocess: PostprocessConfig::default(),
             logging: Default::default(),
         };
@@ -3435,9 +3414,7 @@ steps = ["compress-video"]
                 Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
             )
             .unwrap(),
-            state_dir: None,
             gc: Default::default(),
-            log_dir: None,
             postprocess: PostprocessConfig::default(),
             logging: Default::default(),
         };
@@ -3877,9 +3854,7 @@ steps = ["compress-video"]
                 Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
             )
             .unwrap(),
-            state_dir: None,
             gc: Default::default(),
-            log_dir: None,
             postprocess: PostprocessConfig::default(),
             logging: Default::default(),
         };
@@ -3924,5 +3899,224 @@ steps = ["compress-video"]
         let parsed: purgery_core::RunStatus = purgery_core::RunStatus::from_toml(&status_str)
             .expect("status stdout must be valid RunStatus TOML");
         assert_eq!(parsed.state, purgery_core::RunState::Done);
+    }
+
+    #[test]
+    fn test_rsync_oracle_directory_conflicts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
+        fs::create_dir_all(&root).unwrap();
+
+        let missing = root.join("missing");
+        assert_eq!(
+            commit_directory_entry(&missing, &root).unwrap(),
+            CommitDisposition::Created
+        );
+
+        let existing = root.join("existing");
+        fs::create_dir(&existing).unwrap();
+        fs::write(existing.join("extra"), "keep").unwrap();
+        assert_eq!(
+            commit_directory_entry(&existing, &root).unwrap(),
+            CommitDisposition::Kept
+        );
+        assert_eq!(fs::read_to_string(existing.join("extra")).unwrap(), "keep");
+
+        let file = root.join("file");
+        fs::write(&file, "old").unwrap();
+        assert_eq!(
+            commit_directory_entry(&file, &root).unwrap(),
+            CommitDisposition::Replaced
+        );
+        assert!(file.is_dir());
+
+        let symlink = root.join("symlink");
+        std::os::unix::fs::symlink("elsewhere", &symlink).unwrap();
+        assert_eq!(
+            commit_directory_entry(&symlink, &root).unwrap(),
+            CommitDisposition::Replaced
+        );
+        assert!(symlink.is_dir());
+    }
+
+    #[test]
+    fn test_rsync_oracle_regular_file_conflicts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
+        fs::create_dir_all(&root).unwrap();
+        let source = Utf8PathBuf::from_path_buf(tmp.path().join("source")).unwrap();
+        fs::write(&source, "new content").unwrap();
+        let run_id = RunId::new("oracle-file".into()).unwrap();
+
+        for name in ["missing", "file", "symlink", "empty-dir"] {
+            let destination = root.join(name);
+            match name {
+                "file" => fs::write(&destination, "old").unwrap(),
+                "symlink" => std::os::unix::fs::symlink("target", &destination).unwrap(),
+                "empty-dir" => fs::create_dir(&destination).unwrap(),
+                _ => {}
+            }
+            commit_regular_file_entry(&source, &destination, &root, &run_id).unwrap();
+            assert_eq!(fs::read_to_string(&destination).unwrap(), "new content");
+            assert!(!fs::symlink_metadata(&destination)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        }
+
+        let nonempty = root.join("nonempty-dir");
+        fs::create_dir(&nonempty).unwrap();
+        fs::write(nonempty.join("extra"), "keep").unwrap();
+        assert!(commit_regular_file_entry(&source, &nonempty, &root, &run_id).is_err());
+        assert_eq!(fs::read_to_string(nonempty.join("extra")).unwrap(), "keep");
+    }
+
+    #[test]
+    fn test_rsync_oracle_symlink_conflicts_and_literal_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
+        fs::create_dir_all(&root).unwrap();
+        let run_id = RunId::new("oracle-link".into()).unwrap();
+        let target = Utf8Path::new("../literal-target");
+
+        for name in ["missing", "file", "symlink", "empty-dir"] {
+            let destination = root.join(name);
+            match name {
+                "file" => fs::write(&destination, "old").unwrap(),
+                "symlink" => std::os::unix::fs::symlink("old-target", &destination).unwrap(),
+                "empty-dir" => fs::create_dir(&destination).unwrap(),
+                _ => {}
+            }
+            commit_symlink_entry(target, &destination, &root, &run_id).unwrap();
+            assert_eq!(fs::read_link(&destination).unwrap(), target.as_std_path());
+        }
+
+        let nonempty = root.join("nonempty-dir");
+        fs::create_dir(&nonempty).unwrap();
+        fs::write(nonempty.join("extra"), "keep").unwrap();
+        assert!(commit_symlink_entry(target, &nonempty, &root, &run_id).is_err());
+        assert_eq!(fs::read_to_string(nonempty.join("extra")).unwrap(), "keep");
+    }
+
+    #[test]
+    fn test_rsync_oracle_parent_conflicts_are_resolved_by_directory_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
+        fs::create_dir_all(&root).unwrap();
+        let source = Utf8PathBuf::from_path_buf(tmp.path().join("source")).unwrap();
+        fs::write(&source, "child").unwrap();
+        let run_id = RunId::new("oracle-parent".into()).unwrap();
+
+        for name in ["file-parent", "symlink-parent"] {
+            let parent = root.join(name);
+            if name == "file-parent" {
+                fs::write(&parent, "old").unwrap();
+            } else {
+                std::os::unix::fs::symlink("elsewhere", &parent).unwrap();
+            }
+            commit_directory_entry(&parent, &root).unwrap();
+            let child = parent.join("child");
+            commit_regular_file_entry(&source, &child, &root, &run_id).unwrap();
+            assert_eq!(fs::read_to_string(child).unwrap(), "child");
+        }
+    }
+
+    #[test]
+    fn test_process_run_overlays_directory_file_and_symlink_without_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&purgery_root, &server_root);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("tree-overlay".into()).unwrap();
+        let ready = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let staged = ready.join("files/data/tree");
+        fs::create_dir_all(&staged).unwrap();
+        fs::write(staged.join("new.txt"), "new").unwrap();
+        std::os::unix::fs::symlink("../target", staged.join("link")).unwrap();
+        write_run_toml_with_sync(&ready, &nickname, "data", "data");
+
+        let entry = |relative: &str, kind, size, target: Option<&str>| ManifestEntry {
+            sync_name: SyncName::new("data".into()).unwrap(),
+            local_path: ClientLocalPath::new(format!("/source/{relative}")).unwrap(),
+            staged_path: NormalizedRelativePath::new(format!("files/data/{relative}").into())
+                .unwrap(),
+            relative_path: NormalizedRelativePath::new(relative.into()).unwrap(),
+            kind,
+            size,
+            mtime_ns: 0,
+            sha256: None,
+            link_target: target.map(Utf8PathBuf::from),
+        };
+        let manifest = Manifest {
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![
+                entry("tree", ManifestEntryKind::Directory, 0, None),
+                entry(
+                    "tree/link",
+                    ManifestEntryKind::Symlink,
+                    0,
+                    Some("../target"),
+                ),
+                entry("tree/new.txt", ManifestEntryKind::RegularFile, 3, None),
+            ],
+        };
+        fs::write(ready.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+
+        let final_tree = server_root.join("laptop/data/tree");
+        fs::create_dir_all(&final_tree).unwrap();
+        fs::write(final_tree.join("extra.txt"), "keep").unwrap();
+        process_run(&config, &nickname, &run_id).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(final_tree.join("new.txt")).unwrap(),
+            "new"
+        );
+        assert_eq!(
+            fs::read_to_string(final_tree.join("extra.txt")).unwrap(),
+            "keep"
+        );
+        assert_eq!(
+            fs::read_link(final_tree.join("link")).unwrap(),
+            std::path::Path::new("../target")
+        );
+        let done = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let status =
+            RunStatus::from_toml(&fs::read_to_string(done.join("status.toml")).unwrap()).unwrap();
+        assert_eq!(status.state, RunState::Done);
+        assert_eq!(status.files.len(), 3);
+        assert_eq!(status.files[0].kind, ManifestEntryKind::Directory);
+        assert_eq!(status.files[1].kind, ManifestEntryKind::Symlink);
+        assert_eq!(status.files[2].kind, ManifestEntryKind::RegularFile);
+    }
+
+    #[test]
+    fn test_read_run_status_rejects_mismatched_terminal_envelope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&purgery_root, &server_root);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("requested".into()).unwrap();
+        let done = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Done);
+        fs::create_dir_all(&done).unwrap();
+        let status = RunStatus {
+            run_id: RunId::new("different".into()).unwrap(),
+            nickname: nickname.clone(),
+            state: RunState::Done,
+            files: vec![],
+            error: None,
+        };
+        fs::write(done.join("status.toml"), status.to_toml().unwrap()).unwrap();
+
+        let error = read_run_status(&config, &nickname, &run_id).unwrap_err();
+        assert!(error.to_string().contains("status envelope mismatch"));
     }
 }
