@@ -634,8 +634,11 @@ fn validate_unique_final_paths(
     let sync_map: HashMap<&str, &RunConfigSync> = run_config.sync_map().into_iter().collect();
     let mut destinations: HashMap<String, &ManifestEntry> = HashMap::new();
 
-    // First pass: collect all planned destinations and detect exact duplicates.
-    for entry in &manifest.entries {
+    // First pass: collect planned destinations over active entries only.
+    for (entry_idx, entry) in manifest.entries.iter().enumerate() {
+        if covered_indices.contains(&entry_idx) {
+            continue; // covered entries are not active processing units
+        }
         let Some(sync) = sync_map.get(entry.sync_name.as_str()) else {
             continue;
         };
@@ -1102,7 +1105,25 @@ pub fn process_processing_run(
         .map(|(i, _)| i)
         .collect();
 
-    // --- Phase 2: Sync-root setup for used syncs only ---
+    // --- Phase 2: Planned-path validation over active (non-covered) entries ---
+    // This must happen before any final-storage mutation (sync-root setup).
+    if let Err(error) = validate_unique_final_paths(
+        config,
+        nickname,
+        &run_config,
+        &manifest,
+        &run_plan,
+        &covered_indices,
+    ) {
+        let msg = format!("manifest destination validation failed: {error}");
+        warn!("{}", msg);
+        write_run_failure(&config.purgery_root, nickname, run_id, &msg)?;
+        anyhow::bail!("{msg}");
+    }
+
+    // --- Phase 3: Sync-root setup for used syncs only ---
+    // This mutates final storage, so it must run after planned-path validation
+    // has confirmed the run is semantically valid.
     let used_sync_names: std::collections::HashSet<&str> = manifest
         .entries
         .iter()
@@ -1113,7 +1134,7 @@ pub fn process_processing_run(
 
     for sync in run_config.sync.iter() {
         if !used_sync_names.contains(sync.name.as_str()) {
-            continue; // unused sync — do not touch
+            continue;
         }
         let root_dir = config
             .root
@@ -1129,21 +1150,6 @@ pub fn process_processing_run(
             );
             failed_sync_roots.insert(sync.name.as_str().to_owned());
         }
-    }
-
-    // --- Phase 3: Planned-path validation over active (non-covered) entries ---
-    if let Err(error) = validate_unique_final_paths(
-        config,
-        nickname,
-        &run_config,
-        &manifest,
-        &run_plan,
-        &covered_indices,
-    ) {
-        let msg = format!("manifest destination validation failed: {error}");
-        warn!("{}", msg);
-        write_run_failure(&config.purgery_root, nickname, run_id, &msg)?;
-        anyhow::bail!("{msg}");
     }
 
     // --- Phase 4: Process entries ---
