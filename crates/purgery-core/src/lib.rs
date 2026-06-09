@@ -3669,7 +3669,6 @@ color = "never"
 
     // ── Issue 19: Postprocess requires delete_after_import=true ──
 
-    #[ignore = "expected to fail until issue 19 purgatory/delete_after_import rules are enforced"]
     #[test]
     fn config_rejects_postprocess_on_no_delete_sync() {
         let toml = r#"
@@ -3695,7 +3694,6 @@ steps = ["compress-video"]
         );
     }
 
-    #[ignore = "expected to fail until issue 19 purgatory/delete_after_import rules are enforced"]
     #[test]
     fn config_rejects_postprocess_with_omitted_for_on_no_delete_sync() {
         let toml = r#"
@@ -3722,7 +3720,6 @@ steps = ["compress-video"]
         );
     }
 
-    #[ignore = "expected to fail until issue 19 purgatory/delete_after_import rules are enforced"]
     #[test]
     fn config_accepts_postprocess_on_delete_true_sync() {
         let toml = r#"
@@ -3746,7 +3743,6 @@ steps = ["compress-video"]
         assert_eq!(config.postprocess.rules.len(), 1);
     }
 
-    #[ignore = "expected to fail until issue 19 purgatory/delete_after_import rules are enforced"]
     #[test]
     fn config_accepts_no_delete_sync_with_only_out_of_scope_rules() {
         let toml = r#"

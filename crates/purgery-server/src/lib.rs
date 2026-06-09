@@ -6404,6 +6404,89 @@ steps = ["pack"]
     }
 
     #[test]
+    fn prepare_run_rejects_sync_with_delete_after_import_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&purgery_root, &server_root);
+        let config = ServerConfig {
+            postprocess: PostprocessConfig {
+                steps: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "pack".to_owned(),
+                        PostprocessStepDefinition {
+                            kind: PostprocessKind::Subprocess,
+                            program: "true".into(),
+                            args: vec![],
+                            expected_outputs: vec![],
+                            keep_original: true,
+                        },
+                    );
+                    m
+                },
+            },
+            ..config
+        };
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("no-delete-purgatory".into()).unwrap();
+        let incoming = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Incoming);
+        fs::create_dir_all(&incoming).unwrap();
+
+        // Run config with delete_after_import = false but a postprocess rule
+        fs::write(
+            incoming.join("run.toml"),
+            r#"
+nickname = "laptop"
+
+[[sync]]
+name = "videos"
+to = "videos"
+delete_after_import = false
+
+[[postprocess.rules]]
+match = "*.mp4"
+steps = ["pack"]
+"#,
+        )
+        .unwrap();
+
+        // Minimal manifest with one postprocess entry
+        let manifest = Manifest {
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![ManifestEntry {
+                sync_name: SyncName::new("videos".into()).unwrap(),
+                local_path: ClientLocalPath::new("/source/a.mp4".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/videos/a.mp4".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
+                size: 10,
+                mtime_ns: 100,
+                sha256: None,
+                link_target: None,
+                mode: purgery_core::ManifestEntryMode::Postprocess,
+                postprocess_steps: vec!["pack".into()],
+                covered_by: None,
+            }],
+        };
+        fs::write(incoming.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+
+        let result = prepare_run(&config, &nickname, &run_id);
+        assert!(
+            result.is_err(),
+            "prepare_run must reject purgatory sync with delete_after_import=false"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("delete_after_import = false"),
+            "error should mention delete_after_import=false: {err}"
+        );
+    }
+
+    #[test]
     fn scoped_rule_does_not_cover_directory_in_other_sync_group() {
         // A postprocess rule scoped to "videos" must not cause a directory
         // in "docs" to be considered covered by a postprocessed ancestor.
