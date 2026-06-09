@@ -283,19 +283,56 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
     // cleanup does not accumulate.
     resume_pending_cleanups(config)?;
 
-    // 1. Build manifest for local planning
+    // 1. Validate postprocess rules against sync names before any walking
+    let sync_names: Vec<purgery_core::SyncName> =
+        config.sync.iter().map(|s| s.name.clone()).collect();
+    if let Err(e) = config.postprocess.validate(&sync_names) {
+        anyhow::bail!("postprocess config validation failed: {e}");
+    }
+    info!("postprocess rules validated");
+
+    // 2. For each sync group, decide whether to walk based on applicable rules.
     let run_id = RunId::generate();
-    let manifest = build_manifest(config, &run_id)?;
+    let mut all_manifest_entries: Vec<purgery_core::ManifestEntry> = Vec::new();
+    let mut direct_rsync_syncs: Vec<&purgery_core::SyncMapping> = Vec::new();
+    let mut any_postprocess = false;
+
+    for sync in &config.sync {
+        let sync_name = sync.name.as_str();
+        let applicable = purgery_core::applicable_rules(&config.postprocess.rules, sync_name);
+
+        if applicable.is_empty() && !sync.delete_after_import {
+            // No applicable rules + no-delete = direct unfiltered rsync, no walking
+            info!(
+                sync = sync_name,
+                "no applicable postprocess rules, direct rsync only"
+            );
+            direct_rsync_syncs.push(sync);
+        } else {
+            // Walk this sync group and build manifest entries
+            let (entries, has_pp) = walk_and_classify_sync(config, sync, &run_id, &applicable)?;
+            if has_pp {
+                any_postprocess = true;
+            }
+            all_manifest_entries.extend(entries);
+        }
+    }
+
+    if all_manifest_entries.is_empty() && direct_rsync_syncs.is_empty() {
+        anyhow::bail!("no filesystem entries found to sync");
+    }
+
+    // Build the full manifest from walked entries
+    let manifest = purgery_core::Manifest {
+        run_id: run_id.clone(),
+        nickname: config.nickname.clone(),
+        entries: all_manifest_entries,
+    };
     let transfer_plan = manifest.to_transfer_plan();
-    info!(entries = manifest.entries.len(), "manifest built");
+    info!(walked = manifest.entries.len(), "manifest built");
 
-    // 2. Determine if any sync group has postprocess entries
-    let has_postprocess = transfer_plan.iter().any(|e| {
-        e.mode == purgery_core::ManifestEntryMode::Postprocess
-            || e.mode == purgery_core::ManifestEntryMode::Covered
-    });
-
-    if has_postprocess {
+    // 3. Execute transfers based on whether any postprocess work exists
+    if any_postprocess {
         run_postprocess_path(
             config,
             host,
@@ -303,9 +340,17 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
             &manifest,
             &transfer_plan,
             &run_id,
+            &direct_rsync_syncs,
         )
     } else {
-        run_passthrough_path(config, host, server_command, &manifest, &transfer_plan)
+        run_passthrough_path(
+            config,
+            host,
+            server_command,
+            &manifest,
+            &transfer_plan,
+            &direct_rsync_syncs,
+        )
     }
 }
 
@@ -319,6 +364,7 @@ fn run_passthrough_path(
     server_command: &str,
     manifest: &Manifest,
     _transfer_plan: &[purgery_core::TransferPlanEntry],
+    direct_rsync_syncs: &[&purgery_core::SyncMapping],
 ) -> Result<()> {
     let _span = span!(
         Level::INFO,
@@ -365,8 +411,20 @@ fn run_passthrough_path(
             .map(|d| (d.sync_name.as_str(), d))
             .collect();
 
-    // Transfer per sync group
+    // Handle direct-rsync-only groups first (unfiltered, no manifest entries)
+    for sync in direct_rsync_syncs {
+        run_unfiltered_rsync(config, host, sync, &dest_map)?;
+    }
+
+    // Transfer per sync group that was walked
     for sync in &config.sync {
+        // Skip direct-rsync-only groups (already handled above)
+        if direct_rsync_syncs
+            .iter()
+            .any(|s| s.name.as_str() == sync.name.as_str())
+        {
+            continue;
+        }
         let sync_name = sync.name.as_str();
         let from_path = sync.from_path.as_str();
         let dest = dest_map
@@ -422,6 +480,38 @@ fn run_passthrough_path(
     Ok(())
 }
 
+/// Run unfiltered rsync for a direct-rsync-only sync group (no filter file needed).
+fn run_unfiltered_rsync(
+    _config: &ClientConfig,
+    host: &str,
+    sync: &purgery_core::SyncMapping,
+    dest_map: &std::collections::HashMap<&str, &purgery_core::SyncPassthroughDestination>,
+) -> Result<()> {
+    let sync_name = sync.name.as_str();
+    let from_path = sync.from_path.as_str();
+    let dest = dest_map
+        .get(sync_name)
+        .ok_or_else(|| anyhow::anyhow!("no destination for sync mapping '{sync_name}'"))?;
+    let rsync_dest = format!("{}:{}/", host, dest.passthrough_dest);
+    info!(
+        sync = sync_name,
+        from = from_path,
+        dest = %dest.passthrough_dest,
+        "direct rsync (no postprocess rules)"
+    );
+    let rsync_args = build_rsync_args(from_path, &rsync_dest);
+    // No filter needed for direct-rsync-only groups
+    let status = std::process::Command::new("rsync")
+        .args(&rsync_args)
+        .status()
+        .with_context(|| format!("failed to execute rsync for {from_path}"))?;
+    if !status.success() {
+        anyhow::bail!("rsync failed for sync mapping '{sync_name}'");
+    }
+    info!(sync = sync_name, "direct rsync complete");
+    Ok(())
+}
+
 /// Run a postprocess invocation (one or more sync groups have postprocess roots).
 ///
 /// Creates a server run: begin-run, upload filtered manifest, prepare-run,
@@ -433,6 +523,7 @@ fn run_postprocess_path(
     manifest: &Manifest,
     transfer_plan: &[purgery_core::TransferPlanEntry],
     run_id: &RunId,
+    direct_rsync_syncs: &[&purgery_core::SyncMapping],
 ) -> Result<()> {
     let _span = span!(
         Level::INFO,
@@ -577,6 +668,30 @@ fn run_postprocess_path(
         .iter()
         .map(|d| (d.sync_name.as_str(), d))
         .collect();
+
+    // Handle direct-rsync-only groups (unfiltered, no manifest entries)
+    for sync in direct_rsync_syncs {
+        let sync_name = sync.name.as_str();
+        let from_path = sync.from_path.as_str();
+        if let Some(dest) = dest_map.get(sync_name) {
+            let rsync_dest = format!("{}:{}/", host, dest.passthrough_dest);
+            info!(
+                sync = sync_name,
+                from = from_path,
+                dest = %dest.passthrough_dest,
+                "direct rsync (no postprocess rules)"
+            );
+            let rsync_args = build_rsync_args(from_path, &rsync_dest);
+            let status = std::process::Command::new("rsync")
+                .args(&rsync_args)
+                .status()
+                .with_context(|| format!("failed to execute rsync for {from_path}"))?;
+            if !status.success() {
+                anyhow::bail!("rsync failed for sync mapping '{sync_name}'");
+            }
+            info!(sync = sync_name, "direct rsync complete");
+        }
+    }
 
     // 4. Start heartbeat guard thread
     let heartbeat_interval = Duration::from_secs(begin_resp.heartbeat_interval_secs);
@@ -795,7 +910,170 @@ fn run_postprocess_path(
     Ok(())
 }
 
+/// Walk one sync group and return manifest entries plus whether any are postprocess.
+/// Uses only the provided applicable rules for classification.
+fn walk_and_classify_sync(
+    _config: &ClientConfig,
+    sync: &purgery_core::SyncMapping,
+    _run_id: &RunId,
+    applicable_rules: &[&purgery_core::PostprocessRule],
+) -> Result<(Vec<purgery_core::ManifestEntry>, bool)> {
+    let from_path = sync.from_path.as_str();
+    let to_path = sync.to_path.as_str();
+    let from = Path::new(from_path);
+
+    if !from.exists() {
+        warn!(path = from_path, "sync path does not exist, skipping");
+        return Ok((Vec::new(), false));
+    }
+
+    let mut entries = Vec::new();
+    let mut has_postprocess = false;
+
+    for walk_entry in WalkDir::new(from).follow_links(false).min_depth(1) {
+        let walk_entry = walk_entry.with_context(|| format!("error walking {from_path}"))?;
+        let path = walk_entry.path();
+        let relative = path
+            .strip_prefix(from)
+            .with_context(|| format!("failed to compute relative path for: {}", path.display()))?;
+        let relative_path =
+            camino::Utf8PathBuf::from_path_buf(relative.to_path_buf()).map_err(|path| {
+                anyhow::anyhow!("non-UTF-8 relative path is unsupported: {}", path.display())
+            })?;
+        let staged_path = camino::Utf8Path::new("files")
+            .join(to_path)
+            .join(&relative_path);
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("failed to read metadata: {}", path.display()))?;
+        let file_type = metadata.file_type();
+        let normalized_path = relative_path.as_str().to_owned();
+
+        // Classify using only applicable rules for this sync
+        let matched_rule = applicable_rules
+            .iter()
+            .find(|r| purgery_core::rsync_pattern_match(&r.pattern, &normalized_path));
+        let mode = if matched_rule.is_some() {
+            has_postprocess = true;
+            purgery_core::ManifestEntryMode::Postprocess
+        } else {
+            purgery_core::ManifestEntryMode::Passthrough
+        };
+        let postprocess_steps: Vec<String> =
+            matched_rule.map(|r| r.steps.clone()).unwrap_or_default();
+        let needs_bookkeeping = matched_rule.is_some() || sync.delete_after_import;
+
+        let (kind, size, mtime_ns, sha256, link_target) = if file_type.is_dir() {
+            (purgery_core::ManifestEntryKind::Directory, 0, 0, None, None)
+        } else if file_type.is_file() {
+            let (mtime_ns, sha256) = if needs_bookkeeping {
+                let mtime_ns = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_nanos() as i64)
+                    .unwrap_or(0);
+                (mtime_ns, compute_sha256(path).ok())
+            } else {
+                (0, None)
+            };
+            (
+                purgery_core::ManifestEntryKind::RegularFile,
+                metadata.len(),
+                mtime_ns,
+                sha256,
+                None,
+            )
+        } else if file_type.is_symlink() {
+            let target = fs::read_link(path)
+                .with_context(|| format!("failed to read symlink: {}", path.display()))?;
+            let target = camino::Utf8PathBuf::from_path_buf(target).map_err(|path| {
+                anyhow::anyhow!(
+                    "non-UTF-8 symlink target is unsupported: {}",
+                    path.display()
+                )
+            })?;
+            (
+                purgery_core::ManifestEntryKind::Symlink,
+                0,
+                0,
+                None,
+                Some(target),
+            )
+        } else {
+            anyhow::bail!("unsupported filesystem object: {}", path.display());
+        };
+
+        entries.push(purgery_core::ManifestEntry {
+            sync_name: sync.name.clone(),
+            local_path: purgery_core::ClientLocalPath::new(path.to_string_lossy().to_string())
+                .with_context(|| format!("invalid local path for: {}", path.display()))?,
+            staged_path: purgery_core::NormalizedRelativePath::new(staged_path)
+                .with_context(|| format!("invalid staged path for: {}", path.display()))?,
+            relative_path: purgery_core::NormalizedRelativePath::new(relative_path)
+                .with_context(|| format!("invalid relative path for: {}", path.display()))?,
+            kind,
+            size,
+            mtime_ns,
+            sha256,
+            link_target,
+            mode,
+            postprocess_steps,
+            covered_by: None,
+        });
+    }
+
+    // Identify covered entries under postprocessed directories.
+    let covering_dirs: Vec<String> = entries
+        .iter()
+        .filter(|e| {
+            e.kind == purgery_core::ManifestEntryKind::Directory
+                && e.mode == purgery_core::ManifestEntryMode::Postprocess
+        })
+        .map(|e| e.relative_path.as_str().to_owned())
+        .collect();
+    for entry in entries.iter_mut() {
+        let rp = entry.relative_path.as_str();
+        for dir_path in &covering_dirs {
+            if rp == dir_path.as_str() {
+                continue;
+            }
+            if rp.starts_with(dir_path.as_str()) && rp.as_bytes().get(dir_path.len()) == Some(&b'/')
+            {
+                entry.mode = purgery_core::ManifestEntryMode::Covered;
+                entry.covered_by = Some(dir_path.clone());
+                entry.postprocess_steps = Vec::new();
+                break;
+            }
+        }
+    }
+
+    // Sort: directories first, then by depth, then by name
+    entries.sort_by(|left, right| {
+        let left_depth = left.relative_path.as_path().components().count();
+        let right_depth = right.relative_path.as_path().components().count();
+        let kind_order = |kind| match kind {
+            purgery_core::ManifestEntryKind::Directory => 0,
+            purgery_core::ManifestEntryKind::RegularFile
+            | purgery_core::ManifestEntryKind::Symlink => 1,
+        };
+        left_depth
+            .cmp(&right_depth)
+            .then_with(|| kind_order(left.kind).cmp(&kind_order(right.kind)))
+            .then_with(|| left.sync_name.as_str().cmp(right.sync_name.as_str()))
+            .then_with(|| {
+                left.relative_path
+                    .as_str()
+                    .cmp(right.relative_path.as_str())
+            })
+    });
+
+    Ok((entries, has_postprocess))
+}
+
 /// Walk all sync directories and build the manifest.
+/// Used in tests; kept for backward compat but production code uses
+/// walk_and_classify_sync per sync group.
+#[allow(dead_code)]
 fn build_manifest(config: &ClientConfig, run_id: &RunId) -> Result<Manifest> {
     let mut entries = Vec::new();
     let nickname = config.nickname.clone();

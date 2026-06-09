@@ -1351,12 +1351,22 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
 pub struct CompiledRule {
     pub pattern: String,
     pub steps: Vec<ResolvedStep>,
+    /// Optional sync group scoping (None means all groups).
+    pub sync_names: Option<Vec<purgery_core::SyncName>>,
 }
 
 impl CompiledRule {
     /// Returns true if the normalized path matches this rule's rsync pattern.
     pub fn is_match(&self, normalized_path: &str) -> bool {
         purgery_core::rsync_pattern_match(&self.pattern, normalized_path)
+    }
+
+    /// Returns true if this rule applies to the given sync group.
+    pub fn applies_to(&self, sync_name: &str) -> bool {
+        match &self.sync_names {
+            None => true,
+            Some(names) => names.iter().any(|n| n.as_str() == sync_name),
+        }
     }
 }
 
@@ -1421,6 +1431,7 @@ impl RunPlan {
             rules.push(CompiledRule {
                 pattern: rule.pattern.clone(),
                 steps,
+                sync_names: rule.sync_names.clone(),
             });
         }
 
@@ -1766,10 +1777,13 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
         for entry in &manifest.entries {
             let _sync = sync_map.get(entry.sync_name.as_str());
             let rp = entry.relative_path.as_str();
-            let matched = run_config
-                .postprocess
-                .rules
-                .iter()
+            // Only consider rules applicable to this entry's sync group
+            let scoped_rules = purgery_core::applicable_rules(
+                &run_config.postprocess.rules,
+                entry.sync_name.as_str(),
+            );
+            let matched = scoped_rules
+                .into_iter()
                 .find(|r| purgery_core::rsync_pattern_match(&r.pattern, rp));
             let expected_mode = match matched {
                 Some(_) => purgery_core::ManifestEntryMode::Postprocess,
@@ -2945,6 +2959,7 @@ to = "{}"
                 rules: vec![purgery_core::PostprocessRule {
                     pattern: "videos/*".to_owned(),
                     steps: vec!["compress-video".to_owned()],
+                    sync_names: None,
                 }],
             },
         };
@@ -3093,6 +3108,7 @@ steps = ["compress-video"]
                 rules: vec![purgery_core::PostprocessRule {
                     pattern: "videos/*.mp4".to_owned(),
                     steps: vec!["compress-video".to_owned()],
+                    sync_names: None,
                 }],
             },
         };
@@ -3143,6 +3159,7 @@ steps = ["compress-video"]
                 rules: vec![purgery_core::PostprocessRule {
                     pattern: "videos/*".to_owned(),
                     steps: vec!["compress-video".to_owned()],
+                    sync_names: None,
                 }],
             },
         };
@@ -3200,6 +3217,7 @@ steps = ["compress-video"]
                 rules: vec![purgery_core::PostprocessRule {
                     pattern: "videos/*".to_owned(),
                     steps: vec!["compress-video".to_owned()],
+                    sync_names: None,
                 }],
             },
         };
@@ -4005,6 +4023,7 @@ steps = ["compress-video"]
                 rules: vec![purgery_core::PostprocessRule {
                     pattern: "".into(),
                     steps: vec!["compress-video".into()],
+                    sync_names: None,
                 }],
             },
         };
@@ -4029,6 +4048,7 @@ steps = ["compress-video"]
                 rules: vec![purgery_core::PostprocessRule {
                     pattern: "videos/*".into(),
                     steps: vec!["nonexistent-step".into()],
+                    sync_names: None,
                 }],
             },
         };
@@ -4918,6 +4938,7 @@ steps = ["compress-video"]
         RunPlan {
             rules: vec![CompiledRule {
                 pattern: "data/*.txt".into(),
+                sync_names: None,
                 steps: vec![ResolvedStep {
                     step_name: "generate".into(),
                     step_def: PostprocessStepDefinition {
@@ -5384,6 +5405,7 @@ steps = ["compress"]
         RunPlan {
             rules: vec![CompiledRule {
                 pattern: "*.txt".into(),
+                sync_names: None,
                 steps: vec![ResolvedStep {
                     step_name: "compress".into(),
                     step_def: PostprocessStepDefinition {
@@ -5493,6 +5515,7 @@ steps = ["compress"]
         let pp_plan = RunPlan {
             rules: vec![CompiledRule {
                 pattern: "*.txt".into(),
+                sync_names: None,
                 steps: vec![ResolvedStep {
                     step_name: "generate".into(),
                     step_def: PostprocessStepDefinition {
@@ -5581,6 +5604,7 @@ steps = ["compress"]
         let run_plan = RunPlan {
             rules: vec![CompiledRule {
                 pattern: "*.txt".into(),
+                sync_names: None,
                 steps: vec![ResolvedStep {
                     step_name: "compress".into(),
                     step_def: PostprocessStepDefinition {

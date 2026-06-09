@@ -1425,7 +1425,10 @@ impl PostprocessRule {
 }
 
 /// Returns the subset of rules applicable to a given sync group.
-pub fn applicable_rules<'a>(rules: &'a [PostprocessRule], sync_name: &str) -> Vec<&'a PostprocessRule> {
+pub fn applicable_rules<'a>(
+    rules: &'a [PostprocessRule],
+    sync_name: &str,
+) -> Vec<&'a PostprocessRule> {
     rules.iter().filter(|r| r.applies_to(sync_name)).collect()
 }
 
@@ -3611,15 +3614,9 @@ color = "never"
 
     // ── TransferPlanEntry tests ──
 
-    #[test]
     // ── PostprocessRule `for` field tests ──
-    // These tests assert the correct behavior once the for field is added.
-
-    #[ignore = "expected to fail until per-sync postprocess scoping is implemented"]
     #[test]
     fn config_with_postprocess_rule_for_is_accepted() {
-        // Currently `for` is an unknown field and rejected by deny_unknown_fields.
-        // After implementation, for = ["videos"] must be accepted.
         let toml = r#"
 nickname = "laptop"
 
@@ -3638,11 +3635,11 @@ for = ["videos"]
 "#;
         let config = ClientConfig::from_toml(toml).unwrap();
         let rule = &config.postprocess.rules[0];
-        // After implementation, the rule must parse with for capturing "videos"
         assert_eq!(rule.pattern, "*.mp4");
+        assert!(rule.sync_names.is_some());
+        assert_eq!(rule.sync_names.as_deref().unwrap()[0].as_str(), "videos");
     }
 
-    #[ignore = "expected to fail until per-sync postprocess scoping is implemented"]
     #[test]
     fn config_with_postprocess_rule_empty_for_is_rejected() {
         let toml = r#"
@@ -3661,11 +3658,14 @@ match = "*.mp4"
 steps = ["compress-video"]
 for = []
 "#;
-        let result = ClientConfig::from_toml(toml);
+        let config = ClientConfig::from_toml(toml).unwrap();
+        // Validation must reject empty for
+        let result = config
+            .postprocess
+            .validate(&[SyncName::new("videos".into()).unwrap()]);
         assert!(result.is_err(), "empty for must be rejected");
     }
 
-    #[ignore = "expected to fail until per-sync postprocess scoping is implemented"]
     #[test]
     fn config_with_postprocess_rule_unknown_sync_in_for_is_rejected() {
         let toml = r#"
@@ -3684,10 +3684,15 @@ match = "*.mp4"
 steps = ["compress-video"]
 for = ["missing-sync"]
 "#;
-        let result = ClientConfig::from_toml(toml);
+        let config = ClientConfig::from_toml(toml).unwrap();
+        // Validation must reject unknown sync names
+        let result = config
+            .postprocess
+            .validate(&[SyncName::new("videos".into()).unwrap()]);
         assert!(result.is_err(), "unknown sync in for must be rejected");
     }
 
+    #[test]
     fn transfer_plan_entry_has_no_size_field() {
         let entry = TransferPlanEntry {
             sync_name: SyncName::new("data".into()).unwrap(),
