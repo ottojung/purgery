@@ -230,13 +230,25 @@ fn write_remote_file(host: &str, path: &str, content: &str) -> Result<()> {
 }
 
 /// Build a RunConfig from a ClientConfig — strips server-local fields.
-fn build_run_config(config: &ClientConfig) -> RunConfig {
+/// Build a RunConfig from ClientConfig, optionally filtering to include
+/// only purgatory sync groups (those with applicable postprocess rules).
+fn build_run_config(config: &ClientConfig, purgatory_only: bool) -> RunConfig {
     let sync: Vec<RunConfigSync> = config
         .sync
         .iter()
+        .filter(|s| {
+            if purgatory_only {
+                let applicable =
+                    purgery_core::applicable_rules(&config.postprocess.rules, s.name.as_str());
+                !applicable.is_empty()
+            } else {
+                true
+            }
+        })
         .map(|s| RunConfigSync {
             name: s.name.clone(),
             to_path: s.to_path.clone(),
+            delete_after_import: s.delete_after_import,
         })
         .collect();
 
@@ -376,15 +388,15 @@ fn run_passthrough_path(
     )
     .entered();
 
-    let run_config = build_run_config(config);
-    let run_config_toml = run_config
+    // Resolve destinations for all sync groups (side-effect-free, run config sent via stdin)
+    let run_config_all = build_run_config(config, false);
+    let run_config_all_toml = run_config_all
         .to_toml()
         .with_context(|| "failed to serialize run config")?;
 
     let tmp_dir = std::env::temp_dir().join("purgery-filters");
     fs::create_dir_all(&tmp_dir).ok();
 
-    // Resolve destinations (side-effect-free, run config sent via stdin)
     info!("resolving destinations");
     let resolve_out = server_cmd_with_stdin(
         host,
@@ -394,7 +406,7 @@ fn run_passthrough_path(
             "--nickname",
             config.nickname.as_str(),
         ],
-        &run_config_toml,
+        &run_config_all_toml,
     )
     .context("resolve-destinations failed")?;
     let resolve_resp: purgery_core::ResolveDestinationsResponse =
@@ -519,6 +531,9 @@ fn run_unfiltered_rsync(
 ///
 /// Creates a server run: begin-run, upload filtered manifest, prepare-run,
 /// rsync passthrough + purgatory, finish-run, poll status, cleanup from status.
+///
+/// Passthrough-only sync groups (no applicable rules) are handled outside
+/// the purgatory run lifecycle via resolve-destinations + direct rsync.
 fn run_postprocess_path(
     config: &ClientConfig,
     host: &str,
@@ -543,6 +558,74 @@ fn run_postprocess_path(
         server_entries = server_manifest.entries.len(),
         "built server manifest"
     );
+
+    // 0a. Resolve destinations for passthrough-only groups via resolve-destinations
+    let passthrough_dest_map: std::collections::HashMap<String, String> = if !direct_rsync_syncs.is_empty() {
+        let run_config_all = build_run_config(config, false);
+        let run_config_all_toml = run_config_all
+            .to_toml()
+            .with_context(|| "failed to serialize run config")?;
+        let resolve_out = server_cmd_with_stdin(
+            host,
+            server_command,
+            &[
+                "resolve-destinations",
+                "--nickname",
+                config.nickname.as_str(),
+            ],
+            &run_config_all_toml,
+        )
+        .context("resolve-destinations failed")?;
+        let resolve_resp: purgery_core::ResolveDestinationsResponse =
+            toml::from_str(&resolve_out).context("failed to parse resolve-destinations response")?;
+        resolve_resp
+            .destinations
+            .into_iter()
+            .map(|d| (d.sync_name, d.passthrough_dest))
+            .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    // 0b. Handle direct-rsync groups (passthrough, no applicable rules) before the purgatory run.
+    //     These groups are outside the purgatory lifecycle.
+    for sync in direct_rsync_syncs {
+        let sync_name = sync.name.as_str();
+        let from_path = sync.from_path.as_str();
+        if let Some(passthrough_dest) = passthrough_dest_map.get(sync_name) {
+            let rsync_dest = format!("{}:{}/", host, passthrough_dest);
+            info!(
+                sync = sync_name,
+                from = from_path,
+                dest = %passthrough_dest,
+                "passthrough-only direct rsync (outside purgatory run)"
+            );
+            let rsync_args = build_rsync_args(from_path, &rsync_dest);
+            let status = std::process::Command::new("rsync")
+                .args(&rsync_args)
+                .status()
+                .with_context(|| format!("failed to execute rsync for {from_path}"))?;
+            if !status.success() {
+                anyhow::bail!("rsync failed for sync mapping '{sync_name}'");
+            }
+            info!(sync = sync_name, "direct rsync complete");
+        } else {
+            anyhow::bail!("no destination resolved for passthrough sync mapping '{sync_name}'");
+        }
+    }
+
+    // 0c. The purgatory-only run config excludes passthrough-only sync groups
+    let run_config = build_run_config(config, true);
+    let run_config_toml = run_config
+        .to_toml()
+        .with_context(|| "failed to serialize purgatory run config")?;
+
+    // If no purgatory groups remain after filtering, we're done (all groups were passthrough).
+    // This should not normally happen since run_postprocess_path is only called when
+    // any_postprocess is true, but handle it gracefully.
+    if run_config.sync.is_empty() {
+        return Ok(());
+    }
 
     // 1. Begin run
     let begin_out = server_cmd(
@@ -632,11 +715,7 @@ fn run_postprocess_path(
 
     debug!(incoming_dir = %begin_resp.incoming_dir, "begin-run accepted");
 
-    // 2. Write run.toml and filtered manifest.toml to server
-    let run_config = build_run_config(config);
-    let run_config_toml = run_config
-        .to_toml()
-        .with_context(|| "failed to serialize run config")?;
+    // 2. Write purgatory-only run.toml and filtered manifest.toml to server
     write_remote_file(host, &begin_resp.run_config_path, &run_config_toml)?;
     let manifest_toml = server_manifest
         .to_toml()
@@ -671,30 +750,6 @@ fn run_postprocess_path(
         .iter()
         .map(|d| (d.sync_name.as_str(), d))
         .collect();
-
-    // Handle direct-rsync-only groups (unfiltered, no manifest entries)
-    for sync in direct_rsync_syncs {
-        let sync_name = sync.name.as_str();
-        let from_path = sync.from_path.as_str();
-        if let Some(dest) = dest_map.get(sync_name) {
-            let rsync_dest = format!("{}:{}/", host, dest.passthrough_dest);
-            info!(
-                sync = sync_name,
-                from = from_path,
-                dest = %dest.passthrough_dest,
-                "direct rsync (no postprocess rules)"
-            );
-            let rsync_args = build_rsync_args(from_path, &rsync_dest);
-            let status = std::process::Command::new("rsync")
-                .args(&rsync_args)
-                .status()
-                .with_context(|| format!("failed to execute rsync for {from_path}"))?;
-            if !status.success() {
-                anyhow::bail!("rsync failed for sync mapping '{sync_name}'");
-            }
-            info!(sync = sync_name, "direct rsync complete");
-        }
-    }
 
     // 4. Start heartbeat guard thread
     let heartbeat_interval = Duration::from_secs(begin_resp.heartbeat_interval_secs);

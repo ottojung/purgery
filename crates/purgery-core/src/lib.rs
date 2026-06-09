@@ -1502,6 +1502,11 @@ pub struct RunConfigSync {
     pub name: SyncName,
     #[serde(rename = "to")]
     pub to_path: RelativeDestinationPath,
+    /// Whether the client will delete local files after confirmed import.
+    /// The server validates that every sync in a purgatory run config
+    /// has `delete_after_import = true`.
+    #[serde(default = "default_delete_after_import")]
+    pub delete_after_import: bool,
 }
 
 /// Mode of a manifest entry in the import pipeline.
@@ -3368,6 +3373,7 @@ steps = ["compress-video"]
             sync: vec![RunConfigSync {
                 name: SyncName::new("videos".into()).unwrap(),
                 to_path: RelativeDestinationPath::new("videos".into()).unwrap(),
+                delete_after_import: false,
             }],
             postprocess: ClientPostprocessConfig::default(),
         };
@@ -3459,10 +3465,12 @@ to = "videos"
                 RunConfigSync {
                     name: SyncName::new("videos".into()).unwrap(),
                     to_path: RelativeDestinationPath::new("videos".into()).unwrap(),
+                    delete_after_import: false,
                 },
                 RunConfigSync {
                     name: SyncName::new("pictures".into()).unwrap(),
                     to_path: RelativeDestinationPath::new("pictures".into()).unwrap(),
+                    delete_after_import: false,
                 },
             ],
             postprocess: ClientPostprocessConfig::default(),
