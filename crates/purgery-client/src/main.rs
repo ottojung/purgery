@@ -414,24 +414,37 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
                 .get(sync_name)
                 .ok_or_else(|| anyhow::anyhow!("no destination for sync mapping '{sync_name}'"))?;
 
-            // Collect match patterns
-            let match_patterns: Vec<String> = config
-                .postprocess
-                .rules
+            // Collect classified paths from manifest for this sync
+            let passthrough_paths: Vec<String> = manifest
+                .entries
                 .iter()
-                .map(|r| r.pattern.clone())
+                .filter(|e| {
+                    e.sync_name.as_str() == sync_name
+                        && e.mode == purgery_core::ManifestEntryMode::Passthrough
+                })
+                .map(|e| e.relative_path.as_str().to_owned())
                 .collect();
-            let purgatory_filter = purgery_core::purgatory_filter_content(&match_patterns);
-            let passthrough_filter = purgery_core::passthrough_filter_content(&match_patterns);
+            let purgatory_paths: Vec<String> = manifest
+                .entries
+                .iter()
+                .filter(|e| {
+                    e.sync_name.as_str() == sync_name
+                        && e.mode == purgery_core::ManifestEntryMode::Postprocess
+                })
+                .map(|e| e.relative_path.as_str().to_owned())
+                .collect();
+
+            let passthrough_filter = purgery_core::transfer_set_filter(&passthrough_paths);
+            let purgatory_filter = purgery_core::transfer_set_filter(&purgatory_paths);
 
             let tmp_dir = std::env::temp_dir().join("purgery-filters");
             fs::create_dir_all(&tmp_dir).ok();
-            let purgatory_file = tmp_dir.join(format!("purgatory-{sync_name}"));
             let passthrough_file = tmp_dir.join(format!("passthrough-{sync_name}"));
-            fs::write(&purgatory_file, &purgatory_filter)
-                .with_context(|| "failed to write purgatory filter")?;
+            let purgatory_file = tmp_dir.join(format!("purgatory-{sync_name}"));
             fs::write(&passthrough_file, &passthrough_filter)
                 .with_context(|| "failed to write passthrough filter")?;
+            fs::write(&purgatory_file, &purgatory_filter)
+                .with_context(|| "failed to write purgatory filter")?;
 
             // --- Passthrough rsync: direct to final storage ---
             let passthrough_rsync_dest = format!("{}:{}/", host, dest.passthrough_dest);

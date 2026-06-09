@@ -1607,32 +1607,42 @@ pub fn build_rsync_args(source: &str, destination: &str) -> Vec<String> {
     ]
 }
 
-/// Generate rsync filter file content for a purgatory (selected) transfer set.
+/// Generate rsync filter file content from a set of exact entry paths.
 ///
-/// The filter includes directories needed for traversal, then includes entries
-/// matching any of the given patterns, then excludes everything else.
-pub fn purgatory_filter_content(patterns: &[String]) -> String {
+/// The filter includes directories needed for traversal to reach each path,
+/// then includes the exact paths, then excludes everything else.
+/// Used for both passthrough and purgatory transfer sets.
+pub fn transfer_set_filter(paths: &[String]) -> String {
     let mut lines: Vec<String> = Vec::new();
-    lines.push("+ */".to_string()); // include all directories for traversal
-    for pat in patterns {
-        lines.push(format!("+ {pat}"));
+    // Collect all ancestor directories needed for traversal
+    let mut dirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for path in paths {
+        // Add the path itself
+        // Add all parent directories
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            let mut ancestor = String::new();
+            for component in parent.components() {
+                use std::path::Component;
+                if let Component::Normal(c) = component {
+                    if !ancestor.is_empty() {
+                        ancestor.push('/');
+                    }
+                    ancestor.push_str(&c.to_string_lossy());
+                    dirs.insert(ancestor.clone() + "/");
+                }
+            }
+        }
     }
-    lines.push("- *".to_string()); // exclude everything else
-    lines.join("\n")
-}
-
-/// Generate rsync filter file content for a passthrough transfer set.
-///
-/// The filter includes directories needed for traversal, excludes entries
-/// matching any of the given patterns, and rsync defaults to including
-/// everything else.
-pub fn passthrough_filter_content(patterns: &[String]) -> String {
-    let mut lines: Vec<String> = Vec::new();
-    lines.push("+ */".to_string()); // include all directories for traversal
-    for pat in patterns {
-        lines.push(format!("- {pat}")); // exclude postprocess-selected entries
+    // Include all ancestor directories for traversal
+    for dir in &dirs {
+        lines.push(format!("+ {dir}"));
     }
-    // rsync default is include for non-matched entries
+    // Include exact paths
+    for path in paths {
+        lines.push(format!("+ {path}"));
+    }
+    // Exclude everything else
+    lines.push("- *".to_string());
     lines.join("\n")
 }
 
