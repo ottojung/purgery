@@ -923,6 +923,38 @@ fn run_postprocess_path(
             let passthrough_file = tmp_dir.join(format!("passthrough-{sync_name}"));
             let purgatory_file = tmp_dir.join(format!("purgatory-{sync_name}"));
 
+            // Pre-rsync cleanup ledger state for delete_after_import=true
+            // Write cleanup state before passthrough rsync so that deletion
+            // is only authorized after rsync succeeds.
+            let maybe_cleanup_state: Option<purgery_core::DurableCleanupState> =
+                if sync.delete_after_import && !passthrough_roots.is_empty() {
+                    let cleanup_entries =
+                        build_cleanup_entries_from_manifest(config, sync_name, manifest)?;
+                    if cleanup_entries.is_empty() {
+                        None
+                    } else {
+                        Some(purgery_core::DurableCleanupState {
+                            nickname: config.nickname.as_str().to_owned(),
+                            operation_id: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_nanos()
+                                .to_string(),
+                            entries: cleanup_entries,
+                        })
+                    }
+                } else {
+                    None
+                };
+
+            let state_path = match &maybe_cleanup_state {
+                Some(state) => Some(
+                    write_cleanup_state(state)
+                        .with_context(|| "failed to write pre-rsync cleanup state")?,
+                ),
+                None => None,
+            };
+
             // Passthrough rsync (non-postprocess entries)
             if !passthrough_roots.is_empty() {
                 let passthrough_filter = purgery_core::transfer_set_filter(&passthrough_roots);
@@ -951,6 +983,12 @@ fn run_postprocess_path(
                     anyhow::bail!("passthrough rsync failed for sync mapping '{sync_name}'");
                 }
                 info!(sync = sync_name, mode = "passthrough", "rsync complete");
+
+                // Mark rsync succeeded durably so cleanup is authorized
+                if let Some(ref sp) = state_path {
+                    mark_rsync_succeeded(sp, sync_name)
+                        .with_context(|| "failed to mark rsync succeeded")?;
+                }
             } else {
                 info!(
                     sync = sync_name,
@@ -959,9 +997,10 @@ fn run_postprocess_path(
                 );
             }
 
-            // Durable cleanup state for delete_after_import=true passthrough regular files
-            if sync.delete_after_import {
-                process_cleanup_entries(config, sync_name, manifest)?;
+            // Process cleanup state: delete files whose identity still matches
+            if let Some(ref sp) = state_path {
+                process_cleanup_state_file(sp)
+                    .with_context(|| "failed to process cleanup state")?;
             }
 
             // Check heartbeat
@@ -1553,12 +1592,15 @@ fn resume_pending_cleanups(_config: &ClientConfig) -> Result<()> {
 }
 
 /// Process cleanup entries: write durable state, delete verified files with atomic progress.
-fn process_cleanup_entries(
-    config: &ClientConfig,
+/// Build cleanup entries from manifest passthrough regular files for a given sync group.
+/// Entries are created with `rsync_succeeded = false` — they do not authorize
+/// deletion until the ledger protocol marks success after rsync completes.
+fn build_cleanup_entries_from_manifest(
+    _config: &ClientConfig,
     sync_name: &str,
     manifest: &Manifest,
-) -> Result<()> {
-    let cleanup_entries: Vec<purgery_core::CleanupEntry> = manifest
+) -> Result<Vec<purgery_core::CleanupEntry>> {
+    let entries: Vec<purgery_core::CleanupEntry> = manifest
         .entries
         .iter()
         .filter(|e| {
@@ -1573,72 +1615,11 @@ fn process_cleanup_entries(
             size: e.size,
             mtime_ns: e.mtime_ns,
             sha256: e.sha256.clone(),
-            rsync_succeeded: true,
+            rsync_succeeded: false,
             cleaned: false,
         })
         .collect();
-
-    if cleanup_entries.is_empty() {
-        return Ok(());
-    }
-
-    let cleanup_state = purgery_core::DurableCleanupState {
-        nickname: config.nickname.as_str().to_owned(),
-        operation_id: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-            .to_string(),
-        entries: cleanup_entries,
-    };
-
-    let state_path = write_cleanup_state(&cleanup_state)?;
-
-    for entry in &cleanup_state.entries {
-        let local_path = Path::new(&entry.local_path);
-        let symmeta = match fs::symlink_metadata(local_path) {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let _ = mark_cleaned(&state_path, &entry.sync_name, &entry.local_path);
-                continue;
-            }
-            Err(_) => continue,
-        };
-        if !symmeta.file_type().is_file() || symmeta.file_type().is_symlink() {
-            continue;
-        }
-        let Ok(meta) = fs::metadata(local_path) else {
-            continue;
-        };
-        if meta.len() != entry.size {
-            continue;
-        }
-        let current_mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_nanos() as i64)
-            .unwrap_or(0);
-        if current_mtime != entry.mtime_ns {
-            continue;
-        }
-        if let Some(ref expected_sha) = entry.sha256 {
-            if let Ok(actual_sha) = compute_sha256(local_path) {
-                if &actual_sha != expected_sha {
-                    continue;
-                }
-            } else {
-                continue;
-            }
-        }
-        if let Err(e) = fs::remove_file(local_path) {
-            warn!(path = %entry.local_path, error = %e, "failed to delete");
-        } else {
-            let _ = mark_cleaned(&state_path, &entry.sync_name, &entry.local_path);
-        }
-    }
-
-    Ok(())
+    Ok(entries)
 }
 
 /// Compute SHA-256 of a file.
