@@ -7,8 +7,6 @@ use purgery_core::{
 };
 use std::collections::HashMap;
 use std::fs;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 
 /// A run-level failure — written when the run cannot be processed at all.
 fn write_run_failure(
@@ -198,7 +196,7 @@ fn commit_output(source: &Utf8Path, final_path: &Utf8Path, run_id: &RunId) -> Re
 #[allow(clippy::too_many_arguments)]
 fn process_one_file(
     server_config: &ServerConfig,
-    run_config: &RunConfig,
+    run_plan: &RunPlan,
     sync: &RunConfigSync,
     file_entry: &purgery_core::ManifestFileEntry,
     nickname: &Nickname,
@@ -328,16 +326,13 @@ fn process_one_file(
         };
     }
 
-    // 8. Apply postprocessing
+    // 8. Apply postprocessing using precompiled run plan
     let normalized_path = format!(
         "{}/{}",
         sync.to_path.as_str(),
         file_entry.relative_path.as_str()
     );
-
-    // Preflight: derive all final output paths before committing
-    let postprocess_result =
-        apply_postprocessing(server_config, run_config, &normalized_path, &work_path);
+    let postprocess_result = apply_postprocessing(run_plan, &normalized_path, &work_path);
 
     match postprocess_result {
         Ok(outputs) => {
@@ -417,17 +412,12 @@ fn process_one_file(
                 }
             }
 
-            // 10. Determine postprocess step names that were applied
-            let applied_steps: Vec<String> = run_config
-                .postprocess
+            // 10. Determine postprocess step names that were applied (from run plan)
+            let applied_steps: Vec<String> = run_plan
                 .rules
                 .iter()
-                .filter(|r| {
-                    regex::Regex::new(&r.pattern)
-                        .map(|re| re.is_match(&normalized_path))
-                        .unwrap_or(false)
-                })
-                .flat_map(|r| r.steps.clone())
+                .filter(|cr| cr.regex.is_match(work_path.as_str()))
+                .flat_map(|cr| cr.steps.iter().map(|s| s.step_name.clone()))
                 .collect();
 
             let steps_opt = if applied_steps.is_empty() {
@@ -445,7 +435,7 @@ fn process_one_file(
             }
         }
         Err(e) => {
-            eprintln!("postprocessing failed for '{}': {e}", normalized_path);
+            eprintln!("postprocessing failed: {e}",);
             FileOutcome::Failure {
                 sync_name,
                 local_path,
@@ -501,13 +491,16 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
         }
     };
 
-    // Build and validate run plan (validates all regexes + step references)
-    if let Err(e) = RunPlan::build(config, &run_config) {
-        let msg = format!("run plan validation failed: {e}");
-        eprintln!("{msg}");
-        write_run_failure(&config.purgery_root, nickname, run_id, &msg);
-        anyhow::bail!("{msg}");
-    }
+    // Build and validate run plan (compiles all regexes, validates step references)
+    let run_plan = match RunPlan::build(config, &run_config) {
+        Ok(p) => p,
+        Err(e) => {
+            let msg = format!("run plan validation failed: {e}");
+            eprintln!("{msg}");
+            write_run_failure(&config.purgery_root, nickname, run_id, &msg);
+            anyhow::bail!("{msg}");
+        }
+    };
 
     // Read manifest
     let manifest_path = processing_path.join("manifest.toml");
@@ -562,7 +555,7 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
 
         let outcome = process_one_file(
             config,
-            &run_config,
+            &run_plan,
             sync,
             file_entry,
             nickname,
@@ -654,16 +647,23 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
     Ok(())
 }
 
-/// A validated run plan: precompiled regexes and resolved step definitions.
+/// A compiled postprocess rule with resolved step definitions.
 #[derive(Debug)]
-pub struct RunPlan {
-    pub resolved_steps: Vec<ResolvedStep>,
+pub struct CompiledRule {
+    pub regex: regex::Regex,
+    pub steps: Vec<ResolvedStep>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ResolvedStep {
     pub step_name: String,
     pub step_def: purgery_core::PostprocessStepDefinition,
+}
+
+/// A validated run plan: precompiled regexes and resolved step definitions.
+#[derive(Debug)]
+pub struct RunPlan {
+    pub rules: Vec<CompiledRule>,
 }
 
 impl RunPlan {
@@ -675,79 +675,60 @@ impl RunPlan {
         server_config: &ServerConfig,
         run_config: &purgery_core::RunConfig,
     ) -> Result<Self, String> {
+        let mut rules = Vec::new();
+
         for rule in &run_config.postprocess.rules {
-            regex::Regex::new(&rule.pattern)
+            let re = regex::Regex::new(&rule.pattern)
                 .map_err(|e| format!("invalid postprocess regex '{}': {e}", rule.pattern))?;
 
+            let mut steps = Vec::new();
             for step_name in &rule.steps {
-                if !server_config
-                    .postprocess
-                    .steps
-                    .contains_key(step_name.as_str())
-                {
+                let Some(def) = server_config.postprocess.steps.get(step_name.as_str()) else {
                     return Err(format!(
                         "postprocess step '{step_name}' referenced by rule is not defined on server"
                     ));
-                }
+                };
+                steps.push(ResolvedStep {
+                    step_name: step_name.clone(),
+                    step_def: def.clone(),
+                });
             }
+
+            rules.push(CompiledRule { regex: re, steps });
         }
 
-        let mut resolved_steps = Vec::new();
-        for rule in &run_config.postprocess.rules {
-            for step_name in &rule.steps {
-                if let Some(def) = server_config.postprocess.steps.get(step_name.as_str()) {
-                    resolved_steps.push(ResolvedStep {
-                        step_name: step_name.clone(),
-                        step_def: def.clone(),
-                    });
-                }
-            }
-        }
-
-        Ok(RunPlan { resolved_steps })
-    }
-
-    /// Check if any step in the plan matches this normalized path.
-    #[allow(unused)]
-    pub fn matches(&self, _normalized_path: &str) -> bool {
-        !self.resolved_steps.is_empty()
+        Ok(RunPlan { rules })
     }
 }
 
-/// Apply postprocessing rules to a file in the work area.
+/// Apply postprocessing rules to a file in the work area using a precompiled RunPlan.
 ///
+/// `normalized_path` is the logical path used for rule matching (e.g. `videos/video.mp4`).
+/// `work_path` is the absolute work area path used for subprocess execution.
 /// Returns the list of work area paths to commit.
-/// Uses the subprocess model: `args` with `{input}`, `{stem}`, `{parent}`, `{file_name}` placeholders.
 pub fn apply_postprocessing(
-    server_config: &ServerConfig,
-    run_config: &purgery_core::RunConfig,
+    run_plan: &RunPlan,
     normalized_path: &str,
     work_path: &Utf8Path,
 ) -> Result<Vec<Utf8PathBuf>, String> {
     let mut results: Vec<Utf8PathBuf> = Vec::new();
     let mut any_rule_matched = false;
 
-    for rule in &run_config.postprocess.rules {
-        let re = regex::Regex::new(&rule.pattern)
-            .map_err(|e| format!("invalid regex pattern '{}': {e}", rule.pattern))?;
-
-        if !re.is_match(normalized_path) {
+    for compiled in &run_plan.rules {
+        if !compiled.regex.is_match(normalized_path) {
             continue;
         }
         any_rule_matched = true;
 
-        for step_name in &rule.steps {
-            let Some(step_def) = server_config.postprocess.steps.get(step_name) else {
-                return Err(format!(
-                    "postprocess step '{step_name}' not defined on server"
-                ));
-            };
+        for step in &compiled.steps {
+            let step_def = &step.step_def;
 
             match step_def.kind {
                 purgery_core::PostprocessKind::Subprocess => {
                     let args = step_def.build_args(work_path);
                     eprintln!(
-                        "running postprocess step '{step_name}': {} {}",
+                        "running postprocess step '{}': {} {}",
+                        step.step_name,
                         step_def.program,
                         args.join(" ")
                     );
@@ -755,11 +736,12 @@ pub fn apply_postprocessing(
                     let status = std::process::Command::new(&step_def.program)
                         .args(&args)
                         .status()
-                        .map_err(|e| format!("failed to run {step_name}: {e}"))?;
+                        .map_err(|e| format!("failed to run {}: {e}", step.step_name))?;
 
                     if !status.success() {
                         return Err(format!(
-                            "{step_name} failed with exit code {:?}",
+                            "{} failed with exit code {:?}",
+                            step.step_name,
                             status.code()
                         ));
                     }
@@ -784,6 +766,10 @@ pub fn apply_postprocessing(
     if !any_rule_matched {
         // No matching rules, just commit the original
         results.push(work_path.to_owned());
+    }
+
+    if results.is_empty() {
+        return Err("postprocessing produced zero outputs, but at least one is required".into());
     }
 
     Ok(results)
@@ -844,6 +830,30 @@ pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
 /// Creates the incoming directory and prints a machine-readable TOML
 /// response with server-derived paths.
 pub fn begin_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> Result<String> {
+    // Run server checks before mutation
+    server_check(config)?;
+
+    // Check run does not already exist in any phase
+    let phases = [
+        RunPhase::Incoming,
+        RunPhase::Ready,
+        RunPhase::Processing,
+        RunPhase::Done,
+        RunPhase::Failed,
+    ];
+    for phase in &phases {
+        let phase_path = config.purgery_root.run_dir(nickname, run_id, *phase);
+        if phase_path.exists() {
+            anyhow::bail!(
+                "run {}/{} already exists in '{}' phase at '{}'",
+                nickname.as_str(),
+                run_id.as_str(),
+                phase.as_str(),
+                phase_path.as_str()
+            );
+        }
+    }
+
     let incoming_path = config
         .purgery_root
         .run_dir(nickname, run_id, RunPhase::Incoming);
@@ -870,12 +880,32 @@ pub fn begin_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> 
 
 /// Server-side subcommand: finish a run by moving from incoming to ready.
 pub fn finish_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> Result<()> {
+    // Run server checks before mutation
+    server_check(config)?;
+
     let incoming_path = config
         .purgery_root
         .run_dir(nickname, run_id, RunPhase::Incoming);
+    if !incoming_path.exists() {
+        anyhow::bail!(
+            "incoming directory does not exist for run {}/{} at '{}'",
+            nickname.as_str(),
+            run_id.as_str(),
+            incoming_path.as_str()
+        );
+    }
+
     let ready_path = config
         .purgery_root
         .run_dir(nickname, run_id, RunPhase::Ready);
+    if ready_path.exists() {
+        anyhow::bail!(
+            "ready directory already exists for run {}/{} at '{}'",
+            nickname.as_str(),
+            run_id.as_str(),
+            ready_path.as_str()
+        );
+    }
 
     if let Some(parent) = ready_path.parent() {
         fs::create_dir_all(parent)
@@ -906,9 +936,15 @@ pub fn read_run_status(
             .purgery_root
             .run_dir(nickname, run_id, *phase)
             .join("status.toml");
-        if let Ok(content) = fs::read_to_string(&status_path) {
-            if let Ok(status) = RunStatus::from_toml(&content) {
-                return Ok(status);
+        if !status_path.exists() {
+            continue;
+        }
+        let content = fs::read_to_string(&status_path)
+            .with_context(|| format!("failed to read status from '{}'", status_path.as_str()))?;
+        match RunStatus::from_toml(&content) {
+            Ok(status) => return Ok(status),
+            Err(e) => {
+                anyhow::bail!("malformed status file '{}': {e}", status_path.as_str());
             }
         }
     }
@@ -975,36 +1011,22 @@ pub fn server_check(config: &ServerConfig) -> Result<()> {
             anyhow::bail!("postprocess step '{}' has empty program", name);
         }
 
-        let program_path = Utf8Path::new(program);
-        if program_path.is_absolute() {
-            if !program_path.exists() {
-                anyhow::bail!(
-                    "postprocess step '{}' program '{}' not found (absolute path)",
-                    name,
-                    program
-                );
-            }
-            let meta = fs::symlink_metadata(program_path.as_std_path())
-                .with_context(|| format!("failed to read metadata for '{}'", program))?;
-            if !meta.file_type().is_symlink() && meta.permissions().mode() & 0o111 == 0 {
-                // Check executable bit (not applicable to symlinks)
-            }
-        } else {
-            // Relative name — check in PATH
-            let found = std::env::var("PATH")
-                .unwrap_or_default()
-                .split(':')
-                .map(|p| Utf8Path::new(p).join(program))
-                .any(|p| p.exists());
-            if !found {
-                anyhow::bail!(
-                    "postprocess step '{}' program '{}' not found in PATH",
-                    name,
-                    program
-                );
-            }
+        // Validate step produces at least one output
+        if !step.keep_original && step.expected_outputs.is_empty() {
+            anyhow::bail!(
+                "postprocess step '{}': keep_original=false with no expected_outputs would produce zero committed outputs",
+                name
+            );
         }
-        eprintln!("  postprocess step '{}': program '{}' found", name, program);
+
+        purgery_core::resolve_executable(program).map(|r| {
+            eprintln!(
+                "  postprocess step '{}': program '{}' found at {}",
+                name,
+                program,
+                r.path.as_str()
+            )
+        })?;
     }
 
     eprintln!("server configuration: OK");
@@ -1513,12 +1535,8 @@ to = "{}"
         let work_path = work_area.join("some file.mp4");
         fs::write(&work_path, b"test data").unwrap();
 
-        let results = apply_postprocessing(
-            &server_config,
-            &run_config,
-            "videos/some file.mp4",
-            &work_path,
-        );
+        let run_plan = RunPlan::build(&server_config, &run_config).unwrap();
+        let results = apply_postprocessing(&run_plan, "videos/some file.mp4", &work_path);
         assert!(results.is_ok(), "postprocess with spaces should succeed");
         let outputs = results.unwrap();
         // With keep_original=true and no expected outputs, should return [original, ...]
@@ -1663,8 +1681,8 @@ steps = ["compress-video"]
         let compressed = work_area.join("video.Z.webm");
         fs::write(&compressed, b"compressed").unwrap();
 
-        let result =
-            apply_postprocessing(&server_config, &run_config, "videos/video.mp4", &work_path);
+        let pp_run_plan = RunPlan::build(&server_config, &run_config).unwrap();
+        let result = apply_postprocessing(&pp_run_plan, "videos/video.mp4", &work_path);
         assert!(result.is_ok());
         let outputs = result.unwrap();
         assert!(outputs.contains(&work_path));
@@ -1714,8 +1732,8 @@ steps = ["compress-video"]
             },
         };
 
-        let result =
-            apply_postprocessing(&server_config, &run_config, "videos/video.mp4", &work_path);
+        let pp_run_plan = RunPlan::build(&server_config, &run_config).unwrap();
+        let result = apply_postprocessing(&pp_run_plan, "videos/video.mp4", &work_path);
         assert!(result.is_ok());
         let outputs = result.unwrap();
         assert!(
@@ -1772,8 +1790,8 @@ steps = ["compress-video"]
             },
         };
 
-        let result =
-            apply_postprocessing(&server_config, &run_config, "videos/video.mp4", &work_path);
+        let pp_run_plan = RunPlan::build(&server_config, &run_config).unwrap();
+        let result = apply_postprocessing(&pp_run_plan, "videos/video.mp4", &work_path);
         assert!(result.is_ok());
         let outputs = result.unwrap();
         assert!(
@@ -2536,8 +2554,9 @@ steps = ["compress-video"]
     #[test]
     fn test_begin_run_creates_directory() {
         let tmp = tempfile::tempdir().unwrap();
+        let root_path = tmp.path().join("storage");
         let server_config = ServerConfig {
-            root: ServerRoot::new("/data".into()).unwrap(),
+            root: ServerRoot::new(Utf8PathBuf::from_path_buf(root_path).unwrap()).unwrap(),
             purgery_root: PurgeryRoot::new(
                 Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
             )
@@ -2566,8 +2585,9 @@ steps = ["compress-video"]
     #[test]
     fn test_finish_run_moves_from_incoming_to_ready() {
         let tmp = tempfile::tempdir().unwrap();
+        let root_path = tmp.path().join("storage");
         let server_config = ServerConfig {
-            root: ServerRoot::new("/data".into()).unwrap(),
+            root: ServerRoot::new(Utf8PathBuf::from_path_buf(root_path).unwrap()).unwrap(),
             purgery_root: PurgeryRoot::new(
                 Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
             )
@@ -2631,8 +2651,9 @@ steps = ["compress-video"]
     #[test]
     fn test_read_run_status_not_found() {
         let tmp = tempfile::tempdir().unwrap();
+        let root_path = tmp.path().join("storage");
         let server_config = ServerConfig {
-            root: ServerRoot::new("/data".into()).unwrap(),
+            root: ServerRoot::new(Utf8PathBuf::from_path_buf(root_path).unwrap()).unwrap(),
             purgery_root: PurgeryRoot::new(
                 Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
             )

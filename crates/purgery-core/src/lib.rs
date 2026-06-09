@@ -59,6 +59,8 @@ pub enum PathValidationError {
 pub enum ConfigError {
     #[error("failed to parse config TOML: {0}")]
     TomlParse(#[from] toml::de::Error),
+    #[error("failed to serialize config: {0}")]
+    TomlSerialize(String),
     #[error("invalid nickname: {0}")]
     Nickname(#[from] NicknameError),
     #[error("invalid sync name: {0}")]
@@ -69,8 +71,6 @@ pub enum ConfigError {
     Path(#[from] PathValidationError),
     #[error("invalid run ID: {0}")]
     RunId(#[from] RunIdError),
-    #[error("missing field: {0}")]
-    MissingField(&'static str),
 }
 
 #[derive(Error, Debug)]
@@ -123,6 +123,87 @@ pub enum IdentityVerificationError {
     Sha256Mismatch,
     #[error("mtime unavailable")]
     MtimeUnavailable,
+}
+
+#[derive(Error, Debug)]
+pub enum ExecutableError {
+    #[error("empty program name")]
+    EmptyProgram,
+    #[error("program '{0}' not found")]
+    NotFound(String),
+    #[error("program '{0}' is not executable")]
+    NotExecutable(String),
+    #[error("program '{0}' absolute path not found")]
+    AbsoluteNotFound(String),
+    #[error("I/O error checking program '{0}': {1}")]
+    Io(String, #[source] io::Error),
+}
+
+/// Result of resolving an executable.
+pub struct ResolvedExecutable {
+    pub path: Utf8PathBuf,
+}
+
+/// Resolve an executable program path.
+///
+/// Absolute paths must exist and be executable.
+/// Relative names are searched in PATH.
+pub fn resolve_executable(program: &str) -> Result<ResolvedExecutable, ExecutableError> {
+    if program.is_empty() {
+        return Err(ExecutableError::EmptyProgram);
+    }
+
+    let program_path = Utf8Path::new(program);
+
+    if program_path.is_absolute() {
+        if !program_path.exists() {
+            return Err(ExecutableError::AbsoluteNotFound(program.to_owned()));
+        }
+        let meta = std::fs::symlink_metadata(program_path.as_std_path())
+            .map_err(|e| ExecutableError::Io(program.to_owned(), e))?;
+        let is_executable = meta.file_type().is_symlink() || {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                meta.permissions().mode() & 0o111 != 0
+            }
+            #[cfg(not(unix))]
+            {
+                true
+            }
+        };
+        if !is_executable {
+            return Err(ExecutableError::NotExecutable(program.to_owned()));
+        }
+        Ok(ResolvedExecutable {
+            path: program_path.to_owned(),
+        })
+    } else {
+        let path_var = std::env::var("PATH").unwrap_or_default();
+        for dir in path_var.split(':') {
+            let candidate = Utf8Path::new(dir).join(program);
+            if !candidate.exists() {
+                continue;
+            }
+            let meta = std::fs::symlink_metadata(candidate.as_std_path())
+                .map_err(|e| ExecutableError::Io(program.to_owned(), e))?;
+            let is_executable = meta.file_type().is_symlink() || {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    meta.permissions().mode() & 0o111 != 0
+                }
+                #[cfg(not(unix))]
+                {
+                    true
+                }
+            };
+            if is_executable {
+                return Ok(ResolvedExecutable { path: candidate });
+            }
+        }
+        Err(ExecutableError::NotFound(program.to_owned()))
+    }
 }
 
 // ── Run Phase ────────────────────────────────────────────────────────
@@ -863,17 +944,19 @@ pub struct PostprocessStepDefinition {
 }
 
 impl PostprocessStepDefinition {
-    /// Resolve `{input}`, `{parent}`, `{file_name}`, `{stem}` placeholders
+    /// Resolve `{input}`, `{parent}`, `{file_name}`, `{file_stem}`, `{stem}` placeholders
     /// in a string using the given work path.
+    /// `{stem}` is kept as a deprecated alias for `{file_stem}`.
     pub fn resolve_placeholders(&self, work_path: &Utf8Path, s: &str) -> String {
         let input = work_path.as_str();
         let parent = work_path.parent().map(|p| p.as_str()).unwrap_or("");
         let file_name = work_path.file_name().unwrap_or("");
-        let stem = work_path.file_stem().unwrap_or("");
+        let file_stem = work_path.file_stem().unwrap_or("");
         s.replace("{input}", input)
             .replace("{parent}", parent)
             .replace("{file_name}", file_name)
-            .replace("{stem}", stem)
+            .replace("{file_stem}", file_stem)
+            .replace("{stem}", file_stem)
     }
 
     /// Build the command arguments for this step given the work path.
@@ -1168,8 +1251,7 @@ impl RunConfig {
     }
 
     pub fn to_toml(&self) -> Result<String, ConfigError> {
-        toml::to_string(self)
-            .map_err(|e| ConfigError::MissingField(Box::leak(e.to_string().into_boxed_str())))
+        toml::to_string(self).map_err(|e| ConfigError::TomlSerialize(e.to_string()))
     }
 
     /// Build a lookup map from sync name to sync.

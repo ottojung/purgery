@@ -10,5 +10,5 @@ max_parallel_jobs = 1
 kind = "subprocess"
 program = "my-compress-video"
 args = ["--input", "{input}"]
-expected_outputs = ["{stem}.Z.webm"]
+expected_outputs = ["{file_stem}.Z.webm"]
 keep_original = true

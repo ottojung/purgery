@@ -6,16 +6,17 @@ Clients upload files to a server. The server validates runs, applies optional po
 
 ## Lifecycle
 
-1. Client runs `purgery-server begin-run` over SSH to get server-derived staging paths.
-2. Client builds manifest and writes `run.toml` + `manifest.toml` to the server's incoming directory.
-3. Client rsyncs files into the server's files directory, namespaced by sync mapping destination.
-4. Client runs `purgery-server finish-run` to atomically move `incoming/` → `ready/`.
-5. Server claims the run (atomic rename `ready/` → `processing/`).
-6. Server validates the run's plan (regexes, step references), manifest, and envelope.
-7. For each file, the server validates staged path identity (size/SHA-256), rejects symlinks, copies to a work area namespaced by sync mapping destination, applies postprocessing via subprocess, then commits each output via a same-directory temp file followed by atomic `rename`. Failed files produce per-file status entries; remaining files continue processing.
-8. Server writes `status.toml` atomically.
-9. Client polls `purgery-server status` until the run completes.
-10. Client verifies `status.nickname == manifest.nickname` and `status.run_id == manifest.run_id`, then deletes only unchanged, confirmed-imported local files.
+1. Client runs local checks (ssh, rsync, server reachability), then calls `purgery-server begin-run` over SSH.
+2. Client validates the `begin-run` response envelope (protocol_version, nickname, run_id, all paths absolute).
+3. Client builds manifest and writes `run.toml` + `manifest.toml` to the server's incoming directory.
+4. Client rsyncs files into the server's files directory, namespaced by sync mapping destination.
+5. Client runs `purgery-server finish-run` to atomically move `incoming/` → `ready/`.
+6. Server runs server checks, then claims the run (atomic rename `ready/` → `processing/`).
+7. Server builds a `RunPlan`: compiles all regexes once, resolves step references. If invalid, the run is rejected before any file import.
+8. For each file, the server validates staged path identity (size/SHA-256), rejects symlinks, copies to a work area namespaced by sync mapping destination, applies postprocessing via subprocess using the precompiled plan, then commits each output via a same-directory temp file followed by atomic `rename`. Failed files produce per-file status entries; remaining files continue processing.
+9. Server writes `status.toml` atomically.
+10. Client polls `purgery-server status` until the run completes.
+11. Client verifies `status.nickname == manifest.nickname` and `status.run_id == manifest.run_id`, then deletes only unchanged, confirmed-imported local files.
 
 ## Import / Commit Semantics
 
@@ -81,7 +82,15 @@ Cleanup policy:
 | `partial` | kept            |
 | `failed`  | kept            |
 
-### Run states
+### Run plan validation
+
+Before processing any files, the server builds a `RunPlan` that compiles all postprocess regexes once and resolves every referenced step against the server config. If any regex is invalid or any step is missing on the server, the run is rejected with a run-level `Failed` status before any file is imported. File processing uses the precompiled plan and never recompiles regexes.
+
+### Malformed status handling
+
+`purgery-server status` returns the status file if it exists and parses correctly. If a `status.toml` exists but is malformed (e.g., invalid TOML or missing required fields), the command returns a parse error rather than silently skipping it.
+
+## Run states
 
 | Run state | Meaning |
 |-----------|---------|
@@ -135,7 +144,7 @@ Server-side postprocess step kind is `"subprocess"`. Steps are defined with:
 kind = "subprocess"
 program = "my-compress-video"
 args = ["--input", "{input}"]
-expected_outputs = ["{stem}.Z.webm"]
+expected_outputs = ["{file_stem}.Z.webm"]
 keep_original = true
 ```
 
@@ -145,8 +154,11 @@ Supported placeholders in `args` and `expected_outputs`:
 |-------------|-------------|
 | `{input}` | Absolute work-area input path |
 | `{parent}` | Work-area parent directory |
-| `{file_name}` | Input file name |
-| `{stem}` | Input path without extension |
+| `{file_name}` | Input file name with extension |
+| `{file_stem}` | Input file name without extension |
+| `{stem}` | Deprecated alias for `{file_stem}` |
+
+A subprocess step must produce at least one committed output. If `keep_original = false`, then `expected_outputs` must be non-empty. This is validated at server boot time.
 
 The client references steps by name only:
 
@@ -165,11 +177,34 @@ purgery-client check --config client.toml
 purgery-server check --config server.toml
 ```
 
-Client checks: `ssh` and `rsync` executables are accessible, server is reachable.
+Client checks: `ssh` and `rsync` executables are resolved (via `resolve_executable`), server is reachable via `purgery-server check`.
 
-Server checks: `root` and `purgery_root` are accessible, all postprocess programs exist and are executable, config is internally valid.
+Server checks: `root` and `purgery_root` are accessible, all postprocess programs are resolved (absolute paths must exist and be executable; relative names found in PATH and must be executable), config is internally valid.
 
-Normal operations (`process-once`, `sync-and-cleanup`) run the same checks before mutating state.
+Normal operations run the same checks before mutating state:
+
+- `purgery-client sync-and-cleanup` calls `client_check` before `begin-run`.
+- `purgery-server process-once` calls `server_check` before scanning ready runs.
+- `purgery-server begin-run` and `purgery-server finish-run` call `server_check` before mutating state.
+
+### `begin-run` single-use safety
+
+`begin-run` fails if the run ID already exists in any phase (incoming, ready, processing, done, failed). A run ID is single-use per nickname.
+
+`finish-run` fails if the incoming directory does not exist or the ready directory already exists.
+
+### `server.command` trust model
+
+The client's `[server].command` value is a trusted shell command prefix executed on the remote host via SSH. Purgery appends shell-escaped arguments. This is not intended to accept untrusted input.
+
+## Executable resolution
+
+Executable resolution (`purgery_core::resolve_executable`) follows these rules:
+
+- **Absolute path**: must exist, must be executable (file type is symlink or Unix executable bit is set).
+- **Relative name**: searched in `PATH`; first executable candidate wins.
+
+This is used for client `ssh`, `rsync`, and server postprocess `program` values.
 
 ## Status envelope verification
 
@@ -221,7 +256,7 @@ max_parallel_jobs = 1
 kind = "subprocess"
 program = "my-compress-video"
 args = ["--input", "{input}"]
-expected_outputs = ["{stem}.Z.webm"]
+expected_outputs = ["{file_stem}.Z.webm"]
 keep_original = true
 ```
 

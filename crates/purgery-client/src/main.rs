@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
+use camino::Utf8Path;
 use clap::{Parser, Subcommand};
 use purgery_core::{
-    build_rsync_args, shell_escape, BeginRunResponse, ClientConfig, ClientLocalPath, Manifest,
-    ManifestFileEntry, NormalizedRelativePath, RunConfig, RunConfigSync, RunId, RunStatus,
+    build_rsync_args, resolve_executable, shell_escape, BeginRunResponse, ClientConfig,
+    ClientLocalPath, Manifest, ManifestFileEntry, NormalizedRelativePath, RunConfig, RunConfigSync,
+    RunId, RunStatus,
 };
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -140,24 +142,14 @@ fn client_check(config_path: &str) -> Result<()> {
     eprintln!("checking client configuration...");
 
     // 1. Check ssh is accessible
-    let ssh_check = std::process::Command::new("ssh").arg("-V").output();
-    match ssh_check {
-        Ok(output) if output.status.success() => {
-            eprintln!("  ssh: found");
-        }
-        _ => anyhow::bail!("ssh executable not found or not accessible"),
-    }
+    resolve_executable("ssh").map(|r| {
+        eprintln!("  ssh: found at {}", r.path.as_str());
+    })?;
 
     // 2. Check rsync is accessible
-    let rsync_check = std::process::Command::new("rsync")
-        .arg("--version")
-        .output();
-    match rsync_check {
-        Ok(output) if output.status.success() => {
-            eprintln!("  rsync: found");
-        }
-        _ => anyhow::bail!("rsync executable not found or not accessible"),
-    }
+    resolve_executable("rsync").map(|r| {
+        eprintln!("  rsync: found at {}", r.path.as_str());
+    })?;
 
     // 3. Check server connectivity
     let config_content = fs::read_to_string(config_path)
@@ -189,6 +181,9 @@ fn client_check(config_path: &str) -> Result<()> {
 }
 
 fn sync_and_cleanup(config_path: &str) -> Result<()> {
+    // 0. Run checks before any mutation
+    client_check(config_path)?;
+
     let config_content = fs::read_to_string(config_path)
         .with_context(|| format!("failed to read client config: {config_path}"))?;
     let config = ClientConfig::from_toml(&config_content)
@@ -219,6 +214,56 @@ fn sync_and_cleanup(config_path: &str) -> Result<()> {
     )?;
     let begin_resp: BeginRunResponse =
         toml::from_str(&begin_out).with_context(|| "failed to parse begin-run response")?;
+
+    // Validate begin-run response envelope
+    if begin_resp.protocol_version != 1 {
+        anyhow::bail!(
+            "unsupported begin-run protocol version: {}",
+            begin_resp.protocol_version
+        );
+    }
+    if begin_resp.nickname != config.nickname.as_str() {
+        anyhow::bail!(
+            "begin-run response nickname '{}' does not match config nickname '{}'",
+            begin_resp.nickname,
+            config.nickname.as_str()
+        );
+    }
+    if begin_resp.run_id != run_id.as_str() {
+        anyhow::bail!(
+            "begin-run response run_id '{}' does not match generated run_id '{}'",
+            begin_resp.run_id,
+            run_id.as_str()
+        );
+    }
+    let incoming_path = Utf8Path::new(&begin_resp.incoming_dir);
+    if !incoming_path.is_absolute() {
+        anyhow::bail!(
+            "begin-run response incoming_dir is not absolute: {}",
+            begin_resp.incoming_dir
+        );
+    }
+    let files_path = Utf8Path::new(&begin_resp.files_dir);
+    if !files_path.is_absolute() {
+        anyhow::bail!(
+            "begin-run response files_dir is not absolute: {}",
+            begin_resp.files_dir
+        );
+    }
+    let run_config_path = Utf8Path::new(&begin_resp.run_config_path);
+    if !run_config_path.is_absolute() {
+        anyhow::bail!(
+            "begin-run response run_config_path is not absolute: {}",
+            begin_resp.run_config_path
+        );
+    }
+    let manifest_path = Utf8Path::new(&begin_resp.manifest_path);
+    if !manifest_path.is_absolute() {
+        anyhow::bail!(
+            "begin-run response manifest_path is not absolute: {}",
+            begin_resp.manifest_path
+        );
+    }
 
     eprintln!("  incoming dir: {}", begin_resp.incoming_dir);
 

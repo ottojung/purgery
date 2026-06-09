@@ -8,6 +8,7 @@ license.workspace = true
 clap = { version = "4", features = ["derive"] }
 purgery-core = { path = "../purgery-core" }
 anyhow = "1"
+camino = { version = "1", features = ["serde1"] }
 walkdir = "2"
 sha2 = "0.10"
 toml = "1.1"
