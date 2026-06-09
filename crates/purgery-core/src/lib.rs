@@ -1566,7 +1566,8 @@ pub enum ManifestEntryMode {
 
 /// Durable cleanup state for passthrough regular files with `delete_after_import = true`.
 ///
-/// Written atomically to a local file after successful rsync.
+/// Written atomically before rsync with `rsync_succeeded = false`.
+/// After rsync completes successfully, `rsync_succeeded` is durably set to `true`.
 /// On restart, the client reads this state to resume safe cleanup.
 /// The state records the operation identity and per-file identity so that
 /// changed files are not deleted and already-deleted files are idempotent.

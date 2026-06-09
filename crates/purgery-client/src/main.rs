@@ -2,9 +2,9 @@ use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Parser, Subcommand};
 use purgery_core::{
-    build_rsync_args, resolve_executable, shell_escape, BeginRunResponse, ClientConfig,
-    ClientLocalPath, Manifest, ManifestEntry, ManifestEntryKind, NormalizedRelativePath, RunConfig,
-    RunConfigSync, RunId, RunStatus, SyncExecutionClass,
+    build_rsync_args, resolve_executable, shell_escape, BeginRunResponse, ClientConfig, Manifest,
+    ManifestEntry, ManifestEntryKind, RunConfig, RunConfigSync, RunId, RunStatus,
+    SyncExecutionClass,
 };
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -393,8 +393,6 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
             config,
             host,
             server_command,
-            &manifest,
-            &transfer_plan,
             &passthrough_nodelete,
             &passthrough_cleanup,
         )
@@ -404,15 +402,13 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
 /// Run a pure passthrough invocation (no postprocess entries in any sync group).
 ///
 /// Every passthrough group uses direct unfiltered rsync.
-/// PassthroughDeleteAfterImport groups additionally get a cleanup scan.
-/// There is no per-entry filtered transfer loop — pure passthrough
-/// does not use transfer_plan or transfer filters.
+/// PassthroughDeleteAfterImport groups additionally use the cleanup ledger
+/// protocol: pre-rsync identity, cleanup state, rsync, success marker,
+/// cleanup deletion.
 fn run_passthrough_path(
     config: &ClientConfig,
     host: &str,
     server_command: &str,
-    _manifest: &Manifest,
-    _transfer_plan: &[purgery_core::TransferPlanEntry],
     passthrough_nodelete: &[&purgery_core::SyncMapping],
     passthrough_cleanup: &[&purgery_core::SyncMapping],
 ) -> Result<()> {
@@ -1261,146 +1257,20 @@ fn walk_and_classify_sync(
     Ok((entries, has_postprocess))
 }
 
-/// Walk all sync directories and build the manifest.
-/// Used in tests; kept for backward compat but production code uses
-/// walk_and_classify_sync per sync group.
-#[allow(dead_code)]
+/// Walk all sync directories and build the manifest using the current
+/// per-sync walk-and-classify model. Test-only; production code uses
+/// classify_sync_groups + walk_and_classify_sync per purgatory group.
+#[cfg(test)]
 fn build_manifest(config: &ClientConfig, run_id: &RunId) -> Result<Manifest> {
     let mut entries = Vec::new();
-    let nickname = config.nickname.clone();
-
     for sync in &config.sync {
-        let from_path = sync.from_path.as_str();
-        let to_path = sync.to_path.as_str();
-        let from = Path::new(from_path);
-
-        if !from.exists() {
-            warn!(path = from_path, "sync path does not exist, skipping");
-            continue;
-        }
-
-        for entry in WalkDir::new(from).follow_links(false).min_depth(1) {
-            let entry = entry.with_context(|| format!("error walking {from_path}"))?;
-            let path = entry.path();
-            let relative = path.strip_prefix(from).with_context(|| {
-                format!("failed to compute relative path for: {}", path.display())
-            })?;
-            let relative_path = camino::Utf8PathBuf::from_path_buf(relative.to_path_buf())
-                .map_err(|path| {
-                    anyhow::anyhow!("non-UTF-8 relative path is unsupported: {}", path.display())
-                })?;
-            let staged_path = camino::Utf8Path::new("files")
-                .join(to_path)
-                .join(&relative_path);
-            let metadata = fs::symlink_metadata(path)
-                .with_context(|| format!("failed to read metadata: {}", path.display()))?;
-            let file_type = metadata.file_type();
-
-            // Classify entry as passthrough or postprocessed before computing identity.
-            let normalized_path = relative_path.as_str().to_owned();
-            let matched_rule = config
-                .postprocess
-                .rules
-                .iter()
-                .find(|r| purgery_core::rsync_pattern_match(&r.pattern, &normalized_path));
-            let mode = if matched_rule.is_some() {
-                purgery_core::ManifestEntryMode::Postprocess
-            } else {
-                purgery_core::ManifestEntryMode::Passthrough
-            };
-            let postprocess_steps: Vec<String> =
-                matched_rule.map(|r| r.steps.clone()).unwrap_or_default();
-
-            // Identity bookkeeping is needed for postprocess entries (server verification)
-            // and for passthrough entries with delete_after_import=true (local cleanup).
-            let needs_bookkeeping = matched_rule.is_some() || sync.delete_after_import;
-
-            let (kind, size, mtime_ns, sha256, link_target) = if file_type.is_dir() {
-                (purgery_core::ManifestEntryKind::Directory, 0, 0, None, None)
-            } else if file_type.is_file() {
-                let (mtime_ns, sha256) = if needs_bookkeeping {
-                    let mtime_ns = metadata
-                        .modified()
-                        .ok()
-                        .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
-                        .map(|duration| duration.as_nanos() as i64)
-                        .unwrap_or(0);
-                    (mtime_ns, compute_sha256(path).ok())
-                } else {
-                    (0, None)
-                };
-                (
-                    purgery_core::ManifestEntryKind::RegularFile,
-                    metadata.len(),
-                    mtime_ns,
-                    sha256,
-                    None,
-                )
-            } else if file_type.is_symlink() {
-                let target = fs::read_link(path)
-                    .with_context(|| format!("failed to read symlink: {}", path.display()))?;
-                let target = camino::Utf8PathBuf::from_path_buf(target).map_err(|path| {
-                    anyhow::anyhow!(
-                        "non-UTF-8 symlink target is unsupported: {}",
-                        path.display()
-                    )
-                })?;
-                (
-                    purgery_core::ManifestEntryKind::Symlink,
-                    0,
-                    0,
-                    None,
-                    Some(target),
-                )
-            } else {
-                anyhow::bail!("unsupported filesystem object: {}", path.display());
-            };
-
-            entries.push(ManifestEntry {
-                sync_name: sync.name.clone(),
-                local_path: ClientLocalPath::new(path.to_string_lossy().to_string())
-                    .with_context(|| format!("invalid local path for: {}", path.display()))?,
-                staged_path: NormalizedRelativePath::new(staged_path)
-                    .with_context(|| format!("invalid staged path for: {}", path.display()))?,
-                relative_path: NormalizedRelativePath::new(relative_path)
-                    .with_context(|| format!("invalid relative path for: {}", path.display()))?,
-                kind,
-                size,
-                mtime_ns,
-                sha256,
-                link_target,
-                mode,
-                postprocess_steps,
-                covered_by: None,
-            });
-        }
+        let sync_name = sync.name.as_str();
+        let applicable = purgery_core::applicable_rules(&config.postprocess.rules, sync_name);
+        let (sync_entries, _) = walk_and_classify_sync(config, sync, run_id, &applicable)?;
+        entries.extend(sync_entries);
     }
 
-    // Second pass: identify covered entries under postprocessed directories.
-    let covering_dirs: Vec<String> = entries
-        .iter()
-        .filter(|e| {
-            e.kind == purgery_core::ManifestEntryKind::Directory
-                && e.mode == purgery_core::ManifestEntryMode::Postprocess
-        })
-        .map(|e| e.relative_path.as_str().to_owned())
-        .collect();
-    for entry in entries.iter_mut() {
-        let rp = entry.relative_path.as_str();
-        for dir_path in &covering_dirs {
-            if rp == dir_path.as_str() {
-                continue;
-            }
-            if rp.starts_with(dir_path.as_str()) && rp.as_bytes().get(dir_path.len()) == Some(&b'/')
-            {
-                entry.mode = purgery_core::ManifestEntryMode::Covered;
-                entry.covered_by = Some(dir_path.clone());
-                entry.postprocess_steps = Vec::new();
-                break;
-            }
-        }
-    }
-
+    // Sort: directories first, then by depth, then by name
     entries.sort_by(|left, right| {
         let left_depth = left.relative_path.as_path().components().count();
         let right_depth = right.relative_path.as_path().components().count();
@@ -1426,7 +1296,7 @@ fn build_manifest(config: &ClientConfig, run_id: &RunId) -> Result<Manifest> {
 
     Ok(Manifest {
         run_id: run_id.clone(),
-        nickname,
+        nickname: config.nickname.clone(),
         entries,
     })
 }
