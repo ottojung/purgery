@@ -3142,4 +3142,67 @@ steps = ["compress-video"]
         let err = result.unwrap_err().to_string();
         assert!(err.contains("nickname"), "error: {err}");
     }
+
+    /// begin-run output must be parseable as BeginRunResponse TOML.
+    /// This is a stdout-clean invariant: protocol output must never be
+    /// contaminated by log output, and the returned string must always
+    /// be valid TOML regardless of logging configuration.
+    #[test]
+    fn test_begin_run_stdout_is_parseable_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_path = tmp.path().join("storage");
+        let server_config = ServerConfig {
+            root: ServerRoot::new(Utf8PathBuf::from_path_buf(root_path).unwrap()).unwrap(),
+            purgery_root: PurgeryRoot::new(
+                Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
+            )
+            .unwrap(),
+            state_dir: None,
+            gc: Default::default(),
+            log_dir: None,
+            postprocess: PostprocessConfig::default(),
+            logging: Default::default(),
+        };
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("test-stdout-begin".into()).unwrap();
+
+        let response_str = begin_run(&server_config, &nickname, &run_id).unwrap();
+        // Must parse as BeginRunResponse — if logging contaminated stdout,
+        // this parse would fail.
+        let response: purgery_core::BeginRunResponse = toml::from_str(&response_str)
+            .expect("begin-run stdout must be valid BeginRunResponse TOML");
+        assert_eq!(response.protocol_version, 1);
+        assert_eq!(response.nickname, "laptop");
+        assert_eq!(response.run_id, "test-stdout-begin");
+    }
+
+    /// status output must be parseable as RunStatus TOML.
+    #[test]
+    fn test_status_stdout_is_parseable_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("test-stdout-status".into()).unwrap();
+
+        let (config, _) = setup_single_file_ready(
+            &purgery_root,
+            &server_root,
+            &nickname,
+            &run_id,
+            "videos",
+            "videos",
+            "files/videos/test.mp4",
+            b"hello",
+        );
+
+        process_run(&config, &nickname, &run_id).unwrap();
+
+        let status = read_run_status(&config, &nickname, &run_id).unwrap();
+        let status_str = status.to_toml().unwrap();
+        // Must parse back as RunStatus
+        let parsed: purgery_core::RunStatus = purgery_core::RunStatus::from_toml(&status_str)
+            .expect("status stdout must be valid RunStatus TOML");
+        assert_eq!(parsed.state, purgery_core::RunState::Done);
+    }
 }

@@ -27,7 +27,7 @@ Both binaries support global flags that override config file and environment:
 | `--quiet` | Set level to `error` (conflicts with `--verbose`) |
 | `--verbose` | Set level to `debug` (conflicts with `--quiet`) |
 
-Precedence: CLI flags > config file > `RUST_LOG` environment variable > default.
+Precedence: CLI flags > config file > default. The `RUST_LOG` environment variable is not consulted; logging is controlled entirely through the config file and CLI flags.
 
 ## Setup
 

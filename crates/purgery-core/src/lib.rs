@@ -1019,7 +1019,9 @@ impl FromStr for ColorMode {
 /// Uses the configured level directly — `RUST_LOG` environment variable is not
 /// consulted. The caller is responsible for resolving precedence
 /// (CLI > config > default) before calling this function.
-pub fn init_logging(config: &LoggingConfig) -> Result<(), Box<dyn std::error::Error>> {
+pub fn init_logging(
+    config: &LoggingConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let level_filter: tracing_subscriber::filter::LevelFilter = match config.level {
         LogLevel::Error => tracing_subscriber::filter::LevelFilter::ERROR,
         LogLevel::Warn => tracing_subscriber::filter::LevelFilter::WARN,
@@ -1042,7 +1044,7 @@ pub fn init_logging(config: &LoggingConfig) -> Result<(), Box<dyn std::error::Er
                 .json()
                 .with_writer(std::io::stderr)
                 .with_ansi(false)
-                .init();
+                .try_init()?;
         }
         LogFormat::Compact => {
             tracing_subscriber::fmt()
@@ -1050,7 +1052,7 @@ pub fn init_logging(config: &LoggingConfig) -> Result<(), Box<dyn std::error::Er
                 .compact()
                 .with_writer(std::io::stderr)
                 .with_ansi(use_color)
-                .init();
+                .try_init()?;
         }
         LogFormat::Pretty => {
             tracing_subscriber::fmt()
@@ -1058,7 +1060,7 @@ pub fn init_logging(config: &LoggingConfig) -> Result<(), Box<dyn std::error::Er
                 .pretty()
                 .with_writer(std::io::stderr)
                 .with_ansi(use_color)
-                .init();
+                .try_init()?;
         }
     }
     Ok(())

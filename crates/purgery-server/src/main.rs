@@ -53,8 +53,8 @@ struct Cli {
     /// Color mode override (auto, always, never)
     #[arg(long, global = true)]
     color: Option<String>,
-    /// Suppress all logs except errors
-    #[arg(long, global = true, conflicts_with = "verbose")]
+    /// Suppress all logs except errors (conflicts with --verbose and --log-level)
+    #[arg(long, global = true, conflicts_with_all = &["verbose", "log-level"])]
     quiet: bool,
     /// Enable verbose (debug) logging
     #[arg(long, global = true, conflicts_with = "quiet")]
