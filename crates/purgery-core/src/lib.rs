@@ -3563,6 +3563,82 @@ color = "never"
     // ── TransferPlanEntry tests ──
 
     #[test]
+    // ── PostprocessRule `for` field tests ──
+    // These tests assert the correct behavior once the for field is added.
+
+    #[ignore = "expected to fail until per-sync postprocess scoping is implemented"]
+    #[test]
+    fn config_with_postprocess_rule_for_is_accepted() {
+        // Currently `for` is an unknown field and rejected by deny_unknown_fields.
+        // After implementation, for = ["videos"] must be accepted.
+        let toml = r#"
+nickname = "laptop"
+
+[server]
+host = "example.com"
+
+[[sync]]
+name = "videos"
+from = "/home/user/Videos"
+to = "videos"
+
+[[postprocess.rules]]
+match = "*.mp4"
+steps = ["compress-video"]
+for = ["videos"]
+"#;
+        let config = ClientConfig::from_toml(toml).unwrap();
+        let rule = &config.postprocess.rules[0];
+        // After implementation, the rule must parse with for capturing "videos"
+        assert_eq!(rule.pattern, "*.mp4");
+    }
+
+    #[ignore = "expected to fail until per-sync postprocess scoping is implemented"]
+    #[test]
+    fn config_with_postprocess_rule_empty_for_is_rejected() {
+        let toml = r#"
+nickname = "laptop"
+
+[server]
+host = "example.com"
+
+[[sync]]
+name = "videos"
+from = "/home/user/Videos"
+to = "videos"
+
+[[postprocess.rules]]
+match = "*.mp4"
+steps = ["compress-video"]
+for = []
+"#;
+        let result = ClientConfig::from_toml(toml);
+        assert!(result.is_err(), "empty for must be rejected");
+    }
+
+    #[ignore = "expected to fail until per-sync postprocess scoping is implemented"]
+    #[test]
+    fn config_with_postprocess_rule_unknown_sync_in_for_is_rejected() {
+        let toml = r#"
+nickname = "laptop"
+
+[server]
+host = "example.com"
+
+[[sync]]
+name = "videos"
+from = "/home/user/Videos"
+to = "videos"
+
+[[postprocess.rules]]
+match = "*.mp4"
+steps = ["compress-video"]
+for = ["missing-sync"]
+"#;
+        let result = ClientConfig::from_toml(toml);
+        assert!(result.is_err(), "unknown sync in for must be rejected");
+    }
+
     fn transfer_plan_entry_has_no_size_field() {
         let entry = TransferPlanEntry {
             sync_name: SyncName::new("data".into()).unwrap(),
