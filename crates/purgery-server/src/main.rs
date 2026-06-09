@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use purgery_core::{ColorMode, LogFormat, LogLevel, Nickname, RunId, ServerConfig};
 use purgery_server::{
-    begin_run, bootstrap, finish_run, heartbeat_run, process_once_raw, read_run_status, run_gc,
-    server_check,
+    begin_run, bootstrap, finish_run, heartbeat_run, prepare_run, process_once_raw,
+    read_run_status, run_gc, server_check,
 };
 use std::fs;
 
@@ -95,6 +95,13 @@ enum Command {
     Bootstrap,
     /// Run garbage collection on expired incoming runs
     Gc,
+    /// Validate run plan and return transfer destinations (passthrough + purgatory roots)
+    PrepareRun {
+        #[arg(long)]
+        nickname: String,
+        #[arg(long)]
+        run_id: String,
+    },
     /// Send heartbeat for an incoming run
     HeartbeatRun {
         #[arg(long)]
@@ -178,6 +185,12 @@ fn main() -> Result<()> {
         }
         Command::Gc => {
             run_gc(&server_config)?;
+        }
+        Command::PrepareRun { nickname, run_id } => {
+            let nickname = Nickname::new(nickname).with_context(|| "invalid nickname")?;
+            let run_id = RunId::new(run_id).with_context(|| "invalid run ID")?;
+            let response = prepare_run(&server_config, &nickname, &run_id)?;
+            print!("{response}");
         }
         Command::HeartbeatRun { nickname, run_id } => {
             let nickname = Nickname::new(nickname).with_context(|| "invalid nickname")?;

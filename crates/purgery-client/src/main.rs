@@ -478,7 +478,7 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
                     .filter(|e| {
                         e.sync_name.as_str() == sync_name
                             && e.kind == ManifestEntryKind::RegularFile
-                            && e.postprocess_steps.is_none()
+                            && e.mode == purgery_core::ManifestEntryMode::Passthrough
                     })
                     .collect();
                 let mut early_count = 0usize;
@@ -653,13 +653,18 @@ fn build_manifest(config: &ClientConfig, run_id: &RunId) -> Result<Manifest> {
 
             // Classify entry as passthrough or postprocessed
             let normalized_path = format!("{}/{}", to_path, relative_path.as_str());
-            let postprocess_steps: Option<Vec<String>> = config
+            let matched_rule = config
                 .postprocess
                 .rules
                 .iter()
-                .find(|r| purgery_core::rsync_pattern_match(&r.pattern, &normalized_path))
-                .map(|r| r.steps.clone())
-                .filter(|steps| !steps.is_empty());
+                .find(|r| purgery_core::rsync_pattern_match(&r.pattern, &normalized_path));
+            let mode = if matched_rule.is_some() {
+                purgery_core::ManifestEntryMode::Postprocess
+            } else {
+                purgery_core::ManifestEntryMode::Passthrough
+            };
+            let postprocess_steps: Vec<String> =
+                matched_rule.map(|r| r.steps.clone()).unwrap_or_default();
 
             entries.push(ManifestEntry {
                 sync_name: sync.name.clone(),
@@ -674,7 +679,9 @@ fn build_manifest(config: &ClientConfig, run_id: &RunId) -> Result<Manifest> {
                 mtime_ns,
                 sha256,
                 link_target,
+                mode,
                 postprocess_steps,
+                covered_by: None,
             });
         }
     }

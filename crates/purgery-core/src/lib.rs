@@ -756,9 +756,15 @@ pub struct ManifestEntry {
     pub sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link_target: Option<Utf8PathBuf>,
-    /// Postprocess step names if this entry is postprocessed; `None` if passthrough.
+    /// Import mode: passthrough, postprocess (with steps), or covered.
+    #[serde(default)]
+    pub mode: ManifestEntryMode,
+    /// Postprocess step names for postprocess entries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub postprocess_steps: Vec<String>,
+    /// Normalized path of the postprocessed ancestor that covers this entry.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub postprocess_steps: Option<Vec<String>>,
+    pub covered_by: Option<String>,
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -1422,6 +1428,16 @@ pub struct RunConfigSync {
     pub to_path: RelativeDestinationPath,
 }
 
+/// Mode of a manifest entry in the import pipeline.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ManifestEntryMode {
+    #[default]
+    Passthrough,
+    Postprocess,
+    Covered,
+}
+
 /// Response from `purgery-server begin-run`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BeginRunResponse {
@@ -1433,6 +1449,23 @@ pub struct BeginRunResponse {
     pub run_config_path: String,
     pub manifest_path: String,
     pub heartbeat_interval_secs: u64,
+}
+
+/// Response from `purgery-server prepare-run`.
+/// Returned after the server validates the run config and manifest.
+/// Contains the destinations the client needs for the passthrough and
+/// purgatory rsync transfers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrepareRunResponse {
+    pub protocol_version: u32,
+    pub nickname: String,
+    pub run_id: String,
+    /// Base destination path on the server for passthrough entries
+    /// (typically `<root>/<nickname>`).
+    pub final_root: String,
+    /// Base purgatory/staging destination path for postprocess entries
+    /// (typically `<incoming_dir>/files`).
+    pub purgatory_root: String,
 }
 
 // ── Parsing Helpers ──────────────────────────────────────────────────
@@ -2515,7 +2548,9 @@ files = []
             mtime_ns: 200,
             sha256: Some("abc".into()),
             link_target: None,
-            postprocess_steps: None,
+            mode: Default::default(),
+            postprocess_steps: Vec::new(),
+            covered_by: None,
         };
         let identity = entry.identity();
         assert_eq!(identity.size, 100);
@@ -2565,7 +2600,9 @@ files = []
                 mtime_ns: 200,
                 sha256: Some("abcdef".into()),
                 link_target: None,
-                postprocess_steps: None,
+                mode: Default::default(),
+                postprocess_steps: Vec::new(),
+                covered_by: None,
             }],
         };
         let toml = manifest.to_toml().unwrap();
@@ -2631,7 +2668,9 @@ files = []
                 mtime_ns: 100,
                 sha256: None,
                 link_target: None,
-                postprocess_steps: None,
+                mode: Default::default(),
+                postprocess_steps: Vec::new(),
+                covered_by: None,
             }],
         };
         assert!(validate_envelope(&nick, &run_id, &run_config, &manifest).is_ok());
@@ -2660,7 +2699,9 @@ files = []
                 mtime_ns: 100,
                 sha256: None,
                 link_target: None,
-                postprocess_steps: None,
+                mode: Default::default(),
+                postprocess_steps: Vec::new(),
+                covered_by: None,
             }],
         };
         assert!(validate_envelope(&dir_nick, &run_id, &run_config, &manifest).is_err());
@@ -2689,7 +2730,9 @@ files = []
                 mtime_ns: 100,
                 sha256: None,
                 link_target: None,
-                postprocess_steps: None,
+                mode: Default::default(),
+                postprocess_steps: Vec::new(),
+                covered_by: None,
             }],
         };
         assert!(validate_envelope(&nick, &run_id, &run_config, &manifest).is_err());
@@ -2718,7 +2761,9 @@ files = []
                 mtime_ns: 100,
                 sha256: None,
                 link_target: None,
-                postprocess_steps: None,
+                mode: Default::default(),
+                postprocess_steps: Vec::new(),
+                covered_by: None,
             }],
         };
         assert!(validate_envelope(&nick, &run_id, &run_config, &manifest).is_err());
@@ -2742,7 +2787,9 @@ files = []
             mtime_ns: 0,
             sha256: None,
             link_target: None,
-            postprocess_steps: None,
+            mode: Default::default(),
+            postprocess_steps: Vec::new(),
+            covered_by: None,
         };
 
         let result = entry.verify_staged(&staged);
@@ -2768,7 +2815,9 @@ files = []
             mtime_ns: 0,
             sha256: Some("badbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbad1".into()),
             link_target: None,
-            postprocess_steps: None,
+            mode: Default::default(),
+            postprocess_steps: Vec::new(),
+            covered_by: None,
         };
 
         let result = entry.verify_staged(&staged);
@@ -2794,7 +2843,9 @@ files = []
             mtime_ns: 0,
             sha256: None,
             link_target: None,
-            postprocess_steps: None,
+            mode: Default::default(),
+            postprocess_steps: Vec::new(),
+            covered_by: None,
         };
 
         assert!(entry.verify_staged(&staged).is_ok());
@@ -2815,7 +2866,9 @@ files = []
             mtime_ns: 0,
             sha256: None,
             link_target: None,
-            postprocess_steps: None,
+            mode: Default::default(),
+            postprocess_steps: Vec::new(),
+            covered_by: None,
         };
 
         let result = entry.verify_staged(&staged);

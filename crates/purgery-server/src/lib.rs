@@ -1728,6 +1728,115 @@ pub fn begin_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> 
 }
 
 /// Server-side subcommand: finish a run by moving from incoming to ready.
+/// Server-side subcommand: validate the run plan and return transfer destinations.
+///
+/// Must be called after the client has written `run.toml` and `manifest.toml`
+/// into the incoming directory but before any rsync transfer.
+/// This is the gate that prevents passthrough transfers into final storage
+/// for an invalid run plan.
+pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> Result<String> {
+    let incoming_path = config
+        .purgery_root
+        .run_dir(nickname, run_id, RunPhase::Incoming);
+    if !incoming_path.exists() {
+        anyhow::bail!(
+            "incoming directory does not exist for run {}/{} at '{}'",
+            nickname.as_str(),
+            run_id.as_str(),
+            incoming_path.as_str()
+        );
+    }
+
+    let run_config_path = incoming_path.join("run.toml");
+    let run_config_content =
+        fs::read_to_string(&run_config_path).with_context(|| "failed to read run config")?;
+    let run_config = purgery_core::RunConfig::from_toml(&run_config_content)
+        .with_context(|| "failed to parse run config")?;
+
+    let manifest_path = incoming_path.join("manifest.toml");
+    let manifest_content =
+        fs::read_to_string(&manifest_path).with_context(|| "failed to read manifest")?;
+    let manifest = purgery_core::Manifest::from_toml(&manifest_content)
+        .with_context(|| "failed to parse manifest")?;
+
+    // Validate envelope
+    if let Err(e) = purgery_core::validate_envelope(nickname, run_id, &run_config, &manifest) {
+        anyhow::bail!("envelope validation failed: {e}");
+    }
+
+    // Build run plan (validates patterns, step references, expected outputs)
+    let run_plan = RunPlan::build(config, &run_config)
+        .map_err(|e| anyhow::anyhow!("run plan validation failed: {e}"))?;
+
+    // Compute covered descendants
+    let sync_map = run_config.sync_map();
+    let covered_by_dir: std::collections::HashSet<String> = manifest
+        .entries
+        .iter()
+        .filter(|e| e.kind == purgery_core::ManifestEntryKind::Directory)
+        .filter_map(|dir_entry| {
+            let sync = sync_map.get(dir_entry.sync_name.as_str())?;
+            let np = format!(
+                "{}/{}",
+                sync.to_path.as_str(),
+                dir_entry.relative_path.as_str()
+            );
+            let matched = run_plan.rules.iter().any(|rule| rule.is_match(&np));
+            if matched {
+                Some(np)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Validate planned final paths over active (non-covered) entries
+    let sync_map2 = run_config.sync_map();
+    let covered_indices: std::collections::HashSet<usize> = manifest
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            let Some(sync) = sync_map2.get(entry.sync_name.as_str()) else {
+                return false;
+            };
+            let np2 = format!("{}/{}", sync.to_path.as_str(), entry.relative_path.as_str());
+            covered_by_dir
+                .iter()
+                .any(|prefix| match np2.as_str().strip_prefix(prefix.as_str()) {
+                    Some(tail) => tail.starts_with('/'),
+                    None => false,
+                })
+        })
+        .map(|(i, _)| i)
+        .collect();
+
+    validate_unique_final_paths(
+        config,
+        nickname,
+        &run_config,
+        &manifest,
+        &run_plan,
+        &covered_indices,
+    )
+    .map_err(|e| anyhow::anyhow!("destination validation failed: {e}"))?;
+
+    // Build response with transfer destinations
+    let final_root = config.root.as_path().join(nickname.as_str());
+    let purgatory_root = incoming_path.join("files");
+
+    let response = purgery_core::PrepareRunResponse {
+        protocol_version: 1,
+        nickname: nickname.as_str().to_owned(),
+        run_id: run_id.as_str().to_owned(),
+        final_root: final_root.as_str().to_owned(),
+        purgatory_root: purgatory_root.as_str().to_owned(),
+    };
+
+    toml::to_string(&response)
+        .map_err(|e| anyhow::anyhow!("failed to serialize prepare-run response: {e}"))
+}
+
 pub fn finish_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> Result<()> {
     let incoming_path = config
         .purgery_root
@@ -2307,7 +2416,9 @@ to = "{}"
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
-                postprocess_steps: None,
+                mode: Default::default(),
+                postprocess_steps: Vec::new(),
+                covered_by: None,
             }],
         };
         fs::write(
@@ -2394,7 +2505,9 @@ to = "{}"
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
-                postprocess_steps: None,
+                mode: Default::default(),
+                postprocess_steps: Vec::new(),
+                covered_by: None,
             }],
         };
         fs::write(
@@ -2444,7 +2557,9 @@ to = "{}"
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
-                postprocess_steps: None,
+                mode: Default::default(),
+                postprocess_steps: Vec::new(),
+                covered_by: None,
             }],
         };
         fs::write(
@@ -2552,7 +2667,9 @@ to = "{}"
                 mtime_ns: 100,
                 sha256: None,
                 link_target: None,
-                postprocess_steps: None,
+                mode: Default::default(),
+                postprocess_steps: Vec::new(),
+                covered_by: None,
             }],
         };
         fs::write(
@@ -2635,7 +2752,9 @@ to = "{}"
                 mtime_ns: 100,
                 sha256: None,
                 link_target: None,
-                postprocess_steps: None,
+                mode: Default::default(),
+                postprocess_steps: Vec::new(),
+                covered_by: None,
             }],
         };
         fs::write(
@@ -2789,7 +2908,9 @@ steps = ["compress-video"]
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
-                postprocess_steps: None,
+                mode: Default::default(),
+                postprocess_steps: Vec::new(),
+                covered_by: None,
             }],
         };
         fs::write(
@@ -3164,7 +3285,9 @@ to = "pictures"
                     mtime_ns: 1000000,
                     sha256: None,
                     link_target: None,
-                    postprocess_steps: None,
+                    mode: Default::default(),
+                    postprocess_steps: Vec::new(),
+                    covered_by: None,
                 },
                 ManifestEntry {
                     sync_name: SyncName::new("pictures".into()).unwrap(),
@@ -3177,7 +3300,9 @@ to = "pictures"
                     mtime_ns: 1000001,
                     sha256: None,
                     link_target: None,
-                    postprocess_steps: None,
+                    mode: Default::default(),
+                    postprocess_steps: Vec::new(),
+                    covered_by: None,
                 },
             ],
         };
@@ -3242,7 +3367,9 @@ to = "pictures"
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
-                postprocess_steps: None,
+                mode: Default::default(),
+                postprocess_steps: Vec::new(),
+                covered_by: None,
             }],
         };
         fs::write(
@@ -3333,7 +3460,9 @@ to = "pictures"
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
-                postprocess_steps: None,
+                mode: Default::default(),
+                postprocess_steps: Vec::new(),
+                covered_by: None,
             }],
         };
         fs::write(
@@ -3503,7 +3632,9 @@ steps = ["compress-video"]
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
-                postprocess_steps: None,
+                mode: Default::default(),
+                postprocess_steps: Vec::new(),
+                covered_by: None,
             }],
         };
         fs::write(
@@ -3602,7 +3733,9 @@ steps = ["compress-video"]
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
-                postprocess_steps: None,
+                mode: Default::default(),
+                postprocess_steps: Vec::new(),
+                covered_by: None,
             }],
         };
         fs::write(
@@ -3703,7 +3836,9 @@ steps = ["compress-video"]
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
-                postprocess_steps: None,
+                mode: Default::default(),
+                postprocess_steps: Vec::new(),
+                covered_by: None,
             }],
         };
         fs::write(
@@ -4585,7 +4720,9 @@ steps = ["compress-video"]
             mtime_ns: 0,
             sha256: None,
             link_target: target.map(Utf8PathBuf::from),
-            postprocess_steps: None,
+            mode: Default::default(),
+            postprocess_steps: Vec::new(),
+            covered_by: None,
         };
         let manifest = Manifest {
             run_id: run_id.clone(),
@@ -4790,7 +4927,9 @@ steps = ["compress-video"]
             mtime_ns: 0,
             sha256: None,
             link_target: None,
-            postprocess_steps: None,
+            mode: Default::default(),
+            postprocess_steps: Vec::new(),
+            covered_by: None,
         }
     }
 
@@ -4946,7 +5085,9 @@ to = "shared"
                     mtime_ns: 0,
                     sha256: None,
                     link_target: None,
-                    postprocess_steps: None,
+                    mode: Default::default(),
+                    postprocess_steps: Vec::new(),
+                    covered_by: None,
                 },
                 ManifestEntry {
                     sync_name: SyncName::new("second".into()).unwrap(),
@@ -4959,7 +5100,9 @@ to = "shared"
                     mtime_ns: 0,
                     sha256: None,
                     link_target: None,
-                    postprocess_steps: None,
+                    mode: Default::default(),
+                    postprocess_steps: Vec::new(),
+                    covered_by: None,
                 },
             ],
         };
@@ -5052,7 +5195,9 @@ steps = ["pack"]
                     mtime_ns: 0,
                     sha256: None,
                     link_target: None,
-                    postprocess_steps: None,
+                    mode: Default::default(),
+                    postprocess_steps: Vec::new(),
+                    covered_by: None,
                 },
                 ManifestEntry {
                     sync_name: SyncName::new("data".into()).unwrap(),
@@ -5065,7 +5210,9 @@ steps = ["pack"]
                     mtime_ns: 0,
                     sha256: None,
                     link_target: None,
-                    postprocess_steps: None,
+                    mode: Default::default(),
+                    postprocess_steps: Vec::new(),
+                    covered_by: None,
                 },
             ],
         };
@@ -5157,7 +5304,9 @@ steps = ["compress"]
                     mtime_ns: 0,
                     sha256: None,
                     link_target: None,
-                    postprocess_steps: None,
+                    mode: Default::default(),
+                    postprocess_steps: Vec::new(),
+                    covered_by: None,
                 },
                 // document.Z.webm — would collide with the postprocess output above
                 ManifestEntry {
@@ -5172,7 +5321,9 @@ steps = ["compress"]
                     mtime_ns: 0,
                     sha256: None,
                     link_target: None,
-                    postprocess_steps: None,
+                    mode: Default::default(),
+                    postprocess_steps: Vec::new(),
+                    covered_by: None,
                 },
             ],
         };
@@ -5249,7 +5400,9 @@ steps = ["compress"]
                     mtime_ns: 0,
                     sha256: None,
                     link_target: None,
-                    postprocess_steps: None,
+                    mode: Default::default(),
+                    postprocess_steps: Vec::new(),
+                    covered_by: None,
                 },
                 ManifestEntry {
                     sync_name: SyncName::new("data".into()).unwrap(),
@@ -5261,7 +5414,9 @@ steps = ["compress"]
                     mtime_ns: 0,
                     sha256: None,
                     link_target: None,
-                    postprocess_steps: None,
+                    mode: Default::default(),
+                    postprocess_steps: Vec::new(),
+                    covered_by: None,
                 },
             ],
         };
@@ -5334,7 +5489,9 @@ steps = ["compress"]
                     mtime_ns: 0,
                     sha256: None,
                     link_target: None,
-                    postprocess_steps: None,
+                    mode: Default::default(),
+                    postprocess_steps: Vec::new(),
+                    covered_by: None,
                 },
                 // Directory with the same name as the postprocess output
                 ManifestEntry {
@@ -5348,7 +5505,9 @@ steps = ["compress"]
                     mtime_ns: 0,
                     sha256: None,
                     link_target: None,
-                    postprocess_steps: None,
+                    mode: Default::default(),
+                    postprocess_steps: Vec::new(),
+                    covered_by: None,
                 },
             ],
         };
