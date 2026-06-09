@@ -1594,7 +1594,7 @@ delete_after_import = false
             .expect("must find file.txt entry");
         assert_eq!(entry.mode, purgery_core::ManifestEntryMode::Passthrough);
         assert!(
-            filter_contains_path(&entry),
+            filter_contains_path(entry),
             "entry must be usable for filter generation"
         );
     }
