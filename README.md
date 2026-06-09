@@ -85,7 +85,7 @@ keep_original = true
 ```toml
 # client.toml
 [[postprocess.rules]]
-match = '^videos/.*\.(mp4|mov|mkv|webm)$'
+match = "*.mp4"
 steps = ["compress-video"]
 ```
 

@@ -1242,6 +1242,88 @@ pub fn validate_expected_output_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Match a normalized path against an rsync include/exclude pattern.
+///
+/// Supports the following rsync pattern syntax:
+/// - `*` matches any characters except `/`
+/// - `**` matches any characters including `/`
+/// - `?` matches any single character except `/`
+/// - Leading `/` anchors the pattern to the start of the path
+/// - Trailing `/` is not directly handled here (caller decides)
+///
+/// The pattern is matched against the full normalized path
+/// (e.g. `"videos/sub/file.mp4"`).  A leading `/` in the pattern
+/// matches the start of the normalized path.
+pub fn rsync_pattern_match(pattern: &str, path: &str) -> bool {
+    if pattern.is_empty() {
+        return false;
+    }
+
+    let anchored = pattern.starts_with('/');
+    let pat_body = if anchored { &pattern[1..] } else { pattern };
+
+    // If the pattern starts with "**/" it should match anywhere
+    let pat_str = pat_body;
+
+    // Convert rsync pattern to a simple glob-like matching.
+    // We implement a basic recursive matcher for * and **.
+    fn match_rsync(pat: &[u8], path: &[u8]) -> bool {
+        match (pat.first(), path.first()) {
+            (None, None) => true,
+            (None, Some(_)) => false,
+            (Some(&b'*'), _) => {
+                // ** matches everything including /
+                if pat.len() > 1 && pat[1] == b'*' {
+                    // **/ or ** at end
+                    let rest = &pat[2..];
+                    if rest.is_empty() || (rest.len() == 1 && rest[0] == b'/') {
+                        return true; // ** matches everything
+                    }
+                    let rest = if rest[0] == b'/' { &rest[1..] } else { rest };
+                    // Try matching at each position
+                    for i in 0..=path.len() {
+                        if match_rsync(rest, &path[i..]) {
+                            return true;
+                        }
+                    }
+                    false
+                } else {
+                    // * matches anything except /
+                    let mut i = 0;
+                    while i <= path.len() {
+                        if i > 0 && path[i - 1] == b'/' {
+                            break;
+                        }
+                        if match_rsync(&pat[1..], &path[i..]) {
+                            return true;
+                        }
+                        i += 1;
+                    }
+                    false
+                }
+            }
+            (Some(&b'?'), Some(_)) if path[0] != b'/' => match_rsync(&pat[1..], &path[1..]),
+            (Some(&p), Some(&q)) if p == q => match_rsync(&pat[1..], &path[1..]),
+            _ => false,
+        }
+    }
+
+    let pat_bytes = pat_str.as_bytes();
+    let path_bytes = path.as_bytes();
+
+    if anchored {
+        match_rsync(pat_bytes, path_bytes)
+    } else {
+        // Unanchored: try matching at any position
+        for start in 0..path_bytes.len() {
+            if match_rsync(pat_bytes, &path_bytes[start..]) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 /// Client configuration, loaded from a TOML file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1300,12 +1382,17 @@ pub struct ClientPostprocessConfig {
     pub rules: Vec<PostprocessRule>,
 }
 
-/// A postprocessing rule: files matching `match` regex get the listed steps.
+/// A postprocessing rule: entries matching `match` rsync pattern get the listed steps.
+///
+/// Rules are evaluated in order. If no rule matches, the entry is passthrough.
+/// The `match` value is an rsync include/exclude pattern, not a regex.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PostprocessRule {
+    /// Rsync include/exclude pattern (e.g. `"*.mp4"`, `"cache/**"`).
     #[serde(rename = "match")]
     pub pattern: String,
+    /// Postprocess step names to apply when this rule matches.
     pub steps: Vec<String>,
 }
 
@@ -2106,7 +2193,19 @@ from = "/home/vitalik/Pictures"
 to = "pictures"
 
 [[postprocess.rules]]
-match = '^videos/.*\.(mp4|mov|mkv|webm)$'
+match = "*.mp4"
+steps = ["compress-video"]
+
+[[postprocess.rules]]
+match = "*.mov"
+steps = ["compress-video"]
+
+[[postprocess.rules]]
+match = "*.mkv"
+steps = ["compress-video"]
+
+[[postprocess.rules]]
+match = "*.webm"
 steps = ["compress-video"]
 "#;
         let config = ClientConfig::from_toml(toml).unwrap();
@@ -2114,7 +2213,8 @@ steps = ["compress-video"]
         assert_eq!(config.sync[0].name.as_str(), "videos");
         assert!(config.sync[0].delete_after_import);
         assert!(!config.sync[1].delete_after_import);
-        assert_eq!(config.postprocess.rules.len(), 1);
+        assert_eq!(config.postprocess.rules.len(), 4);
+        assert_eq!(config.postprocess.rules[0].pattern, "*.mp4");
         assert_eq!(config.postprocess.rules[0].steps, vec!["compress-video"]);
         assert_eq!(
             config.server.command,
@@ -2921,7 +3021,7 @@ name = "videos"
 to = "videos"
 
 [[postprocess.rules]]
-match = '^videos/.*\.(mp4|mov|mkv|webm)$'
+match = "*.mp4"
 steps = ["compress-video"]
 "#;
         let config = RunConfig::from_toml(toml).unwrap();
@@ -2929,6 +3029,7 @@ steps = ["compress-video"]
         assert_eq!(config.sync.len(), 1);
         assert_eq!(config.sync[0].name.as_str(), "videos");
         assert_eq!(config.postprocess.rules.len(), 1);
+        assert_eq!(config.postprocess.rules[0].pattern, "*.mp4");
     }
 
     #[test]

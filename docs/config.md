@@ -106,7 +106,7 @@ to = "pictures"
 delete_after_import = true
 
 [[postprocess.rules]]
-match = '^videos/.*\.(mp4|mov|mkv|webm)$'
+match = "*.mp4"
 steps = ["compress-video"]
 ```
 
@@ -154,7 +154,7 @@ name = "videos"
 to = "videos"
 
 [[postprocess.rules]]
-match = '^videos/.*\.(mp4|mov|mkv|webm)$'
+match = "*.mp4"
 steps = ["compress-video"]
 ```
 

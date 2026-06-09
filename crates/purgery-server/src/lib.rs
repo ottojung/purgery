@@ -582,7 +582,7 @@ fn planned_entry_outputs(
     let mut outputs: Vec<String> = Vec::new();
 
     for rule in &run_plan.rules {
-        if !rule.regex.is_match(&normalized_path) {
+        if !rule.is_match(&normalized_path) {
             continue;
         }
         any_rule_matched = true;
@@ -672,7 +672,7 @@ fn validate_unique_final_paths(
                 .get(e.sync_name.as_str())
                 .map(|sync| {
                     let np = format!("{}/{}", sync.to_path.as_str(), e.relative_path.as_str());
-                    run_plan.rules.iter().any(|r| r.regex.is_match(&np))
+                    run_plan.rules.iter().any(|r| r.is_match(&np))
                 })
                 .unwrap_or(false)
         })
@@ -824,7 +824,7 @@ fn process_manifest_entry(
     let matched = run_plan
         .rules
         .iter()
-        .any(|rule| rule.regex.is_match(&normalized_path));
+        .any(|rule| rule.is_match(&normalized_path));
 
     let result = if !matched {
         // Direct commit — no postprocessing.
@@ -891,7 +891,7 @@ fn process_manifest_entry(
                 let steps: Vec<String> = run_plan
                     .rules
                     .iter()
-                    .filter(|rule| rule.regex.is_match(&normalized_path))
+                    .filter(|rule| rule.is_match(&normalized_path))
                     .flat_map(|rule| rule.steps.iter().map(|step| step.step_name.clone()))
                     .collect();
                 Ok((final_paths, (!steps.is_empty()).then_some(steps)))
@@ -1076,7 +1076,7 @@ pub fn process_processing_run(
                 sync.to_path.as_str(),
                 dir_entry.relative_path.as_str()
             );
-            let matched = run_plan.rules.iter().any(|rule| rule.regex.is_match(&np));
+            let matched = run_plan.rules.iter().any(|rule| rule.is_match(&np));
             if matched {
                 Some(np)
             } else {
@@ -1353,8 +1353,15 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
 /// A compiled postprocess rule with resolved step definitions.
 #[derive(Debug)]
 pub struct CompiledRule {
-    pub regex: regex::Regex,
+    pub pattern: String,
     pub steps: Vec<ResolvedStep>,
+}
+
+impl CompiledRule {
+    /// Returns true if the normalized path matches this rule's rsync pattern.
+    pub fn is_match(&self, normalized_path: &str) -> bool {
+        purgery_core::rsync_pattern_match(&self.pattern, normalized_path)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1363,7 +1370,7 @@ pub struct ResolvedStep {
     pub step_def: purgery_core::PostprocessStepDefinition,
 }
 
-/// A validated run plan: precompiled regexes and resolved step definitions.
+/// A validated run plan: precompiled rsync patterns and resolved step definitions.
 #[derive(Debug)]
 pub struct RunPlan {
     pub rules: Vec<CompiledRule>,
@@ -1372,7 +1379,7 @@ pub struct RunPlan {
 impl RunPlan {
     /// Build a run plan from server config and run config.
     ///
-    /// Validates all regexes and step references. Returns an error
+    /// Validates all patterns and step references. Returns an error
     /// (suitable for run-level failure) if anything is invalid.
     pub fn build(
         server_config: &ServerConfig,
@@ -1381,8 +1388,9 @@ impl RunPlan {
         let mut rules = Vec::new();
 
         for rule in &run_config.postprocess.rules {
-            let re = regex::Regex::new(&rule.pattern)
-                .map_err(|e| format!("invalid postprocess regex '{}': {e}", rule.pattern))?;
+            if rule.pattern.is_empty() {
+                return Err("postprocess rule has empty pattern".into());
+            }
 
             let mut steps = Vec::new();
             for step_name in &rule.steps {
@@ -1414,7 +1422,10 @@ impl RunPlan {
                 });
             }
 
-            rules.push(CompiledRule { regex: re, steps });
+            rules.push(CompiledRule {
+                pattern: rule.pattern.clone(),
+                steps,
+            });
         }
 
         Ok(RunPlan { rules })
@@ -1439,7 +1450,7 @@ pub fn apply_postprocessing(
         .ok_or_else(|| "work path has no parent directory".to_string())?;
 
     for compiled in &run_plan.rules {
-        if !compiled.regex.is_match(normalized_path) {
+        if !compiled.is_match(normalized_path) {
             continue;
         }
         any_rule_matched = true;
@@ -2457,16 +2468,19 @@ to = "{}"
 
     #[test]
     fn test_rule_matching() {
-        let rule = purgery_core::PostprocessRule {
-            pattern: r"^videos/.*\.(mp4|mov|mkv|webm)$".into(),
-            steps: vec!["compress-video".into()],
-        };
-        let re = regex::Regex::new(&rule.pattern).unwrap();
-        assert!(re.is_match("videos/a.mp4"));
-        assert!(re.is_match("videos/subdir/b.mov"));
-        assert!(re.is_match("videos/c.webm"));
-        assert!(!re.is_match("audio/song.mp3"));
-        assert!(!re.is_match("videos/a.txt"));
+        use purgery_core::rsync_pattern_match;
+        // Unanchored patterns match at any position
+        assert!(rsync_pattern_match("*.mp4", "videos/a.mp4"));
+        assert!(rsync_pattern_match("*.mov", "videos/subdir/b.mov"));
+        assert!(rsync_pattern_match("*.webm", "videos/c.webm"));
+        assert!(rsync_pattern_match("*.mp3", "audio/song.mp3")); // unanchored matches at "song.mp3"
+        assert!(!rsync_pattern_match("*.mp4", "videos/a.txt"));
+        // Anchored patterns match from start of path
+        assert!(rsync_pattern_match("/videos/*", "videos/a.mp4"));
+        assert!(!rsync_pattern_match("/audio/*", "videos/a.mp4"));
+        // ** patterns
+        assert!(rsync_pattern_match("**/*.mp4", "videos/sub/a.mp4"));
+        assert!(rsync_pattern_match("cache/**", "cache/sub/file.txt"));
     }
 
     #[test]
@@ -2685,7 +2699,7 @@ to = "{}"
             sync: vec![],
             postprocess: purgery_core::ClientPostprocessConfig {
                 rules: vec![purgery_core::PostprocessRule {
-                    pattern: r"^videos/.*$".to_owned(),
+                    pattern: "videos/*".to_owned(),
                     steps: vec!["compress-video".to_owned()],
                 }],
             },
@@ -2751,7 +2765,7 @@ name = "videos"
 to = "videos"
 
 [[postprocess.rules]]
-match = '^videos/.*\.mp4$'
+match = "*.mp4"
 steps = ["compress-video"]
 "#
         .to_string();
@@ -2830,7 +2844,7 @@ steps = ["compress-video"]
             sync: vec![],
             postprocess: purgery_core::ClientPostprocessConfig {
                 rules: vec![purgery_core::PostprocessRule {
-                    pattern: r"^videos/.*\.mp4$".to_owned(),
+                    pattern: "videos/*.mp4".to_owned(),
                     steps: vec!["compress-video".to_owned()],
                 }],
             },
@@ -2880,7 +2894,7 @@ steps = ["compress-video"]
             sync: vec![],
             postprocess: purgery_core::ClientPostprocessConfig {
                 rules: vec![purgery_core::PostprocessRule {
-                    pattern: r"^videos/.*$".to_owned(),
+                    pattern: "videos/*".to_owned(),
                     steps: vec!["compress-video".to_owned()],
                 }],
             },
@@ -2937,7 +2951,7 @@ steps = ["compress-video"]
             sync: vec![],
             postprocess: purgery_core::ClientPostprocessConfig {
                 rules: vec![purgery_core::PostprocessRule {
-                    pattern: r"^videos/.*$".to_owned(),
+                    pattern: "videos/*".to_owned(),
                     steps: vec!["compress-video".to_owned()],
                 }],
             },
@@ -3343,13 +3357,13 @@ to = "pictures"
     // ── Invalid regex test ──
 
     #[test]
-    fn test_invalid_regex_produces_failed_status() {
+    fn test_empty_postprocess_pattern_produces_failed_status() {
         let tmp = tempfile::tempdir().unwrap();
         let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let config = test_server_config(&purgery_root, &server_root);
         let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_id = RunId::new("test-bad-regex".into()).unwrap();
+        let run_id = RunId::new("test-bad-pattern".into()).unwrap();
 
         let ready_path = config
             .purgery_root
@@ -3365,34 +3379,13 @@ name = "videos"
 to = "videos"
 
 [[postprocess.rules]]
-match = '[invalid-regex'
+match = ""
 steps = ["compress-video"]
 "#;
         fs::write(ready_path.join("run.toml"), run_config_content).unwrap();
 
-        let manifest = Manifest {
-            run_id: run_id.clone(),
-            nickname: nickname.clone(),
-            entries: vec![ManifestEntry {
-                sync_name: SyncName::new("videos".into()).unwrap(),
-                local_path: ClientLocalPath::new("/home/user/Videos/a.mp4".into()).unwrap(),
-                staged_path: NormalizedRelativePath::new("files/videos/a.mp4".into()).unwrap(),
-                relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
-                kind: ManifestEntryKind::RegularFile,
-                size: 7,
-                mtime_ns: 1000000,
-                sha256: None,
-                link_target: None,
-            }],
-        };
-        fs::write(
-            ready_path.join("manifest.toml"),
-            manifest.to_toml().unwrap(),
-        )
-        .unwrap();
-
         let result = process_run(&config, &nickname, &run_id);
-        assert!(result.is_err(), "process_run must error on invalid regex");
+        assert!(result.is_err(), "process_run must error on empty pattern");
 
         let failed_path = config
             .purgery_root
@@ -3403,7 +3396,10 @@ steps = ["compress-video"]
         let status_content = fs::read_to_string(&status_path).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
         assert_eq!(status.state, RunState::Failed);
-        assert!(status.error.unwrap().contains("invalid postprocess regex"));
+        assert!(
+            status.error.as_deref().unwrap().contains("pattern")
+                || status.error.as_deref().unwrap().contains("invalid")
+        );
     }
 
     // ── Work area cleanup tests ──
@@ -3479,7 +3475,7 @@ name = "videos"
 to = "videos"
 
 [[postprocess.rules]]
-match = '^videos/.*\.mp4$'
+match = "*.mp4"
 steps = ["compress-video"]
 "#;
         fs::write(ready_path.join("run.toml"), run_config_content).unwrap();
@@ -3577,7 +3573,7 @@ name = "videos"
 to = "videos"
 
 [[postprocess.rules]]
-match = '^videos/.*\.mp4$'
+match = "*.mp4"
 steps = ["compress-video"]
 "#;
         fs::write(ready_path.join("run.toml"), run_config_content).unwrap();
@@ -3677,7 +3673,7 @@ name = "videos"
 to = "videos"
 
 [[postprocess.rules]]
-match = '^videos/.*\.mp4$'
+match = "*.mp4"
 steps = ["compress-video"]
 "#;
         fs::write(ready_path.join("run.toml"), run_config_content).unwrap();
@@ -3726,7 +3722,7 @@ steps = ["compress-video"]
     // ── Run Plan tests ──
 
     #[test]
-    fn test_run_plan_validates_regexes() {
+    fn test_run_plan_validates_empty_pattern() {
         let server_config = ServerConfig {
             root: ServerRoot::new("/data".into()).unwrap(),
             purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
@@ -3739,14 +3735,14 @@ steps = ["compress-video"]
             sync: vec![],
             postprocess: purgery_core::ClientPostprocessConfig {
                 rules: vec![purgery_core::PostprocessRule {
-                    pattern: "[invalid-regex".into(),
+                    pattern: "".into(),
                     steps: vec!["compress-video".into()],
                 }],
             },
         };
         let result = RunPlan::build(&server_config, &run_config);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("invalid postprocess regex"));
+        assert!(result.unwrap_err().contains("empty pattern"));
     }
 
     #[test]
@@ -3763,7 +3759,7 @@ steps = ["compress-video"]
             sync: vec![],
             postprocess: purgery_core::ClientPostprocessConfig {
                 rules: vec![purgery_core::PostprocessRule {
-                    pattern: r"^videos/.*$".into(),
+                    pattern: "videos/*".into(),
                     steps: vec!["nonexistent-step".into()],
                 }],
             },
@@ -4650,7 +4646,7 @@ steps = ["compress-video"]
     fn expected_output_test_plan() -> RunPlan {
         RunPlan {
             rules: vec![CompiledRule {
-                regex: regex::Regex::new(r"^data/.*\.txt$").unwrap(),
+                pattern: "data/*.txt".into(),
                 steps: vec![ResolvedStep {
                     step_name: "generate".into(),
                     step_def: PostprocessStepDefinition {
@@ -4997,7 +4993,7 @@ name = "data"
 to = "data"
 
 [[postprocess.rules]]
-match = '^data/photos$'
+match = "data/photos"
 steps = ["pack"]
 "#;
         fs::write(ready.join("run.toml"), run_config_src).unwrap();
@@ -5091,7 +5087,7 @@ name = "data"
 to = "data"
 
 [[postprocess.rules]]
-match = '^data/.*\.txt$'
+match = "data/*.txt"
 steps = ["compress"]
 "#,
         )
@@ -5101,7 +5097,7 @@ steps = ["compress"]
     fn postprocess_collision_run_plan() -> RunPlan {
         RunPlan {
             rules: vec![CompiledRule {
-                regex: regex::Regex::new(r"^data/.*\.txt$").unwrap(),
+                pattern: "data/*.txt".into(),
                 steps: vec![ResolvedStep {
                     step_name: "compress".into(),
                     step_def: PostprocessStepDefinition {
@@ -5196,32 +5192,15 @@ name = "data"
 to = "data"
 
 [[postprocess.rules]]
-match = '^data/.*\.txt$'
+match = "data/*.txt"
 steps = ["compress"]
 "#,
         )
         .unwrap();
-        // Two different source files whose postprocess outputs resolve to
-        // the same final path: a.txt → a.out, b.txt → b.out? No, both
-        // produce {stem}.out which is unique per source.  But if both
-        // produce an output named "collision.out" via a static pattern:
-        //
-        // a.txt with step {stem}.out → a.out  (unique)
-        // b.txt with step {stem}.out → b.out  (different)
-        //
-        // Those don't collide.  Use an entry that explicitly names a
-        // static output that another entry also produces.
-        //
-        // Simpler: two entries with different relative paths whose
-        // postprocess outputs happen to land on the same filename.
-        // This happens when expected_outputs is a static name:
-        //
-        //   expected_outputs = ["result.bin"]
-        //
-        // Both a.txt and b.txt would produce data/result.bin.
+
         let pp_plan = RunPlan {
             rules: vec![CompiledRule {
-                regex: regex::Regex::new(r"^data/.*\.txt$").unwrap(),
+                pattern: "data/*.txt".into(),
                 steps: vec![ResolvedStep {
                     step_name: "generate".into(),
                     step_def: PostprocessStepDefinition {
@@ -5296,14 +5275,14 @@ name = "data"
 to = "data"
 
 [[postprocess.rules]]
-match = '^data/.*\.txt$'
+match = "data/*.txt"
 steps = ["compress"]
 "#,
         )
         .unwrap();
         let run_plan = RunPlan {
             rules: vec![CompiledRule {
-                regex: regex::Regex::new(r"^data/.*\.txt$").unwrap(),
+                pattern: "data/*.txt".into(),
                 steps: vec![ResolvedStep {
                     step_name: "compress".into(),
                     step_def: PostprocessStepDefinition {
