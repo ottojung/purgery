@@ -283,10 +283,13 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
     // cleanup does not accumulate.
     resume_pending_cleanups(config)?;
 
-    // 1. Validate postprocess rules against sync names before any walking
+    // 1. Validate postprocess config before any walking
     let sync_names: Vec<purgery_core::SyncName> =
         config.sync.iter().map(|s| s.name.clone()).collect();
     if let Err(e) = config.postprocess.validate(&sync_names) {
+        anyhow::bail!("postprocess config validation failed: {e}");
+    }
+    if let Err(e) = config.postprocess.validate_delete_after_import(&config.sync) {
         anyhow::bail!("postprocess config validation failed: {e}");
     }
     info!("postprocess rules validated");

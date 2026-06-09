@@ -1457,6 +1457,28 @@ impl ClientPostprocessConfig {
         }
         Ok(())
     }
+
+    /// Validate that every sync group with applicable postprocess rules
+    /// has `delete_after_import = true`. A sync group with applicable
+    /// rules but `delete_after_import = false` is rejected because
+    /// local files would remain, making re-upload and reprocess
+    /// ambiguous.
+    ///
+    /// This check runs statically before any filesystem walking.
+    pub fn validate_delete_after_import(&self, syncs: &[SyncMapping]) -> Result<(), String> {
+        for sync in syncs {
+            let applicable = applicable_rules(&self.rules, sync.name.as_str());
+            if !applicable.is_empty() && !sync.delete_after_import {
+                return Err(format!(
+                    "sync group '{}' has applicable postprocess rules but \
+                     delete_after_import is false; postprocessing requires \
+                     delete_after_import = true",
+                    sync.name.as_str()
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Server-relevant per-run configuration uploaded alongside files.
@@ -1593,6 +1615,11 @@ impl ClientConfig {
         config
             .postprocess
             .validate(&sync_names)
+            .map_err(ConfigError::PostprocessConfig)?;
+        // Validate that postprocess rules require delete_after_import=true
+        config
+            .postprocess
+            .validate_delete_after_import(&config.sync)
             .map_err(ConfigError::PostprocessConfig)?;
         Ok(config)
     }
@@ -2463,18 +2490,22 @@ to = "pictures"
 [[postprocess.rules]]
 match = "*.mp4"
 steps = ["compress-video"]
+for = ["videos"]
 
 [[postprocess.rules]]
 match = "*.mov"
 steps = ["compress-video"]
+for = ["videos"]
 
 [[postprocess.rules]]
 match = "*.mkv"
 steps = ["compress-video"]
+for = ["videos"]
 
 [[postprocess.rules]]
 match = "*.webm"
 steps = ["compress-video"]
+for = ["videos"]
 "#;
         let config = ClientConfig::from_toml(toml).unwrap();
         assert_eq!(config.sync.len(), 2);
@@ -3799,6 +3830,7 @@ host = "example.com"
 name = "videos"
 from = "/home/user/Videos"
 to = "videos"
+delete_after_import = true
 
 [[postprocess.rules]]
 match = "*.mp4"
