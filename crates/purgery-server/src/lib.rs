@@ -1201,48 +1201,6 @@ pub fn process_processing_run(
             continue;
         }
 
-        // Passthrough entries are imported by the client directly to final
-        // storage via rsync.  Status is derived from the passthrough receipt,
-        // not from staged content verification.  No receipt means the entry
-        // was not imported — it must not be processed from staging.
-        if entry.mode == purgery_core::ManifestEntryMode::Passthrough {
-            let receipt_path = processing_path.join(format!("passthrough.{sync_name}.toml"));
-            let receipt_ok = receipt_path.exists()
-                && fs::read_to_string(&receipt_path)
-                    .ok()
-                    .and_then(|c| toml::from_str::<purgery_core::PassthroughReceipt>(&c).ok())
-                    .map(|r| r.status == "imported")
-                    .unwrap_or(false);
-
-            if receipt_ok {
-                let final_path =
-                    config
-                        .root
-                        .final_path(nickname, &sync.to_path, &entry.relative_path);
-                let final_relative = final_path
-                    .strip_prefix(config.root.as_path())
-                    .unwrap_or(&final_path)
-                    .to_string();
-                outcomes.push(EntryOutcome::Success {
-                    kind: entry.kind,
-                    sync_name: entry.sync_name.clone(),
-                    local_path: entry.local_path.as_str().to_owned(),
-                    relative_path: entry.relative_path.as_str().to_owned(),
-                    final_paths: vec![final_relative],
-                    postprocess: None,
-                });
-            } else {
-                outcomes.push(EntryOutcome::Skipped {
-                    kind: entry.kind,
-                    sync_name: entry.sync_name.clone(),
-                    local_path: entry.local_path.as_str().to_owned(),
-                    relative_path: entry.relative_path.as_str().to_owned(),
-                    error: "passthrough receipt missing or failed".into(),
-                });
-            }
-            continue;
-        }
-
         outcomes.push(process_manifest_entry(
             config,
             &run_plan,
