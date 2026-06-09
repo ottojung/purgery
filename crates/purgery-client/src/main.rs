@@ -499,14 +499,35 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
                     if !symmeta.file_type().is_file() || symmeta.file_type().is_symlink() {
                         continue;
                     }
-                    if let Ok(meta) = fs::metadata(local_path) {
-                        if meta.len() == entry.size {
-                            if let Err(e) = fs::remove_file(local_path) {
-                                warn!(path = %local_path.display(), error = %e, "failed to delete passthrough file");
-                            } else {
-                                early_count += 1;
+                    let Ok(meta) = fs::metadata(local_path) else {
+                        continue;
+                    };
+                    // Full identity check: size, mtime, and sha256 if present
+                    if meta.len() != entry.size {
+                        continue;
+                    }
+                    let current_mtime = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_nanos() as i64)
+                        .unwrap_or(0);
+                    if current_mtime != entry.mtime_ns {
+                        continue;
+                    }
+                    if let Some(ref expected_sha) = entry.sha256 {
+                        if let Ok(actual_sha) = compute_sha256(local_path) {
+                            if &actual_sha != expected_sha {
+                                continue;
                             }
+                        } else {
+                            continue;
                         }
+                    }
+                    if let Err(e) = fs::remove_file(local_path) {
+                        warn!(path = %local_path.display(), error = %e, "failed to delete passthrough file");
+                    } else {
+                        early_count += 1;
                     }
                 }
                 if early_count > 0 {
