@@ -110,12 +110,10 @@ enum Command {
         run_id: String,
     },
     /// Resolve final storage destinations for pure passthrough groups (side-effect-free)
+    /// Reads run config from stdin.
     ResolveDestinations {
         #[arg(long)]
         nickname: String,
-        /// Path to run config TOML (client sub-set with sync mappings)
-        #[arg(long)]
-        run_config: String,
     },
 }
 
@@ -205,11 +203,14 @@ fn main() -> Result<()> {
             let run_id = RunId::new(run_id).with_context(|| "invalid run ID")?;
             heartbeat_run(&server_config, &nickname, &run_id)?;
         }
-        Command::ResolveDestinations { nickname, run_config } => {
+        Command::ResolveDestinations { nickname } => {
             let nickname = Nickname::new(nickname).with_context(|| "invalid nickname")?;
-            let config_content = fs::read_to_string(&run_config)
-                .with_context(|| format!("failed to read run config: {run_config}"))?;
-            let run_config = purgery_core::RunConfig::from_toml(&config_content)
+            use std::io::Read;
+            let mut stdin_content = String::new();
+            std::io::stdin()
+                .read_to_string(&mut stdin_content)
+                .with_context(|| "failed to read stdin")?;
+            let run_config = purgery_core::RunConfig::from_toml(&stdin_content)
                 .with_context(|| "failed to parse run config")?;
             let response = resolve_destinations(&server_config, &nickname, &run_config)?;
             print!("{response}");

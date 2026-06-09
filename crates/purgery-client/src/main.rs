@@ -149,6 +149,49 @@ fn server_cmd(host: &str, server_command: &str, args: &[&str]) -> Result<String>
     ssh_run(host, &full_cmd)
 }
 
+/// Run the server command over SSH with stdin content.
+fn server_cmd_with_stdin(
+    host: &str,
+    server_command: &str,
+    args: &[&str],
+    stdin_content: &str,
+) -> Result<String> {
+    let full_cmd = {
+        let mut cmd = server_command.to_owned();
+        for a in args {
+            cmd.push(' ');
+            cmd.push_str(&shell_escape(a));
+        }
+        cmd
+    };
+    let mut child = std::process::Command::new("ssh")
+        .arg(host)
+        .arg(&full_cmd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn SSH command to {host}"))?;
+
+    use std::io::Write;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(stdin_content.as_bytes())
+            .with_context(|| "failed to write stdin content")?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("failed to wait for SSH command on {host}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("SSH command on {host} failed: {stderr}");
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 /// Read a remote file via SSH.
 #[allow(dead_code)]
 fn read_remote_file(host: &str, path: &str) -> Result<String> {
@@ -232,11 +275,249 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
     // 0. Run local checks before any remote operations
     client_check(config, "")?;
 
-    // 1. Generate a unique run ID and build manifest BEFORE begin-run
-    let run_id = RunId::generate();
     let host = config.server.host.as_str();
     let server_command = &config.server.command;
 
+    // 1. Build manifest for local planning
+    let run_id = RunId::generate();
+    let manifest = build_manifest(config, &run_id)?;
+    info!(entries = manifest.entries.len(), "manifest built");
+
+    // 2. Determine if any sync group has postprocess entries
+    let has_postprocess = manifest.entries.iter().any(|e| {
+        e.mode == purgery_core::ManifestEntryMode::Postprocess
+            || e.mode == purgery_core::ManifestEntryMode::Covered
+    });
+
+    if has_postprocess {
+        run_postprocess_path(config, host, server_command, &manifest, &run_id)
+    } else {
+        run_passthrough_path(config, host, server_command, &manifest)
+    }
+}
+
+/// Run a pure passthrough invocation (no postprocess entries in any sync group).
+///
+/// Uses resolve-destinations to get final storage paths, rsyncs directly,
+/// and optionally writes durable cleanup state for delete_after_import syncs.
+fn run_passthrough_path(
+    config: &ClientConfig,
+    host: &str,
+    server_command: &str,
+    manifest: &Manifest,
+) -> Result<()> {
+    let _span = span!(
+        Level::INFO,
+        "client passthrough",
+        nickname = %config.nickname.as_str()
+    )
+    .entered();
+
+    let run_config = build_run_config(config);
+    let run_config_toml = run_config
+        .to_toml()
+        .with_context(|| "failed to serialize run config")?;
+
+    let tmp_dir = std::env::temp_dir().join("purgery-filters");
+    fs::create_dir_all(&tmp_dir).ok();
+
+    // Resolve destinations (side-effect-free, run config sent via stdin)
+    info!("resolving destinations");
+    let resolve_out = server_cmd_with_stdin(
+        host,
+        server_command,
+        &[
+            "resolve-destinations",
+            "--nickname",
+            config.nickname.as_str(),
+        ],
+        &run_config_toml,
+    )
+    .context("resolve-destinations failed")?;
+    let resolve_resp: purgery_core::ResolveDestinationsResponse =
+        toml::from_str(&resolve_out).context("failed to parse resolve-destinations response")?;
+    if resolve_resp.protocol_version != 1 {
+        anyhow::bail!(
+            "unsupported resolve-destinations protocol version: {}",
+            resolve_resp.protocol_version
+        );
+    }
+
+    // Build destination lookup
+    let dest_map: std::collections::HashMap<&str, &purgery_core::SyncPassthroughDestination> =
+        resolve_resp
+            .destinations
+            .iter()
+            .map(|d| (d.sync_name.as_str(), d))
+            .collect();
+
+    // Transfer per sync group
+    for sync in &config.sync {
+        let sync_name = sync.name.as_str();
+        let from_path = sync.from_path.as_str();
+        let dest = dest_map.get(sync_name).ok_or_else(|| {
+            anyhow::anyhow!("no destination for sync mapping '{sync_name}'")
+        })?;
+
+        // Build passthrough transfer roots for this sync
+        let passthrough_roots: Vec<purgery_core::TransferRoot> = manifest
+            .entries
+            .iter()
+            .filter(|e| {
+                e.sync_name.as_str() == sync_name
+                    && e.mode == purgery_core::ManifestEntryMode::Passthrough
+            })
+            .map(|e| purgery_core::TransferRoot::Exact(e.relative_path.as_str().to_owned()))
+            .collect();
+
+        if passthrough_roots.is_empty() {
+            continue;
+        }
+
+        // --- Passthrough rsync ---
+        let passthrough_filter = purgery_core::transfer_set_filter(&passthrough_roots);
+        let filter_file = tmp_dir.join(format!("passthrough-{sync_name}"));
+        fs::write(&filter_file, &passthrough_filter)
+            .with_context(|| "failed to write passthrough filter")?;
+
+        let rsync_dest = format!("{}:{}/", host, dest.passthrough_dest);
+        info!(
+            sync = sync_name,
+            from = from_path,
+            dest = %dest.passthrough_dest,
+            "passthrough rsync started"
+        );
+        let mut rsync_args = build_rsync_args(from_path, &rsync_dest);
+        let filter_arg = format!("--filter=merge {}", filter_file.to_string_lossy());
+        rsync_args.insert(5, filter_arg);
+        let status = std::process::Command::new("rsync")
+            .args(&rsync_args)
+            .status()
+            .with_context(|| format!("failed to execute rsync for {from_path}"))?;
+        if !status.success() {
+            anyhow::bail!("rsync failed for sync mapping '{sync_name}'");
+        }
+        info!(sync = sync_name, mode = "passthrough", "rsync complete");
+
+        // Durable cleanup state for delete_after_import=true
+        if sync.delete_after_import {
+            let cleanup_entries: Vec<purgery_core::CleanupEntry> = manifest
+                .entries
+                .iter()
+                .filter(|e| {
+                    e.sync_name.as_str() == sync_name
+                        && e.kind == ManifestEntryKind::RegularFile
+                        && e.mode == purgery_core::ManifestEntryMode::Passthrough
+                })
+                .map(|e| purgery_core::CleanupEntry {
+                    sync_name: sync_name.to_owned(),
+                    relative_path: e.relative_path.as_str().to_owned(),
+                    local_path: e.local_path.as_str().to_owned(),
+                    size: e.size,
+                    mtime_ns: e.mtime_ns,
+                    sha256: e.sha256.clone(),
+                    rsync_succeeded: true,
+                    cleaned: false,
+                })
+                .collect();
+
+            if !cleanup_entries.is_empty() {
+                let cleanup_state = purgery_core::DurableCleanupState {
+                    nickname: config.nickname.as_str().to_owned(),
+                    operation_id: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                        .to_string(),
+                    entries: cleanup_entries,
+                };
+
+                // Write atomically via temp file + rename
+                let cleanup_path = tmp_dir.join(format!("cleanup-{sync_name}.toml"));
+                let cleanup_tmp = tmp_dir.join(format!("cleanup-{sync_name}.toml.tmp"));
+                let cleanup_content = toml::to_string(&cleanup_state)
+                    .map_err(|e| anyhow::anyhow!("failed to serialize cleanup state: {e}"))?;
+                fs::write(&cleanup_tmp, &cleanup_content)
+                    .with_context(|| "failed to write cleanup state")?;
+                fs::rename(&cleanup_tmp, &cleanup_path)
+                    .with_context(|| "failed to atomically publish cleanup state")?;
+
+                // Execute cleanup from the durable state
+                if let Ok(cleanup_content) = fs::read_to_string(&cleanup_path) {
+                    if let Ok(state) =
+                        toml::from_str::<purgery_core::DurableCleanupState>(&cleanup_content)
+                    {
+                        let mut deleted = 0usize;
+                        for entry in &state.entries {
+                            if !entry.rsync_succeeded || entry.cleaned {
+                                continue;
+                            }
+                            let local_path = Path::new(&entry.local_path);
+                            let symmeta = match fs::symlink_metadata(local_path) {
+                                Ok(m) => m,
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                    deleted += 1;
+                                    continue;
+                                }
+                                Err(_) => continue,
+                            };
+                            if !symmeta.file_type().is_file() || symmeta.file_type().is_symlink() {
+                                continue;
+                            }
+                            let Ok(meta) = fs::metadata(local_path) else {
+                                continue;
+                            };
+                            if meta.len() != entry.size {
+                                continue;
+                            }
+                            let current_mtime = meta
+                                .modified()
+                                .ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_nanos() as i64)
+                                .unwrap_or(0);
+                            if current_mtime != entry.mtime_ns {
+                                continue;
+                            }
+                            if let Some(ref expected_sha) = entry.sha256 {
+                                if let Ok(actual_sha) = compute_sha256(local_path) {
+                                    if &actual_sha != expected_sha {
+                                        continue;
+                                    }
+                                } else {
+                                    continue;
+                                }
+                            }
+                            if let Err(e) = fs::remove_file(local_path) {
+                                warn!(path = %entry.local_path, error = %e, "failed to delete");
+                            } else {
+                                deleted += 1;
+                            }
+                        }
+                        if deleted > 0 {
+                            info!(sync = sync_name, deleted, "passthrough cleanup");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    info!("passthrough run complete");
+    Ok(())
+}
+
+/// Run a postprocess invocation (one or more sync groups have postprocess roots).
+///
+/// Creates a server run: begin-run, upload filtered manifest, prepare-run,
+/// rsync passthrough + purgatory, finish-run, poll status, cleanup from status.
+fn run_postprocess_path(
+    config: &ClientConfig,
+    host: &str,
+    server_command: &str,
+    manifest: &Manifest,
+    run_id: &RunId,
+) -> Result<()> {
     let _span = span!(
         Level::INFO,
         "client run",
@@ -245,10 +526,15 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
     )
     .entered();
 
-    let manifest = build_manifest(config, &run_id)?;
-    info!(entries = manifest.entries.len(), "manifest built");
+    // Build server manifest (postprocess/covered entries only)
+    let server_manifest = manifest.build_server_manifest();
+    info!(
+        entries = manifest.entries.len(),
+        server_entries = server_manifest.entries.len(),
+        "built server manifest"
+    );
 
-    // 2. Begin run on server — get server-derived paths
+    // 1. Begin run
     let begin_out = server_cmd(
         host,
         server_command,
@@ -263,7 +549,6 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
     let begin_resp: BeginRunResponse =
         toml::from_str(&begin_out).with_context(|| "failed to parse begin-run response")?;
 
-    // Validate begin-run response envelope
     if begin_resp.protocol_version != 1 {
         anyhow::bail!(
             "unsupported begin-run protocol version: {}",
@@ -305,6 +590,7 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
             begin_resp.incoming_dir
         );
     }
+
     let run_config_path = Utf8Path::new(&begin_resp.run_config_path);
     if !run_config_path.is_absolute() {
         anyhow::bail!(
@@ -336,16 +622,18 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
 
     debug!(incoming_dir = %begin_resp.incoming_dir, "begin-run accepted");
 
-    // 3. Write run.toml and manifest.toml to server
+    // 2. Write run.toml and filtered manifest.toml to server
     let run_config = build_run_config(config);
     let run_config_toml = run_config
         .to_toml()
         .with_context(|| "failed to serialize run config")?;
     write_remote_file(host, &begin_resp.run_config_path, &run_config_toml)?;
-    let manifest_toml = manifest.to_toml()?;
+    let manifest_toml = server_manifest
+        .to_toml()
+        .with_context(|| "failed to serialize server manifest")?;
     write_remote_file(host, &begin_resp.manifest_path, &manifest_toml)?;
 
-    // 4. Prepare-run: validate plan and get transfer destinations
+    // 3. Prepare-run
     info!("validating run plan");
     let prepare_out = server_cmd(
         host,
@@ -368,14 +656,13 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
         );
     }
 
-    // Build a destination lookup map
     let dest_map: std::collections::HashMap<&str, &purgery_core::SyncDestination> = prepare_resp
         .destinations
         .iter()
         .map(|d| (d.sync_name.as_str(), d))
         .collect();
 
-    // 5. Start heartbeat guard thread
+    // 4. Start heartbeat guard thread
     let heartbeat_interval = Duration::from_secs(begin_resp.heartbeat_interval_secs);
     let stop_hb = Arc::new(AtomicBool::new(false));
     let hb_error = Arc::new(Mutex::new(None::<String>));
@@ -405,7 +692,7 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
         }
     });
 
-    // 6. Transfer: passthrough then purgatory per sync group
+    // 5. Transfer per sync group
     let sync_result = (|| -> Result<()> {
         for sync in &config.sync {
             let sync_name = sync.name.as_str();
@@ -414,11 +701,6 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
                 .get(sync_name)
                 .ok_or_else(|| anyhow::anyhow!("no destination for sync mapping '{sync_name}'"))?;
 
-            // Build transfer roots from classified manifest entries for this sync.
-            // Passthrough entries are always exact roots. Postprocess directories
-            // are subtree roots (transfer entire subtree). Postprocess files and
-            // symlinks are exact roots. Covered entries are excluded — they are
-            // transferred as part of the postprocessed directory subtree root.
             let passthrough_roots: Vec<purgery_core::TransferRoot> = manifest
                 .entries
                 .iter()
@@ -455,14 +737,12 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
                 a_str.cmp(b_str)
             });
 
-            // Write filter files
             let tmp_dir = std::env::temp_dir().join("purgery-filters");
             fs::create_dir_all(&tmp_dir).ok();
             let passthrough_file = tmp_dir.join(format!("passthrough-{sync_name}"));
             let purgatory_file = tmp_dir.join(format!("purgatory-{sync_name}"));
 
-            // --- Passthrough rsync: direct to final storage ---
-            // Skip if no passthrough transfer roots for this sync
+            // Passthrough rsync (non-postprocess entries)
             if !passthrough_roots.is_empty() {
                 let passthrough_filter = purgery_core::transfer_set_filter(&passthrough_roots);
                 fs::write(&passthrough_file, &passthrough_filter)
@@ -490,17 +770,6 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
                     anyhow::bail!("passthrough rsync failed for sync mapping '{sync_name}'");
                 }
                 info!(sync = sync_name, mode = "passthrough", "rsync complete");
-
-                // Write passthrough receipt only after successful passthrough rsync
-                let receipt = purgery_core::PassthroughReceipt {
-                    sync_name: sync_name.to_owned(),
-                    status: "imported".into(),
-                };
-                let receipt_content = toml::to_string(&receipt)
-                    .map_err(|e| anyhow::anyhow!("failed to serialize receipt: {e}"))?;
-                let receipt_remote =
-                    format!("{}/passthrough.{sync_name}.toml", begin_resp.incoming_dir);
-                write_remote_file(host, &receipt_remote, &receipt_content)?;
             } else {
                 info!(
                     sync = sync_name,
@@ -509,9 +778,9 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
                 );
             }
 
-            // Early cleanup for passthrough regular files
+            // Early cleanup for passthrough regular files with delete_after_import
             if sync.delete_after_import {
-                let pt_entries: Vec<&ManifestEntry> = manifest
+                let cleanup_entries: Vec<purgery_core::CleanupEntry> = manifest
                     .entries
                     .iter()
                     .filter(|e| {
@@ -519,10 +788,20 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
                             && e.kind == ManifestEntryKind::RegularFile
                             && e.mode == purgery_core::ManifestEntryMode::Passthrough
                     })
+                    .map(|e| purgery_core::CleanupEntry {
+                        sync_name: sync_name.to_owned(),
+                        relative_path: e.relative_path.as_str().to_owned(),
+                        local_path: e.local_path.as_str().to_owned(),
+                        size: e.size,
+                        mtime_ns: e.mtime_ns,
+                        sha256: e.sha256.clone(),
+                        rsync_succeeded: true,
+                        cleaned: false,
+                    })
                     .collect();
-                let mut early_count = 0usize;
-                for entry in &pt_entries {
-                    let local_path = Path::new(entry.local_path.as_str());
+
+                for entry in &cleanup_entries {
+                    let local_path = Path::new(&entry.local_path);
                     let symmeta = match fs::symlink_metadata(local_path) {
                         Ok(m) => m,
                         Err(_) => continue,
@@ -533,7 +812,6 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
                     let Ok(meta) = fs::metadata(local_path) else {
                         continue;
                     };
-                    // Full identity check: size, mtime, and sha256 if present
                     if meta.len() != entry.size {
                         continue;
                     }
@@ -556,17 +834,8 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
                         }
                     }
                     if let Err(e) = fs::remove_file(local_path) {
-                        warn!(path = %local_path.display(), error = %e, "failed to delete passthrough file");
-                    } else {
-                        early_count += 1;
+                        warn!(path = %entry.local_path, error = %e, "failed to delete");
                     }
-                }
-                if early_count > 0 {
-                    info!(
-                        sync = sync_name,
-                        deleted = early_count,
-                        "passthrough early cleanup"
-                    );
                 }
             }
 
@@ -575,8 +844,7 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
                 anyhow::bail!("{err}");
             }
 
-            // --- Purgatory rsync: selected entries to staging ---
-            // Skip if no purgatory transfer roots for this sync
+            // Purgatory rsync (postprocess entries)
             if !purgatory_roots.is_empty() {
                 let purgatory_filter = purgery_core::transfer_set_filter(&purgatory_roots);
                 fs::write(&purgatory_file, &purgatory_filter)
@@ -617,7 +885,7 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
             }
         }
 
-        // 7. Finish run
+        // 6. Finish run
         if let Some(err) = hb_error.lock().unwrap().take() {
             anyhow::bail!("{err}");
         }
@@ -637,24 +905,14 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
         Ok(())
     })();
 
-    // After finish-run succeeds, the run is no longer incoming.
-    // A concurrent final heartbeat from the background thread may fail
-    // harmlessly because the incoming directory no longer exists.
-    // The heartbeat thread records failures in hb_error before exiting.
-    // The sync result was checked immediately before finish-run, and
-    // post-finish heartbeat errors are intentionally ignored.
-
-    // Stop heartbeat thread regardless of sync/finish outcome
     stop_hb.store(true, Ordering::Relaxed);
     let _ = hb_handle.join();
-
-    // Propagate sync/finish/heartbeat error first
     sync_result?;
 
-    // 6. Poll for status via server command
-    let status = poll_for_status(host, server_command, &config.nickname, &run_id)?;
+    // 7. Poll for status (contains postprocess/covered entries only)
+    let status = poll_for_status(host, server_command, &config.nickname, run_id)?;
 
-    // 8. Verify status envelope before deletion
+    // 8. Verify status envelope
     if status.nickname != manifest.nickname {
         anyhow::bail!(
             "status nickname '{}' does not match manifest nickname '{}'; aborting deletion",
@@ -670,7 +928,7 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
         );
     }
 
-    // 9. Delete confirmed local files
+    // 9. Delete confirmed postprocess files from status
     let deletion_count = delete_confirmed_files(config, &manifest, &status)?;
     info!(deleted = deletion_count, "cleanup complete");
 
