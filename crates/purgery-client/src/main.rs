@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use purgery_core::{
     build_rsync_args, resolve_executable, shell_escape, BeginRunResponse, ClientConfig,
     ClientLocalPath, Manifest, ManifestEntry, ManifestEntryKind, NormalizedRelativePath, RunConfig,
-    RunConfigSync, RunId, RunStatus,
+    RunConfigSync, RunId, RunStatus, SyncExecutionClass,
 };
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -231,7 +231,7 @@ fn write_remote_file(host: &str, path: &str, content: &str) -> Result<()> {
 
 /// Build a RunConfig from a ClientConfig — strips server-local fields.
 /// Build a RunConfig from ClientConfig, optionally filtering to include
-/// only purgatory sync groups (those with applicable postprocess rules).
+/// only purgatory sync groups and rules applicable to those groups.
 fn build_run_config(config: &ClientConfig, purgatory_only: bool) -> RunConfig {
     let sync: Vec<RunConfigSync> = config
         .sync
@@ -252,10 +252,26 @@ fn build_run_config(config: &ClientConfig, purgatory_only: bool) -> RunConfig {
         })
         .collect();
 
+    let purgatory_names: Vec<&str> = sync.iter().map(|s| s.name.as_str()).collect();
+    let rules = if purgatory_only {
+        config
+            .postprocess
+            .rules
+            .iter()
+            .filter(|r| {
+                // Include rules that apply to at least one purgatory sync group
+                purgatory_names.iter().any(|name| r.applies_to(name))
+            })
+            .cloned()
+            .collect()
+    } else {
+        config.postprocess.rules.clone()
+    };
+
     RunConfig {
         nickname: config.nickname.clone(),
         sync,
-        postprocess: config.postprocess.clone(),
+        postprocess: purgery_core::ClientPostprocessConfig { rules },
     }
 }
 
@@ -309,45 +325,45 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
     }
     info!("postprocess rules validated");
 
-    // 2. Partition sync groups by their execution class.
+    // 2. Classify sync groups by their execution class.
     let run_id = RunId::generate();
     let mut all_manifest_entries: Vec<purgery_core::ManifestEntry> = Vec::new();
-    let mut direct_rsync_syncs: Vec<&purgery_core::SyncMapping> = Vec::new();
-    let mut cleanup_rsync_syncs: Vec<&purgery_core::SyncMapping> = Vec::new();
-    let mut any_postprocess = false;
+    let mut passthrough_nodelete: Vec<&purgery_core::SyncMapping> = Vec::new();
+    let mut passthrough_cleanup: Vec<&purgery_core::SyncMapping> = Vec::new();
+    let mut purgatory_syncs: Vec<&purgery_core::SyncMapping> = Vec::new();
 
-    for sync in &config.sync {
-        let sync_name = sync.name.as_str();
-        let applicable = purgery_core::applicable_rules(&config.postprocess.rules, sync_name);
-
-        if applicable.is_empty() && !sync.delete_after_import {
-            // Passthrough no-delete: direct unfiltered rsync, no walking, no cleanup
-            info!(
-                sync = sync_name,
-                "no applicable postprocess rules, direct rsync only"
-            );
-            direct_rsync_syncs.push(sync);
-        } else if applicable.is_empty() && sync.delete_after_import {
-            // Passthrough delete-after-import: direct unfiltered rsync, then cleanup.
-            // Walk the source for cleanup identity only, not for transfer planning.
-            info!(
-                sync = sync_name,
-                "no applicable postprocess rules, direct rsync with cleanup"
-            );
-            let (entries, _) = walk_and_classify_sync(config, sync, &run_id, &applicable)?;
-            all_manifest_entries.extend(entries);
-            cleanup_rsync_syncs.push(sync);
-        } else {
-            // Purgatory group: walk and classify
-            let (entries, has_pp) = walk_and_classify_sync(config, sync, &run_id, &applicable)?;
-            if has_pp {
-                any_postprocess = true;
+    let classes = purgery_core::classify_sync_groups(&config.sync, &config.postprocess.rules)
+        .map_err(|e| anyhow::anyhow!("sync group classification failed: {e}"))?;
+    for (class, sync) in &classes {
+        match class {
+            SyncExecutionClass::PassthroughNoDelete => {
+                info!(
+                    sync = sync.name.as_str(),
+                    "PassthroughNoDelete: direct rsync only"
+                );
+                passthrough_nodelete.push(sync);
             }
-            all_manifest_entries.extend(entries);
+            SyncExecutionClass::PassthroughDeleteAfterImport => {
+                info!(
+                    sync = sync.name.as_str(),
+                    "PassthroughDeleteAfterImport: direct rsync with cleanup"
+                );
+                passthrough_cleanup.push(sync);
+            }
+            SyncExecutionClass::Purgatory => {
+                let applicable =
+                    purgery_core::applicable_rules(&config.postprocess.rules, sync.name.as_str());
+                let (entries, _) = walk_and_classify_sync(config, sync, &run_id, &applicable)?;
+                all_manifest_entries.extend(entries);
+                purgatory_syncs.push(sync);
+            }
         }
     }
 
-    if all_manifest_entries.is_empty() && direct_rsync_syncs.is_empty() {
+    if all_manifest_entries.is_empty()
+        && passthrough_nodelete.is_empty()
+        && passthrough_cleanup.is_empty()
+    {
         anyhow::bail!("no filesystem entries found to sync");
     }
 
@@ -360,8 +376,8 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
     let transfer_plan = manifest.to_transfer_plan();
     info!(walked = manifest.entries.len(), "manifest built");
 
-    // 3. Execute transfers based on whether any postprocess work exists
-    if any_postprocess {
+    // 3. Execute transfers based on whether any purgatory groups exist
+    if !purgatory_syncs.is_empty() {
         run_postprocess_path(
             config,
             host,
@@ -369,8 +385,8 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
             &manifest,
             &transfer_plan,
             &run_id,
-            &direct_rsync_syncs,
-            &cleanup_rsync_syncs,
+            &passthrough_nodelete,
+            &passthrough_cleanup,
         )
     } else {
         run_passthrough_path(
@@ -379,8 +395,8 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
             server_command,
             &manifest,
             &transfer_plan,
-            &direct_rsync_syncs,
-            &cleanup_rsync_syncs,
+            &passthrough_nodelete,
+            &passthrough_cleanup,
         )
     }
 }
@@ -395,8 +411,8 @@ fn run_passthrough_path(
     server_command: &str,
     manifest: &Manifest,
     _transfer_plan: &[purgery_core::TransferPlanEntry],
-    direct_rsync_syncs: &[&purgery_core::SyncMapping],
-    cleanup_rsync_syncs: &[&purgery_core::SyncMapping],
+    passthrough_nodelete: &[&purgery_core::SyncMapping],
+    passthrough_cleanup: &[&purgery_core::SyncMapping],
 ) -> Result<()> {
     let _span = span!(
         Level::INFO,
@@ -443,15 +459,15 @@ fn run_passthrough_path(
             .map(|d| (d.sync_name.as_str(), d))
             .collect();
 
-    // Handle direct-rsync-only groups first (unfiltered, no manifest entries)
-    for sync in direct_rsync_syncs {
+    // Handle PassthroughNoDelete groups first (unfiltered, no manifest entries)
+    for sync in passthrough_nodelete {
         run_unfiltered_rsync(config, host, sync, &dest_map)?;
     }
 
     // Transfer per sync group that was walked
     for sync in &config.sync {
-        // Skip direct-rsync-only groups (already handled above)
-        if direct_rsync_syncs
+        // Skip PassthroughNoDelete groups (already handled above)
+        if passthrough_nodelete
             .iter()
             .any(|s| s.name.as_str() == sync.name.as_str())
         {
@@ -508,9 +524,9 @@ fn run_passthrough_path(
         }
     }
 
-    // Handle cleanup_rsync_syncs (no-rule delete-after-import groups):
+    // Handle PassthroughDeleteAfterImport groups:
     // direct unfiltered rsync + cleanup from manifest entries.
-    for sync in cleanup_rsync_syncs {
+    for sync in passthrough_cleanup {
         let sync_name = sync.name.as_str();
         if let Some(dest) = dest_map.get(sync_name) {
             let rsync_dest = format!("{}:{}/", host, dest.passthrough_dest);
@@ -584,8 +600,8 @@ fn run_postprocess_path(
     manifest: &Manifest,
     transfer_plan: &[purgery_core::TransferPlanEntry],
     run_id: &RunId,
-    direct_rsync_syncs: &[&purgery_core::SyncMapping],
-    cleanup_rsync_syncs: &[&purgery_core::SyncMapping],
+    passthrough_nodelete: &[&purgery_core::SyncMapping],
+    passthrough_cleanup: &[&purgery_core::SyncMapping],
 ) -> Result<()> {
     let _span = span!(
         Level::INFO,
@@ -605,7 +621,7 @@ fn run_postprocess_path(
 
     // 0a. Resolve destinations for passthrough-only groups via resolve-destinations
     let passthrough_dest_map: std::collections::HashMap<String, String> =
-        if !direct_rsync_syncs.is_empty() || !cleanup_rsync_syncs.is_empty() {
+        if !passthrough_nodelete.is_empty() || !passthrough_cleanup.is_empty() {
             let run_config_all = build_run_config(config, false);
             let run_config_all_toml = run_config_all
                 .to_toml()
@@ -633,9 +649,9 @@ fn run_postprocess_path(
             std::collections::HashMap::new()
         };
 
-    // 0b. Handle direct-rsync groups (passthrough, no applicable rules) before the purgatory run.
+    // 0b. Handle PassthroughNoDelete groups before the purgatory run.
     //     These groups are outside the purgatory lifecycle.
-    for sync in direct_rsync_syncs {
+    for sync in passthrough_nodelete {
         let sync_name = sync.name.as_str();
         let from_path = sync.from_path.as_str();
         if let Some(passthrough_dest) = passthrough_dest_map.get(sync_name) {
@@ -660,9 +676,9 @@ fn run_postprocess_path(
         }
     }
 
-    // 0c. Handle cleanup_rsync_syncs (no-rule delete-after-import):
+    // 0c. Handle PassthroughDeleteAfterImport groups:
     //     direct unfiltered rsync + cleanup from manifest entries.
-    for sync in cleanup_rsync_syncs {
+    for sync in passthrough_cleanup {
         let sync_name = sync.name.as_str();
         if let Some(passthrough_dest) = passthrough_dest_map.get(sync_name) {
             let rsync_dest = format!("{}:{}/", host, passthrough_dest);
@@ -853,16 +869,18 @@ fn run_postprocess_path(
     });
 
     // 5. Transfer per purgatory sync group
+    let sync_map = config
+        .sync
+        .iter()
+        .map(|s| (s.name.as_str(), s))
+        .collect::<std::collections::HashMap<&str, &purgery_core::SyncMapping>>();
     let sync_result = (|| -> Result<()> {
-        for sync in &config.sync {
-            // Skip groups already handled as direct rsync (passthrough-only)
-            if direct_rsync_syncs
-                .iter()
-                .any(|s| s.name.as_str() == sync.name.as_str())
-            {
-                continue;
-            }
-            let sync_name = sync.name.as_str();
+        // Iterate only purgatory groups via the purgatory-only run config.
+        for rcsync in &run_config.sync {
+            let sync_name = rcsync.name.as_str();
+            let Some(sync) = sync_map.get(sync_name) else {
+                anyhow::bail!("sync mapping '{}' not found in client config", sync_name);
+            };
             let from_path = sync.from_path.as_str();
             let dest = dest_map
                 .get(sync_name)

@@ -1481,6 +1481,51 @@ impl ClientPostprocessConfig {
     }
 }
 
+/// Execution class of a sync group, determined at planning time before
+/// any filesystem walking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncExecutionClass {
+    /// No applicable postprocess rules and `delete_after_import = false`.
+    /// Direct unfiltered rsync, no walk, no metadata, no cleanup.
+    PassthroughNoDelete,
+    /// No applicable postprocess rules but `delete_after_import = true`.
+    /// Direct unfiltered rsync plus durable cleanup scan for regular files.
+    PassthroughDeleteAfterImport,
+    /// One or more applicable postprocess rules and `delete_after_import = true`.
+    /// Walk, classify, upload manifest, server processing, status-based cleanup.
+    Purgatory,
+}
+
+/// Partition a list of sync mappings into their execution classes.
+///
+/// Returns a vector of (class, sync) pairs and an error if any group has
+/// applicable postprocess rules but `delete_after_import = false`.
+pub fn classify_sync_groups<'a>(
+    syncs: &'a [SyncMapping],
+    rules: &'a [PostprocessRule],
+) -> Result<Vec<(SyncExecutionClass, &'a SyncMapping)>, String> {
+    let mut result = Vec::with_capacity(syncs.len());
+    for sync in syncs {
+        let applicable = applicable_rules(rules, sync.name.as_str());
+        if !applicable.is_empty() && !sync.delete_after_import {
+            return Err(format!(
+                "sync group '{}' has applicable postprocess rules but \
+                 delete_after_import is false",
+                sync.name.as_str()
+            ));
+        }
+        let class = if !applicable.is_empty() {
+            SyncExecutionClass::Purgatory
+        } else if sync.delete_after_import {
+            SyncExecutionClass::PassthroughDeleteAfterImport
+        } else {
+            SyncExecutionClass::PassthroughNoDelete
+        };
+        result.push((class, sync));
+    }
+    Ok(result)
+}
+
 /// Server-relevant per-run configuration uploaded alongside files.
 ///
 /// Unlike `ClientConfig`, this does not include server transport
