@@ -2,6 +2,24 @@
 
 This document defines the filesystem invariants that make Purgery restart-safe. The [import semantics](import-semantics.md) describe per-entry tree-overlay details; this document describes the durable state machine around them.
 
+## Client cleanup state
+
+For passthrough entries with `delete_after_import = true`, the client writes a durable cleanup state file at a stable location:
+
+```text
+$XDG_STATE_HOME/purgery/  or  ~/.local/state/purgery/
+```
+
+This is the only cleanup mechanism. It is used for both pure passthrough invocations and mixed invocations.
+
+### Atomicity
+
+The cleanup state is written atomically via temporary file + rename. After each successful local deletion, the cleanup state is rewritten atomically so that a crash during cleanup does not make progress ambiguous.
+
+### Replay/idempotence
+
+On a later `sync-and-cleanup` invocation, the client scans the cleanup state directory for pending cleanup. Already-deleted files are idempotent (file not found = success). Changed files are skipped (identity check fails). Pending entries are retried.
+
 ## Statelessness invariant
 
 Purgery has no durable hidden database. Its durable state is the filesystem:
@@ -111,11 +129,16 @@ A run affects only outputs it explicitly commits. Purgery does not use `rsync --
 
 | Crash point | Durable result and restart behavior |
 |---|---|
-| Before rsync | No server state exists. |
+| Before rsync | No cleanup state exists. |
 | During passthrough rsync | The rsync may partially transfer files. Rerunning the client rsyncs again (idempotent). |
 | After rsync, before cleanup state write | Files were transferred but cleanup is not authorized. Rerunning rsyncs again (idempotent). |
-| After cleanup state written atomically, before deletion | Cleanup state authorizes deletion. Restart reads cleanup state and resumes deletion. |
-| After some deletions, before cleanup state cleared | Already-deleted files are idempotent (not found = OK). Remaining files are deleted after identity check. |
+| After cleanup state written atomically, before deletion | Cleanup state authorizes deletion. Restart reads cleanup state from stable directory and resumes deletion. |
+| After some deletions, before cleanup state updated | Already-deleted files are idempotent (not found = OK). Remaining files are deleted after identity check. Next cleanup state write will atomically update progress. |
+| After cleanup state updated, all deletions complete | Cleanup state marks all entries as cleaned. Restart sees no pending cleanup. |
+
+### Cleanup state discovery
+
+On startup, the client scans the cleanup state directory (`$XDG_STATE_HOME/purgery/` or `~/.local/state/purgery/`) for state files with pending cleanup. If found, cleanup is resumed before any new rsync operation. This ensures that partially-completed cleanup from a previous run does not accumulate indefinitely.
 
 The client keeps no local run database. For postprocess entries, verified server status remains the authority for local deletion. For passthrough entries with `delete_after_import=true`, the durable local cleanup state is the authority.
 

@@ -93,6 +93,20 @@ The client generates transfer roots from the classified manifest. Each transfer 
 
 Covered descendants are excluded from independent transfer roots. They are transferred only as part of the postprocessed directory subtree root.
 
+### Transfer planning vs identity bookkeeping
+
+Path planning computes lightweight records (sync name, relative path, kind, classification) for rsync filter generation. Identity bookkeeping computes size, mtime, and SHA-256 for cleanup.
+
+Identity bookkeeping is separated from path planning:
+
+- Path planning runs for all entries regardless of mode
+- Identity is computed only when needed (delete_after_import=true passthrough regular files, or postprocess entries)
+- No-delete passthrough entries get no identity bookkeeping
+
+### Durable cleanup state
+
+Cleanup state is stored at `$XDG_STATE_HOME/purgery/` or `~/.local/state/purgery/`. It is never stored in the temporary filter directory. The state file is written atomically and updated atomically after each deletion.
+
 ### Empty transfer sets
 
 If a sync group has no passthrough transfer roots, the passthrough rsync is skipped. If a sync group has no purgatory transfer roots, the purgatory rsync is skipped.

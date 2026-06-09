@@ -52,9 +52,27 @@ Before processing any entries, the server validates the run plan via `prepare-ru
 
 Ordinary passthrough entries have no server bookkeeping. They are transferred directly to final server storage by bulk rsync. The uploaded server manifest contains only postprocess roots and covered descendants — ordinary passthrough entries are excluded.
 
-For a sync group with `delete_after_import = false`, successful rsync is the complete import. No cleanup state is created.
+### Identity bookkeeping boundaries
 
-For a sync group with `delete_after_import = true`, the client writes a durable cleanup state file atomically after confirming rsync success. This state records the file identity (size, mtime, optional SHA-256) and is used on restart to safely delete confirmed files. The cleanup state is replayable and idempotent: already-deleted files are safe, changed files are skipped.
+For ordinary passthrough entries with `delete_after_import = false`:
+
+- Path planning (sync name, relative path, kind, classification) is computed for rsync filter generation
+- Size is read from filesystem metadata only to determine file type for classification
+- mtime_ns and SHA-256 are never computed
+- No cleanup state is written
+- The only operation is direct rsync
+
+For ordinary passthrough regular files with `delete_after_import = true`:
+
+- Size, mtime_ns, and optional SHA-256 are computed
+- Durable cleanup state is written atomically to the stable state directory
+- Cleanup verifies local identity before deletion
+
+### Durable cleanup state
+
+The cleanup state is stored at `$XDG_STATE_HOME/purgery/` or `~/.local/state/purgery/`. It is never stored in a temporary directory. For a sync group with `delete_after_import = true`, the client writes a durable cleanup state file atomically after confirming rsync success. This state records the file identity (size, mtime, optional SHA-256) and is used on restart to safely delete confirmed files. The cleanup state is replayable and idempotent: already-deleted files are safe, changed files are skipped.
+
+After each successful deletion, the cleanup state is rewritten atomically (temp file + rename). A crash during cleanup does not make progress ambiguous: already-deleted entries are idempotent, pending entries are retried.
 
 If no sync group has any postprocess roots, no server run is created. The client uses a side-effect-free `resolve-destinations` server command to obtain final storage paths, then rsyncs directly.
 

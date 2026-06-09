@@ -205,12 +205,46 @@ Both calls use `rsync --archive --no-inc-recursive --protect-args --no-delete` w
 
 The purgatory filter includes ancestor traversal directories needed to reach selected roots, then the roots themselves (exact or subtree), then excludes everything else.
 
+### Identity-bearing bookkeeping
+
+The client computes identity fields (size, mtime, SHA-256) only when they are needed for cleanup or server processing.
+
+For ordinary passthrough entries in a sync group with `delete_after_import = false`:
+
+- size is read from metadata for classification only (file type), not tracked for cleanup
+- mtime_ns and SHA-256 are never computed
+- no cleanup state is written
+- the only operation is direct rsync
+
+For ordinary passthrough regular files with `delete_after_import = true`:
+
+- size, mtime_ns, and optional SHA-256 are computed for cleanup identity verification
+- durable cleanup state is written atomically to a stable state directory
+- cleanup verifies local identity before deleting
+
 ### Import modes and cleanup
 
-- **Passthrough regular files with `delete_after_import = false`**: not cleaned locally. Successful rsync is the import.
+- **Passthrough regular files with `delete_after_import = false`**: not cleaned locally. No identity bookkeeping.
 - **Passthrough regular files with `delete_after_import = true`**: cleaned locally after durable disk-backed state atomically records rsync success. Local identity (size, mtime, optional SHA-256) is verified before deletion.
 - **Postprocessed regular files**: deleted after server status confirms the entry as imported.
 - **Directories and symlinks**: never deleted regardless of mode.
+
+### Durable cleanup state
+
+For `delete_after_import = true` passthrough, the client writes cleanup state to a stable directory:
+
+```text
+$XDG_STATE_HOME/purgery/  or  ~/.local/state/purgery/
+```
+
+The state file records:
+
+- nickname and operation ID
+- per-file entries with local path, size, mtime, optional SHA-256, rsync success flag, and cleanup status
+
+The state file is written atomically (temp file + rename). After each successful deletion, the state is updated atomically. A crashed or interrupted cleanup resumes safely on the next `sync-and-cleanup` invocation: already-deleted files are idempotent, changed files are skipped.
+
+This is the only cleanup mechanism. It is used for both pure passthrough invocations and mixed invocations where some entries are postprocessed.
 
 ## Run config
 
