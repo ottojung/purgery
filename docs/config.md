@@ -144,10 +144,10 @@ steps = ["compress-video"]
 
 ### Match patterns and import modes
 
-Each manifest entry is either **passthrough** or **postprocessed** (purgatory).
+Each entry is classified as **passthrough** or **postprocessed** (purgatory).
 
-- Passthrough entries are transferred directly to final server storage by a bulk rsync call.
-- Postprocessed entries are transferred to the server's staging area, where subprocesses run before final commit.
+- Passthrough entries are transferred directly to final server storage by a bulk rsync call. They have no server bookkeeping: no manifest entry, no receipt, no status entry.
+- Postprocessed entries are transferred to the server's staging area, where subprocesses run before final commit. They are tracked in the server manifest and status.
 
 The `match` value is an rsync include/exclude pattern. Rules are evaluated in order. The first matching rule selects the entry for postprocessing with that rule's steps. If no rule matches, the entry is passthrough.
 
@@ -192,7 +192,7 @@ A postprocessed directory root generates an rsync filter that includes the direc
 
 ### Empty transfer sets
 
-If a sync group has no passthrough transfer roots, the passthrough rsync is skipped and no passthrough receipt is written. If a sync group has no purgatory transfer roots, the purgatory rsync is skipped.
+If a sync group has no passthrough transfer roots, the passthrough rsync is skipped. If a sync group has no purgatory transfer roots, the purgatory rsync is skipped.
 
 ### Rsync filter generation
 
@@ -207,7 +207,8 @@ The purgatory filter includes ancestor traversal directories needed to reach sel
 
 ### Import modes and cleanup
 
-- **Passthrough regular files**: deleted locally as soon as the passthrough rsync call succeeds and local identity is verified.
+- **Passthrough regular files with `delete_after_import = false`**: not cleaned locally. Successful rsync is the import.
+- **Passthrough regular files with `delete_after_import = true`**: cleaned locally after durable disk-backed state atomically records rsync success. Local identity (size, mtime, optional SHA-256) is verified before deletion.
 - **Postprocessed regular files**: deleted after server status confirms the entry as imported.
 - **Directories and symlinks**: never deleted regardless of mode.
 

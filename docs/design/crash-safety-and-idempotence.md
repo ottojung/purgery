@@ -18,6 +18,7 @@ manifest.toml
 status.toml
 work area
 final storage
+client cleanup state (local, for delete_after_import passthrough)
 ```
 
 Client and server processes may stop at any instruction. Recovery must follow from these files and directories alone, without remembered process state. Metadata files are written through temporary files and renamed into place where applicable.
@@ -48,7 +49,9 @@ The staged files in the processing directory are the replay source. The work are
 
 ## Status and deletion invariant
 
-The client may delete a local file only after reading a valid `status.toml` whose envelope matches the uploaded manifest:
+### Postprocess entries
+
+The client may delete a local postprocessed file only after reading a valid `status.toml` whose envelope matches the uploaded manifest:
 
 ```text
 status.nickname == manifest.nickname
@@ -62,6 +65,12 @@ No status means no deletion. An entry is recorded as `imported` only after all o
 - `failed`: no entries were imported.
 
 The server commits final outputs before atomically publishing successful status. A crash before status publication therefore cannot authorize client deletion of local regular files.
+
+### Passthrough entries with delete_after_import=true
+
+The client may delete a local passthrough file only after a durable cleanup state file on disk records that rsync succeeded. The cleanup state is written atomically (via temporary file + rename) after verifying the rsync process exited successfully. A crash before the rename leaves no cleanup state, so deletion is not authorized.
+
+The client verifies local identity (size, mtime, optional SHA-256) against the cleanup state before deleting. Changed files are skipped. Already-deleted files are idempotent.
 
 ## Idempotent tree-overlay invariant
 
@@ -98,7 +107,17 @@ A run affects only outputs it explicitly commits. Purgery does not use `rsync --
 | After server import, before cleanup | A valid server status exists, but the client may upload again after restart. Atomic replacement makes the repeated import safe. |
 | After cleanup | Confirmed local regular files are gone. If a file is later re-created at the same local path, importing it again safely replaces the regular final file. |
 
-The client keeps no local run database. Verified server status remains the sole authority for local deletion.
+### Passthrough-specific crash matrix (pure passthrough groups)
+
+| Crash point | Durable result and restart behavior |
+|---|---|
+| Before rsync | No server state exists. |
+| During passthrough rsync | The rsync may partially transfer files. Rerunning the client rsyncs again (idempotent). |
+| After rsync, before cleanup state write | Files were transferred but cleanup is not authorized. Rerunning rsyncs again (idempotent). |
+| After cleanup state written atomically, before deletion | Cleanup state authorizes deletion. Restart reads cleanup state and resumes deletion. |
+| After some deletions, before cleanup state cleared | Already-deleted files are idempotent (not found = OK). Remaining files are deleted after identity check. |
+
+The client keeps no local run database. For postprocess entries, verified server status remains the authority for local deletion. For passthrough entries with `delete_after_import=true`, the durable local cleanup state is the authority.
 
 ## Tree-overlay recovery guarantee
 

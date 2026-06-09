@@ -48,9 +48,19 @@ Cleanup policy:
 
 Before processing any entries, the server validates the run plan via `prepare-run`. This validates the manifest classification, match patterns, step references, expected-output names, and planned final paths. If anything is invalid, the run is rejected before any passthrough rsync mutates final storage.
 
+## Passthrough architecture
+
+Ordinary passthrough entries have no server bookkeeping. They are transferred directly to final server storage by bulk rsync. The uploaded server manifest contains only postprocess roots and covered descendants — ordinary passthrough entries are excluded.
+
+For a sync group with `delete_after_import = false`, successful rsync is the complete import. No cleanup state is created.
+
+For a sync group with `delete_after_import = true`, the client writes a durable cleanup state file atomically after confirming rsync success. This state records the file identity (size, mtime, optional SHA-256) and is used on restart to safely delete confirmed files. The cleanup state is replayable and idempotent: already-deleted files are safe, changed files are skipped.
+
+If no sync group has any postprocess roots, no server run is created. The client uses a side-effect-free `resolve-destinations` server command to obtain final storage paths, then rsyncs directly.
+
 ## Transfer model
 
-Manifest entries are transferred from the client source tree to the server by rsync. The client generates two transfer sets per sync group:
+The client generates two transfer sets per sync group:
 
 1. **Passthrough transfer set**: exact-path roots for entries with mode `passthrough` (regular files, symlinks, empty directories). Transferred directly to final storage.
 2. **Purgatory transfer set**: exact-path roots for ordinary postprocess entries plus subtree roots for postprocessed directories. Transferred to the staging area.
@@ -140,18 +150,11 @@ If a `status.toml` exists but is malformed (invalid TOML or missing required fie
 
 A run is rejected before entry processing if planned final paths conflict, including direct manifest-entry paths and postprocess-derived output roots.
 
-## Status envelope verification
+## Cleanup authority by entry type
 
-Before deleting any local file, the client verifies:
+### Postprocess entries
 
-- `status.nickname == manifest.nickname`
-- `status.run_id == manifest.run_id`
-
-If either mismatches, cleanup is aborted and nothing is deleted.
-
-## Client deletion semantics
-
-Local files are deleted only after all of the following are true:
+For postprocess entries, cleanup authority is the server's `status.toml`:
 
 1. The server's `status.toml` is valid and parseable.
 2. `status.nickname == manifest.nickname` and `status.run_id == manifest.run_id`.
@@ -159,5 +162,18 @@ Local files are deleted only after all of the following are true:
 4. The manifest entry kind is `regular_file`.
 5. The local file still matches the uploaded identity (size, mtime, and optional SHA-256) and is still a regular file (not a symlink replacement).
 6. The sync mapping has `delete_after_import = true`.
+
+### Passthrough entries
+
+For passthrough entries, cleanup authority is the durable local cleanup state:
+
+1. A valid cleanup state file exists on disk with a recorded rsync success marker.
+2. The local file still matches the recorded identity (size, mtime, optional SHA-256).
+3. The local file is still a regular file (not a symlink replacement).
+4. The sync mapping has `delete_after_import = true`.
+
+Passthrough entries with `delete_after_import = false` are never cleaned.
+
+### General properties
 
 Deletion is idempotent. If the local file is already gone, it is counted as a successful cleanup. If the file changed since upload, the client leaves it untouched. Directories and symlinks are never deleted.

@@ -37,11 +37,11 @@ purgery-client sync-and-cleanup --config client.toml
 
 ## How it works
 
-1. The client walks configured local trees without following symlinks and builds a manifest of directories, regular files, and symlinks.
-2. The client uploads each tree to a server staging area over SSH via recursive archive-mode rsync without delete.
-3. The server validates the staged entries, postprocesses matching entries (directories, regular files, or symlinks), and overlays the tree onto final storage.
-4. The server writes a status file describing what was imported and what failed.
-5. The client reads the status and, for sync mappings with cleanup enabled, removes only confirmed unchanged local originals.
+1. The client walks configured local trees without following symlinks and classifies every entry as either **passthrough** (direct rsync to final storage) or **postprocess** (server-transformed via subprocesses).
+2. If any sync group has postprocess entries, the client creates a server run: uploads a manifest of only postprocess roots and covered descendants, validates the plan, and transfers entries to the staging area.
+3. The server processes postprocess entries (prepares work areas, runs subprocesses, commits outputs) and writes a status file.
+4. For pure passthrough groups (no postprocess), the client skips server bookkeeping entirely and rsyncs directly to final storage.
+5. Local cleanup of passthrough regular files uses the rsync transfer as authority when `delete_after_import=false`. When `delete_after_import=true`, local cleanup uses durable disk-backed state atomically recorded after successful rsync. Postprocessed files are cleaned only after server status confirms the import.
 
 ## Configuration
 
@@ -94,7 +94,9 @@ steps = ["compress-video"]
 Purgery targets Unix/POSIX filesystem semantics and is conservative about data loss:
 
 - Cleanup is opt-in per sync mapping (`delete_after_import = true`).
-- The client deletes local regular files only after the server confirms the import in a valid status file whose nickname and run ID match the original upload.
+- For postprocess entries, the client deletes local regular files only after the server confirms the import in a valid status file whose nickname and run ID match the original upload.
+- For passthrough entries with `delete_after_import = true`, cleanup authority is a durable disk-backed state file atomically written after successful rsync. The client verifies the local file still matches its uploaded identity (size, mtime, optional SHA-256) before deletion.
+- For passthrough entries with `delete_after_import = false`, no cleanup bookkeeping exists. Successful rsync is the import — the local file remains.
 - Before deleting, the client verifies the local regular file still matches its uploaded identity (size, mtime, optional SHA-256).
 - The server performs a recursive rsync-like no-delete overlay: directories merge, regular files replace, symlinks remain symlinks, and absent source entries never delete final entries.
 - Symlink targets are literal data. The server never follows staged or final-storage symlinks as directories.
