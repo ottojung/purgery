@@ -158,16 +158,30 @@ Supported rsync pattern syntax:
 | `*` | Matches any characters except `/` |
 | `**` | Matches any characters including `/` |
 | `?` | Matches any single character except `/` |
-| Leading `/` | Anchors the pattern to the start of the normalized path |
+| Leading `/` | Anchors the pattern to the start of the path |
 | No leading `/` | Pattern matches at any position in the path |
+
+Patterns are evaluated relative to each sync source root (`sync.from`), not the server destination. So for:
+
+```toml
+[[sync]]
+name = "videos"
+from = "/home/user/Videos"
+to = "videos"
+
+[[postprocess.rules]]
+match = "**/*.mp4"
+```
+
+the pattern sees `a.mp4`, `subdir/b.mp4` — not `videos/a.mp4`.
 
 Examples:
 
 ```
-match = "*.mp4"                    # any .mp4 file anywhere
-match = "videos/*"                 # files directly inside videos/
-match = "videos/**/*.mp4"          # any .mp4 under videos/ and subdirectories
-match = "/photos"                  # exactly the photos directory
+match = "*.mp4"                    # any .mp4 file in any directory
+match = "videos/*"                 # files directly inside videos/ subdirectory
+match = "videos/**/*.mp4"          # any .mp4 under videos/ and its subdirectories
+match = "/photos"                  # exactly the photos directory at source root
 ```
 
 ### Rsync filter generation

@@ -681,7 +681,7 @@ fn build_manifest(config: &ClientConfig, run_id: &RunId) -> Result<Manifest> {
             };
 
             // Classify entry as passthrough or postprocessed
-            let normalized_path = format!("{}/{}", to_path, relative_path.as_str());
+            let normalized_path = relative_path.as_str().to_owned();
             let matched_rule = config
                 .postprocess
                 .rules
