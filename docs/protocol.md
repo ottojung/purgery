@@ -192,9 +192,13 @@ The uploaded `run.toml` is validated through a central API in `purgery-core`:
 - `RunConfig::from_toml` parses TOML and validates `postprocess.rules.for` scoping.
 - `RunConfig::validate_uploaded_purgatory_run` confirms every sync has `delete_after_import = true` and `for` lists are valid.
 
-The server applies these validations in `prepare-run` before any manifest processing, final-path validation, or storage mutation.
+The server applies these validations at every lifecycle point that reads the uploaded run config:
 
-`resolve-destinations` uses structural validation (for lists only) but does not require `delete_after_import = true`, since it is also called for pure passthrough groups.
+- `resolve-destinations` uses structural validation only (for lists). It does not require `delete_after_import = true`, since it is also called for pure passthrough groups.
+- `prepare-run` performs full purgatory validation before any manifest processing, final-path validation, or storage mutation.
+- `process_processing_run` and `recover_or_process_processing_run` perform full purgatory validation again before `RunPlan::build` and before final-storage mutation.
+
+`RunPlan::build` defensively validates the run config independently, so that invalid uploaded run configs are rejected even if a caller forgets to validate beforehand.
 
 ## Destination resolution
 
