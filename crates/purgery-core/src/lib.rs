@@ -1445,6 +1445,35 @@ pub struct PassthroughReceipt {
     pub status: String,
 }
 
+/// Durable cleanup state for passthrough regular files with `delete_after_import = true`.
+///
+/// Written atomically to a local file after successful rsync.
+/// On restart, the client reads this state to resume safe cleanup.
+/// The state records the operation identity and per-file identity so that
+/// changed files are not deleted and already-deleted files are idempotent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DurableCleanupState {
+    pub nickname: String,
+    pub operation_id: String,
+    pub entries: Vec<CleanupEntry>,
+}
+
+/// One file entry in the durable cleanup state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CleanupEntry {
+    pub sync_name: String,
+    pub relative_path: String,
+    pub local_path: String,
+    pub size: u64,
+    pub mtime_ns: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// True once rsync has successfully transferred this file.
+    pub rsync_succeeded: bool,
+    /// True once the local file has been deleted.
+    pub cleaned: bool,
+}
+
 /// Response from `purgery-server begin-run`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BeginRunResponse {
