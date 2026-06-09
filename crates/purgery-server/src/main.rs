@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use purgery_core::{Nickname, RunId, ServerConfig};
+use purgery_core::{ColorMode, LogFormat, LogLevel, Nickname, RunId, ServerConfig};
 use purgery_server::{
     begin_run, bootstrap, finish_run, heartbeat_run, process_once_raw, read_run_status, run_gc,
     server_check,
@@ -43,6 +43,22 @@ struct Cli {
     /// Path to server configuration TOML
     #[arg(long, global = true)]
     config: Option<String>,
+
+    /// Log level override (error, warn, info, debug, trace)
+    #[arg(long, global = true)]
+    log_level: Option<String>,
+    /// Log format override (pretty, compact, json)
+    #[arg(long, global = true)]
+    log_format: Option<String>,
+    /// Color mode override (auto, always, never)
+    #[arg(long, global = true)]
+    color: Option<String>,
+    /// Suppress all logs except errors
+    #[arg(long, global = true, conflicts_with = "verbose")]
+    quiet: bool,
+    /// Enable verbose (debug) logging
+    #[arg(long, global = true, conflicts_with = "quiet")]
+    verbose: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -88,63 +104,85 @@ enum Command {
     },
 }
 
+/// Apply CLI logging overrides on top of a base config.
+fn apply_cli_overrides(log_cfg: &mut purgery_core::LoggingConfig, cli: &Cli) -> Result<()> {
+    if cli.quiet {
+        log_cfg.level = LogLevel::Error;
+    }
+    if cli.verbose {
+        log_cfg.level = LogLevel::Debug;
+    }
+    if let Some(ref level) = cli.log_level {
+        log_cfg.level = level
+            .parse::<LogLevel>()
+            .map_err(|e| anyhow::anyhow!("invalid log level: {e}"))?;
+    }
+    if let Some(ref fmt) = cli.log_format {
+        log_cfg.format = fmt
+            .parse::<LogFormat>()
+            .map_err(|e| anyhow::anyhow!("invalid log format: {e}"))?;
+    }
+    if let Some(ref color) = cli.color {
+        log_cfg.color = color
+            .parse::<ColorMode>()
+            .map_err(|e| anyhow::anyhow!("invalid color mode: {e}"))?;
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let call_with_config = |f: &dyn Fn(&ServerConfig) -> Result<()>| -> Result<()> {
-        let config_path = cli.config.as_deref().unwrap_or("");
-        let path = if config_path.is_empty() {
-            find_config()?
-        } else {
-            config_path.to_owned()
-        };
-        let server_config = load_server_config(&path)?;
-        f(&server_config)
+    // Resolve config path before dispatch so we can load config once.
+    let config_path = cli.config.as_deref().unwrap_or("");
+    let path = if config_path.is_empty() {
+        find_config()?
+    } else {
+        config_path.to_owned()
     };
+    let server_config = load_server_config(&path)?;
+
+    // Merge logging: config defaults + CLI overrides, then init.
+    let mut log_cfg = server_config.logging.clone();
+    apply_cli_overrides(&mut log_cfg, &cli)?;
+    purgery_core::init_logging(&log_cfg)
+        .map_err(|e| anyhow::anyhow!("failed to initialize logging: {e}"))?;
 
     match cli.command {
         Command::ProcessOnce => {
-            call_with_config(&|config| {
-                server_check(config)?;
-                process_once_raw(config)
-            })?;
+            server_check(&server_config)?;
+            process_once_raw(&server_config)?;
         }
         Command::BeginRun { nickname, run_id } => {
             let nickname = Nickname::new(nickname).with_context(|| "invalid nickname")?;
             let run_id = RunId::new(run_id).with_context(|| "invalid run ID")?;
-            call_with_config(&|config| {
-                let response = begin_run(config, &nickname, &run_id)?;
-                print!("{response}");
-                Ok(())
-            })?;
+            let response = begin_run(&server_config, &nickname, &run_id)?;
+            print!("{response}");
         }
         Command::FinishRun { nickname, run_id } => {
             let nickname = Nickname::new(nickname).with_context(|| "invalid nickname")?;
             let run_id = RunId::new(run_id).with_context(|| "invalid run ID")?;
-            call_with_config(&|config| finish_run(config, &nickname, &run_id))?;
+            finish_run(&server_config, &nickname, &run_id)?;
         }
         Command::Status { nickname, run_id } => {
             let nickname = Nickname::new(nickname).with_context(|| "invalid nickname")?;
             let run_id = RunId::new(run_id).with_context(|| "invalid run ID")?;
-            call_with_config(&|config| {
-                let status = read_run_status(config, &nickname, &run_id)?;
-                print!("{}", status.to_toml()?);
-                Ok(())
-            })?;
+            let status = read_run_status(&server_config, &nickname, &run_id)?;
+            print!("{}", status.to_toml()?);
         }
         Command::Check => {
-            call_with_config(&|config| server_check(config))?;
+            server_check(&server_config)?;
         }
         Command::Bootstrap => {
-            call_with_config(&|config| bootstrap(config))?;
+            bootstrap(&server_config)?;
         }
         Command::Gc => {
-            call_with_config(&|config| run_gc(config))?;
+            run_gc(&server_config)?;
         }
         Command::HeartbeatRun { nickname, run_id } => {
             let nickname = Nickname::new(nickname).with_context(|| "invalid nickname")?;
             let run_id = RunId::new(run_id).with_context(|| "invalid run ID")?;
-            call_with_config(&|config| heartbeat_run(config, &nickname, &run_id))?;
+            heartbeat_run(&server_config, &nickname, &run_id)?;
         }
     }
 

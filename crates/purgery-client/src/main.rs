@@ -3,8 +3,8 @@ use camino::Utf8Path;
 use clap::{Parser, Subcommand};
 use purgery_core::{
     build_rsync_args, resolve_executable, shell_escape, BeginRunResponse, ClientConfig,
-    ClientLocalPath, ColorMode, LogFormat, LogLevel, Manifest, ManifestFileEntry,
-    NormalizedRelativePath, RunConfig, RunConfigSync, RunId, RunStatus,
+    ClientLocalPath, Manifest, ManifestFileEntry, NormalizedRelativePath, RunConfig, RunConfigSync,
+    RunId, RunStatus,
 };
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -63,8 +63,39 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Build logging config from defaults, then apply CLI overrides
-    let mut log_cfg = purgery_core::LoggingConfig::default();
+    // Extract config path from whichever subcommand is active
+    let config_path = match &cli.command {
+        Command::SyncAndCleanup { config } => config.as_str(),
+        Command::Check { config } => config.as_str(),
+    };
+
+    // Load client config first — needed for logging settings
+    let config_content = fs::read_to_string(config_path)
+        .with_context(|| format!("failed to read client config: {config_path}"))?;
+    let config = ClientConfig::from_toml(&config_content)
+        .with_context(|| "failed to parse client config")?;
+
+    // Merge logging: start with config's logging settings, then apply CLI overrides.
+    // Precedence: CLI > config > default.
+    let mut log_cfg = config.logging.clone();
+    apply_cli_overrides(&mut log_cfg, &cli)?;
+    purgery_core::init_logging(&log_cfg)
+        .map_err(|e| anyhow::anyhow!("failed to initialize logging: {e}"))?;
+
+    match cli.command {
+        Command::SyncAndCleanup { .. } => {
+            sync_and_cleanup(&config)?;
+        }
+        Command::Check { .. } => {
+            client_check(&config, config_path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Apply CLI logging overrides on top of a base config.
+fn apply_cli_overrides(log_cfg: &mut purgery_core::LoggingConfig, cli: &Cli) -> Result<()> {
+    use purgery_core::{ColorMode, LogFormat, LogLevel};
     if cli.quiet {
         log_cfg.level = LogLevel::Error;
     }
@@ -85,18 +116,6 @@ fn main() -> Result<()> {
         log_cfg.color = color
             .parse::<ColorMode>()
             .map_err(|e| anyhow::anyhow!("invalid color mode: {e}"))?;
-    }
-
-    purgery_core::init_logging(&log_cfg)
-        .map_err(|e| anyhow::anyhow!("failed to initialize logging: {e}"))?;
-
-    match cli.command {
-        Command::SyncAndCleanup { config } => {
-            sync_and_cleanup(&config)?;
-        }
-        Command::Check { config } => {
-            client_check(&config)?;
-        }
     }
     Ok(())
 }
@@ -187,7 +206,7 @@ fn build_run_config(config: &ClientConfig) -> RunConfig {
 
 /// Client boot-time check: verify local executables and config only.
 /// Does NOT SSH into the server or mutate anything.
-fn client_check(config_path: &str) -> Result<()> {
+fn client_check(config: &ClientConfig, _config_path: &str) -> Result<()> {
     info!("checking client configuration");
 
     resolve_executable("ssh").map(|r| {
@@ -197,11 +216,6 @@ fn client_check(config_path: &str) -> Result<()> {
     resolve_executable("rsync").map(|r| {
         info!(path = %r.path.as_str(), "rsync: found");
     })?;
-
-    let config_content = fs::read_to_string(config_path)
-        .with_context(|| format!("failed to read client config: {config_path}"))?;
-    let config = ClientConfig::from_toml(&config_content)
-        .with_context(|| "failed to parse client config")?;
 
     if config.server.host.as_str().is_empty() {
         anyhow::bail!("server host is empty");
@@ -214,14 +228,9 @@ fn client_check(config_path: &str) -> Result<()> {
     Ok(())
 }
 
-fn sync_and_cleanup(config_path: &str) -> Result<()> {
+fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
     // 0. Run local checks before any remote operations
-    client_check(config_path)?;
-
-    let config_content = fs::read_to_string(config_path)
-        .with_context(|| format!("failed to read client config: {config_path}"))?;
-    let config = ClientConfig::from_toml(&config_content)
-        .with_context(|| "failed to parse client config")?;
+    client_check(config, "")?;
 
     // 1. Generate a unique run ID and build manifest BEFORE begin-run
     let run_id = RunId::generate();
@@ -236,7 +245,7 @@ fn sync_and_cleanup(config_path: &str) -> Result<()> {
     )
     .entered();
 
-    let manifest = build_manifest(&config, &run_id)?;
+    let manifest = build_manifest(config, &run_id)?;
     info!(files = manifest.files.len(), "manifest built");
 
     // 2. Begin run on server — get server-derived paths
@@ -328,7 +337,7 @@ fn sync_and_cleanup(config_path: &str) -> Result<()> {
     debug!(incoming_dir = %begin_resp.incoming_dir, "begin-run accepted");
 
     // 3. Write run.toml and manifest.toml to server
-    let run_config = build_run_config(&config);
+    let run_config = build_run_config(config);
     let run_config_toml = run_config
         .to_toml()
         .with_context(|| "failed to serialize run config")?;
@@ -461,7 +470,7 @@ fn sync_and_cleanup(config_path: &str) -> Result<()> {
     }
 
     // 9. Delete confirmed local files
-    let deletion_count = delete_confirmed_files(&config, &manifest, &status)?;
+    let deletion_count = delete_confirmed_files(config, &manifest, &status)?;
     info!(deleted = deletion_count, "cleanup complete");
 
     info!(state = %status.state.as_str(), "run finished");

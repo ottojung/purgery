@@ -1016,18 +1016,19 @@ impl FromStr for ColorMode {
 ///
 /// Must be called at most once, near the binary entry point.
 /// Logs go to stderr; stdout is reserved for machine-readable protocol output.
+/// Uses the configured level directly — `RUST_LOG` environment variable is not
+/// consulted. The caller is responsible for resolving precedence
+/// (CLI > config > default) before calling this function.
 pub fn init_logging(config: &LoggingConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let filter = tracing_subscriber::EnvFilter::builder()
-        .with_default_directive(
-            config
-                .level
-                .to_string()
-                .parse::<tracing_subscriber::filter::Directive>()?,
-        )
-        .from_env_lossy();
+    let level_filter: tracing_subscriber::filter::LevelFilter = match config.level {
+        LogLevel::Error => tracing_subscriber::filter::LevelFilter::ERROR,
+        LogLevel::Warn => tracing_subscriber::filter::LevelFilter::WARN,
+        LogLevel::Info => tracing_subscriber::filter::LevelFilter::INFO,
+        LogLevel::Debug => tracing_subscriber::filter::LevelFilter::DEBUG,
+        LogLevel::Trace => tracing_subscriber::filter::LevelFilter::TRACE,
+    };
 
     let is_terminal = atty::is(atty::Stream::Stderr);
-
     let use_color = match config.color {
         ColorMode::Always => true,
         ColorMode::Never => false,
@@ -1037,25 +1038,25 @@ pub fn init_logging(config: &LoggingConfig) -> Result<(), Box<dyn std::error::Er
     match config.format {
         LogFormat::Json => {
             tracing_subscriber::fmt()
+                .with_max_level(level_filter)
                 .json()
                 .with_writer(std::io::stderr)
-                .with_env_filter(filter)
                 .with_ansi(false)
                 .init();
         }
         LogFormat::Compact => {
             tracing_subscriber::fmt()
+                .with_max_level(level_filter)
                 .compact()
                 .with_writer(std::io::stderr)
-                .with_env_filter(filter)
                 .with_ansi(use_color)
                 .init();
         }
         LogFormat::Pretty => {
             tracing_subscriber::fmt()
+                .with_max_level(level_filter)
                 .pretty()
                 .with_writer(std::io::stderr)
-                .with_env_filter(filter)
                 .with_ansi(use_color)
                 .init();
         }
