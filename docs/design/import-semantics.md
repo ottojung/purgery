@@ -12,7 +12,7 @@ The temp file is on the same filesystem as the final path, so the rename is atom
 
 ## Directory overlay semantics
 
-Purgery uses recursive no-delete overlay semantics for commits. Existing directories are kept and merged. Regular files and symlinks replace conflicting existing entries of the same type. Conflicting non-empty directories are not replaced — the operator must resolve them.
+Purgery uses recursive no-delete overlay semantics for commits. Existing directories are kept and merged. Regular files and symlinks replace existing conflicting entries (files, symlinks, or empty directories). Non-empty directories are not replaced — the operator must resolve them.
 
 Commits are not all-or-nothing. A crash during commit may leave some outputs already written to final storage. This is acceptable because `status.toml` has not been published yet, `processing/` still exists, and `process-once` replays from staged files with idempotent commits.
 

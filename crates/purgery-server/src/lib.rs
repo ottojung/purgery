@@ -4963,6 +4963,118 @@ to = "shared"
 
     // ── Postprocess-derived duplicate final path tests ──
 
+    #[test]
+    fn postprocessed_directory_does_not_cause_false_overlap_rejection() {
+        // Postprocessed directory + descendant file must not trigger a false
+        // overlap validation failure.  The descendant should be skipped as
+        // covered, not rejected as a planned-path conflict.
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&purgery_root, &server_root);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("dir-transform".into()).unwrap();
+        let ready = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Ready);
+
+        // Create staged directory with child file
+        fs::create_dir_all(ready.join("files/data/photos")).unwrap();
+        fs::write(ready.join("files/data/photos/photo.txt"), "content").unwrap();
+
+        // Run config with a postprocess rule that matches the directory
+        let run_config_src = r#"
+nickname = "laptop"
+
+[[sync]]
+name = "data"
+to = "data"
+
+[[postprocess.rules]]
+match = '^data/photos$'
+steps = ["pack"]
+"#;
+        fs::write(ready.join("run.toml"), run_config_src).unwrap();
+        // Server config with a matching step
+        let config = ServerConfig {
+            root: ServerRoot::new(server_root.clone()).unwrap(),
+            purgery_root: PurgeryRoot::new(purgery_root.clone()).unwrap(),
+            gc: Default::default(),
+            postprocess: PostprocessConfig {
+                steps: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "pack".to_owned(),
+                        PostprocessStepDefinition {
+                            kind: PostprocessKind::Subprocess,
+                            program: "true".into(),
+                            args: vec![],
+                            expected_outputs: vec![],
+                            keep_original: true,
+                        },
+                    );
+                    m
+                },
+            },
+            logging: Default::default(),
+        };
+
+        let manifest = Manifest {
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![
+                ManifestEntry {
+                    sync_name: SyncName::new("data".into()).unwrap(),
+                    local_path: ClientLocalPath::new("/source/photos".into()).unwrap(),
+                    staged_path: NormalizedRelativePath::new("files/data/photos".into()).unwrap(),
+                    relative_path: NormalizedRelativePath::new("photos".into()).unwrap(),
+                    kind: ManifestEntryKind::Directory,
+                    size: 0,
+                    mtime_ns: 0,
+                    sha256: None,
+                    link_target: None,
+                },
+                ManifestEntry {
+                    sync_name: SyncName::new("data".into()).unwrap(),
+                    local_path: ClientLocalPath::new("/source/photos/photo.txt".into()).unwrap(),
+                    staged_path: NormalizedRelativePath::new("files/data/photos/photo.txt".into())
+                        .unwrap(),
+                    relative_path: NormalizedRelativePath::new("photos/photo.txt".into()).unwrap(),
+                    kind: ManifestEntryKind::RegularFile,
+                    size: 7,
+                    mtime_ns: 0,
+                    sha256: None,
+                    link_target: None,
+                },
+            ],
+        };
+        fs::write(ready.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+
+        // This must succeed — no false overlap rejection.
+        assert!(
+            process_run(&config, &nickname, &run_id).is_ok(),
+            "postprocessed directory with descendant must not be rejected by overlap validation"
+        );
+
+        // The descendant should be skipped, not imported independently.
+        let status = read_run_status(&config, &nickname, &run_id).unwrap();
+        assert_eq!(status.entries.len(), 2);
+        let dir_entry = &status.entries[0];
+        let child_entry = &status.entries[1];
+        assert_eq!(dir_entry.kind, ManifestEntryKind::Directory);
+        assert_eq!(dir_entry.status, FileStatus::Imported);
+        assert_eq!(child_entry.status, FileStatus::Skipped);
+        assert!(
+            child_entry
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("covered by postprocessed ancestor"),
+            "child must be skipped: {:?}",
+            child_entry.error
+        );
+    }
+
     fn postprocess_collision_run_config() -> RunConfig {
         RunConfig::from_toml(
             r#"

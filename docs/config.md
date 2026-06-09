@@ -66,7 +66,7 @@ keep_original = true
 | `kind` | yes | Must be `"subprocess"` |
 | `program` | yes | Executable path or name (resolved via `PATH`) |
 | `args` | `[]` | Arguments with placeholders |
-| `expected_outputs` | `[]` | Output file patterns with placeholders |
+| `expected_outputs` | `[]` | Output entry-root name patterns with placeholders |
 | `keep_original` | `true` | Whether to keep the original input entry/root as one committed output |
 
 ### Placeholders
