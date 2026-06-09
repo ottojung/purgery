@@ -5640,4 +5640,42 @@ steps = ["compress"]
             "error must mention duplicate final path: {error}"
         );
     }
+
+    #[test]
+    fn source_relative_classification_does_not_use_sync_to_prefix() {
+        // Classification must evaluate match patterns against the source-relative
+        // path, not the sync.to-prefixed path.
+        let matched_mp4 = purgery_core::rsync_pattern_match("*.mp4", "a.mp4");
+        assert!(matched_mp4, "*.mp4 must match a.mp4");
+        let matched_videos = purgery_core::rsync_pattern_match("videos/*.mp4", "a.mp4");
+        assert!(
+            !matched_videos,
+            "videos/*.mp4 must NOT match a.mp4 (source-relative)"
+        );
+        let matched_nested = purgery_core::rsync_pattern_match("**/*.mp4", "sub/b.mp4");
+        assert!(matched_nested, "**/*.mp4 must match sub/b.mp4");
+    }
+
+    #[test]
+    fn covered_entries_have_covered_mode_and_covered_by() {
+        let entry_descendant = ManifestEntry {
+            sync_name: SyncName::new("data".into()).unwrap(),
+            local_path: ClientLocalPath::new("/source/photos/photo.txt".into()).unwrap(),
+            staged_path: NormalizedRelativePath::new("files/data/photos/photo.txt".into()).unwrap(),
+            relative_path: NormalizedRelativePath::new("photos/photo.txt".into()).unwrap(),
+            kind: ManifestEntryKind::RegularFile,
+            size: 7,
+            mtime_ns: 0,
+            sha256: None,
+            link_target: None,
+            mode: purgery_core::ManifestEntryMode::Covered,
+            postprocess_steps: Vec::new(),
+            covered_by: Some("photos".into()),
+        };
+        assert_eq!(
+            entry_descendant.mode,
+            purgery_core::ManifestEntryMode::Covered
+        );
+        assert_eq!(entry_descendant.covered_by.as_deref(), Some("photos"));
+    }
 }
