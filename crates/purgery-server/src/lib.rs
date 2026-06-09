@@ -6705,6 +6705,114 @@ for = ["videos"]
     }
 
     #[test]
+    fn prepare_run_rejects_rule_with_empty_for() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&purgery_root, &server_root);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("empty-for".into()).unwrap();
+        let incoming = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Incoming);
+        fs::create_dir_all(&incoming).unwrap();
+
+        fs::write(
+            incoming.join("run.toml"),
+            r#"
+nickname = "laptop"
+
+[[sync]]
+name = "videos"
+to = "videos"
+delete_after_import = true
+
+[[postprocess.rules]]
+match = "*.mp4"
+steps = ["pack"]
+for = []
+"#,
+        )
+        .unwrap();
+        fs::write(
+            incoming.join("manifest.toml"),
+            r#"
+run_id = "empty-for"
+nickname = "laptop"
+
+[[entries]]
+sync_name = "videos"
+local_path = "/source/a.mp4"
+staged_path = "files/videos/a.mp4"
+relative_path = "a.mp4"
+kind = "regular_file"
+size = 5
+mtime_ns = 100
+mode = "postprocess"
+postprocess_steps = ["pack"]
+"#,
+        )
+        .unwrap();
+
+        let result = prepare_run(&config, &nickname, &run_id);
+        assert!(result.is_err(), "empty for must be rejected");
+    }
+
+    #[test]
+    fn prepare_run_rejects_rule_with_unknown_for() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&purgery_root, &server_root);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("unknown-for".into()).unwrap();
+        let incoming = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Incoming);
+        fs::create_dir_all(&incoming).unwrap();
+
+        fs::write(
+            incoming.join("run.toml"),
+            r#"
+nickname = "laptop"
+
+[[sync]]
+name = "videos"
+to = "videos"
+delete_after_import = true
+
+[[postprocess.rules]]
+match = "*.mp4"
+steps = ["pack"]
+for = ["missing"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            incoming.join("manifest.toml"),
+            r#"
+run_id = "unknown-for"
+nickname = "laptop"
+
+[[entries]]
+sync_name = "videos"
+local_path = "/source/a.mp4"
+staged_path = "files/videos/a.mp4"
+relative_path = "a.mp4"
+kind = "regular_file"
+size = 5
+mtime_ns = 100
+mode = "postprocess"
+postprocess_steps = ["pack"]
+"#,
+        )
+        .unwrap();
+
+        let result = prepare_run(&config, &nickname, &run_id);
+        assert!(result.is_err(), "unknown sync in for must be rejected");
+    }
+
+    #[test]
     fn out_of_scope_rule_does_not_process_entry() {
         let tmp = tempfile::tempdir().unwrap();
         let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
