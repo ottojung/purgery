@@ -1,6 +1,6 @@
 # Purgery — Agent Instructions
 
-## 1. Project Overview
+## Project Overview
 
 Purgery is a Rust client/server file sync and postprocessing tool. Two binaries:
 
@@ -11,7 +11,7 @@ purgery-server    # processes ready runs, postprocesses, writes status
 
 Shared types live in `crates/purgery-core`.
 
-## 2. Setup
+## Setup
 
 ```sh
 cargo build --workspace
@@ -19,7 +19,7 @@ cargo build --workspace
 
 No external dependencies beyond Rust toolchain.
 
-## 3. Commands
+## Commands
 
 ```sh
 cargo fmt --all -- --check      # formatting
@@ -28,7 +28,7 @@ cargo test --workspace          # run all tests
 cargo build --workspace         # build everything
 ```
 
-## 4. Rust Coding Conventions
+## Rust Coding Conventions
 
 ### Side-effect boundaries
 
@@ -66,13 +66,13 @@ Each newtype documents:
 - Prefer enums and separate types over boolean flags.
 - Make impossible states unrepresentable where practical.
 
-## 5. Testing
+## Testing
 
 - Unit tests for config parsing, path validation, run status parsing, and deletion safety.
 - Integration tests should avoid requiring real SSH initially.
 - Tests live alongside code (`#[cfg(test)] mod tests`).
 
-## 6. Compatibility
+## Compatibility
 
 - Correctness and beauty must override backwards compatibility.
 
