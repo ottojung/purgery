@@ -18,37 +18,35 @@ client: for each sync group:
 
 ```
 client: local checks (config, executables)
-client: partition sync groups:
-         purgatory: groups with applicable postprocess rules
-         passthrough: groups without applicable postprocess rules
-client: for each passthrough group:
+client: partition sync groups into execution classes:
+         PassthroughNoDelete:  no rules, delete_after_import=false
+         PassthroughDeleteAfterImport:  no rules, delete_after_import=true
+         Purgatory:  one or more rules, delete_after_import=true
+client: for each passthrough group (both kinds):
          resolve destination via resolve-destinations (side-effect-free)
          direct unfiltered rsync to final storage
-         if delete_after_import=true:
+         if PassthroughDeleteAfterImport:
            scan for cleanup state, write durable cleanup state atomically
            delete confirmed regular files
 client: generate run ID, build manifest with entry classification (purgatory groups only)
 client: begin-run over SSH -> server creates incoming directory, returns paths
 client: validate begin-run response envelope
 client: write purgatory-only run.toml + filtered manifest.toml to incoming dir
+        run.toml contains only purgatory sync groups and rules applicable to them
 client: prepare-run over SSH -> server validates plan, returns purgatory destinations
 client: for each purgatory group:
             run passthrough rsync to final storage (non-postprocess entries)
-            if delete_after_import=true:
-              write durable cleanup state atomically
-              delete confirmed passthrough regular files
             run purgatory rsync to incoming/files (postprocess entries)
 client: finish-run over SSH -> server moves incoming -> ready
 server: claim run by renaming ready -> processing
-server: process postprocess entries (verify staged content, prepare work area, run subprocesses, commit outputs)
-server: publish status for postprocess entries (postprocess via processing, covered as skipped)
+server: process postprocess entries
+server: publish status for postprocess entries
 server: write status.toml, move to done or failed
-client: poll status, verify envelope, cleanup postprocessed regular files as soon as imported
+client: poll status, verify envelope, cleanup postprocessed regular files
 ```
 
 Passthrough groups are handled entirely outside the purgatory run lifecycle.
-The purgatory transfer loop operates only on purgatory groups.
-No-rule passthrough groups with `delete_after_import=true` use direct unfiltered rsync plus separate cleanup scanning — not per-entry transfer filters.
+The purgatory transfer loop operates only on purgatory groups — it never looks up passthrough groups in the prepare-run destination map.
 
 ## Server subcommands
 

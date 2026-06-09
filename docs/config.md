@@ -185,23 +185,24 @@ This config is invalid because the rule applies to `videos` and `videos` has `de
 
 A sync group with no applicable postprocess rules is unaffected — whether `delete_after_import` is true or false.
 
-### Sync group classes
+### Sync execution classes
 
-After config validation, each sync group is one of:
+After config validation, each sync group is classified into one of three execution classes before any filesystem walking:
 
-| Class | Applicable rules | delete_after_import |
-|-------|-----------------|---------------------|
-| Passthrough | none | true or false |
-| Purgatory | non-empty | true (guaranteed) |
+| Class | Applicable rules | delete_after_import | Behavior |
+|-------|-----------------|---------------------|----------|
+| `PassthroughNoDelete` | none | false | Direct unfiltered rsync, no walk, no metadata, no cleanup |
+| `PassthroughDeleteAfterImport` | none | true | Direct unfiltered rsync plus durable cleanup scan for regular files |
+| `Purgatory` | non-empty | true | Walk, classify, upload manifest, server processing, status-based cleanup |
 
-Passthrough groups do not participate in purgatory run config, server manifest, status, or processing. In mixed invocations, passthrough destinations are resolved separately from the purgatory run.
+Passthrough groups do not participate in purgatory run config, server manifest, status, or processing. In mixed invocations, passthrough destinations are resolved separately from the purgatory run via `resolve-destinations`.
 
-### No-rule groups
+### No-rule groups (PassthroughNoDelete / PassthroughDeleteAfterImport)
 
-If a sync group has no applicable postprocess rules and:
+If a sync group has no applicable postprocess rules:
 
-- `delete_after_import = false`: the group is handled by one direct unfiltered rsync to final storage. The source tree is not walked, entries are not classified, metadata is not read, and no bookkeeping is created.
-- `delete_after_import = true`: the group is handled by direct unfiltered rsync plus a separate filesystem scan for cleanup. After rsync, the client scans the source directory for regular files, records their identity, and deletes verified files. No per-entry transfer filters are used.
+- `delete_after_import = false` (PassthroughNoDelete): one direct unfiltered rsync to final storage. The source tree is not walked, entries are not classified, metadata is not read, and no bookkeeping is created.
+- `delete_after_import = true` (PassthroughDeleteAfterImport): direct unfiltered rsync plus a separate filesystem scan for cleanup. After rsync, the client scans the source directory for regular files, records their identity, and deletes verified files. No per-entry transfer filters are used.
 
 ### Match patterns and import modes
 
@@ -319,9 +320,9 @@ This is the only cleanup mechanism. It is used for both pure passthrough invocat
 
 ## Run config
 
-The uploaded run configuration (`run.toml`) is a subset of the client config. It includes `nickname`, purgatory sync mappings (name + `to` path + `delete_after_import`), and postprocess rules. Only sync groups with applicable postprocess rules (purgatory groups) are included. Passthrough-only groups are resolved separately via `resolve-destinations`.
+The uploaded run configuration (`run.toml`) is a subset of the client config. It includes `nickname`, purgatory sync mappings (name + `to` path + `delete_after_import`), and postprocess rules. Only purgatory sync groups are included. Passthrough-only groups are resolved separately via `resolve-destinations`.
 
-It does **not** include server host/command, `purgery_root`, or local source `from` paths. This keeps server topology server-owned.
+The postprocess rules in the purgatory run config are also filtered: only rules applicable to the included purgatory sync groups are present. Rules that only match passthrough-only sync groups are excluded.
 
 ```toml
 nickname = "laptop"
