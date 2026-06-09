@@ -76,6 +76,76 @@ Each newtype documents:
 
 - Correctness and beauty must override backwards compatibility.
 
+## Don't speak of the dead
+
+Comments, JSDoc, tests, and documentation must describe the codebase as it exists.
+
+Do not bring the conversation, prompt, development process, previous implementation, or discarded design into the source tree. The reader should not need to know what the agent was asked, what the agent changed, what used to be here, or why the new version is “better”. That belongs in the issue, pull request, commit message, or changelog.
+
+Only the current codebase exists. Everything outside it is a postapocalyptic no-man's land: old code, abandoned plans, prompt context, temporary reasoning, and implementation attempts. Nothing living can survive there. Do not smuggle it back into the repository.
+
+Bad:
+
+```js
+// Previously this accepted raw strings, but now it uses EventId.
+```
+
+Bad:
+
+```js
+// This improved version avoids the old race condition.
+```
+
+Bad:
+
+```js
+// The user asked for this to be stricter.
+```
+
+Bad:
+
+```js
+// Refactored during the AGENTS.md cleanup.
+```
+
+Good:
+
+```js
+// EventId prevents persisted event identifiers from being confused with arbitrary strings.
+```
+
+Good:
+
+```js
+// Writes are serialized through the repository lock so concurrent callers cannot commit conflicting updates.
+```
+
+Good:
+
+```js
+// The parser rejects unknown fields because client and server schemas may drift during development.
+```
+
+The rule is:
+
+> Replace history with invariants. Replace process narration with current design. Replace comparison against dead code with explanation of living code.
+
+Historical context is allowed only when the history is itself part of the live external contract: migrations, persisted file formats, compatibility boundaries, or public APIs.
+
+Good:
+
+```js
+// Version 1 records do not contain `createdAt`, so the migration derives it from file metadata.
+```
+
+Bad:
+
+```js
+// Before this change, records did not contain `createdAt`.
+```
+
+Git remembers the dead. Source comments serve the living.
+
 ## Git is good
 
 If you have access to `git`, then:
