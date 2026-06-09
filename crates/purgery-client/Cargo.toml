@@ -12,3 +12,4 @@ camino = { version = "1", features = ["serde1"] }
 walkdir = "2"
 sha2 = "0.10"
 toml = "1.1"
+tracing = "0.1"

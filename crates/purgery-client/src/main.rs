@@ -3,8 +3,8 @@ use camino::Utf8Path;
 use clap::{Parser, Subcommand};
 use purgery_core::{
     build_rsync_args, resolve_executable, shell_escape, BeginRunResponse, ClientConfig,
-    ClientLocalPath, Manifest, ManifestFileEntry, NormalizedRelativePath, RunConfig, RunConfigSync,
-    RunId, RunStatus,
+    ClientLocalPath, ColorMode, LogFormat, LogLevel, Manifest, ManifestFileEntry,
+    NormalizedRelativePath, RunConfig, RunConfigSync, RunId, RunStatus,
 };
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime};
+use tracing::{debug, info, span, warn, Level};
 use walkdir::WalkDir;
 
 #[derive(Parser)]
@@ -23,6 +24,22 @@ use walkdir::WalkDir;
     version = env!("CARGO_PKG_VERSION")
 )]
 struct Cli {
+    /// Log level override (error, warn, info, debug, trace)
+    #[arg(long, global = true)]
+    log_level: Option<String>,
+    /// Log format override (pretty, compact, json)
+    #[arg(long, global = true)]
+    log_format: Option<String>,
+    /// Color mode override (auto, always, never)
+    #[arg(long, global = true)]
+    color: Option<String>,
+    /// Suppress all logs except errors
+    #[arg(long, global = true, conflicts_with = "verbose")]
+    quiet: bool,
+    /// Enable verbose (debug) logging
+    #[arg(long, global = true, conflicts_with = "quiet")]
+    verbose: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -45,6 +62,34 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Build logging config from defaults, then apply CLI overrides
+    let mut log_cfg = purgery_core::LoggingConfig::default();
+    if cli.quiet {
+        log_cfg.level = LogLevel::Error;
+    }
+    if cli.verbose {
+        log_cfg.level = LogLevel::Debug;
+    }
+    if let Some(ref level) = cli.log_level {
+        log_cfg.level = level
+            .parse::<LogLevel>()
+            .map_err(|e| anyhow::anyhow!("invalid log level: {e}"))?;
+    }
+    if let Some(ref fmt) = cli.log_format {
+        log_cfg.format = fmt
+            .parse::<LogFormat>()
+            .map_err(|e| anyhow::anyhow!("invalid log format: {e}"))?;
+    }
+    if let Some(ref color) = cli.color {
+        log_cfg.color = color
+            .parse::<ColorMode>()
+            .map_err(|e| anyhow::anyhow!("invalid color mode: {e}"))?;
+    }
+
+    purgery_core::init_logging(&log_cfg)
+        .map_err(|e| anyhow::anyhow!("failed to initialize logging: {e}"))?;
+
     match cli.command {
         Command::SyncAndCleanup { config } => {
             sync_and_cleanup(&config)?;
@@ -143,19 +188,16 @@ fn build_run_config(config: &ClientConfig) -> RunConfig {
 /// Client boot-time check: verify local executables and config only.
 /// Does NOT SSH into the server or mutate anything.
 fn client_check(config_path: &str) -> Result<()> {
-    eprintln!("checking client configuration...");
+    info!("checking client configuration");
 
-    // 1. Check ssh is accessible
     resolve_executable("ssh").map(|r| {
-        eprintln!("  ssh: found at {}", r.path.as_str());
+        info!(path = %r.path.as_str(), "ssh: found");
     })?;
 
-    // 2. Check rsync is accessible
     resolve_executable("rsync").map(|r| {
-        eprintln!("  rsync: found at {}", r.path.as_str());
+        info!(path = %r.path.as_str(), "rsync: found");
     })?;
 
-    // 3. Validate config
     let config_content = fs::read_to_string(config_path)
         .with_context(|| format!("failed to read client config: {config_path}"))?;
     let config = ClientConfig::from_toml(&config_content)
@@ -168,7 +210,7 @@ fn client_check(config_path: &str) -> Result<()> {
         anyhow::bail!("server command is empty");
     }
 
-    eprintln!("client configuration: OK");
+    info!("client configuration: OK");
     Ok(())
 }
 
@@ -186,14 +228,16 @@ fn sync_and_cleanup(config_path: &str) -> Result<()> {
     let host = config.server.host.as_str();
     let server_command = &config.server.command;
 
-    eprintln!(
-        "starting run {}/{}",
-        config.nickname.as_str(),
-        run_id.as_str()
-    );
+    let _span = span!(
+        Level::INFO,
+        "client run",
+        nickname = %config.nickname.as_str(),
+        run_id = %run_id.as_str()
+    )
+    .entered();
 
     let manifest = build_manifest(&config, &run_id)?;
-    eprintln!("discovered {} file(s) to sync", manifest.files.len());
+    info!(files = manifest.files.len(), "manifest built");
 
     // 2. Begin run on server — get server-derived paths
     let begin_out = server_cmd(
@@ -281,7 +325,7 @@ fn sync_and_cleanup(config_path: &str) -> Result<()> {
         );
     }
 
-    eprintln!("  incoming dir: {}", begin_resp.incoming_dir);
+    debug!(incoming_dir = %begin_resp.incoming_dir, "begin-run accepted");
 
     // 3. Write run.toml and manifest.toml to server
     let run_config = build_run_config(&config);
@@ -325,11 +369,18 @@ fn sync_and_cleanup(config_path: &str) -> Result<()> {
     // 5. Rsync files per sync mapping
     let sync_result = (|| -> Result<()> {
         for sync in &config.sync {
+            let sync_name = sync.name.as_str();
             let from_path = sync.from_path.as_str();
             let to_path = sync.to_path.as_str();
             let remote_files_dir = format!("{}/{to_path}/", begin_resp.files_dir);
 
-            eprintln!("syncing {from_path} -> {remote_files_dir}");
+            info!(
+                sync = sync_name,
+                from = from_path,
+                to = to_path,
+                "upload started"
+            );
+
             let rsync_dest = format!("{}:{}", host, remote_files_dir);
             let args = build_rsync_args(from_path, &rsync_dest);
             let status = std::process::Command::new("rsync")
@@ -338,8 +389,10 @@ fn sync_and_cleanup(config_path: &str) -> Result<()> {
                 .with_context(|| format!("failed to execute rsync for {from_path}"))?;
 
             if !status.success() {
-                anyhow::bail!("rsync failed for sync mapping '{}'", sync.name);
+                anyhow::bail!("rsync failed for sync mapping '{sync_name}'");
             }
+
+            info!(sync = sync_name, "upload finished");
 
             // Check for heartbeat failure after each mapping so we can
             // avoid calling finish-run if the lease is already lost.
@@ -352,10 +405,11 @@ fn sync_and_cleanup(config_path: &str) -> Result<()> {
         // Check heartbeat right before the call — no output or logic between
         // the check and the command, so there is no window for finish-run to
         // proceed after the lease has already been lost.
-        eprintln!("finishing run...");
         if let Some(err) = hb_error.lock().unwrap().take() {
             anyhow::bail!("{err}");
         }
+
+        info!("finishing run");
         server_cmd(
             host,
             server_command,
@@ -367,9 +421,18 @@ fn sync_and_cleanup(config_path: &str) -> Result<()> {
                 run_id.as_str(),
             ],
         )?;
-        eprintln!("run moved to ready");
+        info!("finish-run accepted");
         Ok(())
     })();
+
+    // After finish-run succeeds, the run is no longer incoming.
+    // A concurrent final heartbeat from the background thread may fail
+    // harmlessly because the incoming directory no longer exists.
+    // Those errors are consumed by the thread itself (it breaks out of
+    // its loop on failure) and the outer hb_error is not set by a
+    // post-finish heartbeat failure.  Even if a race left an error,
+    // the sync_result above already checked before finish-run, so we
+    // ignore heartbeat errors after this point.
 
     // Stop heartbeat thread regardless of sync/finish outcome
     stop_hb.store(true, Ordering::Relaxed);
@@ -399,14 +462,9 @@ fn sync_and_cleanup(config_path: &str) -> Result<()> {
 
     // 9. Delete confirmed local files
     let deletion_count = delete_confirmed_files(&config, &manifest, &status)?;
-    eprintln!("deleted {deletion_count} confirmed local file(s)");
+    info!(deleted = deletion_count, "cleanup complete");
 
-    eprintln!(
-        "run {}/{} finished with state {}",
-        config.nickname.as_str(),
-        run_id.as_str(),
-        status.state.as_str()
-    );
+    info!(state = %status.state.as_str(), "run finished");
 
     Ok(())
 }
@@ -422,7 +480,7 @@ fn build_manifest(config: &ClientConfig, run_id: &RunId) -> Result<Manifest> {
         let from = Path::new(from_path);
 
         if !from.exists() {
-            eprintln!("warning: sync path does not exist, skipping: {from_path}");
+            warn!(path = from_path, "sync path does not exist, skipping");
             continue;
         }
 
@@ -529,7 +587,11 @@ fn poll_for_status(
         }
 
         if attempt % 10 == 0 {
-            eprintln!("waiting for server to process run (attempt {attempt}/{max_attempts})...");
+            info!(
+                attempt,
+                max = max_attempts,
+                "waiting for server to process run"
+            );
         }
 
         std::thread::sleep(poll_interval);
@@ -561,9 +623,9 @@ fn delete_confirmed_files(
 
         // Find the corresponding manifest entry
         let Some(manifest_entry) = manifest_by_path.get(file_status.local_path.as_str()) else {
-            eprintln!(
-                "warning: status references unknown local path: {}",
-                file_status.local_path
+            warn!(
+                local_path = %file_status.local_path,
+                "status references unknown local path"
             );
             continue;
         };
@@ -574,9 +636,9 @@ fn delete_confirmed_files(
             .iter()
             .find(|s| s.name.as_str() == manifest_entry.sync_name.as_str())
         else {
-            eprintln!(
-                "warning: no sync mapping for '{}'",
-                manifest_entry.sync_name.as_str()
+            warn!(
+                sync_name = %manifest_entry.sync_name.as_str(),
+                "no sync mapping for file"
             );
             continue;
         };
@@ -614,24 +676,23 @@ fn delete_confirmed_files(
             };
 
             if !matches_size || !matches_mtime || !matches_sha {
-                eprintln!(
-                    "warning: file '{}' changed since upload, not deleting",
-                    local_path.display()
+                warn!(
+                    path = %local_path.display(),
+                    "file changed since upload, not deleting"
                 );
                 continue;
             }
         } else {
-            // Can't read metadata — skip for safety
-            eprintln!(
-                "warning: cannot read metadata for '{}', not deleting",
-                local_path.display()
+            warn!(
+                path = %local_path.display(),
+                "cannot read metadata, not deleting"
             );
             continue;
         }
 
         // Safe to delete
         if let Err(e) = fs::remove_file(local_path) {
-            eprintln!("warning: failed to delete '{}': {e}", local_path.display());
+            warn!(path = %local_path.display(), error = %e, "failed to delete file");
         } else {
             count += 1;
         }

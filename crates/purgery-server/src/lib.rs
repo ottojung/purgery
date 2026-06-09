@@ -7,6 +7,7 @@ use purgery_core::{
 };
 use std::collections::HashMap;
 use std::fs;
+use tracing::{info, span, warn, Level};
 
 /// A run-level failure — written when the run cannot be processed at all.
 fn write_run_failure(
@@ -437,7 +438,7 @@ fn process_one_file(
             }
         }
         Err(e) => {
-            eprintln!("postprocessing failed: {e}",);
+            warn!(error = %e, "postprocessing failed");
             FileOutcome::Failure {
                 sync_name,
                 local_path,
@@ -452,6 +453,8 @@ fn process_one_file(
 ///
 /// Returns `Ok(())` on success. On error the run should be moved to failed.
 pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> Result<()> {
+    let _span = span!(Level::INFO, "run", nickname = %nickname.as_str(), run_id = %run_id.as_str())
+        .entered();
     let ready_path = config
         .purgery_root
         .run_dir(nickname, run_id, RunPhase::Ready);
@@ -478,7 +481,7 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
         Ok(c) => c,
         Err(e) => {
             let msg = format!("failed to read run config: {e}");
-            eprintln!("{msg}");
+            warn!("{}", msg);
             write_run_failure(&config.purgery_root, nickname, run_id, &msg);
             anyhow::bail!("{msg}");
         }
@@ -487,7 +490,7 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
         Ok(c) => c,
         Err(e) => {
             let msg = format!("failed to parse run config: {e}");
-            eprintln!("{msg}");
+            warn!("{}", msg);
             write_run_failure(&config.purgery_root, nickname, run_id, &msg);
             anyhow::bail!("{msg}");
         }
@@ -498,7 +501,7 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
         Ok(p) => p,
         Err(e) => {
             let msg = format!("run plan validation failed: {e}");
-            eprintln!("{msg}");
+            warn!("{}", msg);
             write_run_failure(&config.purgery_root, nickname, run_id, &msg);
             anyhow::bail!("{msg}");
         }
@@ -510,7 +513,7 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
         Ok(c) => c,
         Err(e) => {
             let msg = format!("failed to read manifest: {e}");
-            eprintln!("{msg}");
+            warn!("{}", msg);
             write_run_failure(&config.purgery_root, nickname, run_id, &msg);
             anyhow::bail!("{msg}");
         }
@@ -519,7 +522,7 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
         Ok(m) => m,
         Err(e) => {
             let msg = format!("failed to parse manifest: {e}");
-            eprintln!("{msg}");
+            warn!("{}", msg);
             write_run_failure(&config.purgery_root, nickname, run_id, &msg);
             anyhow::bail!("{msg}");
         }
@@ -528,7 +531,7 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
     // Envelope validation: directory nickname/run_config/manifest must agree
     if let Err(e) = validate_envelope(nickname, run_id, &run_config, &manifest) {
         let msg = format!("envelope validation failed: {e}");
-        eprintln!("{msg}");
+        warn!("{}", msg);
         write_run_failure(&config.purgery_root, nickname, run_id, &msg);
         anyhow::bail!("{msg}");
     }
@@ -545,7 +548,10 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
     for file_entry in &manifest.files {
         let sync_name = file_entry.sync_name.as_str();
         let Some(sync) = sync_map.get(sync_name) else {
-            eprintln!("sync mapping '{sync_name}' not found in run config, skipping");
+            warn!(
+                sync_name = sync_name,
+                "sync mapping not found in run config, skipping"
+            );
             outcomes.push(FileOutcome::Skipped {
                 sync_name: file_entry.sync_name.clone(),
                 local_path: file_entry.local_path.as_str().to_owned(),
@@ -591,6 +597,8 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
     if run_state == RunState::Done {
         let _ = fs::remove_dir_all(&work_area);
     }
+
+    info!(state = %run_state.as_str(), "run complete");
 
     let run_status = RunStatus {
         run_id: run_id.clone(),
@@ -638,13 +646,6 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
             dest_path.as_str()
         )
     })?;
-
-    eprintln!(
-        "run {}/{} completed with state {}",
-        nickname.as_str(),
-        run_id.as_str(),
-        run_status.state.as_str()
-    );
 
     Ok(())
 }
@@ -732,12 +733,7 @@ pub fn apply_postprocessing(
             match step_def.kind {
                 purgery_core::PostprocessKind::Subprocess => {
                     let args = step_def.build_args(work_path);
-                    eprintln!(
-                        "running postprocess step '{}': {} {}",
-                        step.step_name,
-                        step_def.program,
-                        args.join(" ")
-                    );
+                    info!(step = %step.step_name, program = %step_def.program, "running postprocess step");
 
                     let status = std::process::Command::new(&step_def.program)
                         .args(&args)
@@ -826,24 +822,19 @@ pub fn move_to_failed(
 pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
     // Run GC opportunistically
     if let Err(e) = run_gc(config) {
-        eprintln!("warning: opportunistic GC failed: {e:#}");
+        warn!(error = %e, "opportunistic GC failed");
     }
 
     let ready_runs = find_ready_runs(&config.purgery_root)?;
     if ready_runs.is_empty() {
-        eprintln!("no ready runs found");
+        info!("no ready runs found");
         return Ok(());
     }
 
     for (nickname, run_id) in &ready_runs {
-        eprintln!("processing run {}/{}", nickname.as_str(), run_id.as_str());
+        info!(nickname = %nickname.as_str(), run_id = %run_id.as_str(), "processing run");
         if let Err(e) = process_run(config, nickname, run_id) {
-            eprintln!(
-                "run {}/{} failed: {:#}",
-                nickname.as_str(),
-                run_id.as_str(),
-                e
-            );
+            warn!(nickname = %nickname.as_str(), run_id = %run_id.as_str(), error = %e, "run failed");
             move_to_failed(&config.purgery_root, nickname, run_id)?;
         }
     }
@@ -858,7 +849,7 @@ pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
 pub fn begin_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> Result<String> {
     // Run GC opportunistically before creating the run
     if let Err(e) = run_gc(config) {
-        eprintln!("warning: opportunistic GC failed: {e:#}");
+        warn!(error = %e, "opportunistic GC failed");
     }
 
     // Check run does not already exist in any phase
@@ -921,13 +912,19 @@ pub fn begin_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> 
     let lease_content =
         toml::to_string(&lease).map_err(|e| anyhow::anyhow!("failed to serialize lease: {e}"))?;
     let lease_tmp = incoming_path.join("lease.toml.tmp");
-    fs::write(lease_tmp.as_std_path(), &lease_content)
-        .with_context(|| "failed to write lease file")?;
-    fs::rename(
-        lease_tmp.as_std_path(),
-        incoming_path.join("lease.toml").as_std_path(),
-    )
-    .with_context(|| "failed to commit lease file")?;
+    let lease_write_result = (|| -> Result<()> {
+        fs::write(lease_tmp.as_std_path(), &lease_content)?;
+        fs::rename(
+            lease_tmp.as_std_path(),
+            incoming_path.join("lease.toml").as_std_path(),
+        )?;
+        Ok(())
+    })();
+
+    if let Err(e) = lease_write_result {
+        let _ = fs::remove_dir_all(&incoming_path);
+        return Err(e.context("failed to write lease file"));
+    }
 
     let response = purgery_core::BeginRunResponse {
         protocol_version: 1,
@@ -940,8 +937,11 @@ pub fn begin_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> 
         heartbeat_interval_secs: config.gc.heartbeat_interval_secs,
     };
 
-    toml::to_string(&response)
-        .map_err(|e| anyhow::anyhow!("failed to serialize begin-run response: {e}"))
+    let response_str = toml::to_string(&response).map_err(|e| {
+        let _ = fs::remove_dir_all(&incoming_path);
+        anyhow::anyhow!("failed to serialize begin-run response: {e}")
+    })?;
+    Ok(response_str)
 }
 
 /// Server-side subcommand: finish a run by moving from incoming to ready.
@@ -956,6 +956,47 @@ pub fn finish_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) ->
             run_id.as_str(),
             incoming_path.as_str()
         );
+    }
+
+    // Validate lease envelope before accepting the finish
+    let lease_path = incoming_path.join("lease.toml");
+    if lease_path.exists() {
+        let lease_content =
+            fs::read_to_string(&lease_path).with_context(|| "failed to read lease file")?;
+        let lease: purgery_core::LeaseFile =
+            toml::from_str(&lease_content).with_context(|| "failed to parse lease file")?;
+        if lease.protocol_version != 1 {
+            anyhow::bail!(
+                "lease protocol version {} does not match expected 1",
+                lease.protocol_version
+            );
+        }
+        if lease.nickname != nickname.as_str() {
+            anyhow::bail!(
+                "lease nickname '{}' does not match expected '{}'",
+                lease.nickname,
+                nickname.as_str()
+            );
+        }
+        if lease.run_id != run_id.as_str() {
+            anyhow::bail!(
+                "lease run_id '{}' does not match expected '{}'",
+                lease.run_id,
+                run_id.as_str()
+            );
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if now >= lease.expires_at_unix_secs {
+            anyhow::bail!(
+                "cannot finish run: incoming lease expired at {}",
+                lease.expires_at_unix_secs
+            );
+        }
+    } else {
+        anyhow::bail!("cannot finish run: no lease file found, run may be incomplete");
     }
 
     let ready_path = config
@@ -1021,7 +1062,7 @@ pub fn read_run_status(
 
 /// Side-effect-free server check: verify config and programs without creating anything.
 pub fn server_check(config: &ServerConfig) -> Result<()> {
-    eprintln!("checking server configuration...");
+    info!("checking server configuration");
 
     // Validate GC config: heartbeat must be frequent enough to keep the lease alive
     if config.gc.incoming_lease_secs == 0 {
@@ -1053,7 +1094,7 @@ pub fn server_check(config: &ServerConfig) -> Result<()> {
             root_path.as_str()
         );
     }
-    eprintln!("  root: {} (exists)", root_path.as_str());
+    info!(path = %root_path.as_str(), "root: OK");
 
     // Check purgery_root path exists and is a directory
     let purgery_path = config.purgery_root.as_path();
@@ -1069,7 +1110,7 @@ pub fn server_check(config: &ServerConfig) -> Result<()> {
             purgery_path.as_str()
         );
     }
-    eprintln!("  purgery_root: {} (exists)", purgery_path.as_str());
+    info!(path = %purgery_path.as_str(), "purgery_root: OK");
 
     // Check postprocess programs and validate step definitions
     for (name, step) in &config.postprocess.steps {
@@ -1094,35 +1135,29 @@ pub fn server_check(config: &ServerConfig) -> Result<()> {
             })?;
         }
 
-        purgery_core::resolve_executable(program).map(|r| {
-            eprintln!(
-                "  postprocess step '{}': program '{}' found at {}",
-                name,
-                program,
-                r.path.as_str()
-            )
-        })?;
+        purgery_core::resolve_executable(program)
+            .map(|r| info!(step = name, path = %r.path.as_str(), "postprocess program found"))?;
     }
 
-    eprintln!("server configuration: OK");
+    info!("server configuration: OK");
     Ok(())
 }
 
 /// Bootstrap: create root and purgery_root directories.
 pub fn bootstrap(config: &ServerConfig) -> Result<()> {
-    eprintln!("bootstrapping server directories...");
+    info!("bootstrapping server directories");
 
     let root_path = config.root.as_path();
     fs::create_dir_all(root_path.as_std_path())
         .with_context(|| format!("failed to create root: {}", root_path.as_str()))?;
-    eprintln!("  created root: {}", root_path.as_str());
+    info!(path = %root_path.as_str(), "created root");
 
     let purgery_path = config.purgery_root.as_path();
     fs::create_dir_all(purgery_path.as_std_path())
         .with_context(|| format!("failed to create purgery_root: {}", purgery_path.as_str()))?;
-    eprintln!("  created purgery_root: {}", purgery_path.as_str());
+    info!(path = %purgery_path.as_str(), "created purgery_root");
 
-    eprintln!("bootstrap complete");
+    info!("bootstrap complete");
     Ok(())
 }
 
@@ -1190,14 +1225,13 @@ pub fn run_gc(config: &ServerConfig) -> Result<()> {
                                     && lease.nickname == nickname.as_str()
                                     && lease.run_id == run_id.as_str();
                                 if !valid {
-                                    eprintln!(
-                                        "gc: lease envelope mismatch for {}/{} \
-                                         (protocol={}, nickname={:?}, run_id={:?})",
-                                        nickname.as_str(),
-                                        run_id.as_str(),
-                                        lease.protocol_version,
-                                        lease.nickname,
-                                        lease.run_id,
+                                    warn!(
+                                        nickname = %nickname.as_str(),
+                                        run_id = %run_id.as_str(),
+                                        protocol = lease.protocol_version,
+                                        lease_nickname = %lease.nickname,
+                                        lease_run_id = %lease.run_id,
+                                        "gc: lease envelope mismatch",
                                     );
                                 }
                                 !valid || now >= lease.expires_at_unix_secs
@@ -1227,10 +1261,10 @@ pub fn run_gc(config: &ServerConfig) -> Result<()> {
                 continue;
             }
 
-            eprintln!(
-                "gc: collecting expired incoming run {}/{}",
-                nickname.as_str(),
-                run_id.as_str()
+            info!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                "gc: collecting expired incoming run"
             );
 
             // Move to failed with a status
@@ -1277,10 +1311,11 @@ pub fn run_gc(config: &ServerConfig) -> Result<()> {
 
             // Claim the abandoned run by renaming incoming to failed
             if let Err(e) = fs::rename(&run_path, failed_path.as_std_path()) {
-                eprintln!(
-                    "gc: failed to claim abandoned run {}/{}: {e}",
-                    nickname.as_str(),
-                    run_id.as_str()
+                warn!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    error = %e,
+                    "gc: failed to claim abandoned run"
                 );
                 continue;
             }
@@ -1403,6 +1438,7 @@ mod tests {
             gc: Default::default(),
             log_dir: None,
             postprocess: PostprocessConfig::default(),
+            logging: Default::default(),
         }
     }
 
@@ -1857,6 +1893,7 @@ to = "{}"
                     m
                 },
             },
+            logging: Default::default(),
         };
         let run_config = RunConfig {
             nickname: Nickname::new("laptop".into()).unwrap(),
@@ -1878,8 +1915,6 @@ to = "{}"
         let results = apply_postprocessing(&run_plan, "videos/some file.mp4", &work_path);
         assert!(results.is_ok(), "postprocess with spaces should succeed");
         let outputs = results.unwrap();
-        // With keep_original=true and no expected outputs, should return [original, ...]
-        // Since "true" succeeds but doesn't create files, the original is returned
         assert!(!outputs.is_empty());
         assert!(outputs.contains(&work_path));
     }
@@ -1914,6 +1949,7 @@ to = "{}"
                     m
                 },
             },
+            logging: Default::default(),
         };
 
         let nickname = Nickname::new("laptop".into()).unwrap();
@@ -1926,7 +1962,6 @@ to = "{}"
         fs::write(ready_path.join("files/videos/test.mp4"), b"video content").unwrap();
 
         write_run_toml_with_sync(&ready_path, &nickname, "videos", "videos");
-        // Add postprocess rules to the run config manually
         let run_config_content = r#"nickname = "laptop"
 
 [[sync]]
@@ -2007,6 +2042,7 @@ steps = ["compress-video"]
                     m
                 },
             },
+            logging: Default::default(),
         };
         let run_config = RunConfig {
             nickname: Nickname::new("laptop".into()).unwrap(),
@@ -2018,9 +2054,6 @@ steps = ["compress-video"]
                 }],
             },
         };
-
-        let compressed = work_area.join("video.Z.webm");
-        fs::write(&compressed, b"compressed").unwrap();
 
         let pp_run_plan = RunPlan::build(&server_config, &run_config).unwrap();
         let result = apply_postprocessing(&pp_run_plan, "videos/video.mp4", &work_path);
@@ -2062,6 +2095,7 @@ steps = ["compress-video"]
                     m
                 },
             },
+            logging: Default::default(),
         };
         let run_config = RunConfig {
             nickname: Nickname::new("laptop".into()).unwrap(),
@@ -2121,6 +2155,7 @@ steps = ["compress-video"]
                     m
                 },
             },
+            logging: Default::default(),
         };
         let run_config = RunConfig {
             nickname: Nickname::new("laptop".into()).unwrap(),
@@ -2584,6 +2619,7 @@ steps = ["compress-video"]
                     m
                 },
             },
+            logging: Default::default(),
         };
 
         let nickname = Nickname::new("laptop".into()).unwrap();
@@ -2682,6 +2718,7 @@ steps = ["compress-video"]
                     m
                 },
             },
+            logging: Default::default(),
         };
 
         let nickname = Nickname::new("laptop".into()).unwrap();
@@ -2782,6 +2819,7 @@ steps = ["compress-video"]
                     m
                 },
             },
+            logging: Default::default(),
         };
 
         let nickname = Nickname::new("laptop".into()).unwrap();
@@ -2856,6 +2894,7 @@ steps = ["compress-video"]
             gc: Default::default(),
             log_dir: None,
             postprocess: PostprocessConfig::default(),
+            logging: Default::default(),
         };
         let run_config = RunConfig {
             nickname: Nickname::new("laptop".into()).unwrap(),
@@ -2881,6 +2920,7 @@ steps = ["compress-video"]
             gc: Default::default(),
             log_dir: None,
             postprocess: PostprocessConfig::default(),
+            logging: Default::default(),
         };
         let run_config = RunConfig {
             nickname: Nickname::new("laptop".into()).unwrap(),
@@ -2913,6 +2953,7 @@ steps = ["compress-video"]
             gc: Default::default(),
             log_dir: None,
             postprocess: PostprocessConfig::default(),
+            logging: Default::default(),
         };
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-begin".into()).unwrap();
@@ -2945,6 +2986,7 @@ steps = ["compress-video"]
             gc: Default::default(),
             log_dir: None,
             postprocess: PostprocessConfig::default(),
+            logging: Default::default(),
         };
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-finish".into()).unwrap();
@@ -3012,11 +3054,92 @@ steps = ["compress-video"]
             gc: Default::default(),
             log_dir: None,
             postprocess: PostprocessConfig::default(),
+            logging: Default::default(),
         };
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("nonexistent".into()).unwrap();
 
         let result = read_run_status(&server_config, &nickname, &run_id);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_finish_run_rejects_expired_lease() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_path = tmp.path().join("storage");
+        let server_config = ServerConfig {
+            root: ServerRoot::new(Utf8PathBuf::from_path_buf(root_path).unwrap()).unwrap(),
+            purgery_root: PurgeryRoot::new(
+                Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
+            )
+            .unwrap(),
+            state_dir: None,
+            gc: Default::default(),
+            log_dir: None,
+            postprocess: PostprocessConfig::default(),
+            logging: Default::default(),
+        };
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("test-expired-lease".into()).unwrap();
+
+        begin_run(&server_config, &nickname, &run_id).unwrap();
+
+        let incoming_path =
+            server_config
+                .purgery_root
+                .run_dir(&nickname, &run_id, RunPhase::Incoming);
+        let lease_path = incoming_path.join("lease.toml");
+        let mut lease: purgery_core::LeaseFile =
+            toml::from_str(&fs::read_to_string(&lease_path).unwrap()).unwrap();
+        lease.expires_at_unix_secs = 0;
+        fs::write(&lease_path, toml::to_string(&lease).unwrap()).unwrap();
+
+        let result = finish_run(&server_config, &nickname, &run_id);
+        assert!(result.is_err(), "finish-run must reject expired lease");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("expired") || err.contains("lease"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_finish_run_rejects_mismatched_lease_nickname() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_path = tmp.path().join("storage");
+        let server_config = ServerConfig {
+            root: ServerRoot::new(Utf8PathBuf::from_path_buf(root_path).unwrap()).unwrap(),
+            purgery_root: PurgeryRoot::new(
+                Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
+            )
+            .unwrap(),
+            state_dir: None,
+            gc: Default::default(),
+            log_dir: None,
+            postprocess: PostprocessConfig::default(),
+            logging: Default::default(),
+        };
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("test-wrong-nickname".into()).unwrap();
+
+        begin_run(&server_config, &nickname, &run_id).unwrap();
+
+        let incoming_path =
+            server_config
+                .purgery_root
+                .run_dir(&nickname, &run_id, RunPhase::Incoming);
+        let lease_path = incoming_path.join("lease.toml");
+        let mut lease: purgery_core::LeaseFile =
+            toml::from_str(&fs::read_to_string(&lease_path).unwrap()).unwrap();
+        lease.nickname = "wrong-machine".into();
+        fs::write(&lease_path, toml::to_string(&lease).unwrap()).unwrap();
+
+        let result = finish_run(&server_config, &nickname, &run_id);
+        assert!(
+            result.is_err(),
+            "finish-run must reject mismatched nickname"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("nickname"), "error: {err}");
     }
 }

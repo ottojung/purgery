@@ -46,6 +46,8 @@ Before processing any files, the server builds a `RunPlan` that compiles all pos
 
 ## Postprocess outputs
 
+Expected outputs must be plain file-name patterns (no paths, no directories). Only `{file_name}`, `{file_stem}`, and `{stem}` placeholders are allowed; `{input}` and `{parent}` are forbidden in expected outputs (they remain allowed in `args`).
+
 Expected outputs are verified to exist and to resolve inside the work area (within the same parent directory as the input). After collection, outputs are deduplicated while preserving order.
 
 The status `postprocess` field is derived by matching rules against the logical normalized path (e.g., `videos/video.mp4`), not the absolute work-area path.

@@ -911,6 +911,158 @@ pub struct FileStatusEntry {
 
 // ── Config Types ─────────────────────────────────────────────────────
 
+/// Logging configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoggingConfig {
+    #[serde(default)]
+    pub level: LogLevel,
+    #[serde(default)]
+    pub format: LogFormat,
+    #[serde(default)]
+    pub color: ColorMode,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        LoggingConfig {
+            level: LogLevel::Info,
+            format: LogFormat::Pretty,
+            color: ColorMode::Auto,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Error,
+    Warn,
+    #[default]
+    Info,
+    Debug,
+    Trace,
+}
+
+impl std::fmt::Display for LogLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LogLevel::Error => write!(f, "error"),
+            LogLevel::Warn => write!(f, "warn"),
+            LogLevel::Info => write!(f, "info"),
+            LogLevel::Debug => write!(f, "debug"),
+            LogLevel::Trace => write!(f, "trace"),
+        }
+    }
+}
+
+impl FromStr for LogLevel {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "error" => Ok(LogLevel::Error),
+            "warn" => Ok(LogLevel::Warn),
+            "info" => Ok(LogLevel::Info),
+            "debug" => Ok(LogLevel::Debug),
+            "trace" => Ok(LogLevel::Trace),
+            other => Err(format!("unknown log level: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    #[default]
+    Pretty,
+    Compact,
+    Json,
+}
+
+impl FromStr for LogFormat {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pretty" => Ok(LogFormat::Pretty),
+            "compact" => Ok(LogFormat::Compact),
+            "json" => Ok(LogFormat::Json),
+            other => Err(format!("unknown log format: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ColorMode {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+impl FromStr for ColorMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(ColorMode::Auto),
+            "always" => Ok(ColorMode::Always),
+            "never" => Ok(ColorMode::Never),
+            other => Err(format!("unknown color mode: {other}")),
+        }
+    }
+}
+
+/// Initialize the global tracing subscriber from a `LoggingConfig`.
+///
+/// Must be called at most once, near the binary entry point.
+/// Logs go to stderr; stdout is reserved for machine-readable protocol output.
+pub fn init_logging(config: &LoggingConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(
+            config
+                .level
+                .to_string()
+                .parse::<tracing_subscriber::filter::Directive>()?,
+        )
+        .from_env_lossy();
+
+    let is_terminal = atty::is(atty::Stream::Stderr);
+
+    let use_color = match config.color {
+        ColorMode::Always => true,
+        ColorMode::Never => false,
+        ColorMode::Auto => is_terminal,
+    };
+
+    match config.format {
+        LogFormat::Json => {
+            tracing_subscriber::fmt()
+                .json()
+                .with_writer(std::io::stderr)
+                .with_env_filter(filter)
+                .with_ansi(false)
+                .init();
+        }
+        LogFormat::Compact => {
+            tracing_subscriber::fmt()
+                .compact()
+                .with_writer(std::io::stderr)
+                .with_env_filter(filter)
+                .with_ansi(use_color)
+                .init();
+        }
+        LogFormat::Pretty => {
+            tracing_subscriber::fmt()
+                .pretty()
+                .with_writer(std::io::stderr)
+                .with_env_filter(filter)
+                .with_ansi(use_color)
+                .init();
+        }
+    }
+    Ok(())
+}
+
 /// Server configuration, loaded from a TOML file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -925,6 +1077,8 @@ pub struct ServerConfig {
     pub postprocess: PostprocessConfig,
     #[serde(default)]
     pub gc: GCConfig,
+    #[serde(default)]
+    pub logging: LoggingConfig,
 }
 
 /// Postprocessing configuration (server-side).
@@ -1046,10 +1200,12 @@ impl PostprocessStepDefinition {
 
 /// Validate that an expected output name is a plain file name.
 ///
-/// Rejects empty names, `.`, `..`, absolute paths, and names containing
-/// path separators (`/` or `\`). This is used at config validation time
-/// and at pattern resolution time to maintain the invariant that expected
-/// outputs are always placed next to the input file in the work directory.
+/// Rejects empty names, `.`, `..`, absolute paths, names containing
+/// path separators (`/` or `\`), and placeholders that reference the
+/// input path (`{input}`, `{parent}`). Only file-stem placeholders
+/// (`{file_name}`, `{file_stem}`, `{stem}`) are allowed because
+/// expected outputs are always placed next to the input file in the
+/// work directory.
 pub fn validate_expected_output_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("expected output name is empty".into());
@@ -1062,6 +1218,13 @@ pub fn validate_expected_output_name(name: &str) -> Result<(), String> {
     }
     if Utf8Path::new(name).is_absolute() {
         return Err("expected output name must not be absolute".into());
+    }
+    if name.contains("{input}") || name.contains("{parent}") {
+        return Err(
+            "expected output name must not use {{input}} or {{parent}} placeholders; \
+             only {{file_name}}, {{file_stem}}, and {{stem}} are allowed"
+                .into(),
+        );
     }
     Ok(())
 }
@@ -1076,6 +1239,8 @@ pub struct ClientConfig {
     pub sync: Vec<SyncMapping>,
     #[serde(default)]
     pub postprocess: ClientPostprocessConfig,
+    #[serde(default)]
+    pub logging: LoggingConfig,
 }
 
 impl ClientConfig {
@@ -2753,5 +2918,95 @@ to = "videos"
         assert_eq!(map.get("videos").unwrap().to_path.as_str(), "videos");
         assert_eq!(map.get("pictures").unwrap().to_path.as_str(), "pictures");
         assert!(!map.contains_key("music"));
+    }
+
+    // ── Logging config tests ──
+
+    #[test]
+    fn logging_config_defaults() {
+        let config = LoggingConfig::default();
+        assert!(matches!(config.level, LogLevel::Info));
+        assert!(matches!(config.format, LogFormat::Pretty));
+        assert!(matches!(config.color, ColorMode::Auto));
+    }
+
+    #[test]
+    fn logging_config_rejects_unknown_fields() {
+        let toml = r#"unknown_field = "value""#;
+        let result: Result<LoggingConfig, _> = toml::from_str(toml);
+        assert!(result.is_err(), "unknown logging fields must be rejected");
+    }
+
+    #[test]
+    fn logging_config_parses_explicit_values() {
+        let toml = r#"
+level = "debug"
+format = "json"
+color = "never"
+"#;
+        let config: LoggingConfig = toml::from_str(toml).unwrap();
+        assert!(matches!(config.level, LogLevel::Debug));
+        assert!(matches!(config.format, LogFormat::Json));
+        assert!(matches!(config.color, ColorMode::Never));
+    }
+
+    // ── Expected output validation tests ──
+
+    #[test]
+    fn validate_expected_output_accepts_file_stem_webm() {
+        assert!(validate_expected_output_name("{file_stem}.Z.webm").is_ok());
+    }
+
+    #[test]
+    fn validate_expected_output_accepts_file_name() {
+        assert!(validate_expected_output_name("{file_name}").is_ok());
+    }
+
+    #[test]
+    fn validate_expected_output_accepts_stem_placeholder() {
+        assert!(validate_expected_output_name("{stem}.out").is_ok());
+    }
+
+    #[test]
+    fn validate_expected_output_rejects_input_placeholder() {
+        let err = validate_expected_output_name("{input}").unwrap_err();
+        assert!(
+            err.contains("{input}"),
+            "error must mention {{input}}: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_expected_output_rejects_parent_placeholder() {
+        let err = validate_expected_output_name("{parent}/out").unwrap_err();
+        assert!(
+            err.contains("{parent}") || err.contains("separator"),
+            "error must mention {{parent}} or separator: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_expected_output_rejects_empty() {
+        assert!(validate_expected_output_name("").is_err());
+    }
+
+    #[test]
+    fn validate_expected_output_rejects_dot() {
+        assert!(validate_expected_output_name(".").is_err());
+    }
+
+    #[test]
+    fn validate_expected_output_rejects_dotdot() {
+        assert!(validate_expected_output_name("..").is_err());
+    }
+
+    #[test]
+    fn validate_expected_output_rejects_absolute() {
+        assert!(validate_expected_output_name("/tmp/out.webm").is_err());
+    }
+
+    #[test]
+    fn validate_expected_output_rejects_path_separator() {
+        assert!(validate_expected_output_name("sub/out.webm").is_err());
     }
 }

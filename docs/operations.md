@@ -1,5 +1,34 @@
 # Purgery Operations
 
+## Logging
+
+Purgery uses the `tracing` framework for structured logging. All log output goes to **stderr**; stdout is reserved for machine-readable protocol output (e.g., `begin-run` and `status` print TOML to stdout).
+
+### Configuration
+
+Logging can be configured in the TOML config file:
+
+```toml
+[logging]
+level = "info"       # error | warn | info | debug | trace
+format = "pretty"    # pretty | compact | json
+color = "auto"       # auto | always | never
+```
+
+### CLI overrides
+
+Both binaries support global flags that override config file and environment:
+
+| Flag | Effect |
+|------|--------|
+| `--log-level <level>` | Override log level |
+| `--log-format <format>` | Override log format |
+| `--color <mode>` | Override color mode |
+| `--quiet` | Set level to `error` (conflicts with `--verbose`) |
+| `--verbose` | Set level to `debug` (conflicts with `--quiet`) |
+
+Precedence: CLI flags > config file > `RUST_LOG` environment variable > default.
+
 ## Setup
 
 ```sh

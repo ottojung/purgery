@@ -110,3 +110,32 @@ run_config_path = "/tmp/purgery/laptop/incoming/01ARZ.../run.toml"
 manifest_path = "/tmp/purgery/laptop/incoming/01ARZ.../manifest.toml"
 heartbeat_interval_secs = 60
 ```
+
+## Expected output restrictions
+
+Expected output names in postprocess step definitions are limited to file-name patterns. The following placeholders are allowed:
+
+- `{file_name}` — input file name with extension
+- `{file_stem}` — input file name without extension
+- `{stem}` — deprecated alias for `{file_stem}`
+
+The following are **forbidden** in expected outputs (but remain allowed in `args`):
+
+- `{input}` — full work-area input path
+- `{parent}` — work-area parent directory
+
+Additional restrictions: non-empty, not `.`, not `..`, not absolute, no `/` or `\`.
+
+The server validates expected output names at boot time (`purgery-server check`) and at pattern resolution time.
+
+## Lease validation on `finish-run`
+
+When `finish-run` is called, the server reads `lease.toml` from the incoming directory and validates:
+
+- `protocol_version == 1`
+- `lease.nickname` matches the command nickname
+- `lease.run_id` matches the command run ID
+- The lease has not expired
+
+If any check fails, `finish-run` rejects the transition with a clear error message.
+```

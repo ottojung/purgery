@@ -43,6 +43,14 @@ keep_original = true
 | `gc` | no | GC configuration (see below) |
 | `postprocess` | no | Postprocessing configuration (see below) |
 
+### Logging config
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `level` | `"info"` | Log level: `error`, `warn`, `info`, `debug`, `trace` |
+| `format` | `"pretty"` | Output format: `pretty`, `compact`, `json` |
+| `color` | `"auto"` | Color mode: `auto`, `always`, `never` |
+
 ### GC config
 
 | Field | Default | Description |
