@@ -67,7 +67,7 @@ keep_original = true
 | `program` | yes | Executable path or name (resolved via `PATH`) |
 | `args` | `[]` | Arguments with placeholders |
 | `expected_outputs` | `[]` | Output file patterns with placeholders |
-| `keep_original` | `true` | Whether to keep the original input file |
+| `keep_original` | `true` | Whether to keep the original input entry/root as one committed output |
 
 ### Placeholders
 

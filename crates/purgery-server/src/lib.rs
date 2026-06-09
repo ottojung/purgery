@@ -629,6 +629,7 @@ fn validate_unique_final_paths(
     run_config: &RunConfig,
     manifest: &Manifest,
     run_plan: &RunPlan,
+    covered_indices: &std::collections::HashSet<usize>,
 ) -> Result<(), String> {
     let sync_map: HashMap<&str, &RunConfigSync> = run_config.sync_map().into_iter().collect();
     let mut destinations: HashMap<String, &ManifestEntry> = HashMap::new();
@@ -676,13 +677,17 @@ fn validate_unique_final_paths(
         .collect();
 
     for (i, entry_a) in manifest.entries.iter().enumerate() {
+        // Skip covered entries — they are not active processing units.
+        if covered_indices.contains(&i) {
+            continue;
+        }
         let Some(sync_a) = sync_map.get(entry_a.sync_name.as_str()) else {
             continue;
         };
         let planned_a = planned_entry_outputs(server_config, nickname, sync_a, entry_a, run_plan);
         for dest_a in &planned_a {
             for (j, entry_b) in manifest.entries.iter().enumerate() {
-                if i == j {
+                if i == j || covered_indices.contains(&j) {
                     continue;
                 }
                 // Only flag overlaps if at least one of the two entries has
@@ -1051,45 +1056,12 @@ pub fn process_processing_run(
         anyhow::bail!("{msg}");
     }
 
-    if let Err(error) =
-        validate_unique_final_paths(config, nickname, &run_config, &manifest, &run_plan)
-    {
-        let msg = format!("manifest destination validation failed: {error}");
-        warn!("{}", msg);
-        write_run_failure(&config.purgery_root, nickname, run_id, &msg)?;
-        anyhow::bail!("{msg}");
-    }
-
     let sync_map: HashMap<&str, &RunConfigSync> = run_config.sync_map().into_iter().collect();
 
-    // Implicit sync-root directory entries.
-    //
-    // Each sync mapping's `to` path resolves to a directory that must exist
-    // as a real directory before child entries are imported.  If it already
-    // exists as a file or symlink, `commit_directory_entry` replaces it
-    // (matching rsync's behaviour).  This ensures <root>/<nickname>/<sync.to>
-    // behaves like the root of the imported source tree, not like an
-    // external prerequisite that the user must set up manually.
-    for sync in run_config.sync.iter() {
-        let root_dir = config
-            .root
-            .as_path()
-            .join(nickname.as_str())
-            .join(sync.to_path.as_str());
-        if let Err(error) = commit_directory_entry(&root_dir, config.root.as_path()) {
-            warn!(
-                sync_name = %sync.name.as_str(),
-                path = %root_dir.as_str(),
-                error = %error,
-                "sync root directory setup failed"
-            );
-        }
-    }
-
-    // Pre-pass: identify directory entries whose normalized path matches a
-    // postprocess rule.  Those directory entries become transformation
-    // boundaries — their descendant manifest entries are covered (skipped)
-    // and must not be imported independently.
+    // --- Phase 1: Coverage pre-pass ---
+    // Identify directories whose normalized path matches a postprocess rule.
+    // Those directories become transformation boundaries — their descendants
+    // are covered/skipped.
     let covered_by_dir: std::collections::HashSet<String> = manifest
         .entries
         .iter()
@@ -1110,6 +1082,71 @@ pub fn process_processing_run(
         })
         .collect();
 
+    // Determine which entries are covered (descendants of a postprocessed directory).
+    let covered_indices: std::collections::HashSet<usize> = manifest
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            let Some(sync) = sync_map.get(entry.sync_name.as_str()) else {
+                return false;
+            };
+            let np = format!("{}/{}", sync.to_path.as_str(), entry.relative_path.as_str());
+            covered_by_dir
+                .iter()
+                .any(|prefix| match np.as_str().strip_prefix(prefix.as_str()) {
+                    Some(tail) => tail.starts_with('/'),
+                    None => false,
+                })
+        })
+        .map(|(i, _)| i)
+        .collect();
+
+    // --- Phase 2: Sync-root setup for used syncs only ---
+    let used_sync_names: std::collections::HashSet<&str> = manifest
+        .entries
+        .iter()
+        .map(|e| e.sync_name.as_str())
+        .collect();
+
+    let mut failed_sync_roots: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for sync in run_config.sync.iter() {
+        if !used_sync_names.contains(sync.name.as_str()) {
+            continue; // unused sync — do not touch
+        }
+        let root_dir = config
+            .root
+            .as_path()
+            .join(nickname.as_str())
+            .join(sync.to_path.as_str());
+        if let Err(error) = commit_directory_entry(&root_dir, config.root.as_path()) {
+            warn!(
+                sync_name = %sync.name.as_str(),
+                path = %root_dir.as_str(),
+                error = %error,
+                "sync root directory setup failed"
+            );
+            failed_sync_roots.insert(sync.name.as_str().to_owned());
+        }
+    }
+
+    // --- Phase 3: Planned-path validation over active (non-covered) entries ---
+    if let Err(error) = validate_unique_final_paths(
+        config,
+        nickname,
+        &run_config,
+        &manifest,
+        &run_plan,
+        &covered_indices,
+    ) {
+        let msg = format!("manifest destination validation failed: {error}");
+        warn!("{}", msg);
+        write_run_failure(&config.purgery_root, nickname, run_id, &msg)?;
+        anyhow::bail!("{msg}");
+    }
+
+    // --- Phase 4: Process entries ---
     let mut outcomes: Vec<EntryOutcome> = Vec::new();
 
     for entry in &manifest.entries {
@@ -1129,16 +1166,25 @@ pub fn process_processing_run(
             continue;
         };
 
+        // Check if this entry's sync root setup failed.
+        if failed_sync_roots.contains(sync.name.as_str()) {
+            outcomes.push(EntryOutcome::Skipped {
+                kind: entry.kind,
+                sync_name: entry.sync_name.clone(),
+                local_path: entry.local_path.as_str().to_owned(),
+                relative_path: entry.relative_path.as_str().to_owned(),
+                error: "sync root setup failed".into(),
+            });
+            continue;
+        }
+
         // Check if this entry is covered by a postprocessed ancestor directory.
-        // The match must be path-component-aware: "data/foo" covers "data/foo/a.txt"
-        // but not "data/foobar.txt" or "data/foo2/bar.txt".
         let np = format!("{}/{}", sync.to_path.as_str(), entry.relative_path.as_str());
         let covered = covered_by_dir.iter().any(|prefix| {
             let tail = match np.as_str().strip_prefix(prefix.as_str()) {
                 Some(t) => t,
                 None => return false,
             };
-            // Only descendants require a "/" after the prefix (not the directory itself).
             tail.starts_with('/')
         });
         if covered {
@@ -1369,7 +1415,7 @@ impl RunPlan {
     }
 }
 
-/// Apply postprocessing rules to a file in the work area using a precompiled RunPlan.
+/// Apply postprocessing rules to an entry root in the work area using a precompiled RunPlan.
 ///
 /// `normalized_path` is the logical path used for rule matching (e.g. `videos/video.mp4`).
 /// `work_path` is the absolute work area path used for subprocess execution.
@@ -4766,9 +4812,16 @@ to = "{second_to}"
         };
 
         let empty_plan = RunPlan { rules: vec![] };
-        let error =
-            validate_unique_final_paths(&config, &nickname, &run_config, &manifest, &empty_plan)
-                .unwrap_err();
+        let empty_covered = std::collections::HashSet::new();
+        let error = validate_unique_final_paths(
+            &config,
+            &nickname,
+            &run_config,
+            &manifest,
+            &empty_plan,
+            &empty_covered,
+        )
+        .unwrap_err();
         assert!(error.contains("duplicate final path"));
     }
 
@@ -4781,6 +4834,7 @@ to = "{second_to}"
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_config = duplicate_path_run_config("first-dest", "second-dest");
         let empty_plan = RunPlan { rules: vec![] };
+        let empty_covered = std::collections::HashSet::new();
         let manifest = Manifest {
             run_id: RunId::new("distinct-files".into()).unwrap(),
             nickname: nickname.clone(),
@@ -4790,8 +4844,15 @@ to = "{second_to}"
             ],
         };
 
-        validate_unique_final_paths(&config, &nickname, &run_config, &manifest, &empty_plan)
-            .unwrap();
+        validate_unique_final_paths(
+            &config,
+            &nickname,
+            &run_config,
+            &manifest,
+            &empty_plan,
+            &empty_covered,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -4803,6 +4864,7 @@ to = "{second_to}"
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_config = duplicate_path_run_config("shared", "shared");
         let empty_plan = RunPlan { rules: vec![] };
+        let empty_covered = std::collections::HashSet::new();
         let manifest = Manifest {
             run_id: RunId::new("duplicate-directories".into()).unwrap(),
             nickname: nickname.clone(),
@@ -4812,9 +4874,15 @@ to = "{second_to}"
             ],
         };
 
-        let error =
-            validate_unique_final_paths(&config, &nickname, &run_config, &manifest, &empty_plan)
-                .unwrap_err();
+        let error = validate_unique_final_paths(
+            &config,
+            &nickname,
+            &run_config,
+            &manifest,
+            &empty_plan,
+            &empty_covered,
+        )
+        .unwrap_err();
         assert!(error.contains("duplicate final path"));
     }
 
@@ -4974,9 +5042,16 @@ steps = ["compress"]
             ],
         };
 
-        let error =
-            validate_unique_final_paths(&config, &nickname, &run_config, &manifest, &run_plan)
-                .unwrap_err();
+        let empty_covered = std::collections::HashSet::new();
+        let error = validate_unique_final_paths(
+            &config,
+            &nickname,
+            &run_config,
+            &manifest,
+            &run_plan,
+            &empty_covered,
+        )
+        .unwrap_err();
         assert!(
             error.contains("duplicate final path"),
             "error must mention duplicate final path: {error}"
@@ -5071,9 +5146,16 @@ steps = ["compress"]
             ],
         };
 
-        let error =
-            validate_unique_final_paths(&config, &nickname, &run_config, &manifest, &pp_plan)
-                .unwrap_err();
+        let empty_covered = std::collections::HashSet::new();
+        let error = validate_unique_final_paths(
+            &config,
+            &nickname,
+            &run_config,
+            &manifest,
+            &pp_plan,
+            &empty_covered,
+        )
+        .unwrap_err();
         assert!(
             error.contains("duplicate final path"),
             "error must mention duplicate final path: {error}"
@@ -5149,9 +5231,16 @@ steps = ["compress"]
             ],
         };
 
-        let error =
-            validate_unique_final_paths(&config, &nickname, &run_config, &manifest, &run_plan)
-                .unwrap_err();
+        let empty_covered = std::collections::HashSet::new();
+        let error = validate_unique_final_paths(
+            &config,
+            &nickname,
+            &run_config,
+            &manifest,
+            &run_plan,
+            &empty_covered,
+        )
+        .unwrap_err();
         assert!(
             error.contains("duplicate final path"),
             "error must mention duplicate final path: {error}"
