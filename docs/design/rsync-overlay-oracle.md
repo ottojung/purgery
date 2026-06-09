@@ -7,7 +7,7 @@ rsync 3.2.7, protocol 31
 rsync --recursive --archive SRC/ DST/
 ```
 
-No `--delete*` option is supplied. Rsync has no `--no-delete` switch; omitting delete options is its no-delete mode. The reproducible characterization is [`scripts/characterize-rsync-overlay.sh`](../../scripts/characterize-rsync-overlay.sh).
+No `--delete*` option is supplied. Rsync has no `--no-delete` switch; omitting delete options is its no-delete mode.
 
 The destination trees below use `d` for a directory, `f(content)` for a regular file and its content, and `l(target)` for a symlink and its literal target.
 
