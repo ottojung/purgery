@@ -116,6 +116,12 @@ manifest_path = "/tmp/purgery/laptop/incoming/01ARZ.../manifest.toml"
 heartbeat_interval_secs = 60
 ```
 
+## Postprocessing applies to all entry kinds
+
+Every manifest entry kind (directory, regular file, symlink) is eligible for postprocessing. If an entry's normalized path matches a postprocess rule, the entry is transformed. Outputs may be directories, regular files, or symlinks — the kind is detected at commit time via `symlink_metadata`.
+
+Directory entries that match a postprocess rule become **transformation boundaries**. Their descendant manifest entries are marked as covered and skipped, producing a status of `"covered by postprocessed ancestor directory"`.
+
 ## Expected output restrictions
 
 Expected output names in postprocess step definitions are limited to file-name patterns. The following placeholders are allowed:

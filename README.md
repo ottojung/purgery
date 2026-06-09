@@ -1,8 +1,8 @@
 # Purgery
 
-One-way filesystem-tree import with optional regular-file postprocessing and safe local cleanup.
+One-way filesystem-tree import with optional entry-based postprocessing and safe local cleanup.
 
-Purgery collects filesystem trees from local directories, overlays them onto managed server storage, optionally transforms regular files during import, and can safely remove confirmed local regular files.
+Purgery collects filesystem trees from local directories, overlays them onto managed server storage, optionally transforms entries (directories, regular files, or symlinks) during import, and can safely remove confirmed local regular files.
 
 Use Purgery when you want to regularly move photos, videos, recordings, or other generated files from devices into a central archive — possibly compressing or converting them on the way — without risking deletion before the import is confirmed.
 
@@ -39,7 +39,7 @@ purgery-client sync-and-cleanup --config client.toml
 
 1. The client walks configured local trees without following symlinks and builds a manifest of directories, regular files, and symlinks.
 2. The client uploads each tree to a server staging area over SSH via recursive archive-mode rsync without delete.
-3. The server validates the staged entries, postprocesses matching regular files, and overlays the tree onto final storage.
+3. The server validates the staged entries, postprocesses matching entries (directories, regular files, or symlinks), and overlays the tree onto final storage.
 4. The server writes a status file describing what was imported and what failed.
 5. The client reads the status and, for sync mappings with cleanup enabled, removes only confirmed unchanged local originals.
 

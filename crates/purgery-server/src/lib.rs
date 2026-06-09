@@ -7,7 +7,7 @@ use purgery_core::{
 };
 use std::collections::HashMap;
 use std::fs;
-use tracing::{info, span, warn, Level};
+use tracing::{debug, info, span, warn, Level};
 
 fn publish_status_atomic(directory: &Utf8Path, status: &RunStatus) -> Result<()> {
     let content = status.to_toml().context("failed to serialize status")?;
@@ -368,6 +368,183 @@ fn commit_symlink_entry(
     Ok(disposition)
 }
 
+/// Recursively overlay a source directory tree onto final storage with
+/// no-delete semantics: directories are created/kept, files and symlinks
+/// are committed, existing unrelated descendants are preserved.
+fn commit_directory_tree(
+    source_root: &Utf8Path,
+    final_root: &Utf8Path,
+    server_root: &Utf8Path,
+    run_id: &RunId,
+) -> Result<CommitDisposition, String> {
+    use walkdir::WalkDir;
+
+    // Commit the root directory first
+    let root_disp = commit_directory_entry(final_root, server_root)?;
+
+    // Walk the source tree in breadth-first order so parents come before children
+    let mut entries: Vec<(Utf8PathBuf, Utf8PathBuf)> = Vec::new();
+    for entry in WalkDir::new(source_root.as_std_path())
+        .min_depth(1)
+        .sort_by_file_name()
+    {
+        let entry = entry.map_err(|e| format!("failed to walk source directory: {e}"))?;
+        let relative = entry
+            .path()
+            .strip_prefix(source_root.as_std_path())
+            .map_err(|_| "failed to compute relative path in source tree".to_string())?;
+        let source_entry = Utf8PathBuf::from_path_buf(entry.path().to_path_buf())
+            .unwrap_or_else(|p| Utf8PathBuf::from(p.to_string_lossy().as_ref()));
+        let final_entry = final_root.join(Utf8Path::new(
+            relative
+                .to_str()
+                .ok_or_else(|| "non-UTF-8 path in directory tree".to_string())?,
+        ));
+        entries.push((source_entry, final_entry));
+    }
+
+    for (source_entry, final_entry) in &entries {
+        let meta = fs::symlink_metadata(source_entry.as_std_path())
+            .map_err(|e| format!("failed to read output entry metadata: {e}"))?;
+        if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
+            commit_directory_entry(final_entry, server_root)?;
+        } else if meta.file_type().is_file() {
+            commit_regular_file_entry(source_entry, final_entry, server_root, run_id)?;
+        } else if meta.file_type().is_symlink() {
+            let target = fs::read_link(source_entry.as_std_path())
+                .map_err(|e| format!("failed to read output symlink target: {e}"))?;
+            let target_utf8 = Utf8PathBuf::from_path_buf(target)
+                .unwrap_or_else(|p| Utf8PathBuf::from(p.to_string_lossy().as_ref()));
+            commit_symlink_entry(&target_utf8, final_entry, server_root, run_id)?;
+        } else {
+            return Err(format!(
+                "unsupported output entry type: {}",
+                source_entry.as_str()
+            ));
+        }
+    }
+
+    Ok(root_disp)
+}
+
+/// Prepare a work-area entry from its staged source.
+/// Returns the work-area path.
+fn prepare_work_entry(
+    entry: &ManifestEntry,
+    sync: &RunConfigSync,
+    source_path: &Utf8Path,
+    work_area: &Utf8Path,
+) -> Result<Utf8PathBuf, String> {
+    let work_path = work_area
+        .join(sync.to_path.as_str())
+        .join(entry.relative_path.as_str());
+
+    match entry.kind {
+        ManifestEntryKind::Directory => {
+            if let Some(parent) = work_path.parent() {
+                fs::create_dir_all(parent.as_std_path())
+                    .map_err(|e| format!("failed to create work parent: {e}"))?;
+            }
+            // Recursively copy staged directory subtree into work area
+            use walkdir::WalkDir;
+            fs::create_dir(work_path.as_std_path())
+                .map_err(|e| format!("failed to create work directory: {e}"))?;
+            for dir_entry in WalkDir::new(source_path.as_std_path())
+                .min_depth(1)
+                .sort_by_file_name()
+            {
+                let dir_entry =
+                    dir_entry.map_err(|e| format!("failed to walk staged directory: {e}"))?;
+                let relative = dir_entry
+                    .path()
+                    .strip_prefix(source_path.as_std_path())
+                    .map_err(|_| "failed to compute relative path".to_string())?;
+                let work_child = work_path.join(Utf8Path::new(
+                    relative
+                        .to_str()
+                        .ok_or_else(|| "non-UTF-8 path in staged directory".to_string())?,
+                ));
+                let meta = fs::symlink_metadata(dir_entry.path())
+                    .map_err(|e| format!("failed to read staged entry metadata: {e}"))?;
+                if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
+                    fs::create_dir(work_child.as_std_path())
+                        .map_err(|e| format!("failed to create work subdirectory: {e}"))?;
+                } else if meta.file_type().is_file() {
+                    if let Some(parent) = work_child.parent() {
+                        fs::create_dir_all(parent.as_std_path())
+                            .map_err(|e| format!("failed to create work parent: {e}"))?;
+                    }
+                    fs::copy(dir_entry.path(), work_child.as_std_path())
+                        .map_err(|e| format!("failed to copy staged file to work area: {e}"))?;
+                } else if meta.file_type().is_symlink() {
+                    if let Some(parent) = work_child.parent() {
+                        fs::create_dir_all(parent.as_std_path())
+                            .map_err(|e| format!("failed to create work parent: {e}"))?;
+                    }
+                    let target = fs::read_link(dir_entry.path())
+                        .map_err(|e| format!("failed to read staged symlink: {e}"))?;
+                    std::os::unix::fs::symlink(&target, work_child.as_std_path())
+                        .map_err(|e| format!("failed to create work symlink: {e}"))?;
+                } else {
+                    return Err(format!(
+                        "unsupported filesystem object in staged directory: {}",
+                        relative.display()
+                    ));
+                }
+            }
+            Ok(work_path)
+        }
+        ManifestEntryKind::RegularFile => {
+            if let Some(parent) = work_path.parent() {
+                fs::create_dir_all(parent.as_std_path())
+                    .map_err(|e| format!("failed to create work parent: {e}"))?;
+            }
+            fs::copy(source_path.as_std_path(), work_path.as_std_path())
+                .map_err(|e| format!("failed to copy to work area: {e}"))?;
+            Ok(work_path)
+        }
+        ManifestEntryKind::Symlink => {
+            if let Some(parent) = work_path.parent() {
+                fs::create_dir_all(parent.as_std_path())
+                    .map_err(|e| format!("failed to create work parent: {e}"))?;
+            }
+            let target = fs::read_link(source_path.as_std_path())
+                .map_err(|e| format!("failed to read staged symlink: {e}"))?;
+            std::os::unix::fs::symlink(&target, work_path.as_std_path())
+                .map_err(|e| format!("failed to create work symlink: {e}"))?;
+            Ok(work_path)
+        }
+    }
+}
+
+/// Commit an output entry (determined by its filesystem kind) from the work
+/// area to final storage.
+fn commit_output_entry(
+    source: &Utf8Path,
+    final_path: &Utf8Path,
+    server_root: &Utf8Path,
+    run_id: &RunId,
+) -> Result<CommitDisposition, String> {
+    let meta = fs::symlink_metadata(source.as_std_path())
+        .map_err(|e| format!("failed to inspect output entry: {e}"))?;
+    if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
+        commit_directory_tree(source, final_path, server_root, run_id)
+    } else if meta.file_type().is_file() {
+        commit_regular_file_entry(source, final_path, server_root, run_id)
+    } else if meta.file_type().is_symlink() {
+        let target = fs::read_link(source.as_std_path())
+            .map_err(|e| format!("failed to read output symlink target: {e}"))?;
+        let target_utf8 = Utf8PathBuf::from_path_buf(target)
+            .unwrap_or_else(|p| Utf8PathBuf::from(p.to_string_lossy().as_ref()));
+        commit_symlink_entry(&target_utf8, final_path, server_root, run_id)
+    } else {
+        Err(format!(
+            "unsupported output entry type: {}",
+            source.as_str()
+        ))
+    }
+}
+
 fn failed_entry(entry: &ManifestEntry, error: impl Into<String>) -> EntryOutcome {
     EntryOutcome::Failure {
         kind: entry.kind,
@@ -571,78 +748,129 @@ fn process_manifest_entry(
         .strip_prefix(server_config.root.as_path())
         .unwrap_or(&final_path)
         .to_string();
+    let normalized_path = format!("{}/{}", sync.to_path.as_str(), entry.relative_path.as_str());
 
-    let result = match entry.kind {
-        ManifestEntryKind::Directory => {
-            commit_directory_entry(&final_path, server_config.root.as_path())
-                .map(|_| (vec![final_relative], None))
+    // Check whether any postprocess rule matches this entry.  If not, commit
+    // directly using the kind-specific path (no work-area overhead).
+    let matched = run_plan
+        .rules
+        .iter()
+        .any(|rule| rule.regex.is_match(&normalized_path));
+
+    let result = if !matched {
+        // Direct commit — no postprocessing.
+        match entry.kind {
+            ManifestEntryKind::Directory => {
+                commit_directory_entry(&final_path, server_config.root.as_path())
+                    .map(|_| (vec![final_relative], None))
+            }
+            ManifestEntryKind::Symlink => {
+                let target = entry.link_target.as_deref().expect("validated target");
+                commit_symlink_entry(target, &final_path, server_config.root.as_path(), run_id)
+                    .map(|_| (vec![final_relative], None))
+            }
+            ManifestEntryKind::RegularFile => {
+                let work_path = work_area
+                    .join(sync.to_path.as_str())
+                    .join(entry.relative_path.as_str());
+                if let Some(parent) = work_path.parent() {
+                    if let Err(error) = fs::create_dir_all(parent) {
+                        return failed_entry(entry, format!("failed to create work dir: {error}"));
+                    }
+                }
+                if let Err(error) = fs::copy(source_path.as_std_path(), work_path.as_std_path()) {
+                    return failed_entry(entry, format!("failed to copy to work area: {error}"));
+                }
+                match apply_postprocessing(run_plan, &normalized_path, &work_path) {
+                    Ok(outputs) => {
+                        let mut final_paths = Vec::new();
+                        for output in outputs {
+                            let output_final = if output == work_path {
+                                final_path.clone()
+                            } else {
+                                let filename = output.file_name().unwrap_or("");
+                                final_path.parent().map_or_else(
+                                    || Utf8PathBuf::from(filename),
+                                    |parent| parent.join(filename),
+                                )
+                            };
+                            if !path_is_within_root(&output_final, server_config.root.as_path()) {
+                                return failed_entry(entry, "output escapes root");
+                            }
+                            if let Err(error) = commit_output_entry(
+                                &output,
+                                &output_final,
+                                server_config.root.as_path(),
+                                run_id,
+                            ) {
+                                return failed_entry(entry, format!("commit failed: {error}"));
+                            }
+                            final_paths.push(
+                                output_final
+                                    .strip_prefix(server_config.root.as_path())
+                                    .unwrap_or(&output_final)
+                                    .to_string(),
+                            );
+                        }
+                        let steps: Vec<String> = run_plan
+                            .rules
+                            .iter()
+                            .filter(|rule| rule.regex.is_match(&normalized_path))
+                            .flat_map(|rule| rule.steps.iter().map(|step| step.step_name.clone()))
+                            .collect();
+                        Ok((final_paths, (!steps.is_empty()).then_some(steps)))
+                    }
+                    Err(error) => Err(error),
+                }
+            }
         }
-        ManifestEntryKind::Symlink => {
-            let target = entry
-                .link_target
-                .as_deref()
-                .expect("validated symlink target");
-            commit_symlink_entry(target, &final_path, server_config.root.as_path(), run_id)
-                .map(|_| (vec![final_relative], None))
-        }
-        ManifestEntryKind::RegularFile => {
-            let work_path = work_area
-                .join(sync.to_path.as_str())
-                .join(entry.relative_path.as_str());
-            if let Some(parent) = work_path.parent() {
-                if let Err(error) = fs::create_dir_all(parent) {
-                    return failed_entry(
-                        entry,
-                        format!("failed to create work directory: {error}"),
+    } else {
+        // Entry matches a postprocess rule — place in work area, run
+        // subprocesses, commit outputs by their detected filesystem kind.
+        let work_path = match prepare_work_entry(entry, sync, &source_path, work_area) {
+            Ok(p) => p,
+            Err(error) => return failed_entry(entry, error),
+        };
+        match apply_postprocessing(run_plan, &normalized_path, &work_path) {
+            Ok(outputs) => {
+                let mut final_paths = Vec::new();
+                for output in outputs {
+                    let output_final = if output == work_path {
+                        final_path.clone()
+                    } else {
+                        let filename = output.file_name().unwrap_or("");
+                        final_path.parent().map_or_else(
+                            || Utf8PathBuf::from(filename),
+                            |parent| parent.join(filename),
+                        )
+                    };
+                    if !path_is_within_root(&output_final, server_config.root.as_path()) {
+                        return failed_entry(entry, "output escapes root");
+                    }
+                    if let Err(error) = commit_output_entry(
+                        &output,
+                        &output_final,
+                        server_config.root.as_path(),
+                        run_id,
+                    ) {
+                        return failed_entry(entry, format!("commit failed: {error}"));
+                    }
+                    final_paths.push(
+                        output_final
+                            .strip_prefix(server_config.root.as_path())
+                            .unwrap_or(&output_final)
+                            .to_string(),
                     );
                 }
+                let steps: Vec<String> = run_plan
+                    .rules
+                    .iter()
+                    .filter(|rule| rule.regex.is_match(&normalized_path))
+                    .flat_map(|rule| rule.steps.iter().map(|step| step.step_name.clone()))
+                    .collect();
+                Ok((final_paths, (!steps.is_empty()).then_some(steps)))
             }
-            if let Err(error) = fs::copy(source_path.as_std_path(), work_path.as_std_path()) {
-                return failed_entry(entry, format!("failed to copy to work area: {error}"));
-            }
-            let normalized_path =
-                format!("{}/{}", sync.to_path.as_str(), entry.relative_path.as_str());
-            match apply_postprocessing(run_plan, &normalized_path, &work_path) {
-                Ok(outputs) => {
-                    let mut final_paths = Vec::new();
-                    for output in outputs {
-                        let output_final = if output == work_path {
-                            final_path.clone()
-                        } else {
-                            let filename = output.file_name().unwrap_or("");
-                            final_path.parent().map_or_else(
-                                || Utf8PathBuf::from(filename),
-                                |parent| parent.join(filename),
-                            )
-                        };
-                        if !path_is_within_root(&output_final, server_config.root.as_path()) {
-                            return failed_entry(entry, "postprocess output escapes final root");
-                        }
-                        if let Err(error) = commit_regular_file_entry(
-                            &output,
-                            &output_final,
-                            server_config.root.as_path(),
-                            run_id,
-                        ) {
-                            return failed_entry(entry, format!("commit failed: {error}"));
-                        }
-                        final_paths.push(
-                            output_final
-                                .strip_prefix(server_config.root.as_path())
-                                .unwrap_or(&output_final)
-                                .to_string(),
-                        );
-                    }
-                    let steps: Vec<String> = run_plan
-                        .rules
-                        .iter()
-                        .filter(|rule| rule.regex.is_match(&normalized_path))
-                        .flat_map(|rule| rule.steps.iter().map(|step| step.step_name.clone()))
-                        .collect();
-                    Ok((final_paths, (!steps.is_empty()).then_some(steps)))
-                }
-                Err(error) => Err(error),
-            }
+            Err(error) => Err(error),
         }
     };
 
@@ -840,6 +1068,30 @@ pub fn process_processing_run(
         }
     }
 
+    // Pre-pass: identify directory entries whose normalized path matches a
+    // postprocess rule.  Those directory entries become transformation
+    // boundaries — their descendant manifest entries are covered (skipped)
+    // and must not be imported independently.
+    let covered_by_dir: std::collections::HashSet<String> = manifest
+        .entries
+        .iter()
+        .filter(|e| e.kind == ManifestEntryKind::Directory)
+        .filter_map(|dir_entry| {
+            let sync = sync_map.get(dir_entry.sync_name.as_str())?;
+            let np = format!(
+                "{}/{}",
+                sync.to_path.as_str(),
+                dir_entry.relative_path.as_str()
+            );
+            let matched = run_plan.rules.iter().any(|rule| rule.regex.is_match(&np));
+            if matched {
+                Some(np)
+            } else {
+                None
+            }
+        })
+        .collect();
+
     let mut outcomes: Vec<EntryOutcome> = Vec::new();
 
     for entry in &manifest.entries {
@@ -858,6 +1110,23 @@ pub fn process_processing_run(
             });
             continue;
         };
+
+        // Check if this entry is covered by a postprocessed ancestor directory.
+        let np = format!("{}/{}", sync.to_path.as_str(), entry.relative_path.as_str());
+        let covered = covered_by_dir
+            .iter()
+            .any(|prefix| np.starts_with(prefix) && np.len() > prefix.len());
+        if covered {
+            debug!(sync_name = sync_name, path = %np, "entry covered by postprocessed ancestor directory, skipping");
+            outcomes.push(EntryOutcome::Skipped {
+                kind: entry.kind,
+                sync_name: entry.sync_name.clone(),
+                local_path: entry.local_path.as_str().to_owned(),
+                relative_path: entry.relative_path.as_str().to_owned(),
+                error: "covered by postprocessed ancestor directory".into(),
+            });
+            continue;
+        }
 
         outcomes.push(process_manifest_entry(
             config,
