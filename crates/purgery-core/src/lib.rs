@@ -3615,6 +3615,56 @@ color = "never"
     // ── TransferPlanEntry tests ──
 
     // ── PostprocessRule `for` field tests ──
+
+    #[ignore = "expected to fail until validation is wired into config parsing"]
+    #[test]
+    fn client_config_rejects_empty_for_at_parse_time() {
+        let toml = r#"
+nickname = "laptop"
+
+[server]
+host = "example.com"
+
+[[sync]]
+name = "videos"
+from = "/home/user/Videos"
+to = "videos"
+
+[[postprocess.rules]]
+match = "*.mp4"
+steps = ["compress-video"]
+for = []
+"#;
+        let result = ClientConfig::from_toml(toml);
+        assert!(result.is_err(), "empty for must be rejected at parse time");
+    }
+
+    #[ignore = "expected to fail until validation is wired into config parsing"]
+    #[test]
+    fn client_config_rejects_unknown_sync_in_for_at_parse_time() {
+        let toml = r#"
+nickname = "laptop"
+
+[server]
+host = "example.com"
+
+[[sync]]
+name = "videos"
+from = "/home/user/Videos"
+to = "videos"
+
+[[postprocess.rules]]
+match = "*.mp4"
+steps = ["compress-video"]
+for = ["missing-sync"]
+"#;
+        let result = ClientConfig::from_toml(toml);
+        assert!(
+            result.is_err(),
+            "unknown sync in for must be rejected at parse time"
+        );
+    }
+
     #[test]
     fn config_with_postprocess_rule_for_is_accepted() {
         let toml = r#"

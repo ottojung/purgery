@@ -6362,4 +6362,161 @@ steps = ["pack"]
             result.err()
         );
     }
+
+    #[ignore = "expected to fail until scoped rules are used in server coverage detection"]
+    #[test]
+    fn scoped_rule_does_not_cover_directory_in_other_sync_group() {
+        // A postprocess rule scoped to "videos" must not cause a directory
+        // in "docs" to be considered covered by a postprocessed ancestor.
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&purgery_root, &server_root);
+        let config = ServerConfig {
+            postprocess: PostprocessConfig {
+                steps: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "pack".to_owned(),
+                        PostprocessStepDefinition {
+                            kind: PostprocessKind::Subprocess,
+                            program: "true".into(),
+                            args: vec![],
+                            expected_outputs: vec![],
+                            keep_original: true,
+                        },
+                    );
+                    m
+                },
+            },
+            ..config
+        };
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("scoped-coverage".into()).unwrap();
+        let ready = config.purgery_root.run_dir(&nickname, &run_id, RunPhase::Ready);
+
+        // Set up two sync groups: "videos" (with album dir) and "docs" (with album dir)
+        fs::create_dir_all(ready.join("files/videos/album")).unwrap();
+        fs::write(ready.join("files/videos/album/song.mp3"), b"audio").unwrap();
+        fs::create_dir_all(ready.join("files/docs/album")).unwrap();
+        fs::write(ready.join("files/docs/album/report.txt"), b"text").unwrap();
+
+        // Run config: rule scoped to "videos" only
+        fs::write(
+            ready.join("run.toml"),
+            r#"
+nickname = "laptop"
+
+[[sync]]
+name = "videos"
+to = "videos"
+
+[[sync]]
+name = "docs"
+to = "docs"
+
+[[postprocess.rules]]
+match = "album"
+steps = ["pack"]
+for = ["videos"]
+"#,
+        )
+        .unwrap();
+
+        let manifest = Manifest {
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![
+                // videos/album is postprocess (rule applies to videos)
+                ManifestEntry {
+                    sync_name: SyncName::new("videos".into()).unwrap(),
+                    local_path: ClientLocalPath::new("/src/videos/album".into()).unwrap(),
+                    staged_path: NormalizedRelativePath::new("files/videos/album".into()).unwrap(),
+                    relative_path: NormalizedRelativePath::new("album".into()).unwrap(),
+                    kind: ManifestEntryKind::Directory,
+                    size: 0,
+                    mtime_ns: 0,
+                    sha256: None,
+                    link_target: None,
+                    mode: purgery_core::ManifestEntryMode::Postprocess,
+                    postprocess_steps: vec!["pack".into()],
+                    covered_by: None,
+                },
+                // videos/album/song.mp3 is covered
+                ManifestEntry {
+                    sync_name: SyncName::new("videos".into()).unwrap(),
+                    local_path: ClientLocalPath::new("/src/videos/album/song.mp3".into()).unwrap(),
+                    staged_path: NormalizedRelativePath::new("files/videos/album/song.mp3".into())
+                        .unwrap(),
+                    relative_path: NormalizedRelativePath::new("album/song.mp3".into()).unwrap(),
+                    kind: ManifestEntryKind::RegularFile,
+                    size: 5,
+                    mtime_ns: 0,
+                    sha256: None,
+                    link_target: None,
+                    mode: purgery_core::ManifestEntryMode::Covered,
+                    postprocess_steps: Vec::new(),
+                    covered_by: Some("album".into()),
+                },
+                // docs/album is NOT postprocess (rule is scoped to videos only)
+                ManifestEntry {
+                    sync_name: SyncName::new("docs".into()).unwrap(),
+                    local_path: ClientLocalPath::new("/src/docs/album".into()).unwrap(),
+                    staged_path: NormalizedRelativePath::new("files/docs/album".into()).unwrap(),
+                    relative_path: NormalizedRelativePath::new("album".into()).unwrap(),
+                    kind: ManifestEntryKind::Directory,
+                    size: 0,
+                    mtime_ns: 0,
+                    sha256: None,
+                    link_target: None,
+                    mode: purgery_core::ManifestEntryMode::Passthrough,
+                    postprocess_steps: Vec::new(),
+                    covered_by: None,
+                },
+                // docs/album/report.txt is NOT covered (rule is scoped to videos only)
+                ManifestEntry {
+                    sync_name: SyncName::new("docs".into()).unwrap(),
+                    local_path: ClientLocalPath::new("/src/docs/album/report.txt".into()).unwrap(),
+                    staged_path: NormalizedRelativePath::new("files/docs/album/report.txt".into())
+                        .unwrap(),
+                    relative_path: NormalizedRelativePath::new("album/report.txt".into()).unwrap(),
+                    kind: ManifestEntryKind::RegularFile,
+                    size: 4,
+                    mtime_ns: 0,
+                    sha256: None,
+                    link_target: None,
+                    mode: purgery_core::ManifestEntryMode::Passthrough,
+                    postprocess_steps: Vec::new(),
+                    covered_by: None,
+                },
+            ],
+        };
+        fs::write(
+            ready.join("manifest.toml"),
+            manifest.to_toml().unwrap(),
+        )
+        .unwrap();
+
+        // Processing must succeed — the docs entries are valid passthrough
+        process_run(&config, &nickname, &run_id).unwrap();
+
+        let done = config.purgery_root.run_dir(&nickname, &run_id, RunPhase::Done);
+        let status_content = fs::read_to_string(done.join("status.toml")).unwrap();
+        let status = RunStatus::from_toml(&status_content).unwrap();
+
+        // The docs/album/report.txt must not be skipped as "covered"
+        let docs_entry = status
+            .entries
+            .iter()
+            .find(|e| e.relative_path == "album/report.txt" && e.sync_name.as_str() == "docs");
+        assert!(
+            docs_entry.is_some(),
+            "docs/album/report.txt must have a status entry"
+        );
+        assert_eq!(
+            docs_entry.unwrap().status,
+            FileStatus::Imported,
+            "docs/album/report.txt must be imported, not skipped as covered"
+        );
+    }
 }
