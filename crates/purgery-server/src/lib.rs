@@ -571,61 +571,50 @@ fn planned_entry_outputs(
             .root
             .final_path(nickname, &sync.to_path, &entry.relative_path);
 
-    match entry.kind {
-        ManifestEntryKind::Directory | ManifestEntryKind::Symlink => {
-            vec![entry_final_path.as_str().to_owned()]
+    // Every manifest entry kind uses the same postprocess-dispatch logic.
+    // If no rule matches, the only planned output is the entry's own final
+    // path.  If a rule matches, include keep_original and expected_outputs.
+    let normalized_path = format!("{}/{}", sync.to_path.as_str(), entry.relative_path.as_str());
+
+    let synthetic_work_path = Utf8Path::new(entry.relative_path.as_str());
+
+    let mut any_rule_matched = false;
+    let mut outputs: Vec<String> = Vec::new();
+
+    for rule in &run_plan.rules {
+        if !rule.regex.is_match(&normalized_path) {
+            continue;
         }
-        ManifestEntryKind::RegularFile => {
-            let normalized_path =
-                format!("{}/{}", sync.to_path.as_str(), entry.relative_path.as_str());
-
-            // A synthetic path for placeholder resolution.  Only `{file_name}`,
-            // `{file_stem}`, and `{stem}` are allowed in expected_outputs, so
-            // the path's parent and absolute location are irrelevant.
-            let synthetic_work_path = Utf8Path::new(entry.relative_path.as_str());
-
-            let mut any_rule_matched = false;
-            let mut outputs: Vec<String> = Vec::new();
-
-            for rule in &run_plan.rules {
-                if !rule.regex.is_match(&normalized_path) {
-                    continue;
-                }
-                any_rule_matched = true;
-                for step in &rule.steps {
-                    if step.step_def.keep_original {
-                        outputs.push(entry_final_path.as_str().to_owned());
-                    }
-                    for pat in &step.step_def.expected_outputs {
-                        if purgery_core::validate_expected_output_name(pat).is_err() {
-                            // Invalid patterns are rejected later during
-                            // processing; skip them here to avoid false
-                            // negatives in duplicate detection.
-                            continue;
-                        }
-                        let resolved = step.step_def.resolve_placeholders(synthetic_work_path, pat);
-                        let p = Utf8Path::new(&resolved);
-                        let fname = p.file_name().unwrap_or(resolved.as_str());
-                        let output_path = entry_final_path
-                            .parent()
-                            .map(|parent| parent.join(fname))
-                            .unwrap_or_else(|| Utf8PathBuf::from(fname));
-                        outputs.push(output_path.as_str().to_owned());
-                    }
-                }
-            }
-
-            if !any_rule_matched {
+        any_rule_matched = true;
+        for step in &rule.steps {
+            if step.step_def.keep_original {
                 outputs.push(entry_final_path.as_str().to_owned());
             }
-
-            // Deduplicate the outputs for this single entry (e.g., if two
-            // rules have keep_original the entry final path appears once).
-            let mut seen = std::collections::HashSet::new();
-            outputs.retain(|p| seen.insert(p.clone()));
-            outputs
+            for pat in &step.step_def.expected_outputs {
+                // RunPlan::build already validates expected-output names,
+                // so an invalid name here is a logic error — skip defensively.
+                if purgery_core::validate_expected_output_name(pat).is_err() {
+                    continue;
+                }
+                let resolved = step.step_def.resolve_placeholders(synthetic_work_path, pat);
+                let p = Utf8Path::new(&resolved);
+                let fname = p.file_name().unwrap_or(resolved.as_str());
+                let output_path = entry_final_path
+                    .parent()
+                    .map(|parent| parent.join(fname))
+                    .unwrap_or_else(|| Utf8PathBuf::from(fname));
+                outputs.push(output_path.as_str().to_owned());
+            }
         }
     }
+
+    if !any_rule_matched {
+        outputs.push(entry_final_path.as_str().to_owned());
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    outputs.retain(|p| seen.insert(p.clone()));
+    outputs
 }
 
 /// Validate that no two manifest entries or their postprocess outputs
@@ -644,6 +633,7 @@ fn validate_unique_final_paths(
     let sync_map: HashMap<&str, &RunConfigSync> = run_config.sync_map().into_iter().collect();
     let mut destinations: HashMap<String, &ManifestEntry> = HashMap::new();
 
+    // First pass: collect all planned destinations and detect exact duplicates.
     for entry in &manifest.entries {
         let Some(sync) = sync_map.get(entry.sync_name.as_str()) else {
             continue;
@@ -660,6 +650,77 @@ fn validate_unique_final_paths(
                     entry.sync_name.as_str(),
                     entry.relative_path.as_str()
                 ));
+            }
+        }
+    }
+
+    // Second pass: detect subtree overlaps between postprocessed entries and
+    // other active entries.  A postprocessed entry's output (which may be a
+    // directory) must not overlap with another active entry's planned root.
+    // Normal non-postprocessed parent-child directory relationships are
+    // allowed.
+    let entries_with_rules: std::collections::HashSet<usize> = manifest
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| {
+            sync_map
+                .get(e.sync_name.as_str())
+                .map(|sync| {
+                    let np = format!("{}/{}", sync.to_path.as_str(), e.relative_path.as_str());
+                    run_plan.rules.iter().any(|r| r.regex.is_match(&np))
+                })
+                .unwrap_or(false)
+        })
+        .map(|(i, _)| i)
+        .collect();
+
+    for (i, entry_a) in manifest.entries.iter().enumerate() {
+        let Some(sync_a) = sync_map.get(entry_a.sync_name.as_str()) else {
+            continue;
+        };
+        let planned_a = planned_entry_outputs(server_config, nickname, sync_a, entry_a, run_plan);
+        for dest_a in &planned_a {
+            for (j, entry_b) in manifest.entries.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                // Only flag overlaps if at least one of the two entries has
+                // matching postprocess rules (otherwise it is a normal
+                // parent-child directory relationship).
+                if !entries_with_rules.contains(&i) && !entries_with_rules.contains(&j) {
+                    continue;
+                }
+                let Some(sync_b) = sync_map.get(entry_b.sync_name.as_str()) else {
+                    continue;
+                };
+                let planned_b =
+                    planned_entry_outputs(server_config, nickname, sync_b, entry_b, run_plan);
+                for dest_b in &planned_b {
+                    if dest_a == dest_b {
+                        // Already caught by exact-duplicate pass above.
+                        continue;
+                    }
+                    // Check if one is an ancestor of the other (subtree overlap).
+                    let a_prefix_of_b = dest_b.as_str().starts_with(dest_a.as_str())
+                        && dest_b.as_str().len() > dest_a.as_str().len()
+                        && dest_b.as_str().as_bytes().get(dest_a.as_str().len()) == Some(&b'/');
+                    let b_prefix_of_a = dest_a.as_str().starts_with(dest_b.as_str())
+                        && dest_a.as_str().len() > dest_b.as_str().len()
+                        && dest_a.as_str().as_bytes().get(dest_b.as_str().len()) == Some(&b'/');
+                    if a_prefix_of_b || b_prefix_of_a {
+                        return Err(format!(
+                            "planned output subtree overlap between '{}:{}' ({}) and \
+                             '{}:{}' ({})",
+                            entry_a.sync_name.as_str(),
+                            entry_a.relative_path.as_str(),
+                            dest_a,
+                            entry_b.sync_name.as_str(),
+                            entry_b.relative_path.as_str(),
+                            dest_b,
+                        ));
+                    }
+                }
             }
         }
     }
