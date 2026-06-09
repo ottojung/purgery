@@ -185,6 +185,17 @@ Ordinary passthrough entries are excluded.
 
 If any covered entry has the wrong `covered_by` or non-empty `postprocess_steps`, the run is rejected.
 
+### Uploaded run config validation
+
+The uploaded `run.toml` is validated through a central API in `purgery-core`:
+
+- `RunConfig::from_toml` parses TOML and validates `postprocess.rules.for` scoping.
+- `RunConfig::validate_uploaded_purgatory_run` confirms every sync has `delete_after_import = true` and `for` lists are valid.
+
+The server applies these validations in `prepare-run` before any manifest processing, final-path validation, or storage mutation.
+
+`resolve-destinations` uses structural validation (for lists only) but does not require `delete_after_import = true`, since it is also called for pure passthrough groups.
+
 ## Destination resolution
 
 ### `resolve-destinations` response
