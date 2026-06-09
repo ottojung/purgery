@@ -1432,8 +1432,8 @@ pub struct RunConfigSync {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ManifestEntryMode {
-    #[default]
     Passthrough,
+    #[default]
     Postprocess,
     Covered,
 }
