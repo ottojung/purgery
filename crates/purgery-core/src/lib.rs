@@ -1596,6 +1596,25 @@ impl Manifest {
             entries,
         }
     }
+
+    /// Build a lightweight transfer plan from manifest entries.
+    ///
+    /// The transfer plan carries only path, classification, and mode.
+    /// It does not include identity-bearing fields (size, mtime, sha256).
+    /// Use this for rsync filter generation and path classification.
+    pub fn to_transfer_plan(&self) -> Vec<TransferPlanEntry> {
+        self.entries
+            .iter()
+            .map(|e| TransferPlanEntry {
+                sync_name: e.sync_name.clone(),
+                relative_path: e.relative_path.clone(),
+                kind: e.kind,
+                mode: e.mode,
+                covered_by: e.covered_by.clone(),
+                postprocess_steps: e.postprocess_steps.clone(),
+            })
+            .collect()
+    }
 }
 
 impl RunStatus {

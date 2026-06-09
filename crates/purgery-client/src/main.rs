@@ -286,18 +286,19 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
     // 1. Build manifest for local planning
     let run_id = RunId::generate();
     let manifest = build_manifest(config, &run_id)?;
+    let transfer_plan = manifest.to_transfer_plan();
     info!(entries = manifest.entries.len(), "manifest built");
 
     // 2. Determine if any sync group has postprocess entries
-    let has_postprocess = manifest.entries.iter().any(|e| {
+    let has_postprocess = transfer_plan.iter().any(|e| {
         e.mode == purgery_core::ManifestEntryMode::Postprocess
             || e.mode == purgery_core::ManifestEntryMode::Covered
     });
 
     if has_postprocess {
-        run_postprocess_path(config, host, server_command, &manifest, &run_id)
+        run_postprocess_path(config, host, server_command, &manifest, &transfer_plan, &run_id)
     } else {
-        run_passthrough_path(config, host, server_command, &manifest)
+        run_passthrough_path(config, host, server_command, &manifest, &transfer_plan)
     }
 }
 
@@ -310,6 +311,7 @@ fn run_passthrough_path(
     host: &str,
     server_command: &str,
     manifest: &Manifest,
+    _transfer_plan: &[purgery_core::TransferPlanEntry],
 ) -> Result<()> {
     let _span = span!(
         Level::INFO,
@@ -364,9 +366,8 @@ fn run_passthrough_path(
             .get(sync_name)
             .ok_or_else(|| anyhow::anyhow!("no destination for sync mapping '{sync_name}'"))?;
 
-        // Build passthrough transfer roots for this sync
-        let passthrough_roots: Vec<purgery_core::TransferRoot> = manifest
-            .entries
+        // Build passthrough transfer roots from the lightweight transfer plan
+        let passthrough_roots: Vec<purgery_core::TransferRoot> = _transfer_plan
             .iter()
             .filter(|e| {
                 e.sync_name.as_str() == sync_name
@@ -423,6 +424,7 @@ fn run_postprocess_path(
     host: &str,
     server_command: &str,
     manifest: &Manifest,
+    transfer_plan: &[purgery_core::TransferPlanEntry],
     run_id: &RunId,
 ) -> Result<()> {
     let _span = span!(
@@ -608,8 +610,7 @@ fn run_postprocess_path(
                 .get(sync_name)
                 .ok_or_else(|| anyhow::anyhow!("no destination for sync mapping '{sync_name}'"))?;
 
-            let passthrough_roots: Vec<purgery_core::TransferRoot> = manifest
-                .entries
+            let passthrough_roots: Vec<purgery_core::TransferRoot> = transfer_plan
                 .iter()
                 .filter(|e| {
                     e.sync_name.as_str() == sync_name
@@ -617,8 +618,7 @@ fn run_postprocess_path(
                 })
                 .map(|e| purgery_core::TransferRoot::Exact(e.relative_path.as_str().to_owned()))
                 .collect();
-            let mut purgatory_roots: Vec<purgery_core::TransferRoot> = manifest
-                .entries
+            let mut purgatory_roots: Vec<purgery_core::TransferRoot> = transfer_plan
                 .iter()
                 .filter(|e| {
                     e.sync_name.as_str() == sync_name
@@ -1276,6 +1276,13 @@ fn delete_confirmed_files(
             continue;
         };
 
+        // Status-based cleanup is for postprocess entries only.
+        // Passthrough entries are cleaned via the durable local cleanup state
+        // (process_cleanup_entries), not from server status.
+        if manifest_entry.mode == purgery_core::ManifestEntryMode::Passthrough {
+            continue;
+        }
+
         if manifest_entry.kind != purgery_core::ManifestEntryKind::RegularFile {
             continue;
         }
@@ -1466,7 +1473,29 @@ delete_after_import = false
         fs::create_dir_all(source.join("directory")).unwrap();
         fs::write(source.join("file.txt"), "data").unwrap();
         std::os::unix::fs::symlink("file.txt", source.join("link")).unwrap();
-        let config = config_for(&source);
+
+        // Use a config that marks file.txt as postprocess so it is eligible for status cleanup
+        let config = ClientConfig::from_toml(&format!(
+            r#"
+nickname = "laptop"
+
+[server]
+host = "example.invalid"
+
+[[sync]]
+name = "data"
+from = "{}"
+to = "data"
+delete_after_import = true
+
+[[postprocess.rules]]
+match = "file.txt"
+steps = ["compress-video"]
+"#,
+            source.display()
+        ))
+        .unwrap();
+
         let run_id = RunId::new("cleanup-tree".into()).unwrap();
         let manifest = build_manifest(&config, &run_id).unwrap();
         let status_entries = manifest
@@ -1510,7 +1539,26 @@ delete_after_import = false
         fs::create_dir_all(&source).unwrap();
         fs::write(source.join("file.txt"), "data").unwrap();
 
-        let config = config_for(&source);
+        let config = ClientConfig::from_toml(&format!(
+            r#"
+nickname = "laptop"
+
+[server]
+host = "example.invalid"
+
+[[sync]]
+name = "data"
+from = "{}"
+to = "data"
+delete_after_import = true
+
+[[postprocess.rules]]
+match = "file.txt"
+steps = ["compress-video"]
+"#,
+            source.display()
+        ))
+        .unwrap();
         let run_id = RunId::new("symlink-safety".into()).unwrap();
         let manifest = build_manifest(&config, &run_id).unwrap();
 
@@ -1606,7 +1654,6 @@ delete_after_import = false
         filter.contains(entry.relative_path.as_str())
     }
 
-    #[ignore = "expected to fail until planning/identity split is implemented"]
     #[test]
     fn delete_confirmed_files_rejects_status_passthrough_entries() {
         // When server status has imported entries but the corresponding
