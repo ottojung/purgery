@@ -3628,6 +3628,116 @@ color = "never"
 
     // ── TransferPlanEntry tests ──
 
+    // ── Issue 19: Postprocess requires delete_after_import=true ──
+
+    #[ignore = "expected to fail until issue 19 purgatory/delete_after_import rules are enforced"]
+    #[test]
+    fn config_rejects_postprocess_on_no_delete_sync() {
+        let toml = r#"
+nickname = "laptop"
+
+[server]
+host = "example.com"
+
+[[sync]]
+name = "videos"
+from = "/home/user/Videos"
+to = "videos"
+delete_after_import = false
+
+[[postprocess.rules]]
+match = "*.mp4"
+steps = ["compress-video"]
+"#;
+        let result = ClientConfig::from_toml(toml);
+        assert!(
+            result.is_err(),
+            "sync with applicable rule but delete_after_import=false must be rejected"
+        );
+    }
+
+    #[ignore = "expected to fail until issue 19 purgatory/delete_after_import rules are enforced"]
+    #[test]
+    fn config_rejects_postprocess_with_omitted_for_on_no_delete_sync() {
+        let toml = r#"
+nickname = "laptop"
+
+[server]
+host = "example.com"
+
+[[sync]]
+name = "videos"
+from = "/home/user/Videos"
+to = "videos"
+delete_after_import = false
+
+[[postprocess.rules]]
+match = "*.mp4"
+steps = ["compress-video"]
+# for omitted — applies to every sync group, including "videos"
+"#;
+        let result = ClientConfig::from_toml(toml);
+        assert!(
+            result.is_err(),
+            "sync with global rule and delete_after_import=false must be rejected"
+        );
+    }
+
+    #[ignore = "expected to fail until issue 19 purgatory/delete_after_import rules are enforced"]
+    #[test]
+    fn config_accepts_postprocess_on_delete_true_sync() {
+        let toml = r#"
+nickname = "laptop"
+
+[server]
+host = "example.com"
+
+[[sync]]
+name = "videos"
+from = "/home/user/Videos"
+to = "videos"
+delete_after_import = true
+
+[[postprocess.rules]]
+match = "*.mp4"
+steps = ["compress-video"]
+"#;
+        let config = ClientConfig::from_toml(toml).unwrap();
+        assert_eq!(config.sync[0].delete_after_import, true);
+        assert_eq!(config.postprocess.rules.len(), 1);
+    }
+
+    #[ignore = "expected to fail until issue 19 purgatory/delete_after_import rules are enforced"]
+    #[test]
+    fn config_accepts_no_delete_sync_with_only_out_of_scope_rules() {
+        let toml = r#"
+nickname = "laptop"
+
+[server]
+host = "example.com"
+
+[[sync]]
+name = "videos"
+from = "/home/user/Videos"
+to = "videos"
+delete_after_import = false
+
+[[sync]]
+name = "pictures"
+from = "/home/user/Pictures"
+to = "pictures"
+delete_after_import = true
+
+[[postprocess.rules]]
+match = "*.mp4"
+steps = ["compress-video"]
+for = ["pictures"]
+"#;
+        let config = ClientConfig::from_toml(toml).unwrap();
+        assert!(!config.sync[0].delete_after_import);
+        assert_eq!(config.sync[1].delete_after_import, true);
+    }
+
     // ── PostprocessRule `for` field tests ──
 
     #[test]
