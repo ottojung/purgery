@@ -1605,4 +1605,49 @@ delete_after_import = false
         let filter = purgery_core::transfer_set_filter(&[root]);
         filter.contains(entry.relative_path.as_str())
     }
+
+    #[ignore = "expected to fail until planning/identity split is implemented"]
+    #[test]
+    fn delete_confirmed_files_rejects_status_passthrough_entries() {
+        // When server status has imported entries but the corresponding
+        // manifest entry is passthrough (not postprocess), delete_confirmed_files
+        // must not delete them. Status-based cleanup is for postprocess entries only.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("file.txt"), b"hello").unwrap();
+        let config = config_for(&source);
+        let run_id = RunId::new("status-safety".into()).unwrap();
+        let manifest = build_manifest(&config, &run_id).unwrap();
+
+        // Find the passthrough entry
+        let passthrough_entry = manifest.entries.iter().find(|e| {
+            e.kind == ManifestEntryKind::RegularFile
+        }).expect("must have a regular file");
+
+        // Create a status that references the passthrough entry's local_path
+        let status_entries = vec![EntryStatusEntry {
+            kind: ManifestEntryKind::RegularFile,
+            sync_name: passthrough_entry.sync_name.clone(),
+            local_path: passthrough_entry.local_path.as_str().to_owned(),
+            relative_path: passthrough_entry.relative_path.as_str().to_owned(),
+            status: FileStatus::Imported,
+            final_paths: vec![],
+            postprocess: None,
+            error: None,
+        }];
+        let status = RunStatus {
+            run_id,
+            nickname: config.nickname.clone(),
+            state: RunState::Done,
+            entries: status_entries,
+            error: None,
+        };
+
+        // delete_confirmed_files must NOT delete the passthrough file even though
+        // status says imported, because passthrough entries are not tracked by server status.
+        let count = delete_confirmed_files(&config, &manifest, &status).unwrap();
+        assert_eq!(count, 0, "must not delete passthrough files from status");
+        assert!(source.join("file.txt").exists(), "passthrough file must remain");
+    }
 }

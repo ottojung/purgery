@@ -3540,4 +3540,46 @@ color = "never"
             "covered descendants must not be independent roots: {filter}"
         );
     }
+
+    // ── TransferPlanEntry tests ──
+
+    #[test]
+    fn transfer_plan_entry_has_no_size_field() {
+        let entry = TransferPlanEntry {
+            sync_name: SyncName::new("data".into()).unwrap(),
+            relative_path: NormalizedRelativePath::new("f.txt".into()).unwrap(),
+            kind: ManifestEntryKind::RegularFile,
+            mode: ManifestEntryMode::Passthrough,
+            covered_by: None,
+            postprocess_steps: Vec::new(),
+        };
+        // TransferPlanEntry must not carry identity fields.
+        // Verify it compiles and has the expected minimal shape.
+        assert_eq!(entry.mode, ManifestEntryMode::Passthrough);
+        assert_eq!(entry.kind, ManifestEntryKind::RegularFile);
+        assert!(entry.covered_by.is_none());
+        assert!(entry.postprocess_steps.is_empty());
+    }
+
+    #[test]
+    fn transfer_plan_entry_is_not_a_manifest_entry() {
+        // TransferPlanEntry and ManifestEntry must be distinct types.
+        // This test will fail to compile if they are unified.
+        let plan = TransferPlanEntry {
+            sync_name: SyncName::new("data".into()).unwrap(),
+            relative_path: NormalizedRelativePath::new("f.txt".into()).unwrap(),
+            kind: ManifestEntryKind::RegularFile,
+            mode: ManifestEntryMode::Passthrough,
+            covered_by: None,
+            postprocess_steps: Vec::new(),
+        };
+        // Plan entries must not have size, mtime_ns, or sha256.
+        // The following line would fail to compile if size existed:
+        // let _ = plan.size;
+        // The following line would fail to compile if sha256 existed:
+        // let _ = plan.sha256;
+        // Assert the plan's fields are accessible for planning:
+        assert_eq!(plan.sync_name.as_str(), "data");
+        assert_eq!(plan.relative_path.as_str(), "f.txt");
+    }
 }
