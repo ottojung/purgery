@@ -1705,8 +1705,8 @@ fn delete_confirmed_files(
         };
 
         // Status-based cleanup is for postprocess entries only.
-        // Passthrough entries are cleaned via the durable local cleanup state
-        // (process_cleanup_entries), not from server status.
+        // Passthrough entries are cleaned via the durable cleanup ledger,
+        // not from server status.
         if manifest_entry.mode == purgery_core::ManifestEntryMode::Passthrough {
             continue;
         }
