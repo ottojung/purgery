@@ -1808,9 +1808,11 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
         for entry in &manifest.entries {
             let _sync = sync_map.get(entry.sync_name.as_str());
             let rp = entry.relative_path.as_str();
-            let matched = run_config.postprocess.rules.iter().find(|r| {
-                purgery_core::rsync_pattern_match(&r.pattern, rp)
-            });
+            let matched = run_config
+                .postprocess
+                .rules
+                .iter()
+                .find(|r| purgery_core::rsync_pattern_match(&r.pattern, rp));
             let expected_mode = match matched {
                 Some(_) => purgery_core::ManifestEntryMode::Postprocess,
                 None => purgery_core::ManifestEntryMode::Passthrough,
@@ -1830,7 +1832,8 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
                     anyhow::bail!(
                         "classification mismatch: '{}' is a descendant of postprocessed \
                          directory but has mode '{:?}' instead of 'covered'",
-                        rp, entry.mode
+                        rp,
+                        entry.mode
                     );
                 }
                 continue;
@@ -1840,7 +1843,9 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
                 anyhow::bail!(
                     "classification mismatch for '{}': manifest says '{:?}' but \
                      pattern classification says '{:?}'",
-                    rp, entry.mode, expected_mode
+                    rp,
+                    entry.mode,
+                    expected_mode
                 );
             }
 
@@ -1855,7 +1860,9 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
                     anyhow::bail!(
                         "classification mismatch for '{}': postprocess_steps {:?} do not \
                          match rule steps {:?}",
-                        rp, entry.postprocess_steps, rule.steps
+                        rp,
+                        entry.postprocess_steps,
+                        rule.steps
                     );
                 }
             }

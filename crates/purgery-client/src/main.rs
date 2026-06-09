@@ -751,8 +751,7 @@ fn build_manifest(config: &ClientConfig, run_id: &RunId) -> Result<Manifest> {
             if rp == dir_path.as_str() {
                 continue;
             }
-            if rp.starts_with(dir_path.as_str())
-                && rp.as_bytes().get(dir_path.len()) == Some(&b'/')
+            if rp.starts_with(dir_path.as_str()) && rp.as_bytes().get(dir_path.len()) == Some(&b'/')
             {
                 entry.mode = purgery_core::ManifestEntryMode::Covered;
                 entry.covered_by = Some(dir_path.clone());
