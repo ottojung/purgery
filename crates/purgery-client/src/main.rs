@@ -246,7 +246,7 @@ fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
     .entered();
 
     let manifest = build_manifest(config, &run_id)?;
-    info!(files = manifest.entries.len(), "manifest built");
+    info!(entries = manifest.entries.len(), "manifest built");
 
     // 2. Begin run on server — get server-derived paths
     let begin_out = server_cmd(
@@ -669,16 +669,16 @@ fn delete_confirmed_files(
         .map(|f| (f.local_path.as_str(), f))
         .collect();
 
-    for file_status in &status.files {
+    for entry_status in &status.entries {
         // Only delete files with status "imported"
-        if file_status.status != purgery_core::FileStatus::Imported {
+        if entry_status.status != purgery_core::FileStatus::Imported {
             continue;
         }
 
         // Find the corresponding manifest entry
-        let Some(manifest_entry) = manifest_by_path.get(file_status.local_path.as_str()) else {
+        let Some(manifest_entry) = manifest_by_path.get(entry_status.local_path.as_str()) else {
             warn!(
-                local_path = %file_status.local_path,
+                local_path = %entry_status.local_path,
                 "status references unknown local path"
             );
             continue;
@@ -840,7 +840,7 @@ delete_after_import = true
         let config = config_for(&source);
         let run_id = RunId::new("cleanup-tree".into()).unwrap();
         let manifest = build_manifest(&config, &run_id).unwrap();
-        let files = manifest
+        let status_entries = manifest
             .entries
             .iter()
             .map(|entry| EntryStatusEntry {
@@ -858,7 +858,7 @@ delete_after_import = true
             run_id,
             nickname: config.nickname.clone(),
             state: RunState::Done,
-            files,
+            entries: status_entries,
             error: None,
         };
 

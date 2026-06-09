@@ -916,7 +916,7 @@ pub struct RunStatus {
     pub nickname: Nickname,
     pub state: RunState,
     #[serde(default)]
-    pub files: Vec<EntryStatusEntry>,
+    pub entries: Vec<EntryStatusEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -1370,11 +1370,17 @@ impl Manifest {
         for entry in &manifest.entries {
             let invalid = match entry.kind {
                 ManifestEntryKind::Directory => {
-                    entry.size != 0 || entry.sha256.is_some() || entry.link_target.is_some()
+                    entry.size != 0
+                        || entry.mtime_ns != 0
+                        || entry.sha256.is_some()
+                        || entry.link_target.is_some()
                 }
                 ManifestEntryKind::RegularFile => entry.link_target.is_some(),
                 ManifestEntryKind::Symlink => {
-                    entry.link_target.is_none() || entry.size != 0 || entry.sha256.is_some()
+                    entry.link_target.is_none()
+                        || entry.size != 0
+                        || entry.mtime_ns != 0
+                        || entry.sha256.is_some()
                 }
             };
             if invalid {
@@ -2236,6 +2242,60 @@ nickname = "laptop"
         assert!(result.is_err());
     }
 
+    #[test]
+    fn directory_manifest_entry_rejects_regular_file_identity_fields() {
+        let toml = r#"
+run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+nickname = "laptop"
+
+[[entries]]
+sync_name = "data"
+local_path = "/source/dir"
+staged_path = "files/data/dir"
+relative_path = "dir"
+kind = "directory"
+mtime_ns = 1
+"#;
+        let error = Manifest::from_toml(toml).unwrap_err();
+        assert!(error.to_string().contains("fields incompatible"));
+    }
+
+    #[test]
+    fn symlink_manifest_entry_rejects_regular_file_identity_fields() {
+        let toml = r#"
+run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+nickname = "laptop"
+
+[[entries]]
+sync_name = "data"
+local_path = "/source/link"
+staged_path = "files/data/link"
+relative_path = "link"
+kind = "symlink"
+mtime_ns = 1
+link_target = "target"
+"#;
+        let error = Manifest::from_toml(toml).unwrap_err();
+        assert!(error.to_string().contains("fields incompatible"));
+    }
+
+    #[test]
+    fn symlink_manifest_entry_requires_link_target() {
+        let toml = r#"
+run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+nickname = "laptop"
+
+[[entries]]
+sync_name = "data"
+local_path = "/source/link"
+staged_path = "files/data/link"
+relative_path = "link"
+kind = "symlink"
+"#;
+        let error = Manifest::from_toml(toml).unwrap_err();
+        assert!(error.to_string().contains("fields incompatible"));
+    }
+
     // ── Status tests ──
 
     #[test]
@@ -2245,15 +2305,15 @@ run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 state = "done"
 
-[[files]]
+[[entries]]
 sync_name = "videos"
 local_path = "/home/vitalik/Videos/a.mp4"
 relative_path = "a.mp4"
 status = "imported"
 "#;
         let status = RunStatus::from_toml(toml).unwrap();
-        assert_eq!(status.files[0].sync_name.as_str(), "videos");
-        assert_eq!(status.files[0].local_path, "/home/vitalik/Videos/a.mp4");
+        assert_eq!(status.entries[0].sync_name.as_str(), "videos");
+        assert_eq!(status.entries[0].local_path, "/home/vitalik/Videos/a.mp4");
     }
 
     #[test]
@@ -2263,7 +2323,7 @@ run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 state = "done"
 
-[[files]]
+[[entries]]
 sync_name = "videos"
 local_path = "/home/vitalik/Videos/a.mp4"
 relative_path = "a.mp4"
@@ -2271,7 +2331,7 @@ status = "imported"
 final_paths = ["laptop/videos/a.mp4"]
 postprocess = ["compress-video"]
 
-[[files]]
+[[entries]]
 sync_name = "videos"
 local_path = "/home/vitalik/Videos/b.mp4"
 relative_path = "b.mp4"
@@ -2280,13 +2340,13 @@ error = "compress-video failed"
 "#;
         let status = RunStatus::from_toml(toml).unwrap();
         assert_eq!(status.state, RunState::Done);
-        assert_eq!(status.files.len(), 2);
-        assert_eq!(status.files[0].status, FileStatus::Imported);
-        assert_eq!(status.files[0].final_paths, vec!["laptop/videos/a.mp4"]);
-        assert_eq!(status.files[0].sync_name.as_str(), "videos");
-        assert_eq!(status.files[1].status, FileStatus::Failed);
+        assert_eq!(status.entries.len(), 2);
+        assert_eq!(status.entries[0].status, FileStatus::Imported);
+        assert_eq!(status.entries[0].final_paths, vec!["laptop/videos/a.mp4"]);
+        assert_eq!(status.entries[0].sync_name.as_str(), "videos");
+        assert_eq!(status.entries[1].status, FileStatus::Failed);
         assert_eq!(
-            status.files[1].error.as_deref(),
+            status.entries[1].error.as_deref(),
             Some("compress-video failed")
         );
     }
@@ -2306,7 +2366,7 @@ files = []
             status.error.as_deref(),
             Some("failed to parse manifest.toml")
         );
-        assert!(status.files.is_empty());
+        assert!(status.entries.is_empty());
     }
 
     // ── Identity tests ──
@@ -2389,7 +2449,7 @@ files = []
             run_id: RunId::new("test-123".into()).unwrap(),
             nickname: Nickname::new("testbox".into()).unwrap(),
             state: RunState::Done,
-            files: vec![EntryStatusEntry {
+            entries: vec![EntryStatusEntry {
                 kind: ManifestEntryKind::RegularFile,
                 sync_name: SyncName::new("videos".into()).unwrap(),
                 local_path: "/tmp/test.mp4".into(),
@@ -2404,10 +2464,13 @@ files = []
         let toml = status.to_toml().unwrap();
         let parsed = RunStatus::from_toml(&toml).unwrap();
         assert_eq!(parsed.state, RunState::Done);
-        assert_eq!(parsed.files.len(), 1);
-        assert_eq!(parsed.files[0].status, FileStatus::Imported);
-        assert_eq!(parsed.files[0].sync_name.as_str(), "videos");
-        assert_eq!(parsed.files[0].final_paths, vec!["laptop/videos/test.mp4"]);
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.entries[0].status, FileStatus::Imported);
+        assert_eq!(parsed.entries[0].sync_name.as_str(), "videos");
+        assert_eq!(
+            parsed.entries[0].final_paths,
+            vec!["laptop/videos/test.mp4"]
+        );
     }
 
     // ── Envelope validation tests ──

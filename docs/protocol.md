@@ -45,7 +45,7 @@ incoming → ready → processing → done
 | `ready` | Upload complete, waiting for server processing |
 | `processing` | Server is actively processing the run |
 | `done` | Processing completed (all or partial success) |
-| `failed` | Processing completed with no files imported, or run-level error |
+| `failed` | Processing completed with no entries imported, or run-level error |
 
 ## Run states
 
@@ -64,7 +64,7 @@ run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 state = "done"
 
-[[files]]
+[[entries]]
 kind = "regular_file"
 sync_name = "videos"
 local_path = "/home/user/Videos/video.mp4"
@@ -73,7 +73,7 @@ status = "imported"
 final_paths = ["laptop/videos/video.mp4"]
 postprocess = ["compress-video"]
 
-[[files]]
+[[entries]]
 kind = "regular_file"
 sync_name = "videos"
 local_path = "/home/user/Videos/broken.mp4"
@@ -82,7 +82,7 @@ status = "failed"
 error = "staged file not found"
 ```
 
-Per-entry status values: `imported`, `failed`, `skipped`.
+Per-entry status values: `imported`, `failed`, `skipped`. Status records are serialized under `[[entries]]`.
 
 ## Manifest format
 
@@ -101,7 +101,7 @@ mtime_ns = 1780944312000000000
 sha256 = "abc123..."
 ```
 
-Manifest `kind` is `directory`, `regular_file`, or `symlink`. Regular files carry `size`, `mtime_ns`, and optional `sha256`; symlinks carry a literal `link_target`; directories need no identity payload. Parent directories precede descendants. Staged validation uses `symlink_metadata` and never follows symlinks.
+The server rejects a manifest before import if multiple entries resolve to the same final path. Manifest `kind` is `directory`, `regular_file`, or `symlink`. Regular files carry `size`, `mtime_ns`, and optional `sha256`; symlinks carry a literal `link_target`; directories need no identity payload. Parent directories precede descendants. Staged validation uses `symlink_metadata` and never follows symlinks.
 
 ## `begin-run` response
 

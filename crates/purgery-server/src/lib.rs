@@ -32,7 +32,7 @@ fn write_run_failure(
         run_id: run_id.clone(),
         nickname: nickname.clone(),
         state: RunState::Failed,
-        files: vec![],
+        entries: vec![],
         error: Some(error_msg.to_owned()),
     };
     let status_toml = status
@@ -378,6 +378,39 @@ fn failed_entry(entry: &ManifestEntry, error: impl Into<String>) -> EntryOutcome
     }
 }
 
+fn validate_unique_final_paths(
+    server_config: &ServerConfig,
+    nickname: &Nickname,
+    run_config: &RunConfig,
+    manifest: &Manifest,
+) -> Result<(), String> {
+    let sync_map: HashMap<&str, &RunConfigSync> = run_config.sync_map().into_iter().collect();
+    let mut destinations: HashMap<String, &ManifestEntry> = HashMap::new();
+
+    for entry in &manifest.entries {
+        let Some(sync) = sync_map.get(entry.sync_name.as_str()) else {
+            continue;
+        };
+        let final_path =
+            server_config
+                .root
+                .final_path(nickname, &sync.to_path, &entry.relative_path);
+        let destination = final_path.as_str().to_owned();
+        if let Some(previous) = destinations.insert(destination.clone(), entry) {
+            return Err(format!(
+                "duplicate final path '{}' from '{}:{}' and '{}:{}'",
+                destination,
+                previous.sync_name.as_str(),
+                previous.relative_path.as_str(),
+                entry.sync_name.as_str(),
+                entry.relative_path.as_str()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Validate and import one manifest entry using recursive no-delete overlay semantics.
 #[allow(clippy::too_many_arguments)]
 fn process_manifest_entry(
@@ -693,6 +726,13 @@ pub fn process_processing_run(
         anyhow::bail!("{msg}");
     }
 
+    if let Err(error) = validate_unique_final_paths(config, nickname, &run_config, &manifest) {
+        let msg = format!("manifest destination validation failed: {error}");
+        warn!("{}", msg);
+        write_run_failure(&config.purgery_root, nickname, run_id, &msg)?;
+        anyhow::bail!("{msg}");
+    }
+
     let sync_map: HashMap<&str, &RunConfigSync> = run_config.sync_map().into_iter().collect();
     let mut outcomes: Vec<EntryOutcome> = Vec::new();
 
@@ -748,7 +788,7 @@ pub fn process_processing_run(
         run_id: run_id.clone(),
         nickname: nickname.clone(),
         state: run_state.clone(),
-        files: outcomes.into_iter().map(EntryOutcome::into_entry).collect(),
+        entries: outcomes.into_iter().map(EntryOutcome::into_entry).collect(),
         error: None,
     };
     let status_toml = run_status
@@ -968,8 +1008,23 @@ pub fn apply_postprocessing(
                                 work_parent.as_str()
                             ));
                         }
-                        if !exp.exists() {
-                            return Err(format!("expected output not found: {}", exp.as_str()));
+                        let metadata =
+                            fs::symlink_metadata(exp.as_std_path()).map_err(|error| {
+                                if error.kind() == std::io::ErrorKind::NotFound {
+                                    format!("expected output not found: {}", exp.as_str())
+                                } else {
+                                    format!(
+                                        "failed to inspect expected output '{}': {error}",
+                                        exp.as_str()
+                                    )
+                                }
+                            })?;
+                        let file_type = metadata.file_type();
+                        if !file_type.is_file() || file_type.is_symlink() {
+                            return Err(format!(
+                                "expected output is not a regular file: {}",
+                                exp.as_str()
+                            ));
                         }
                     }
 
@@ -1544,7 +1599,7 @@ pub fn run_gc(config: &ServerConfig) -> Result<()> {
                         run_id: run_id.clone(),
                         nickname: nickname.clone(),
                         state: RunState::Failed,
-                        files: vec![],
+                        entries: vec![],
                         error: Some("abandoned upload expired (quarantined)".into()),
                     };
                     if let Err(error) = publish_status_atomic(&quarantine_path, &status) {
@@ -1580,7 +1635,7 @@ pub fn run_gc(config: &ServerConfig) -> Result<()> {
                 run_id: run_id.clone(),
                 nickname: nickname.clone(),
                 state: RunState::Failed,
-                files: vec![],
+                entries: vec![],
                 error: Some("abandoned upload expired".into()),
             };
             if let Err(error) = publish_status_atomic(&failed_path, &status) {
@@ -1811,10 +1866,10 @@ to = "{}"
         let status_content = fs::read_to_string(done_path.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
         assert_eq!(status.state, RunState::Done);
-        assert_eq!(status.files.len(), 1);
-        assert_eq!(status.files[0].status, FileStatus::Imported);
+        assert_eq!(status.entries.len(), 1);
+        assert_eq!(status.entries[0].status, FileStatus::Imported);
         assert_eq!(
-            status.files[0].final_paths,
+            status.entries[0].final_paths,
             vec!["laptop/videos/test.mp4"],
             "single-output import must record one final path"
         );
@@ -1871,7 +1926,7 @@ to = "{}"
         let status_content = fs::read_to_string(failed_path.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
         assert_eq!(status.state, RunState::Failed);
-        assert_eq!(status.files[0].status, FileStatus::Skipped);
+        assert_eq!(status.entries[0].status, FileStatus::Skipped);
     }
 
     #[test]
@@ -1920,8 +1975,8 @@ to = "{}"
         let status_content = fs::read_to_string(failed_path.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
         assert_eq!(status.state, RunState::Failed);
-        assert_eq!(status.files[0].status, FileStatus::Failed);
-        assert!(status.files[0]
+        assert_eq!(status.entries[0].status, FileStatus::Failed);
+        assert!(status.entries[0]
             .error
             .as_ref()
             .unwrap()
@@ -2259,8 +2314,8 @@ steps = ["compress-video"]
         let status_content = fs::read_to_string(failed_path.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
         assert_eq!(status.state, RunState::Failed);
-        assert_eq!(status.files[0].status, FileStatus::Failed);
-        assert!(status.files[0].error.as_ref().unwrap().contains("failed"));
+        assert_eq!(status.entries[0].status, FileStatus::Failed);
+        assert!(status.entries[0].error.as_ref().unwrap().contains("failed"));
 
         let final_path = server_root.join("laptop/videos/test.mp4");
         assert!(
@@ -2506,7 +2561,7 @@ steps = ["compress-video"]
             RunStatus::from_toml(&fs::read_to_string(done_path.join("status.toml")).unwrap())
                 .unwrap();
         assert_eq!(status.state, RunState::Done);
-        assert_eq!(status.files[0].status, FileStatus::Imported);
+        assert_eq!(status.entries[0].status, FileStatus::Imported);
     }
 
     #[test]
@@ -2538,7 +2593,7 @@ steps = ["compress-video"]
         let status =
             RunStatus::from_toml(&fs::read_to_string(done_path.join("status.toml")).unwrap())
                 .unwrap();
-        assert_eq!(status.files[0].status, FileStatus::Imported);
+        assert_eq!(status.entries[0].status, FileStatus::Imported);
     }
 
     #[test]
@@ -2656,9 +2711,9 @@ to = "pictures"
         let status_content = fs::read_to_string(done_path.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
         assert_eq!(status.state, RunState::Done);
-        assert_eq!(status.files.len(), 2);
-        assert_eq!(status.files[0].status, FileStatus::Imported);
-        assert_eq!(status.files[1].status, FileStatus::Imported);
+        assert_eq!(status.entries.len(), 2);
+        assert_eq!(status.entries[0].status, FileStatus::Imported);
+        assert_eq!(status.entries[1].status, FileStatus::Imported);
     }
 
     // ── Staged path mismatch test ──
@@ -2709,8 +2764,8 @@ to = "pictures"
         let status_content = fs::read_to_string(failed_path.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
         assert_eq!(status.state, RunState::Failed);
-        assert_eq!(status.files[0].status, FileStatus::Failed);
-        assert!(status.files[0]
+        assert_eq!(status.entries[0].status, FileStatus::Failed);
+        assert!(status.entries[0]
             .error
             .as_ref()
             .unwrap()
@@ -2744,7 +2799,7 @@ to = "pictures"
         let status_content = fs::read_to_string(done_path.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
         assert_eq!(status.state, RunState::Done);
-        assert_eq!(status.files[0].status, FileStatus::Imported);
+        assert_eq!(status.entries[0].status, FileStatus::Imported);
     }
 
     // ── Staged symlink rejection test ──
@@ -2805,8 +2860,8 @@ to = "pictures"
         let status_content = fs::read_to_string(failed_path.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
         assert_eq!(status.state, RunState::Failed);
-        assert_eq!(status.files[0].status, FileStatus::Failed);
-        assert!(status.files[0]
+        assert_eq!(status.entries[0].status, FileStatus::Failed);
+        assert!(status.entries[0]
             .error
             .as_ref()
             .unwrap()
@@ -3084,8 +3139,8 @@ steps = ["compress-video"]
         let status_content = fs::read_to_string(done_path.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
         assert_eq!(status.state, RunState::Done);
-        assert_eq!(status.files[0].status, FileStatus::Imported);
-        assert_eq!(status.files[0].final_paths.len(), 2);
+        assert_eq!(status.entries[0].status, FileStatus::Imported);
+        assert_eq!(status.entries[0].final_paths.len(), 2);
 
         let original_final = server_root.join("laptop/videos/video.mp4");
         let compressed_final = server_root.join("laptop/videos/video.Z.webm");
@@ -3184,8 +3239,8 @@ steps = ["compress-video"]
         let status_content = fs::read_to_string(done_path.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
         assert_eq!(status.state, RunState::Done);
-        assert_eq!(status.files[0].status, FileStatus::Imported);
-        assert_eq!(status.files[0].final_paths.len(), 1);
+        assert_eq!(status.entries[0].status, FileStatus::Imported);
+        assert_eq!(status.entries[0].final_paths.len(), 1);
 
         let original_final = server_root.join("laptop/videos/video.mp4");
         let compressed_final = server_root.join("laptop/videos/video.Z.webm");
@@ -3531,7 +3586,7 @@ steps = ["compress-video"]
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             state: RunState::Partial,
-            files: vec![],
+            entries: vec![],
             error: None,
         };
         fs::write(processing.join("status.toml"), status.to_toml().unwrap()).unwrap();
@@ -3564,7 +3619,7 @@ steps = ["compress-video"]
             run_id: status_run_id,
             nickname: status_nickname,
             state: RunState::Done,
-            files: vec![],
+            entries: vec![],
             error: None,
         };
         fs::write(processing.join("status.toml"), status.to_toml().unwrap()).unwrap();
@@ -3629,7 +3684,7 @@ steps = ["compress-video"]
             run_id: RunId::new("other-run".into()).unwrap(),
             nickname: nickname.clone(),
             state: RunState::Done,
-            files: vec![],
+            entries: vec![],
             error: None,
         };
         fs::write(
@@ -4089,10 +4144,10 @@ steps = ["compress-video"]
         let status =
             RunStatus::from_toml(&fs::read_to_string(done.join("status.toml")).unwrap()).unwrap();
         assert_eq!(status.state, RunState::Done);
-        assert_eq!(status.files.len(), 3);
-        assert_eq!(status.files[0].kind, ManifestEntryKind::Directory);
-        assert_eq!(status.files[1].kind, ManifestEntryKind::Symlink);
-        assert_eq!(status.files[2].kind, ManifestEntryKind::RegularFile);
+        assert_eq!(status.entries.len(), 3);
+        assert_eq!(status.entries[0].kind, ManifestEntryKind::Directory);
+        assert_eq!(status.entries[1].kind, ManifestEntryKind::Symlink);
+        assert_eq!(status.entries[2].kind, ManifestEntryKind::RegularFile);
     }
 
     #[test]
@@ -4111,12 +4166,261 @@ steps = ["compress-video"]
             run_id: RunId::new("different".into()).unwrap(),
             nickname: nickname.clone(),
             state: RunState::Done,
-            files: vec![],
+            entries: vec![],
             error: None,
         };
         fs::write(done.join("status.toml"), status.to_toml().unwrap()).unwrap();
 
         let error = read_run_status(&config, &nickname, &run_id).unwrap_err();
         assert!(error.to_string().contains("status envelope mismatch"));
+    }
+
+    fn expected_output_test_plan() -> RunPlan {
+        RunPlan {
+            rules: vec![CompiledRule {
+                regex: regex::Regex::new(r"^data/.*\.txt$").unwrap(),
+                steps: vec![ResolvedStep {
+                    step_name: "generate".into(),
+                    step_def: PostprocessStepDefinition {
+                        kind: PostprocessKind::Subprocess,
+                        program: "true".into(),
+                        args: vec![],
+                        expected_outputs: vec!["{stem}.out".into()],
+                        keep_original: false,
+                    },
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn postprocess_regular_expected_output_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_path = Utf8PathBuf::from_path_buf(tmp.path().join("input.txt")).unwrap();
+        fs::write(&work_path, "input").unwrap();
+        fs::write(work_path.with_file_name("input.out"), "output").unwrap();
+
+        let outputs =
+            apply_postprocessing(&expected_output_test_plan(), "data/input.txt", &work_path)
+                .unwrap();
+        assert_eq!(outputs, vec![work_path.with_file_name("input.out")]);
+    }
+
+    #[test]
+    fn postprocess_missing_expected_output_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_path = Utf8PathBuf::from_path_buf(tmp.path().join("input.txt")).unwrap();
+        fs::write(&work_path, "input").unwrap();
+
+        let error =
+            apply_postprocessing(&expected_output_test_plan(), "data/input.txt", &work_path)
+                .unwrap_err();
+        assert!(error.contains("expected output not found"));
+    }
+
+    #[test]
+    fn postprocess_symlink_expected_output_fails_without_following_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_path = Utf8PathBuf::from_path_buf(tmp.path().join("input.txt")).unwrap();
+        fs::write(&work_path, "input").unwrap();
+        let target = work_path.with_file_name("target.txt");
+        fs::write(&target, "secret target contents").unwrap();
+        std::os::unix::fs::symlink(&target, work_path.with_file_name("input.out")).unwrap();
+
+        let error =
+            apply_postprocessing(&expected_output_test_plan(), "data/input.txt", &work_path)
+                .unwrap_err();
+        assert!(error.contains("expected output is not a regular file"));
+    }
+
+    #[test]
+    fn postprocess_directory_expected_output_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_path = Utf8PathBuf::from_path_buf(tmp.path().join("input.txt")).unwrap();
+        fs::write(&work_path, "input").unwrap();
+        fs::create_dir(work_path.with_file_name("input.out")).unwrap();
+
+        let error =
+            apply_postprocessing(&expected_output_test_plan(), "data/input.txt", &work_path)
+                .unwrap_err();
+        assert!(error.contains("expected output is not a regular file"));
+    }
+
+    fn duplicate_path_test_entry(
+        sync_name: &str,
+        relative_path: &str,
+        kind: ManifestEntryKind,
+    ) -> ManifestEntry {
+        ManifestEntry {
+            sync_name: SyncName::new(sync_name.into()).unwrap(),
+            local_path: ClientLocalPath::new(format!("/source/{sync_name}/{relative_path}"))
+                .unwrap(),
+            staged_path: NormalizedRelativePath::new(
+                format!("files/{sync_name}/{relative_path}").into(),
+            )
+            .unwrap(),
+            relative_path: NormalizedRelativePath::new(relative_path.into()).unwrap(),
+            kind,
+            size: 0,
+            mtime_ns: 0,
+            sha256: None,
+            link_target: None,
+        }
+    }
+
+    fn duplicate_path_run_config(first_to: &str, second_to: &str) -> RunConfig {
+        RunConfig::from_toml(&format!(
+            r#"
+nickname = "laptop"
+
+[[sync]]
+name = "first"
+to = "{first_to}"
+
+[[sync]]
+name = "second"
+to = "{second_to}"
+"#,
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn duplicate_final_file_paths_across_syncs_are_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let purgery = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let config = test_server_config(&purgery, &root);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_config = duplicate_path_run_config("shared", "shared");
+        let manifest = Manifest {
+            run_id: RunId::new("duplicate-files".into()).unwrap(),
+            nickname: nickname.clone(),
+            entries: vec![
+                duplicate_path_test_entry("first", "same.txt", ManifestEntryKind::RegularFile),
+                duplicate_path_test_entry("second", "same.txt", ManifestEntryKind::RegularFile),
+            ],
+        };
+
+        let error =
+            validate_unique_final_paths(&config, &nickname, &run_config, &manifest).unwrap_err();
+        assert!(error.contains("duplicate final path"));
+    }
+
+    #[test]
+    fn identical_relative_paths_under_different_destinations_are_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let purgery = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let config = test_server_config(&purgery, &root);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_config = duplicate_path_run_config("first-dest", "second-dest");
+        let manifest = Manifest {
+            run_id: RunId::new("distinct-files".into()).unwrap(),
+            nickname: nickname.clone(),
+            entries: vec![
+                duplicate_path_test_entry("first", "same.txt", ManifestEntryKind::RegularFile),
+                duplicate_path_test_entry("second", "same.txt", ManifestEntryKind::RegularFile),
+            ],
+        };
+
+        validate_unique_final_paths(&config, &nickname, &run_config, &manifest).unwrap();
+    }
+
+    #[test]
+    fn duplicate_final_directory_paths_across_syncs_are_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let purgery = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let config = test_server_config(&purgery, &root);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_config = duplicate_path_run_config("shared", "shared");
+        let manifest = Manifest {
+            run_id: RunId::new("duplicate-directories".into()).unwrap(),
+            nickname: nickname.clone(),
+            entries: vec![
+                duplicate_path_test_entry("first", "same-dir", ManifestEntryKind::Directory),
+                duplicate_path_test_entry("second", "same-dir", ManifestEntryKind::Directory),
+            ],
+        };
+
+        let error =
+            validate_unique_final_paths(&config, &nickname, &run_config, &manifest).unwrap_err();
+        assert!(error.contains("duplicate final path"));
+    }
+
+    #[test]
+    fn processing_rejects_duplicate_final_paths_before_importing_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&purgery_root, &server_root);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("duplicate-run".into()).unwrap();
+        let ready = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        fs::create_dir_all(ready.join("files/shared")).unwrap();
+        fs::write(ready.join("files/shared/same.txt"), "staged").unwrap();
+        fs::write(
+            ready.join("run.toml"),
+            r#"
+nickname = "laptop"
+
+[[sync]]
+name = "first"
+to = "shared"
+
+[[sync]]
+name = "second"
+to = "shared"
+"#,
+        )
+        .unwrap();
+        let manifest = Manifest {
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![
+                ManifestEntry {
+                    sync_name: SyncName::new("first".into()).unwrap(),
+                    local_path: ClientLocalPath::new("/source/first/same.txt".into()).unwrap(),
+                    staged_path: NormalizedRelativePath::new("files/shared/same.txt".into())
+                        .unwrap(),
+                    relative_path: NormalizedRelativePath::new("same.txt".into()).unwrap(),
+                    kind: ManifestEntryKind::RegularFile,
+                    size: 6,
+                    mtime_ns: 0,
+                    sha256: None,
+                    link_target: None,
+                },
+                ManifestEntry {
+                    sync_name: SyncName::new("second".into()).unwrap(),
+                    local_path: ClientLocalPath::new("/source/second/same.txt".into()).unwrap(),
+                    staged_path: NormalizedRelativePath::new("files/shared/same.txt".into())
+                        .unwrap(),
+                    relative_path: NormalizedRelativePath::new("same.txt".into()).unwrap(),
+                    kind: ManifestEntryKind::RegularFile,
+                    size: 6,
+                    mtime_ns: 0,
+                    sha256: None,
+                    link_target: None,
+                },
+            ],
+        };
+        fs::write(ready.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+
+        assert!(process_run(&config, &nickname, &run_id).is_err());
+        assert!(!server_root.join("laptop/shared/same.txt").exists());
+        let failed = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        let status =
+            RunStatus::from_toml(&fs::read_to_string(failed.join("status.toml")).unwrap()).unwrap();
+        assert!(status.entries.is_empty());
+        assert!(status
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("duplicate final path"));
     }
 }

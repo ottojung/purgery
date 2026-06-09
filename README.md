@@ -91,20 +91,22 @@ steps = ["compress-video"]
 
 ## Safety model
 
-Purgery is conservative about data loss:
+Purgery targets Unix/POSIX filesystem semantics and is conservative about data loss:
 
 - Cleanup is opt-in per sync mapping (`delete_after_import = true`).
-- The client deletes local files only after the server confirms the import in a valid status file whose nickname and run ID match the original upload.
-- Before deleting, the client verifies the local file still matches its uploaded identity (size, mtime, optional SHA-256).
+- The client deletes local regular files only after the server confirms the import in a valid status file whose nickname and run ID match the original upload.
+- Before deleting, the client verifies the local regular file still matches its uploaded identity (size, mtime, optional SHA-256).
 - The server performs a recursive rsync-like no-delete overlay: directories merge, regular files replace, symlinks remain symlinks, and absent source entries never delete final entries.
 - Symlink targets are literal data. The server never follows staged or final-storage symlinks as directories.
 - Tree imports provide replayable convergence through crash-safe per-entry commits, not an all-or-nothing filesystem transaction.
 - Postprocessing and client cleanup currently apply only to regular files; local directories and symlinks are retained.
+- Overlapping sync mappings that produce the same final path are rejected rather than resolved by ordering.
 
 ## More documentation
 
 - [Config reference](docs/config.md) — server, client, postprocess, run config
 - [Protocol](docs/protocol.md) — lifecycle, subcommands, run states, status format
 - [Operations](docs/operations.md) — bootstrap, check, GC, heartbeat, leases
-- [Import semantics](docs/design/import-semantics.md) — commit model, work areas, and per-file safety rules
+- [Import semantics](docs/design/import-semantics.md) — tree-overlay model, work areas, and per-entry safety rules
+- [Rsync overlay oracle](docs/design/rsync-overlay-oracle.md) — characterized conflict cases and intentional Purgery differences
 - [Crash safety and idempotence](docs/design/crash-safety-and-idempotence.md) — durable phases, replay recovery, atomic replacement, and deletion authority

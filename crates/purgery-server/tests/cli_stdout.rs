@@ -59,7 +59,7 @@ fn debug_logging_does_not_contaminate_status_stdout() {
         run_id,
         nickname,
         state: RunState::Failed,
-        files: vec![],
+        entries: vec![],
         error: Some("test failure".into()),
     };
     fs::write(failed.join("status.toml"), status.to_toml().unwrap()).unwrap();
