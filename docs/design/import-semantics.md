@@ -80,7 +80,9 @@ If no sync group has any postprocess roots, no server run is created. The client
 
 ## Sync group classes
 
-Every sync group is one of two classes determined at config validation time:
+Every sync group is one of two classes determined at config validation time.
+
+The configured `sync.from` path is the source tree root — a traversal boundary and configuration anchor. It is not itself an imported entry. Manifests, cleanup state, and cleanup operations cover entries **under** the source root, not the root directory itself.
 
 - **Passthrough group**: no applicable postprocess rules. `delete_after_import` may be true or false. The group is handled entirely outside the purgatory lifecycle.
   - `delete_after_import = false`: one direct unfiltered rsync, no walk, no cleanup state.
@@ -205,7 +207,7 @@ Therefore, postprocessing is modeled as an import-and-retire operation:
 1. The source entry is uploaded into a server run.
 2. The server transforms and commits outputs.
 3. The server writes a bounded run status.
-4. The client deletes the unchanged local regular-file original after server-confirmed import.
+4. The client removes the unchanged local original entry after server-confirmed import.
 
 The source original is removed from the source tree after successful import, so it will not be repeatedly reprocessed by later runs.
 
