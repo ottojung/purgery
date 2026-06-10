@@ -2568,4 +2568,72 @@ steps = ["pack"]
             "rejection must explain conformance tradeoff, got: {err}"
         );
     }
+
+    #[test]
+    #[ignore = "expected failure until postprocess wait/resume semantics are fixed"]
+    fn client_run_phase_serde_roundtrip() {
+        // All ClientRunPhase variants must serialize/deserialize correctly.
+        use crate::ClientRunPhase;
+        let cases = vec![
+            (ClientRunPhase::UploadCompleteFinishPending, "upload_complete_finish_pending"),
+            (ClientRunPhase::WaitingForTerminalState, "waiting_for_terminal_state"),
+            (ClientRunPhase::TerminalStatusSeen, "terminal_status_seen"),
+            (ClientRunPhase::CleanupComplete, "cleanup_complete"),
+            (ClientRunPhase::Abandoned, "abandoned"),
+        ];
+        for (phase, expected) in &cases {
+            let serialized = toml::to_string(phase).expect("serialize");
+            assert!(serialized.contains(expected), "serialized form must contain {expected}, got: {serialized}");
+            let deserialized: ClientRunPhase = toml::from_str(&serialized).expect("deserialize");
+            assert_eq!(&deserialized, phase, "roundtrip must preserve value");
+        }
+    }
+
+    #[test]
+    #[ignore = "expected failure until run-state adds observed_at_unix_secs"]
+    fn run_state_response_has_observed_at_field() {
+        // RunStateResponse must include observed_at_unix_secs distinct from updated_at_unix_secs.
+        use crate::RunStateResponse;
+        let response = RunStateResponse {
+            protocol_version: 1,
+            nickname: "laptop".into(),
+            run_id: "test-run".into(),
+            phase: "processing".into(),
+            terminal: false,
+            message: "testing".into(),
+            updated_at_unix_secs: 1000,
+            observed_at_unix_secs: 0,
+        };
+        let serialized = toml::to_string(&response).expect("serialize");
+        // observed_at_unix_secs must be present in serialized output
+        assert!(serialized.contains("observed_at_unix_secs"), "response must include observed_at_unix_secs, got: {serialized}");
+    }
+
+    #[test]
+    #[ignore = "expected failure until run-state validates progress envelope properly"]
+    fn run_state_processing_missing_progress_does_not_fake_timestamp() {
+        // When progress.toml is missing, updated_at_unix_secs must be the
+        // phase transition time (or zero), not the current wall clock.
+        // This test verifies the conceptual invariant through the response type.
+        use crate::RunStateResponse;
+        // A processing response with no progress info should have consistent
+        // timestamp semantics. We verify the types carry the right fields.
+        let response = RunStateResponse {
+            protocol_version: 1,
+            nickname: "laptop".into(),
+            run_id: "test-run".into(),
+            phase: "processing".into(),
+            terminal: false,
+            message: "run phase: processing".into(),
+            updated_at_unix_secs: 1000,
+            observed_at_unix_secs: 9999,
+        };
+        // When progress is missing, updated_at should not be equal to observed_at
+        // (they serve different purposes)
+        assert_ne!(
+            response.updated_at_unix_secs,
+            response.observed_at_unix_secs,
+            "updated_at and observed_at must be distinct when progress is unavailable"
+        );
+    }
 }

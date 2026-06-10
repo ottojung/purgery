@@ -459,6 +459,7 @@ pub struct RunStateResponse {
     pub terminal: bool,
     pub message: String,
     pub updated_at_unix_secs: u64,
+    pub observed_at_unix_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

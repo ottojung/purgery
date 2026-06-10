@@ -477,6 +477,7 @@ pub fn run_state(
                     Ok(prog)
                         if prog.nickname == nickname.as_str() && prog.run_id == run_id.as_str() =>
                     {
+                        // Use progress timestamp (actual server-side update time)
                         (
                             format!(
                                 "processing: {}/{} entries, current: {} step: {}",
@@ -490,14 +491,26 @@ pub fn run_state(
                     }
                     Ok(_) => (
                         "run phase: processing (progress envelope mismatch)".to_string(),
-                        now,
+                        // Use directory mtime as the best available update time
+                        dir_modified_at(&dir).unwrap_or(now),
                     ),
-                    Err(_) => ("run phase: processing (malformed progress)".to_string(), now),
+                    Err(_) => (
+                        "run phase: processing (malformed progress)".to_string(),
+                        dir_modified_at(&dir).unwrap_or(now),
+                    ),
                 },
-                Err(_) => ("run phase: processing".to_string(), now),
+                Err(_) => (
+                    "run phase: processing".to_string(),
+                    dir_modified_at(&dir).unwrap_or(now),
+                ),
             }
         } else {
-            (format!("run is {}", phase_str), now)
+            let msg = if is_terminal {
+                format!("run is {}", phase_str)
+            } else {
+                format!("run phase: {}", phase_str)
+            };
+            (msg, dir_modified_at(&dir).unwrap_or(now))
         };
 
         return Ok(purgery_core::RunStateResponse {
@@ -508,6 +521,7 @@ pub fn run_state(
             terminal: is_terminal,
             message,
             updated_at_unix_secs: updated_at,
+            observed_at_unix_secs: now,
         });
     }
 
@@ -519,7 +533,15 @@ pub fn run_state(
         terminal: false,
         message: "no matching run found".to_string(),
         updated_at_unix_secs: now,
+        observed_at_unix_secs: now,
     })
+}
+
+/// Get the modification time of a directory in unix seconds.
+fn dir_modified_at(dir: &camino::Utf8Path) -> Option<u64> {
+    let meta = std::fs::symlink_metadata(dir.as_std_path()).ok()?;
+    let modified = meta.modified().ok()?;
+    modified.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs())
 }
 
 /// Side-effect-free server check: verify config and programs without creating anything.
