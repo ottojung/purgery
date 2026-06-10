@@ -10,23 +10,8 @@ use std::path::Path;
 use tracing::{info, warn};
 use walkdir::WalkDir;
 
-pub(crate) fn cleanup_state_dir(state_dir_override: Option<&str>) -> Result<Utf8PathBuf> {
-    let path = match state_dir_override {
-        Some(d) => Utf8PathBuf::from(d),
-        None => {
-            if let Ok(dir) = std::env::var("XDG_STATE_HOME") {
-                if !dir.is_empty() {
-                    Utf8PathBuf::from(dir).join("purgery")
-                } else {
-                    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-                    Utf8PathBuf::from(format!("{home}/.local/state/purgery"))
-                }
-            } else {
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-                Utf8PathBuf::from(format!("{home}/.local/state/purgery"))
-            }
-        }
-    };
+pub(crate) fn cleanup_state_dir(state_dir: &str) -> Result<Utf8PathBuf> {
+    let path = Utf8PathBuf::from(state_dir);
     fs::create_dir_all(path.as_std_path())
         .with_context(|| format!("failed to create state dir: {path}"))?;
     Ok(path)
@@ -34,9 +19,9 @@ pub(crate) fn cleanup_state_dir(state_dir_override: Option<&str>) -> Result<Utf8
 
 pub(crate) fn write_cleanup_state(
     state: &DurableCleanupState,
-    state_dir_override: Option<&str>,
+    state_dir: &str,
 ) -> Result<Utf8PathBuf> {
-    let dir = cleanup_state_dir(state_dir_override)?;
+    let dir = cleanup_state_dir(state_dir)?;
     let filename = format!("cleanup-{}-{}.toml", state.nickname, state.operation_id);
     let final_path = dir.join(&filename);
     let tmp_path = dir.join(format!("{filename}.tmp"));
@@ -90,7 +75,7 @@ pub(crate) fn mark_rsync_succeeded(state_path: &Utf8Path, sync_name: &str) -> Re
 }
 
 pub(crate) fn resume_pending_cleanups(config: &purgery_core::ClientConfig) -> Result<()> {
-    let dir = match cleanup_state_dir(config.state_dir.as_deref()) {
+    let dir = match cleanup_state_dir(&config.state_dir) {
         Ok(d) => d,
         Err(_) => return Ok(()),
     };
@@ -139,7 +124,11 @@ pub(crate) fn build_cleanup_entries_from_manifest(
     let entries: Vec<CleanupEntry> = manifest
         .entries
         .iter()
-        .filter(|e| e.sync_name.as_str() == sync_name && e.mode == ManifestEntryMode::Passthrough)
+        .filter(|e| {
+            e.sync_name.as_str() == sync_name
+                && e.mode == ManifestEntryMode::Passthrough
+                && e.sha256.is_some()
+        })
         .map(|e| CleanupEntry {
             sync_name: sync_name.to_owned(),
             relative_path: e.relative_path.as_str().to_owned(),
@@ -237,7 +226,10 @@ pub(crate) fn build_pre_rsync_cleanup_entries(
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_nanos() as i64)
                 .unwrap_or(0);
-            let sha256 = compute_sha256(local_path).ok();
+            let sha256 = match compute_sha256(local_path) {
+                Ok(s) => Some(s),
+                Err(_) => continue,
+            };
 
             entries.push(CleanupEntry {
                 sync_name: sync.name.as_str().to_owned(),

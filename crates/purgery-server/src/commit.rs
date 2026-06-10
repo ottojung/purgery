@@ -59,7 +59,7 @@ fn ensure_final_parent(final_path: &Utf8Path, root: &Utf8Path) -> Result<(), Str
                 ));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir(current.as_std_path()).map_err(|error| {
+                fs::create_dir_all(current.as_std_path()).map_err(|error| {
                     format!(
                         "failed to create final parent '{}': {error}",
                         current.as_str()

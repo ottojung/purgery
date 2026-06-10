@@ -181,22 +181,17 @@ pub struct ClientConfig {
     pub postprocess: ClientPostprocessConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub state_dir: Option<String>,
+    pub state_dir: String,
 }
 
 impl ClientConfig {
     pub fn from_toml(input: &str) -> Result<Self, ConfigError> {
         let config: ClientConfig = toml::from_str(input)?;
-        if let Some(ref dir) = config.state_dir {
-            if dir.is_empty() {
-                return Err(ConfigError::StateDir("must be non-empty when set".into()));
-            }
-            if !dir.starts_with('/') {
-                return Err(ConfigError::StateDir(
-                    "must be an absolute path when set".into(),
-                ));
-            }
+        if config.state_dir.is_empty() {
+            return Err(ConfigError::StateDir("must be non-empty".into()));
+        }
+        if !config.state_dir.starts_with('/') {
+            return Err(ConfigError::StateDir("must be an absolute path".into()));
         }
         let sync_names: Vec<SyncName> = config.sync.iter().map(|s| s.name.clone()).collect();
         config

@@ -620,6 +620,8 @@ mod tests {
     };
 
     fn test_server_config(purgery_root: &Utf8Path, server_root: &Utf8Path) -> ServerConfig {
+        fs::create_dir_all(server_root).unwrap();
+        fs::create_dir_all(purgery_root).unwrap();
         ServerConfig {
             root: ServerRoot::new(server_root.to_owned()).unwrap(),
             purgery_root: PurgeryRoot::new(purgery_root.to_owned()).unwrap(),
@@ -742,7 +744,6 @@ delete_after_import = true
         );
 
         process_run(&config, &nickname, &run_id).unwrap();
-
         let done_path = config
             .purgery_root
             .run_dir(&nickname, &run_id, RunPhase::Done);
@@ -1862,7 +1863,7 @@ steps = ["compress-video"]
 
         process_run(&config, &nickname, &run_id).unwrap();
 
-        let work_area = purgery_core::work_dir(config.root.as_path(), &nickname, &run_id);
+        let work_area = purgery_core::work_dir(&config.purgery_root, &nickname, &run_id);
         assert!(!work_area.exists(), "work area must be removed on Done");
     }
 
@@ -1944,13 +1945,15 @@ steps = ["compress-video"]
 
         process_run(&server_config, &nickname, &run_id).unwrap();
 
-        let work_area = purgery_core::work_dir(server_config.root.as_path(), &nickname, &run_id);
         let failed_path = server_config
             .purgery_root
             .run_dir(&nickname, &run_id, RunPhase::Failed);
         assert!(failed_path.exists());
+        // The work area lives inside the run's processing directory, so it moves
+        // with the run to the failed directory when the run is finalized.
+        let work_area_after_move = failed_path.join("work");
         assert!(
-            work_area.exists(),
+            work_area_after_move.exists(),
             "work area must be kept for Failed state"
         );
     }
@@ -2471,7 +2474,7 @@ steps = ["compress-video"]
             .run_dir(&nickname, &run_id, RunPhase::Processing);
         fs::create_dir_all(processing.parent().unwrap()).unwrap();
         fs::rename(&ready, &processing).unwrap();
-        let stale_work = work_dir(config.root.as_path(), &nickname, &run_id);
+        let stale_work = work_dir(&config.purgery_root, &nickname, &run_id);
         fs::create_dir_all(&stale_work).unwrap();
         fs::write(stale_work.join("stale"), b"stale").unwrap();
 

@@ -14,9 +14,17 @@ fn load_server_config(config_path: &str) -> Result<ServerConfig> {
 }
 
 fn find_config() -> Result<String> {
-    if let Ok(path) = std::env::var("PURGERY_CONFIG") {
+    if let Ok(path) = std::env::var("PURGERY_SERVER_CONFIG_PATH") {
         if !path.is_empty() {
             return Ok(path);
+        }
+    }
+    if let Ok(xdg_home) = std::env::var("XDG_CONFIG_HOME") {
+        if !xdg_home.is_empty() {
+            let xdg_path = format!("{xdg_home}/purgery/server.toml");
+            if fs::metadata(&xdg_path).is_ok() {
+                return Ok(xdg_path);
+            }
         }
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
@@ -29,7 +37,9 @@ fn find_config() -> Result<String> {
         return Ok(etc_path);
     }
     anyhow::bail!(
-        "no server config found; use --config, $PURGERY_CONFIG, ~/.config/purgery/server.toml, or /etc/purgery/server.toml"
+        "no server config found; use --config, $PURGERY_SERVER_CONFIG_PATH, \
+         $XDG_CONFIG_HOME/purgery/server.toml, ~/.config/purgery/server.toml, \
+         or /etc/purgery/server.toml"
     )
 }
 

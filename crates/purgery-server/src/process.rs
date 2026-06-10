@@ -549,7 +549,7 @@ pub fn process_processing_run(
         .purgery_root
         .run_dir(nickname, run_id, RunPhase::Processing);
 
-    let work_area = work_dir(config.root.as_path(), nickname, run_id);
+    let work_area = work_dir(&config.purgery_root, nickname, run_id);
     if let Err(error) = fs::remove_dir_all(&work_area) {
         if error.kind() != std::io::ErrorKind::NotFound {
             warn!(

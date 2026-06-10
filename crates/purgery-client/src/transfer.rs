@@ -97,7 +97,7 @@ pub(crate) fn run_passthrough_path(
                 .to_string(),
             entries: cleanup_entries,
         };
-        let state_path = write_cleanup_state(&cleanup_state, config.state_dir.as_deref())
+        let state_path = write_cleanup_state(&cleanup_state, &config.state_dir)
             .with_context(|| "failed to write pre-rsync cleanup state")?;
 
         // 2. Direct unfiltered rsync
@@ -448,7 +448,7 @@ pub(crate) fn run_postprocess_path(
                 .to_string(),
             entries: cleanup_entries,
         };
-        let state_path = write_cleanup_state(&cleanup_state, config.state_dir.as_deref())
+        let state_path = write_cleanup_state(&cleanup_state, &config.state_dir)
             .with_context(|| "failed to write pre-rsync cleanup state")?;
 
         info!(
@@ -524,7 +524,10 @@ pub(crate) fn run_postprocess_path(
                 a_str.cmp(b_str)
             });
 
-            let tmp_dir = std::env::temp_dir().join("purgery-filters");
+            let tmp_dir = Utf8Path::new(&config.state_dir)
+                .join("tmp")
+                .join(run_id.as_str())
+                .join("filters");
             fs::create_dir_all(&tmp_dir).ok();
             let passthrough_file = tmp_dir.join(format!("passthrough-{sync_name}"));
             let purgatory_file = tmp_dir.join(format!("purgatory-{sync_name}"));
@@ -555,7 +558,7 @@ pub(crate) fn run_postprocess_path(
 
             let state_path = match &maybe_cleanup_state {
                 Some(state) => Some(
-                    write_cleanup_state(state, config.state_dir.as_deref())
+                    write_cleanup_state(state, &config.state_dir)
                         .with_context(|| "failed to write pre-rsync cleanup state")?,
                 ),
                 None => None,
@@ -576,8 +579,7 @@ pub(crate) fn run_postprocess_path(
                     "passthrough rsync started"
                 );
                 let mut pt_args = build_rsync_args(from_path, &passthrough_rsync_dest);
-                let pt_filter_arg =
-                    format!("--filter=merge {}", passthrough_file.to_string_lossy());
+                let pt_filter_arg = format!("--filter=merge {}", passthrough_file.as_str());
                 pt_args.insert(5, pt_filter_arg);
                 let pt_status =
                     Command::new("rsync")
@@ -630,7 +632,7 @@ pub(crate) fn run_postprocess_path(
                     "purgatory rsync started"
                 );
                 let mut pg_args = build_rsync_args(from_path, &purgatory_rsync_dest);
-                let pg_filter_arg = format!("--filter=merge {}", purgatory_file.to_string_lossy());
+                let pg_filter_arg = format!("--filter=merge {}", purgatory_file.as_str());
                 pg_args.insert(5, pg_filter_arg);
                 let pg_status =
                     Command::new("rsync")

@@ -181,6 +181,7 @@ pub fn build_rsync_args(source: &str, destination: &str) -> Vec<String> {
         "--archive".to_string(),
         "--no-inc-recursive".to_string(),
         "--protect-args".to_string(),
+        "--".to_string(),
         format!("{}/", source),
         destination.to_string(),
     ]
@@ -188,11 +189,10 @@ pub fn build_rsync_args(source: &str, destination: &str) -> Vec<String> {
 
 // ── Work Area ────────────────────────────────────────────────────────
 
-pub fn work_dir(server_root: &Utf8Path, nickname: &Nickname, run_id: &RunId) -> Utf8PathBuf {
-    server_root
-        .join(".purgery-work")
-        .join(nickname.as_str())
-        .join(run_id.as_str())
+pub fn work_dir(purgery_root: &PurgeryRoot, nickname: &Nickname, run_id: &RunId) -> Utf8PathBuf {
+    purgery_root
+        .run_dir(nickname, run_id, RunPhase::Processing)
+        .join("work")
 }
 
 pub fn commit_temp_path(final_path: &Utf8Path, run_id: &RunId) -> Utf8PathBuf {
@@ -801,6 +801,7 @@ kind = "builtin"
     fn parse_client_config_minimal() {
         let toml = r#"
 nickname = "laptop"
+state_dir = "/tmp/purgery-state"
 
 [server]
 host = "example.com"
@@ -816,6 +817,7 @@ host = "example.com"
     fn parse_client_config_full() {
         let toml = r#"
 nickname = "laptop"
+state_dir = "/tmp/purgery-state"
 
 [server]
 host = "example.com"
@@ -1510,6 +1512,7 @@ files = []
                 "--archive",
                 "--no-inc-recursive",
                 "--protect-args",
+                "--",
                 "/home/user/Videos/",
                 "example.com:/remote/path",
             ]
@@ -1525,7 +1528,43 @@ files = []
     #[test]
     fn build_rsync_args_with_spaces_in_source() {
         let args = build_rsync_args("/home/user/My Videos", "host:/dst");
-        assert_eq!(args[5], "/home/user/My Videos/");
+        assert_eq!(args[6], "/home/user/My Videos/");
+    }
+
+    #[test]
+    fn build_rsync_args_separator_before_path_operands() {
+        let args = build_rsync_args("/src", "host:/dst");
+        let dashdash_pos = args
+            .iter()
+            .position(|a| a == "--")
+            .expect("must contain -- separator");
+        let src_pos = args
+            .iter()
+            .position(|a| a == "/src/")
+            .expect("must contain source");
+        let dst_pos = args
+            .iter()
+            .position(|a| a == "host:/dst")
+            .expect("must contain destination");
+        assert!(dashdash_pos < src_pos, "-- must come before source operand");
+        assert!(
+            dashdash_pos < dst_pos,
+            "-- must come before destination operand"
+        );
+    }
+
+    #[test]
+    fn build_rsync_args_all_options_before_separator() {
+        let args = build_rsync_args("/src", "host:/dst");
+        let dashdash_pos = args
+            .iter()
+            .position(|a| a == "--")
+            .expect("must contain --");
+        for (i, arg) in args.iter().enumerate() {
+            if arg.starts_with("--") && arg != "--" {
+                assert!(i < dashdash_pos, "option {} must be before --", arg);
+            }
+        }
     }
 
     // ── Symlink Check tests ──
@@ -1612,11 +1651,11 @@ files = []
 
     #[test]
     fn work_dir_returns_correct_path() {
-        let root = Utf8Path::new("/data");
+        let purgery_root = PurgeryRoot::new(Utf8PathBuf::from("/tmp/purgery")).unwrap();
         let nick = Nickname::new("laptop".into()).unwrap();
         let run = RunId::new("run1".into()).unwrap();
-        let wd = work_dir(root, &nick, &run);
-        assert_eq!(wd.as_str(), "/data/.purgery-work/laptop/run1");
+        let wd = work_dir(&purgery_root, &nick, &run);
+        assert_eq!(wd.as_str(), "/tmp/purgery/laptop/processing/run1/work");
     }
 
     // ── PostprocessKind serde tests ──
@@ -2150,6 +2189,7 @@ steps = ["compress-video"]
     fn config_accepts_postprocess_on_delete_true_sync() {
         let toml = r#"
 nickname = "laptop"
+state_dir = "/tmp/purgery-state"
 
 [server]
 host = "example.com"
@@ -2173,6 +2213,7 @@ steps = ["compress-video"]
     fn config_accepts_no_delete_sync_with_only_out_of_scope_rules() {
         let toml = r#"
 nickname = "laptop"
+state_dir = "/tmp/purgery-state"
 
 [server]
 host = "example.com"
@@ -2252,6 +2293,7 @@ for = ["missing-sync"]
     fn config_with_postprocess_rule_for_is_accepted() {
         let toml = r#"
 nickname = "laptop"
+state_dir = "/tmp/purgery-state"
 
 [server]
 host = "example.com"
@@ -2402,13 +2444,14 @@ from = "/home/user/Videos"
 to = "videos"
 "#;
         let config = ClientConfig::from_toml(toml).unwrap();
-        assert_eq!(config.state_dir.as_deref(), Some("/custom/state/purgery"));
+        assert_eq!(config.state_dir.as_str(), "/custom/state/purgery");
     }
 
     #[test]
     fn client_config_rejection_mentions_conformance() {
         let toml = r#"
 nickname = "laptop"
+state_dir = "/tmp/purgery-state"
 
 [server]
 host = "example.com"
