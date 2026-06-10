@@ -6,8 +6,8 @@ use crate::transfer::{run_passthrough_path, run_postprocess_path};
 use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
 use purgery_core::{
-    resolve_executable, ClientConfig, ClientPostprocessConfig, ClientRunState, Manifest,
-    ManifestEntry, RunConfig, RunConfigSync, RunId, RunStatus, SyncExecutionClass,
+    resolve_executable, ClientConfig, ClientPostprocessConfig, ClientRunPhase, ClientRunState,
+    Manifest, ManifestEntry, RunConfig, RunConfigSync, RunId, RunStatus, SyncExecutionClass,
 };
 use std::fs;
 use std::path::Path;
@@ -190,8 +190,7 @@ pub(crate) fn write_client_run_state(
     run_id: &str,
     manifest: &Manifest,
     run_config: &RunConfig,
-    phase: &str,
-    cleanup_complete: bool,
+    phase: ClientRunPhase,
 ) -> Result<()> {
     let run_state = ClientRunState {
         protocol_version: 1,
@@ -199,8 +198,7 @@ pub(crate) fn write_client_run_state(
         run_id: run_id.to_owned(),
         manifest: manifest.to_toml()?,
         run_config: run_config.to_toml()?,
-        phase: phase.to_owned(),
-        cleanup_complete,
+        phase,
     };
     let dir = Utf8PathBuf::from(state_dir)
         .join("runs")
@@ -216,24 +214,6 @@ pub(crate) fn write_client_run_state(
     Ok(())
 }
 
-/// Load persisted client run state.
-#[allow(dead_code)]
-pub(crate) fn load_client_run_state(
-    state_dir: &str,
-    nickname: &str,
-    run_id: &str,
-) -> Option<ClientRunState> {
-    let path = Utf8PathBuf::from(state_dir)
-        .join("runs")
-        .join(format!("{nickname}-{run_id}"))
-        .join("state.toml");
-    if !path.exists() {
-        return None;
-    }
-    let content = fs::read_to_string(path.as_std_path()).ok()?;
-    toml::from_str(&content).ok()
-}
-
 /// Remove persisted client run state after cleanup is complete.
 pub(crate) fn remove_client_run_state(state_dir: &str, nickname: &str, run_id: &str) {
     let dir = Utf8PathBuf::from(state_dir)
@@ -242,18 +222,31 @@ pub(crate) fn remove_client_run_state(state_dir: &str, nickname: &str, run_id: &
     let _ = fs::remove_dir_all(dir.as_std_path());
 }
 
-/// Poll for terminal run phase via `run-state`, waiting indefinitely.
-fn wait_for_terminal_run_state(
+/// Wait indefinitely for a postprocess run, then clean up.
+pub(crate) fn wait_for_postprocess_run_and_cleanup(
+    config: &ClientConfig,
     host: &str,
     server_command: &str,
+    manifest: &Manifest,
     nickname: &purgery_core::Nickname,
     run_id: &RunId,
-) -> Result<purgery_core::RunStateResponse> {
+) -> Result<()> {
     let poll_interval = Duration::from_secs(5);
     let mut last_phase = String::new();
     let mut attempts_since_report = 0u64;
 
-    loop {
+    // Write waiting state before entering the loop
+    let _ = write_client_run_state(
+        &config.state_dir,
+        nickname.as_str(),
+        run_id.as_str(),
+        manifest,
+        &build_run_config(config, true),
+        ClientRunPhase::WaitingForTerminalState,
+    );
+
+    // Wait for terminal phase via run-state (indefinite)
+    let _terminal_state = loop {
         let response: Result<purgery_core::RunStateResponse> = (|| {
             let output = server_cmd(
                 host,
@@ -278,7 +271,27 @@ fn wait_for_terminal_run_state(
                         phase = %state.phase,
                         "run reached terminal phase"
                     );
-                    return Ok(state);
+                    break state;
+                }
+                if state.phase == "not_found" {
+                    warn!(
+                        nickname = %nickname.as_str(),
+                        run_id = %run_id.as_str(),
+                        "run not found on server, marking as abandoned"
+                    );
+                    let _ = write_client_run_state(
+                        &config.state_dir,
+                        nickname.as_str(),
+                        run_id.as_str(),
+                        manifest,
+                        &build_run_config(config, true),
+                        ClientRunPhase::Abandoned,
+                    );
+                    anyhow::bail!(
+                        "run {}/{} not found on server; marked as abandoned without deletion",
+                        nickname.as_str(),
+                        run_id.as_str()
+                    );
                 }
                 if state.phase != last_phase {
                     info!(
@@ -312,23 +325,65 @@ fn wait_for_terminal_run_state(
         }
 
         std::thread::sleep(poll_interval);
-    }
-}
+    };
 
-/// Wait indefinitely for a postprocess run, then clean up.
-pub(crate) fn wait_for_postprocess_run_and_cleanup(
-    config: &ClientConfig,
-    host: &str,
-    server_command: &str,
-    manifest: &Manifest,
-    nickname: &purgery_core::Nickname,
-    run_id: &RunId,
-) -> Result<()> {
-    // Wait for terminal phase via run-state
-    let _terminal = wait_for_terminal_run_state(host, server_command, nickname, run_id)?;
+    // Write state that terminal status was seen
+    let _ = write_client_run_state(
+        &config.state_dir,
+        nickname.as_str(),
+        run_id.as_str(),
+        manifest,
+        &build_run_config(config, true),
+        ClientRunPhase::TerminalStatusSeen,
+    );
 
-    // Read terminal status
-    let status = read_terminal_status(host, server_command, nickname, run_id)?;
+    // Read terminal status by polling (no fixed timeout)
+    let status = loop {
+        let output = server_cmd(
+            host,
+            server_command,
+            &[
+                "status",
+                "--nickname",
+                nickname.as_str(),
+                "--run-id",
+                run_id.as_str(),
+            ],
+        );
+        match output {
+            Ok(content) => {
+                let trimmed = content.trim();
+                if !trimmed.is_empty() {
+                    match RunStatus::from_toml(trimmed) {
+                        Ok(s) => break s,
+                        Err(e) => {
+                            anyhow::bail!(
+                                "malformed terminal status for run {}/{}: {e}",
+                                nickname.as_str(),
+                                run_id.as_str()
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    error = %e,
+                    "terminal status read failed, retrying"
+                );
+            }
+        }
+        if attempts_since_report.is_multiple_of(6u64) {
+            warn!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                "terminal status not yet available, retrying..."
+            );
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    };
 
     // Verify status envelope
     if status.nickname != *nickname {
@@ -350,63 +405,19 @@ pub(crate) fn wait_for_postprocess_run_and_cleanup(
     let deletion_count = delete_confirmed_files(config, manifest, &status)?;
     info!(deleted = deletion_count, "cleanup complete");
 
-    // Mark run state complete
-    if let Err(e) = write_client_run_state(
+    // Mark run state complete and remove
+    let _ = write_client_run_state(
         &config.state_dir,
         nickname.as_str(),
         run_id.as_str(),
         manifest,
         &build_run_config(config, true),
-        "cleanup_done",
-        true,
-    ) {
-        warn!(error = %e, "failed to mark run state complete");
-    }
-
-    // Remove local run state after successful cleanup
+        ClientRunPhase::CleanupComplete,
+    );
     remove_client_run_state(&config.state_dir, nickname.as_str(), run_id.as_str());
 
     info!(state = %status.state.as_str(), "run finished");
-
     Ok(())
-}
-
-/// Read terminal status by polling the `status` command.
-fn read_terminal_status(
-    host: &str,
-    server_command: &str,
-    nickname: &purgery_core::Nickname,
-    run_id: &RunId,
-) -> Result<purgery_core::RunStatus> {
-    let poll_interval = Duration::from_secs(2);
-    for attempt in 1..=30 {
-        let output = server_cmd(
-            host,
-            server_command,
-            &[
-                "status",
-                "--nickname",
-                nickname.as_str(),
-                "--run-id",
-                run_id.as_str(),
-            ],
-        );
-        if let Ok(content) = output {
-            if !content.trim().is_empty() {
-                return RunStatus::from_toml(content.trim())
-                    .with_context(|| "failed to parse status from server");
-            }
-        }
-        if attempt == 15 {
-            warn!("terminal status still not available after 30s, retrying...");
-        }
-        std::thread::sleep(poll_interval);
-    }
-    anyhow::bail!(
-        "terminal status not available for run {}/{} after 60s",
-        nickname.as_str(),
-        run_id.as_str()
-    );
 }
 
 /// Resume pending postprocess runs from local state.
@@ -438,9 +449,24 @@ pub(crate) fn resume_pending_postprocess_runs(config: &ClientConfig) -> Result<(
             Ok(s) => s,
             Err(_) => continue,
         };
-        if run_state.cleanup_complete {
-            let _ = fs::remove_dir_all(&dir_path);
-            continue;
+
+        match run_state.phase {
+            ClientRunPhase::CleanupComplete => {
+                let _ = fs::remove_dir_all(&dir_path);
+                continue;
+            }
+            ClientRunPhase::Abandoned => {
+                warn!(
+                    nickname = %run_state.nickname,
+                    run_id = %run_state.run_id,
+                    "run was previously marked as abandoned, skipping"
+                );
+                let _ = fs::remove_dir_all(&dir_path);
+                continue;
+            }
+            _ => {
+                // Continue to resume below
+            }
         }
 
         let nickname = match purgery_core::Nickname::new(run_state.nickname.clone()) {
@@ -459,11 +485,89 @@ pub(crate) fn resume_pending_postprocess_runs(config: &ClientConfig) -> Result<(
         info!(
             nickname = %nickname.as_str(),
             run_id = %run_id.as_str(),
+            phase = ?run_state.phase,
             "resuming pending postprocess run"
         );
 
         let host = config.server.host.as_str();
         let server_command = &config.server.command;
+
+        // Handle upload_complete_finish_pending: check server phase
+        if run_state.phase == ClientRunPhase::UploadCompleteFinishPending {
+            let run_state_resp = match (|| -> Result<purgery_core::RunStateResponse> {
+                let output = server_cmd(
+                    host,
+                    server_command,
+                    &[
+                        "run-state",
+                        "--nickname",
+                        nickname.as_str(),
+                        "--run-id",
+                        run_id.as_str(),
+                    ],
+                )?;
+                toml::from_str(&output).with_context(|| "failed to parse run-state")
+            })() {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(
+                        nickname = %nickname.as_str(),
+                        run_id = %run_id.as_str(),
+                        error = %e,
+                        "run-state query failed during resume, skipping"
+                    );
+                    continue;
+                }
+            };
+
+            match run_state_resp.phase.as_str() {
+                "incoming" => {
+                    info!(
+                        nickname = %nickname.as_str(),
+                        run_id = %run_id.as_str(),
+                        "run still incoming, issuing finish-run"
+                    );
+                    if let Err(e) = server_cmd(
+                        host,
+                        server_command,
+                        &[
+                            "finish-run",
+                            "--nickname",
+                            nickname.as_str(),
+                            "--run-id",
+                            run_id.as_str(),
+                        ],
+                    ) {
+                        warn!(
+                            nickname = %nickname.as_str(),
+                            run_id = %run_id.as_str(),
+                            error = %e,
+                            "finish-run failed during resume"
+                        );
+                        continue;
+                    }
+                }
+                "not_found" => {
+                    warn!(
+                        nickname = %nickname.as_str(),
+                        run_id = %run_id.as_str(),
+                        "run not found on server, marking as abandoned"
+                    );
+                    let _ = write_client_run_state(
+                        &config.state_dir,
+                        nickname.as_str(),
+                        run_id.as_str(),
+                        &manifest,
+                        &build_run_config(config, true),
+                        ClientRunPhase::Abandoned,
+                    );
+                    continue;
+                }
+                _ => {
+                    // ready, processing, done, failed — proceed to waiting
+                }
+            }
+        }
 
         if let Err(e) = wait_for_postprocess_run_and_cleanup(
             config,

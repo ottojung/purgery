@@ -7,7 +7,9 @@ use crate::ssh::{server_cmd, server_cmd_with_stdin, write_remote_file};
 
 use anyhow::{Context, Result};
 use camino::Utf8Path;
-use purgery_core::{build_rsync_args, BeginRunResponse, ClientConfig, Manifest, RunId};
+use purgery_core::{
+    build_rsync_args, BeginRunResponse, ClientConfig, ClientRunPhase, Manifest, RunId,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::process::Command;
@@ -690,8 +692,7 @@ pub(crate) fn run_postprocess_path(
             run_id.as_str(),
             manifest,
             &run_config,
-            "finished",
-            false,
+            ClientRunPhase::UploadCompleteFinishPending,
         )?;
 
         Ok(())

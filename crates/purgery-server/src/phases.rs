@@ -4,7 +4,7 @@ use purgery_core::{
     Nickname, ProcessingProgress, PurgeryRoot, RunId, RunPhase, RunState, RunStatus, ServerConfig,
 };
 use std::fs;
-use tracing::warn;
+use tracing::{info, warn};
 
 pub(crate) fn publish_status_atomic(directory: &Utf8Path, status: &RunStatus) -> Result<()> {
     let content = status.to_toml().context("failed to serialize status")?;
@@ -327,6 +327,27 @@ pub fn finish_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) ->
     let incoming_path = config
         .purgery_root
         .run_dir(nickname, run_id, RunPhase::Incoming);
+
+    // If run is already past incoming, treat finish as already accepted.
+    let later_phases = [
+        RunPhase::Ready,
+        RunPhase::Processing,
+        RunPhase::Done,
+        RunPhase::Failed,
+    ];
+    for phase in &later_phases {
+        let dir = config.purgery_root.run_dir(nickname, run_id, *phase);
+        if dir.exists() {
+            info!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                phase = %phase.as_str(),
+                "finish-run: run already in later phase"
+            );
+            return Ok(());
+        }
+    }
+
     if !incoming_path.exists() {
         anyhow::bail!(
             "incoming directory does not exist for run {}/{} at '{}'",

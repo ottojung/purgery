@@ -468,11 +468,38 @@ pub fn run_state(
             continue;
         }
         let is_terminal = *phase == RunPhase::Done || *phase == RunPhase::Failed;
-        let message = if is_terminal {
-            format!("run is {}", phase_str)
+
+        // For processing phase, try to read progress.toml for richer details
+        let (message, updated_at) = if *phase == RunPhase::Processing {
+            let progress_path = dir.join("progress.toml");
+            match std::fs::read_to_string(&progress_path) {
+                Ok(content) => match toml::from_str::<purgery_core::ProcessingProgress>(&content) {
+                    Ok(prog)
+                        if prog.nickname == nickname.as_str() && prog.run_id == run_id.as_str() =>
+                    {
+                        (
+                            format!(
+                                "processing: {}/{} entries, current: {} step: {}",
+                                prog.entry_index + 1,
+                                prog.entry_total,
+                                prog.current_entry,
+                                prog.current_step
+                            ),
+                            prog.updated_at_unix_secs,
+                        )
+                    }
+                    Ok(_) => (
+                        "run phase: processing (progress envelope mismatch)".to_string(),
+                        now,
+                    ),
+                    Err(_) => ("run phase: processing (malformed progress)".to_string(), now),
+                },
+                Err(_) => ("run phase: processing".to_string(), now),
+            }
         } else {
-            format!("run phase: {}", phase_str)
+            (format!("run is {}", phase_str), now)
         };
+
         return Ok(purgery_core::RunStateResponse {
             protocol_version: 1,
             nickname: nickname.as_str().to_owned(),
@@ -480,7 +507,7 @@ pub fn run_state(
             phase: phase_str.to_string(),
             terminal: is_terminal,
             message,
-            updated_at_unix_secs: now,
+            updated_at_unix_secs: updated_at,
         });
     }
 
