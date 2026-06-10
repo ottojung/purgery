@@ -6,18 +6,6 @@ You have photos, videos, recordings, or other generated files on a laptop, camer
 
 Purgery is the import pipeline for that.
 
-## Terminology
-
-| Term | Meaning |
-|------|---------|
-| **Source tree** | A local directory whose contents you want to import (e.g., `/home/user/Videos`) |
-| **Archive** | The central storage location where imported files accumulate (a path on a server) |
-| **Import** | The act of copying or transforming an entry from a source tree into the archive |
-| **Transform** | An optional server-side postprocessing step (e.g., compress, convert, rename) applied during import |
-| **Passthrough import** | Copying a file directly into the archive without transformation |
-| **Transformed import** | Copying a file into the archive through a server-side transformation step |
-| **Cleanup** | Removing a confirmed local original file after import is complete and verified |
-
 ## Non-goals
 
 Purgery is not bidirectional sync, not a Dropbox/Syncthing replacement, not a network daemon, not a multi-user authorization system, not a remote shell execution framework, and not an automatic conflict-resolution system. It is intentionally a one-way import pipeline.
@@ -48,6 +36,20 @@ purgery-client sync-and-cleanup --config client.toml
 ```
 
 ## How it works
+
+### Terminology
+
+| Term | Meaning |
+|------|---------|
+| **Source tree** | A local directory whose contents you want to import (e.g., `/home/user/Videos`) |
+| **Archive** | The central storage location where imported files accumulate (a path on a server) |
+| **Import** | The act of copying or transforming an entry from a source tree into the archive |
+| **Transform** | An optional server-side postprocessing step (e.g., compress, convert, rename) applied during import |
+| **Passthrough import** | Copying a file directly into the archive without transformation |
+| **Transformed import** | Copying a file into the archive through a server-side transformation step |
+| **Cleanup** | Removing a confirmed local original file after import is complete and verified |
+
+---
 
 1. You configure one or more **source trees** on a device and point each to a destination inside the archive.
 2. The client walks each source tree (never following symlinks) and classifies every entry as either **passthrough** (direct copy to archive) or **transformed** (server-side processing required).
