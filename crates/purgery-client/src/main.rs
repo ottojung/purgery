@@ -988,7 +988,6 @@ delete_after_import = true
     }
 
     #[test]
-    #[ignore = "expected to fail until covered entry status cleanup is rejected"]
     fn delete_confirmed_files_rejects_covered_entry_from_status() {
         // Covered descendants must not be independently deleted from server status,
         // even if a status entry incorrectly reports them as imported.
