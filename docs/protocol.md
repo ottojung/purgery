@@ -127,7 +127,7 @@ Identity bookkeeping is separated from path planning:
 
 ### Durable cleanup state
 
-Cleanup state is stored in the client's configurable state directory (`state_dir` in `client.toml`, defaulting to `$XDG_STATE_HOME/purgery/` or `~/.local/state/purgery/`). It is never stored in the temporary filter directory. The state file is written atomically and updated atomically after each deletion.
+Cleanup state is stored in the client's configured `state_dir` (`state_dir` in `client.toml`, a required absolute path). It is never stored in the temporary filter directory. The state file is written atomically and updated atomically after each deletion.
 
 ### Scoped postprocess rules
 
@@ -238,15 +238,25 @@ run_id = "01ARZ..."
 [[destinations]]
 sync_name = "videos"
 passthrough_dest = "/universe/synced/laptop/videos"
-purgatory_dest = "/tmp/purgery/laptop/incoming/01ARZ.../files/videos"
+purgatory_dest = "/universe/tmp/purgery/laptop/incoming/01ARZ.../files/videos"
 
 [[destinations]]
 sync_name = "pictures"
 passthrough_dest = "/universe/synced/laptop/pictures"
-purgatory_dest = "/tmp/purgery/laptop/incoming/01ARZ.../files/pictures"
+purgatory_dest = "/universe/tmp/purgery/laptop/incoming/01ARZ.../files/pictures"
 ```
 
 The client uses the per-sync destinations as rsync targets. For passthrough, it constructs `host:<passthrough_dest>/`. For purgatory, it constructs `host:<purgatory_dest>/`.
+
+### Work area isolation
+
+Postprocess work areas are under:
+
+```text
+{purgery_root}/{nickname}/processing/{run_id}/work/
+```
+
+This is inside the run's processing directory, so it is naturally cleaned or recovered with the processing run. On successful completion (`Done`), the work area is removed before the run moves to `done`. On failure (`Failed` or `Partial`), the work area stays with the run directory as it moves to `failed` or `done`.
 
 ## Manifest entry classification (server manifest)
 

@@ -1,15 +1,44 @@
 # Purgery Configuration
 
+## Config file discovery
+
+Purgery supports config file discovery so you don't always need `--config`.
+
+### Server config lookup
+
+The server searches for its config in this order:
+
+1. `--config PATH` (explicit CLI argument)
+2. `$PURGERY_SERVER_CONFIG_PATH` environment variable
+3. `$XDG_CONFIG_HOME/purgery/server.toml` (if `XDG_CONFIG_HOME` is set)
+4. `$HOME/.config/purgery/server.toml`
+5. `/etc/purgery/server.toml`
+
+### Client config lookup
+
+The client searches for its config in this order:
+
+1. `--config PATH` (explicit CLI argument)
+2. `$PURGERY_CLIENT_CONFIG_PATH` environment variable
+3. `$XDG_CONFIG_HOME/purgery/client.toml` (if `XDG_CONFIG_HOME` is set)
+4. `$HOME/.config/purgery/client.toml`
+
+The client does not fall back to `/etc/purgery/client.toml` — client config is per-user only.
+
+If no config is found, Purgery emits a clear error listing every path it checked.
+
+## Operational vs config-file paths
+
+**Config files** may be discovered from standard config locations (CLI, env var, XDG, HOME, /etc).
+
+**All other operational files and directories** must be specified in the parsed config:
+
+- Server: `root` (final archive) and `purgery_root` (all working state)
+- Client: `state_dir` (all local state, temp files, cleanup ledgers, rsync filters)
+
+Purgery does not fall back to `$XDG_STATE_HOME`, `$HOME`, `/tmp`, `std::env::temp_dir()`, or any other implicit location for operational state. Every non-config filesystem path comes from a configured value.
+
 ## Server config
-
-The server reads a TOML configuration from one of these locations (checked in order):
-
-1. `--config PATH` (explicit)
-2. `$PURGERY_CONFIG` environment variable
-3. `~/.config/purgery/server.toml`
-4. `/etc/purgery/server.toml`
-
-Example:
 
 ```toml
 root = "/universe/synced"
@@ -33,8 +62,8 @@ keep_original = true
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `root` | yes | Absolute path to final storage root |
-| `purgery_root` | yes | Absolute path to staging area for incoming uploads |
+| `root` | yes | Absolute path to final storage root (archive destination) |
+| `purgery_root` | yes | Absolute path to Purgery's working/state directory. Contains all non-final server state: incoming runs, ready/processing/done/failed runs, lease files, manifests, status files, postprocess work areas, and temporary files used for atomic writes. No internal work directories are created under `root` |
 | `gc` | no | GC configuration (see below) |
 | `postprocess` | no | Postprocessing configuration (see below) |
 
@@ -129,10 +158,10 @@ steps = ["compress-video"]
 | Field | Required | Description |
 |-------|----------|-------------|
 | `nickname` | yes | Machine identifier (alphanumeric, hyphens, underscores) |
+| `state_dir` | yes | Writable state directory for all client-owned operational state. Must be a non-empty absolute path. Contains cleanup ledgers, temporary filter files, and per-run temp subtrees |
 | `server` | yes | Server connection details |
 | `sync` | `[]` | List of sync mappings |
 | `postprocess` | | Postprocess rule configuration |
-| `state_dir` | no | Writable state directory for cleanup bookkeeping. Defaults to `$XDG_STATE_HOME/purgery/` or `~/.local/state/purgery/`. When set, must be a non-empty absolute path |
 
 ### Server connection
 
@@ -352,10 +381,10 @@ Cleanup identity is checked per entry kind:
 
 ### Durable cleanup state
 
-For `delete_after_import = true` passthrough, the client writes cleanup state to a stable directory:
+For `delete_after_import = true` passthrough, the client writes cleanup state to `state_dir`:
 
 ```text
-$XDG_STATE_HOME/purgery/  or  ~/.local/state/purgery/
+{state_dir}/cleanup-{nickname}-{operation}.toml
 ```
 
 The state file records:

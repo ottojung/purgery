@@ -1,4 +1,5 @@
 nickname = "laptop"
+state_dir = "/var/lib/purgery"
 
 [server]
 host = "example.com"

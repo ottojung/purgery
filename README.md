@@ -16,24 +16,26 @@ Purgery is not bidirectional sync, not a Dropbox/Syncthing replacement, not a ne
 
 ```sh
 # Create archive root directories
-purgery-server bootstrap --config server.toml
+purgery-server bootstrap --config /etc/purgery/server.toml
 
 # Verify configuration and dependencies
-purgery-server check --config server.toml
+purgery-server check --config /etc/purgery/server.toml
 
 # Run one batch of imports
-purgery-server process-once --config server.toml
+purgery-server process-once
 ```
+If `--config` is omitted, the server looks for config at `$PURGERY_SERVER_CONFIG_PATH`, `$XDG_CONFIG_HOME/purgery/server.toml`, `~/.config/purgery/server.toml`, or `/etc/purgery/server.toml`.
 
 ### Client (source device)
 
 ```sh
 # Verify local executables and configuration (no SSH)
-purgery-client check --config client.toml
+purgery-client check --config ~/.config/purgery/client.toml
 
 # Run a full import cycle: transfer, transform, clean up confirmed originals
-purgery-client sync-and-cleanup --config client.toml
+purgery-client sync-and-cleanup
 ```
+If `--config` is omitted, the client looks for config at `$PURGERY_CLIENT_CONFIG_PATH`, `$XDG_CONFIG_HOME/purgery/client.toml`, or `~/.config/purgery/client.toml`.
 
 ## How it works
 
@@ -71,6 +73,7 @@ Minimal client config (`client.toml`):
 
 ```toml
 nickname = "laptop"
+state_dir = "/var/lib/purgery"
 
 [server]
 host = "example.com"
