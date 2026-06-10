@@ -187,6 +187,24 @@ pub fn build_rsync_args(source: &str, destination: &str) -> Vec<String> {
     ]
 }
 
+/// Insert an rsync option argument before the `--` operand separator.
+///
+/// Returns an error if the args list does not contain a literal `--` element.
+/// The option is inserted as the last option before `--`, preserving the
+/// invariant that all options appear before the separator and all path
+/// operands appear after it.
+pub fn insert_rsync_option_before_operands(
+    args: &mut Vec<String>,
+    option: String,
+) -> Result<(), String> {
+    let dashdash_pos = args
+        .iter()
+        .position(|a| a == "--")
+        .ok_or_else(|| "rsync args list has no `--` separator".to_string())?;
+    args.insert(dashdash_pos, option);
+    Ok(())
+}
+
 // ── Work Area ────────────────────────────────────────────────────────
 
 pub fn work_dir(purgery_root: &PurgeryRoot, nickname: &Nickname, run_id: &RunId) -> Utf8PathBuf {
@@ -1565,6 +1583,55 @@ files = []
                 assert!(i < dashdash_pos, "option {} must be before --", arg);
             }
         }
+    }
+
+    #[test]
+    fn insert_rsync_option_before_operands_places_option_before_separator() {
+        let mut args = build_rsync_args("/src", "host:/dst");
+        let filter = "--filter=merge /tmp/filters".to_string();
+        insert_rsync_option_before_operands(&mut args, filter.clone()).unwrap();
+        let dashdash_pos = args.iter().position(|a| a == "--").unwrap();
+        let filter_pos = args.iter().position(|a| a == &filter).unwrap();
+        assert!(
+            filter_pos < dashdash_pos,
+            "filter option must be inserted before --"
+        );
+    }
+
+    #[test]
+    #[ignore = "expected to fail until postprocess argv protection is verified"]
+    fn postprocess_argv_not_rewritten() {
+        let configured_args = vec!["--input".to_string(), "{input}".to_string()];
+        let step = PostprocessStepDefinition {
+            kind: PostprocessKind::Subprocess,
+            program: "true".to_owned(),
+            args: configured_args.clone(),
+            expected_outputs: vec![],
+            keep_original: true,
+        };
+        let built = step.build_args(&camino::Utf8Path::new("/tmp/work/file.mp4"));
+        assert_eq!(
+            built, configured_args,
+            "postprocess argv must not be rewritten, but got: {:?}",
+            built
+        );
+    }
+
+    #[test]
+    #[ignore = "expected to fail until postprocess argv placeholder acceptance is verified"]
+    fn postprocess_argv_not_rejected_for_placeholders() {
+        let step = PostprocessStepDefinition {
+            kind: PostprocessKind::Subprocess,
+            program: "ffmpeg".to_owned(),
+            args: vec!["--input".to_string(), "{input}".to_string()],
+            expected_outputs: vec![],
+            keep_original: true,
+        };
+        let built = step.build_args(&camino::Utf8Path::new("/tmp/work/file.mp4"));
+        assert!(
+            built.iter().any(|a| a.contains("/tmp/work")),
+            "build_args must resolve placeholders, not reject them"
+        );
     }
 
     // ── Symlink Check tests ──

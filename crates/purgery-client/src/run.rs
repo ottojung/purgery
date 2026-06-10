@@ -508,7 +508,7 @@ pub(crate) fn delete_confirmed_files(
 
 /// Verify that a manifest entry still matches its captured local identity.
 /// Used by directory cleanup to check children before removal.
-fn verify_manifest_entry_local(entry: &ManifestEntry) -> bool {
+pub(crate) fn verify_manifest_entry_local(entry: &ManifestEntry) -> bool {
     let path = Path::new(entry.local_path.as_str());
     let symmeta = match fs::symlink_metadata(path) {
         Ok(m) => m,

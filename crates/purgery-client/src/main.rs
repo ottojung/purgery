@@ -1521,4 +1521,123 @@ delete_after_import = true
             "same sync name should have same file name but different parent dirs"
         );
     }
+
+    #[test]
+    #[ignore = "expected to fail until build_cleanup_entries_from_manifest includes directories and symlinks"]
+    fn cleanup_ledger_includes_symlinks_and_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let dir_path = source.join("subdir");
+        fs::create_dir_all(&dir_path).unwrap();
+        let file_path = dir_path.join("file.txt");
+        fs::write(&file_path, b"data").unwrap();
+        let link_path = source.join("link.lnk");
+        std::os::unix::fs::symlink("subdir/file.txt", &link_path).unwrap();
+
+        let config = ClientConfig::from_toml(&format!(
+            r#"
+nickname = "laptop"
+state_dir = "/tmp/purgery-state"
+
+[server]
+host = "example.invalid"
+
+[[sync]]
+name = "data"
+from = "{}"
+to = "data"
+delete_after_import = true
+
+[[postprocess.rules]]
+match = "*.mp4"
+steps = ["compress-video"]
+"#,
+            source.display()
+        ))
+        .unwrap();
+
+        let run_id = RunId::new("ledger-kinds".into()).unwrap();
+        let manifest = build_manifest(&config, &run_id).unwrap();
+
+        // Build cleanup entries from manifest (passthrough entries only)
+        let entries =
+            crate::cleanup::build_cleanup_entries_from_manifest(&config, "data", &manifest)
+                .unwrap();
+
+        // Must include directories and symlinks even though they have no SHA
+        assert!(
+            entries.iter().any(|e| e.kind == ManifestEntryKind::Directory),
+            "cleanup ledger must include directory entries"
+        );
+        assert!(
+            entries.iter().any(|e| e.kind == ManifestEntryKind::Symlink),
+            "cleanup ledger must include symlink entries"
+        );
+        // Regular files must have SHA
+        let regular = entries
+            .iter()
+            .find(|e| e.kind == ManifestEntryKind::RegularFile);
+        if let Some(rf) = regular {
+            assert!(
+                rf.sha256.is_some(),
+                "regular file in cleanup ledger must have SHA"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "expected to fail until verify_manifest_entry_local requires SHA for regular files"]
+    fn directory_cleanup_refuses_without_sha_on_descendant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let dir_path = source.join("photos");
+        fs::create_dir_all(&dir_path).unwrap();
+        let file_path = dir_path.join("file.txt");
+        fs::write(&file_path, b"data").unwrap();
+
+        let config = ClientConfig::from_toml(&format!(
+            r#"
+nickname = "laptop"
+state_dir = "/tmp/purgery-state"
+
+[server]
+host = "example.invalid"
+
+[[sync]]
+name = "data"
+from = "{}"
+to = "data"
+delete_after_import = true
+
+[[postprocess.rules]]
+match = "photos"
+steps = ["compress-video"]
+"#,
+            source.display()
+        ))
+        .unwrap();
+
+        let run_id = RunId::new("dir-sha-safety".into()).unwrap();
+        let manifest = build_manifest(&config, &run_id).unwrap();
+
+        // Find a regular-file entry inside the postprocessed directory
+        let child_entry = manifest
+            .entries
+            .iter()
+            .find(|e| {
+                e.mode == ManifestEntryMode::Covered
+                    && e.kind == ManifestEntryKind::RegularFile
+            })
+            .expect("must have a covered regular file");
+
+        // Create a version of the entry without SHA (as if SHA computation failed)
+        let mut entry_no_sha = child_entry.clone();
+        entry_no_sha.sha256 = None;
+
+        // verify_manifest_entry_local must return false when SHA is missing
+        assert!(
+            !crate::run::verify_manifest_entry_local(&entry_no_sha),
+            "verify_manifest_entry_local must refuse regular file without SHA"
+        );
+    }
 }
