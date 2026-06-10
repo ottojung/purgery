@@ -186,7 +186,9 @@ pub(crate) fn build_pre_rsync_cleanup_entries(
     let mut entries = Vec::new();
     // Collect directories for cleanup order (bottom-up)
     let mut dirs: Vec<(String, String)> = Vec::new();
-    for walk_entry in WalkDir::new(from).sort_by_file_name() {
+    // Skip the source root itself (min_depth 1) — it is a traversal boundary,
+    // not an imported entry, and must not be deleted.
+    for walk_entry in WalkDir::new(from).min_depth(1).sort_by_file_name() {
         let walk_entry = match walk_entry {
             Ok(e) => e,
             Err(_) => continue,

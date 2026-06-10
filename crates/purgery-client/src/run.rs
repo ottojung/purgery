@@ -306,7 +306,8 @@ pub(crate) fn delete_confirmed_files(
                     warn!(path = %local_path.display(), "local path is no longer a directory, not removing");
                     continue;
                 }
-                // Recursive preflight: check every directory under the root for unexpected children.
+                // Recursive preflight: check the root directory itself and every
+                // descendant directory for unexpected filesystem children.
                 // First, collect all descendant entries from the manifest.
                 let prefix = format!("{}/", local_path_str);
                 let mut descendants: Vec<&ManifestEntry> = manifest
@@ -314,8 +315,35 @@ pub(crate) fn delete_confirmed_files(
                     .iter()
                     .filter(|me| me.local_path.as_str().starts_with(&prefix))
                     .collect();
-                // Check every directory descendant for unexpected filesystem children.
                 let mut preflight_ok = true;
+                // Check the root directory itself first.
+                if let Ok(reader) = fs::read_dir(local_path) {
+                    for child in reader {
+                        let child = match child {
+                            Ok(c) => c,
+                            Err(_) => {
+                                preflight_ok = false;
+                                break;
+                            }
+                        };
+                        let child_path = child.path();
+                        if child_path == local_path {
+                            continue;
+                        }
+                        let child_local = child_path.to_string_lossy();
+                        if !manifest
+                            .entries
+                            .iter()
+                            .any(|me| me.local_path.as_str() == child_local.as_ref())
+                        {
+                            preflight_ok = false;
+                            break;
+                        }
+                    }
+                } else {
+                    preflight_ok = false;
+                }
+                // Then check every descendant directory.
                 for desc in &descendants {
                     if desc.kind != purgery_core::ManifestEntryKind::Directory {
                         continue;
