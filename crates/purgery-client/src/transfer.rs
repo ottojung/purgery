@@ -528,7 +528,9 @@ pub(crate) fn run_postprocess_path(
                 .join("tmp")
                 .join(run_id.as_str())
                 .join("filters");
-            fs::create_dir_all(&tmp_dir).ok();
+            fs::create_dir_all(&tmp_dir).with_context(|| {
+                format!("failed to create filter directory: {}", tmp_dir.as_str())
+            })?;
             let passthrough_file = tmp_dir.join(format!("passthrough-{sync_name}"));
             let purgatory_file = tmp_dir.join(format!("purgatory-{sync_name}"));
 
@@ -580,7 +582,8 @@ pub(crate) fn run_postprocess_path(
                 );
                 let mut pt_args = build_rsync_args(from_path, &passthrough_rsync_dest);
                 let pt_filter_arg = format!("--filter=merge {}", passthrough_file.as_str());
-                pt_args.insert(5, pt_filter_arg);
+                purgery_core::insert_rsync_option_before_operands(&mut pt_args, pt_filter_arg)
+                    .map_err(|e| anyhow::anyhow!("failed to insert passthrough filter arg: {e}"))?;
                 let pt_status =
                     Command::new("rsync")
                         .args(&pt_args)
@@ -633,7 +636,8 @@ pub(crate) fn run_postprocess_path(
                 );
                 let mut pg_args = build_rsync_args(from_path, &purgatory_rsync_dest);
                 let pg_filter_arg = format!("--filter=merge {}", purgatory_file.as_str());
-                pg_args.insert(5, pg_filter_arg);
+                purgery_core::insert_rsync_option_before_operands(&mut pg_args, pg_filter_arg)
+                    .map_err(|e| anyhow::anyhow!("failed to insert purgatory filter arg: {e}"))?;
                 let pg_status =
                     Command::new("rsync")
                         .args(&pg_args)

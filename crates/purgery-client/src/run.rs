@@ -534,12 +534,13 @@ pub(crate) fn verify_manifest_entry_local(entry: &ManifestEntry) -> bool {
             if mtime != entry.mtime_ns {
                 return false;
             }
-            if let Some(ref expected_sha) = entry.sha256 {
-                if compute_sha256(path).ok().as_deref() != Some(expected_sha) {
-                    return false;
-                }
-            }
-            true
+            let Some(expected_sha) = entry.sha256.as_ref() else {
+                return false;
+            };
+            let Ok(actual_sha) = compute_sha256(path) else {
+                return false;
+            };
+            actual_sha == *expected_sha
         }
         purgery_core::ManifestEntryKind::Symlink => {
             if !symmeta.file_type().is_symlink() {

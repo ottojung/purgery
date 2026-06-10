@@ -125,9 +125,14 @@ pub(crate) fn build_cleanup_entries_from_manifest(
         .entries
         .iter()
         .filter(|e| {
-            e.sync_name.as_str() == sync_name
-                && e.mode == ManifestEntryMode::Passthrough
-                && e.sha256.is_some()
+            if e.sync_name.as_str() != sync_name || e.mode != ManifestEntryMode::Passthrough {
+                return false;
+            }
+            match e.kind {
+                ManifestEntryKind::RegularFile => e.sha256.is_some(),
+                ManifestEntryKind::Symlink => e.link_target.is_some(),
+                ManifestEntryKind::Directory => true,
+            }
         })
         .map(|e| CleanupEntry {
             sync_name: sync_name.to_owned(),
@@ -142,6 +147,13 @@ pub(crate) fn build_cleanup_entries_from_manifest(
             cleaned: false,
         })
         .collect();
+    // Sort bottom-up: deepest paths first so children are processed before parents.
+    let mut entries = entries;
+    entries.sort_by(|a, b| {
+        let a_depth = a.local_path.matches('/').count();
+        let b_depth = b.local_path.matches('/').count();
+        b_depth.cmp(&a_depth)
+    });
     Ok(entries)
 }
 

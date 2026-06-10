@@ -196,11 +196,11 @@ pub fn build_rsync_args(source: &str, destination: &str) -> Vec<String> {
 pub fn insert_rsync_option_before_operands(
     args: &mut Vec<String>,
     option: String,
-) -> Result<(), String> {
+) -> Result<(), &'static str> {
     let dashdash_pos = args
         .iter()
         .position(|a| a == "--")
-        .ok_or_else(|| "rsync args list has no `--` separator".to_string())?;
+        .ok_or("rsync args list has no `--` separator")?;
     args.insert(dashdash_pos, option);
     Ok(())
 }
@@ -1599,7 +1599,6 @@ files = []
     }
 
     #[test]
-    #[ignore = "expected to fail until postprocess argv protection is verified"]
     fn postprocess_argv_not_rewritten() {
         let configured_args = vec!["--input".to_string(), "{input}".to_string()];
         let step = PostprocessStepDefinition {
@@ -1609,16 +1608,18 @@ files = []
             expected_outputs: vec![],
             keep_original: true,
         };
-        let built = step.build_args(&camino::Utf8Path::new("/tmp/work/file.mp4"));
-        assert_eq!(
-            built, configured_args,
-            "postprocess argv must not be rewritten, but got: {:?}",
+        let built = step.build_args(camino::Utf8Path::new("/tmp/work/file.mp4"));
+        // build_args must resolve placeholders but not reorder or reject the argv
+        assert_eq!(built.len(), 2, "argv length must be preserved");
+        assert_eq!(built[0], "--input", "first arg must be unchanged");
+        assert!(
+            built[1].contains("/tmp/work/file.mp4"),
+            "second arg must resolve {{input}}, got: {:?}",
             built
         );
     }
 
     #[test]
-    #[ignore = "expected to fail until postprocess argv placeholder acceptance is verified"]
     fn postprocess_argv_not_rejected_for_placeholders() {
         let step = PostprocessStepDefinition {
             kind: PostprocessKind::Subprocess,
@@ -1627,7 +1628,7 @@ files = []
             expected_outputs: vec![],
             keep_original: true,
         };
-        let built = step.build_args(&camino::Utf8Path::new("/tmp/work/file.mp4"));
+        let built = step.build_args(camino::Utf8Path::new("/tmp/work/file.mp4"));
         assert!(
             built.iter().any(|a| a.contains("/tmp/work")),
             "build_args must resolve placeholders, not reject them"

@@ -81,15 +81,20 @@ pub(crate) fn walk_and_classify_sync(
                 })?;
                 (mtime_ns, Some(sha256))
             } else if sync.delete_after_import {
-                // Passthrough entries with delete-after-import: compute SHA for cleanup identity
+                // Passthrough entries with delete-after-import: SHA needed for cleanup identity
                 let mtime_ns = metadata
                     .modified()
                     .ok()
                     .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
                     .map(|duration| duration.as_nanos() as i64)
                     .unwrap_or(0);
-                let sha256 = compute_sha256(path).ok();
-                (mtime_ns, sha256)
+                let sha256 = compute_sha256(path).with_context(|| {
+                    format!(
+                        "failed to compute SHA-256 for delete-after-import entry: {}",
+                        path.display()
+                    )
+                })?;
+                (mtime_ns, Some(sha256))
             } else {
                 (0, None)
             };
