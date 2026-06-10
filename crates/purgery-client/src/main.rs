@@ -401,6 +401,215 @@ steps = ["compress-video"]
     }
 
     #[test]
+    #[ignore = "expected to fail until all-entry-kind cleanup is implemented"]
+    fn delete_confirmed_files_deletes_postprocessed_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        let target = tmp.path().join("target_file");
+        fs::write(&target, "target data").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, source.join("link.lnk")).unwrap();
+
+        let config = ClientConfig::from_toml(&format!(
+            r#"
+nickname = "laptop"
+
+[server]
+host = "example.invalid"
+
+[[sync]]
+name = "data"
+from = "{}"
+to = "data"
+delete_after_import = true
+
+[[postprocess.rules]]
+match = "link.lnk"
+steps = ["compress-video"]
+"#,
+            source.display()
+        ))
+        .unwrap();
+
+        let run_id = RunId::new("symlink-pp-cleanup".into()).unwrap();
+        let manifest = build_manifest(&config, &run_id).unwrap();
+        let symlink_entry = manifest
+            .entries
+            .iter()
+            .find(|e| e.kind == ManifestEntryKind::Symlink)
+            .expect("must have a symlink entry");
+
+        let status_entries = vec![EntryStatusEntry {
+            kind: ManifestEntryKind::Symlink,
+            sync_name: symlink_entry.sync_name.clone(),
+            local_path: symlink_entry.local_path.as_str().to_owned(),
+            relative_path: symlink_entry.relative_path.as_str().to_owned(),
+            status: FileStatus::Imported,
+            final_paths: vec![],
+            postprocess: Some(vec!["compress-video".into()]),
+            error: None,
+        }];
+        let status = RunStatus {
+            run_id,
+            nickname: config.nickname.clone(),
+            state: RunState::Done,
+            entries: status_entries,
+            error: None,
+        };
+
+        let count = delete_confirmed_files(&config, &manifest, &status).unwrap();
+        assert_eq!(count, 1, "postprocessed symlink must be deleted");
+        assert!(!source.join("link.lnk").exists(), "symlink must be removed");
+        // The target must still exist (symlink cleanup never follows the target)
+        assert!(target.exists(), "symlink target must not be affected");
+    }
+
+    #[test]
+    #[ignore = "expected to fail until all-entry-kind cleanup is implemented"]
+    fn delete_confirmed_files_deletes_postprocessed_directory_bottom_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let dir_path = source.join("photos");
+        fs::create_dir_all(dir_path.join("sub")).unwrap();
+        fs::write(dir_path.join("sub/file1.txt"), "data1").unwrap();
+        fs::write(dir_path.join("file2.txt"), "data2").unwrap();
+
+        let config = ClientConfig::from_toml(&format!(
+            r#"
+nickname = "laptop"
+
+[server]
+host = "example.invalid"
+
+[[sync]]
+name = "data"
+from = "{}"
+to = "data"
+delete_after_import = true
+
+[[postprocess.rules]]
+match = "photos"
+steps = ["compress-video"]
+"#,
+            source.display()
+        ))
+        .unwrap();
+
+        let run_id = RunId::new("dir-pp-cleanup".into()).unwrap();
+        let manifest = build_manifest(&config, &run_id).unwrap();
+        let dir_entry = manifest
+            .entries
+            .iter()
+            .find(|e| e.kind == ManifestEntryKind::Directory)
+            .expect("must have a directory entry");
+
+        // Build status entries that include covered children as skipped
+        let mut status_entries = vec![EntryStatusEntry {
+            kind: ManifestEntryKind::Directory,
+            sync_name: dir_entry.sync_name.clone(),
+            local_path: dir_entry.local_path.as_str().to_owned(),
+            relative_path: dir_entry.relative_path.as_str().to_owned(),
+            status: FileStatus::Imported,
+            final_paths: vec![],
+            postprocess: Some(vec!["compress-video".into()]),
+            error: None,
+        }];
+        // Covered children get skipped status
+        for child in &manifest.entries {
+            if child.mode == purgery_core::ManifestEntryMode::Covered {
+                status_entries.push(EntryStatusEntry {
+                    kind: child.kind,
+                    sync_name: child.sync_name.clone(),
+                    local_path: child.local_path.as_str().to_owned(),
+                    relative_path: child.relative_path.as_str().to_owned(),
+                    status: FileStatus::Skipped,
+                    final_paths: vec![],
+                    postprocess: None,
+                    error: Some("covered by postprocessed ancestor directory".into()),
+                });
+            }
+        }
+        let status = RunStatus {
+            run_id,
+            nickname: config.nickname.clone(),
+            state: RunState::Done,
+            entries: status_entries,
+            error: None,
+        };
+
+        let count = delete_confirmed_files(&config, &manifest, &status).unwrap();
+        assert_eq!(
+            count, 1,
+            "postprocessed directory root must be deleted as one entry"
+        );
+        assert!(!dir_path.exists(), "directory must be removed");
+    }
+
+    #[test]
+    fn delete_confirmed_files_skips_directory_with_new_local_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let dir_path = source.join("photos");
+        fs::create_dir_all(dir_path.join("sub")).unwrap();
+        fs::write(dir_path.join("sub/file1.txt"), "data1").unwrap();
+
+        let config = ClientConfig::from_toml(&format!(
+            r#"
+nickname = "laptop"
+
+[server]
+host = "example.invalid"
+
+[[sync]]
+name = "data"
+from = "{}"
+to = "data"
+delete_after_import = true
+
+[[postprocess.rules]]
+match = "photos"
+steps = ["compress-video"]
+"#,
+            source.display()
+        ))
+        .unwrap();
+
+        let run_id = RunId::new("dir-skip-new".into()).unwrap();
+        let manifest = build_manifest(&config, &run_id).unwrap();
+        let dir_entry = manifest
+            .entries
+            .iter()
+            .find(|e| e.kind == ManifestEntryKind::Directory)
+            .expect("must have a directory entry");
+
+        // After manifest, a new file appears in the directory
+        fs::write(dir_path.join("new_file.txt"), "new data").unwrap();
+
+        let status_entries = vec![EntryStatusEntry {
+            kind: ManifestEntryKind::Directory,
+            sync_name: dir_entry.sync_name.clone(),
+            local_path: dir_entry.local_path.as_str().to_owned(),
+            relative_path: dir_entry.relative_path.as_str().to_owned(),
+            status: FileStatus::Imported,
+            final_paths: vec![],
+            postprocess: Some(vec!["compress-video".into()]),
+            error: None,
+        }];
+        let status = RunStatus {
+            run_id,
+            nickname: config.nickname.clone(),
+            state: RunState::Done,
+            entries: status_entries,
+            error: None,
+        };
+
+        let count = delete_confirmed_files(&config, &manifest, &status).unwrap();
+        assert_eq!(count, 0, "directory with new entries must not be deleted");
+        assert!(dir_path.exists(), "directory must still exist");
+    }
+
+    #[test]
     fn delete_confirmed_files_rejects_status_passthrough_entries() {
         // When server status has imported entries but the corresponding
         // manifest entry is passthrough (not postprocess), delete_confirmed_files
