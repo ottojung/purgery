@@ -1397,19 +1397,6 @@ pub struct RunPlan {
 }
 
 impl RunPlan {
-    /// Return all compiled rules that both apply to the given sync group
-    /// AND match the given normalized relative path.
-    pub fn matching_rules<'a>(
-        &'a self,
-        sync_name: &str,
-        normalized_path: &str,
-    ) -> Vec<&'a CompiledRule> {
-        self.rules
-            .iter()
-            .filter(|r| r.applies_to(sync_name) && r.is_match(normalized_path))
-            .collect()
-    }
-
     /// Return the first compiled rule that both applies to the given sync
     /// group AND matches the given normalized relative path, or None.
     pub fn first_matching_rule<'a>(
@@ -1435,9 +1422,9 @@ impl RunPlan {
     pub fn postprocess_steps_for(&self, sync_name: &str, normalized_path: &str) -> Vec<String> {
         self.rules
             .iter()
-            .filter(|r| r.applies_to(sync_name) && r.is_match(normalized_path))
-            .flat_map(|r| r.steps.iter().map(|s| s.step_name.clone()))
-            .collect()
+            .find(|r| r.applies_to(sync_name) && r.is_match(normalized_path))
+            .map(|r| r.steps.iter().map(|s| s.step_name.clone()).collect())
+            .unwrap_or_default()
     }
 
     /// Build a run plan from server config and run config.
