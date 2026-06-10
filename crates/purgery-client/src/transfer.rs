@@ -224,94 +224,6 @@ pub(crate) fn run_postprocess_path(
         HashMap::new()
     };
 
-    // 0b. Handle PassthroughNoDelete groups before the purgatory run.
-    //     These groups are outside the purgatory lifecycle.
-    for sync in passthrough_nodelete {
-        let sync_name = sync.name.as_str();
-        let from_path = sync.from_path.as_str();
-        if let Some(passthrough_dest) = passthrough_dest_map.get(sync_name) {
-            let rsync_dest = format!("{}:{}/", host, passthrough_dest);
-            info!(
-                sync = sync_name,
-                from = from_path,
-                dest = %passthrough_dest,
-                "passthrough-only direct rsync (outside purgatory run)"
-            );
-            let rsync_args = build_rsync_args(from_path, &rsync_dest);
-            let status = Command::new("rsync")
-                .args(&rsync_args)
-                .status()
-                .with_context(|| format!("failed to execute rsync for {from_path}"))?;
-            if !status.success() {
-                anyhow::bail!("rsync failed for sync mapping '{sync_name}'");
-            }
-            info!(sync = sync_name, "direct rsync complete");
-        } else {
-            anyhow::bail!("no destination resolved for passthrough sync mapping '{sync_name}'");
-        }
-    }
-
-    // 0c. Handle PassthroughDeleteAfterImport groups:
-    //     pre-rsync identity → rsync → mark succeeded → cleanup.
-    for sync in passthrough_cleanup {
-        let sync_name = sync.name.as_str();
-        let Some(passthrough_dest) = passthrough_dest_map.get(sync_name) else {
-            anyhow::bail!("no destination resolved for passthrough sync mapping '{sync_name}'");
-        };
-        let rsync_dest = format!("{}:{}/", host, passthrough_dest);
-
-        // 1. Capture pre-rsync cleanup identity
-        let cleanup_entries = build_pre_rsync_cleanup_entries(config, sync)?;
-        if cleanup_entries.is_empty() {
-            // No regular files to clean up, just rsync
-            let args = build_rsync_args(sync.from_path.as_str(), &rsync_dest);
-            let s = Command::new("rsync")
-                .args(&args)
-                .status()
-                .with_context(|| {
-                    format!("failed to execute rsync for {}", sync.from_path.as_str())
-                })?;
-            if !s.success() {
-                anyhow::bail!("rsync failed for sync mapping '{sync_name}'");
-            }
-            continue;
-        }
-        let cleanup_state = purgery_core::DurableCleanupState {
-            nickname: config.nickname.as_str().to_owned(),
-            operation_id: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-                .to_string(),
-            entries: cleanup_entries,
-        };
-        let state_path = write_cleanup_state(&cleanup_state, config.state_dir.as_deref())
-            .with_context(|| "failed to write pre-rsync cleanup state")?;
-
-        // 2. Direct unfiltered rsync
-        info!(
-            sync = sync_name,
-            dest = %passthrough_dest,
-            "passthrough direct rsync with cleanup"
-        );
-        let rsync_args = build_rsync_args(sync.from_path.as_str(), &rsync_dest);
-        let status = Command::new("rsync")
-            .args(&rsync_args)
-            .status()
-            .with_context(|| format!("failed to execute rsync for {}", sync.from_path.as_str()))?;
-        if !status.success() {
-            anyhow::bail!("rsync failed for sync mapping '{sync_name}'");
-        }
-
-        // 3. Mark rsync succeeded durably
-        mark_rsync_succeeded(&state_path, sync_name)
-            .with_context(|| "failed to mark rsync succeeded in cleanup state")?;
-
-        // 4. Delete files whose identity still matches
-        process_cleanup_state_file(&state_path)
-            .with_context(|| "failed to process cleanup state after rsync")?;
-    }
-
     // 0d. The purgatory-only run config excludes passthrough-only sync groups
     let run_config = build_run_config(config, true);
     let run_config_toml = run_config
@@ -478,6 +390,87 @@ pub(crate) fn run_postprocess_path(
             break;
         }
     });
+
+    // 4b. Handle PassthroughNoDelete groups after prepare-run validation.
+    for sync in passthrough_nodelete {
+        let sync_name = sync.name.as_str();
+        let from_path = sync.from_path.as_str();
+        if let Some(passthrough_dest) = passthrough_dest_map.get(sync_name) {
+            let rsync_dest = format!("{}:{}/", host, passthrough_dest);
+            info!(
+                sync = sync_name,
+                from = from_path,
+                dest = %passthrough_dest,
+                "passthrough-only direct rsync after prepare-run"
+            );
+            let rsync_args = build_rsync_args(from_path, &rsync_dest);
+            let status = Command::new("rsync")
+                .args(&rsync_args)
+                .status()
+                .with_context(|| format!("failed to execute rsync for {from_path}"))?;
+            if !status.success() {
+                anyhow::bail!("rsync failed for sync mapping '{sync_name}'");
+            }
+            info!(sync = sync_name, "direct rsync complete");
+        } else {
+            anyhow::bail!("no destination resolved for passthrough sync mapping '{sync_name}'");
+        }
+    }
+
+    // 4c. Handle PassthroughDeleteAfterImport groups after prepare-run validation.
+    for sync in passthrough_cleanup {
+        let sync_name = sync.name.as_str();
+        let Some(passthrough_dest) = passthrough_dest_map.get(sync_name) else {
+            anyhow::bail!("no destination resolved for passthrough sync mapping '{sync_name}'");
+        };
+        let rsync_dest = format!("{}:{}/", host, passthrough_dest);
+
+        let cleanup_entries = build_pre_rsync_cleanup_entries(config, sync)?;
+        if cleanup_entries.is_empty() {
+            let args = build_rsync_args(sync.from_path.as_str(), &rsync_dest);
+            let s = Command::new("rsync")
+                .args(&args)
+                .status()
+                .with_context(|| {
+                    format!("failed to execute rsync for {}", sync.from_path.as_str())
+                })?;
+            if !s.success() {
+                anyhow::bail!("rsync failed for sync mapping '{sync_name}'");
+            }
+            continue;
+        }
+        let cleanup_state = purgery_core::DurableCleanupState {
+            nickname: config.nickname.as_str().to_owned(),
+            operation_id: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+                .to_string(),
+            entries: cleanup_entries,
+        };
+        let state_path = write_cleanup_state(&cleanup_state, config.state_dir.as_deref())
+            .with_context(|| "failed to write pre-rsync cleanup state")?;
+
+        info!(
+            sync = sync_name,
+            dest = %passthrough_dest,
+            "passthrough direct rsync with cleanup after prepare-run"
+        );
+        let rsync_args = build_rsync_args(sync.from_path.as_str(), &rsync_dest);
+        let status = Command::new("rsync")
+            .args(&rsync_args)
+            .status()
+            .with_context(|| format!("failed to execute rsync for {}", sync.from_path.as_str()))?;
+        if !status.success() {
+            anyhow::bail!("rsync failed for sync mapping '{sync_name}'");
+        }
+
+        mark_rsync_succeeded(&state_path, sync_name)
+            .with_context(|| "failed to mark rsync succeeded in cleanup state")?;
+
+        process_cleanup_state_file(&state_path)
+            .with_context(|| "failed to process cleanup state after rsync")?;
+    }
 
     // 5. Transfer per purgatory sync group
     let sync_map = config

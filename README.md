@@ -104,6 +104,21 @@ match = "*.mp4"
 steps = ["compress-video"]
 ```
 
+## Transform and cleanup coupling
+
+Because transformed outputs are not the original source files, Purgery cannot use the final archive alone to know that an unchanged local original has already been processed in a previous run. The server does not retain indefinite source-file metadata or an ever-growing receipt ledger.
+
+For this reason, a source tree with transforms **must** also enable cleanup (`delete_after_import = true`). The transformed import is an import-and-retire operation:
+
+1. the source entry is uploaded into a server run;
+2. the server transforms and commits outputs;
+3. the server writes a bounded run status;
+4. the client deletes the unchanged local regular-file original after server-confirmed import.
+
+This prevents repeated reprocessing of the same original on subsequent runs.
+
+A source tree without transforms may still use `delete_after_import = false` — passthrough imports preserve the original content in the archive, so repeated runs converge naturally.
+
 ## Safety model
 
 Purgery targets Unix/POSIX filesystem semantics and is conservative about data loss:

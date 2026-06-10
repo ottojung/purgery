@@ -132,7 +132,7 @@ steps = ["compress-video"]
 | `server` | yes | Server connection details |
 | `sync` | `[]` | List of sync mappings |
 | `postprocess` | | Postprocess rule configuration |
-| `state_dir` | no | Writable state directory for cleanup bookkeeping. Defaults to `$XDG_STATE_HOME/purgery/` or `~/.local/state/purgery/` |
+| `state_dir` | no | Writable state directory for cleanup bookkeeping. Defaults to `$XDG_STATE_HOME/purgery/` or `~/.local/state/purgery/`. When set, must be a non-empty absolute path |
 
 ### Server connection
 
@@ -177,13 +177,24 @@ for = ["videos"]
 
 Before a sync group is scanned, the client computes `applicable_rules(sync_name)`. A rule is applicable when its `for` is omitted or the sync group name is listed.
 
-### Postprocessing requires delete_after_import
+### Postprocessing requires delete_after_import (conformance tradeoff)
 
-If a sync group has one or more applicable postprocess rules, its `delete_after_import` must be `true`. This is a static config validation — it is checked before any filesystem walking.
+A sync group with applicable postprocess rules must set `delete_after_import = true`. This is not an arbitrary safety constraint — it follows from Purgery's import-and-retire model.
 
-A sync group with applicable postprocess rules but `delete_after_import = false` is rejected at config parse time.
+Why this rule exists: Purgery does not retain indefinite source-file metadata on the server. Because transformed outputs are not the original source files, the final archive alone cannot tell Purgery whether an unchanged local original has already been processed in a previous run. It cannot know:
+
+* whether the original was already processed;
+* whether it was processed with the same rule set and step definitions;
+* whether it produced the same expected outputs;
+* whether it should be skipped or reprocessed;
+* or whether it represents a changed source that happens to map to the same archive destination.
+
+Solving this would require persistent server-side source fingerprints, retained manifests, or an indefinitely growing receipt ledger — which Purgery explicitly avoids.
+
+Postprocessing is therefore modeled as import-and-retire: the source entry is uploaded, transformed, and the confirmed local original is removed after server-confirmed import. This prevents repeated reprocessing of the same original on subsequent runs.
 
 ```toml
+# This configuration is INVALID
 [[sync]]
 name = "videos"
 from = "/home/user/Videos"
@@ -196,7 +207,7 @@ steps = ["compress-video"]
 # for omitted — applies to all sync groups, including "videos"
 ```
 
-This config is invalid because the rule applies to `videos` and `videos` has `delete_after_import = false`.
+This config is rejected because the rule applies to `videos` and `videos` has `delete_after_import = false`. The error message explains the conformance reason.
 
 A sync group with no applicable postprocess rules is unaffected — whether `delete_after_import` is true or false.
 

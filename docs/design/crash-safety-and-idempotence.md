@@ -10,6 +10,8 @@ For passthrough entries with `delete_after_import = true`, the client writes a d
 $XDG_STATE_HOME/purgery/  or  ~/.local/state/purgery/
 ```
 
+The location is configurable via the `state_dir` field in `client.toml`. When set, `state_dir` must be a non-empty absolute path.
+
 This is the only cleanup mechanism. It is used for all delete-after-import cleanup: pure passthrough invocations, mixed invocations, and purgatory passthrough remainder.
 
 The cleanup ledger protocol is the same everywhere:
@@ -84,7 +86,9 @@ The staged files in the processing directory are the replay source. The work are
 
 ## Status and deletion invariant
 
-### Postprocess entries
+Postprocessing is import-and-retire. Because the server does not retain indefinite source-file metadata, the confirmed local original is removed after successful import to prevent repeated reprocessing. See [import semantics](import-semantics.md#postprocessing-conformance-and-import-and-retire).
+
+### Postprocess entries (server-confirmed cleanup)
 
 The client may delete a local postprocessed file only after reading a valid `status.toml` whose envelope matches the uploaded manifest:
 
@@ -155,7 +159,7 @@ A run affects only outputs it explicitly commits. Purgery does not use `rsync --
 
 ### Cleanup state discovery
 
-On startup, the client scans the cleanup state directory (`$XDG_STATE_HOME/purgery/` or `~/.local/state/purgery/`) for state files with pending cleanup. If found, cleanup is resumed before any new rsync operation. This ensures that partially-completed cleanup from a previous run does not accumulate indefinitely.
+On startup, the client scans the cleanup state directory (`$XDG_STATE_HOME/purgery/`, `~/.local/state/purgery/`, or the configured `state_dir`) for state files with pending cleanup. If found, cleanup is resumed before any new rsync operation. This ensures that partially-completed cleanup from a previous run does not accumulate indefinitely.
 
 The client keeps no local run database. For postprocess entries, verified server status remains the authority for local deletion. For passthrough entries with `delete_after_import=true`, the durable local cleanup state is the authority.
 

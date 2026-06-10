@@ -188,6 +188,16 @@ pub struct ClientConfig {
 impl ClientConfig {
     pub fn from_toml(input: &str) -> Result<Self, ConfigError> {
         let config: ClientConfig = toml::from_str(input)?;
+        if let Some(ref dir) = config.state_dir {
+            if dir.is_empty() {
+                return Err(ConfigError::StateDir("must be non-empty when set".into()));
+            }
+            if !dir.starts_with('/') {
+                return Err(ConfigError::StateDir(
+                    "must be an absolute path when set".into(),
+                ));
+            }
+        }
         let sync_names: Vec<SyncName> = config.sync.iter().map(|s| s.name.clone()).collect();
         config
             .postprocess
@@ -292,8 +302,10 @@ impl ClientPostprocessConfig {
             if !applicable.is_empty() && !sync.delete_after_import {
                 return Err(format!(
                     "sync group '{}' has applicable postprocess rules but \
-                     delete_after_import is false; postprocessing requires \
-                     delete_after_import = true",
+                     delete_after_import is false; \
+                     postprocessing transforms the original and the server does not retain \
+                     indefinite source metadata, so confirmed originals must be retired \
+                     locally (import-and-retire)",
                     sync.name.as_str()
                 ));
             }
@@ -319,7 +331,10 @@ pub fn classify_sync_groups<'a>(
         if !applicable.is_empty() && !sync.delete_after_import {
             return Err(format!(
                 "sync group '{}' has applicable postprocess rules but \
-                 delete_after_import is false",
+                 delete_after_import is false; \
+                 postprocessing transforms the original and the server does not retain \
+                 indefinite source metadata, so confirmed originals must be retired \
+                 locally (import-and-retire)",
                 sync.name.as_str()
             ));
         }
@@ -385,7 +400,9 @@ impl RunConfig {
             if !sync.delete_after_import {
                 return Err(format!(
                     "sync group '{}' in purgatory run config has delete_after_import = false; \
-                     postprocessing requires delete_after_import = true",
+                     postprocessing transforms the original and the server does not retain \
+                     indefinite source metadata, so confirmed originals must be retired \
+                     locally (import-and-retire)",
                     sync.name.as_str()
                 ));
             }
