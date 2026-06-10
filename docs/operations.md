@@ -71,7 +71,7 @@ purgery-server gc --config server.toml
 
 `process-once` runs side-effect-free server validation first, then GC opportunistically, then recovers processing runs and processes ready runs.
 
-`sync-and-cleanup` runs local checks first, then uploads, waits for processing, and cleans up confirmed local files.
+`sync-and-cleanup` runs local checks first, then uploads, waits for processing, and cleans up confirmed local entries.
 
 ## Heartbeat and leases
 

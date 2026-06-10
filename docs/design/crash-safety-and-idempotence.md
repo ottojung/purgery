@@ -37,7 +37,7 @@ The cleanup state is written atomically via temporary file + rename. After each 
 
 ### Replay/idempotence
 
-On a later `sync-and-cleanup` invocation, the client scans the cleanup state directory for pending cleanup. Already-deleted files are idempotent (file not found = success). Changed files are skipped (identity check fails). Pending entries are retried.
+On a later `sync-and-cleanup` invocation, the client scans the cleanup state directory for pending cleanup. Already-removed entries are idempotent (not found = success). Changed entries are skipped (identity check fails). Pending entries are retried.
 
 ## Statelessness invariant
 
@@ -86,7 +86,7 @@ The staged files in the processing directory are the replay source. The work are
 
 ## Status and deletion invariant
 
-Postprocessing is import-and-retire. Because the server does not retain indefinite source-file metadata, the confirmed local original is removed after successful import to prevent repeated reprocessing. See [import semantics](import-semantics.md#postprocessing-conformance-and-import-and-retire).
+Postprocessing is import-and-retire. Because the server does not retain indefinite source-entry metadata, the confirmed local original is removed after successful import to prevent repeated reprocessing. See [import semantics](import-semantics.md#postprocessing-conformance-and-import-and-retire).
 
 ### Postprocess entries (server-confirmed cleanup)
 

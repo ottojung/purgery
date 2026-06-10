@@ -85,9 +85,9 @@ Ordinary passthrough entries are not part of the server manifest. They are handl
 
 Passthrough entries are transferred directly from the client source tree to final server storage by a bulk rsync call. They do not enter the incoming staging area. A successful passthrough rsync is the import authority.
 
-For sync groups with `delete_after_import = false`, no further bookkeeping is needed. The local file remains.
+For sync groups with `delete_after_import = false`, no further bookkeeping is needed. The local entry remains.
 
-For sync groups with `delete_after_import = true`, the client writes a durable cleanup state file atomically after successful rsync. This state records the file identity (size, mtime, optional SHA-256) and authorizes deletion on restart. The client verifies local identity before deleting.
+For sync groups with `delete_after_import = true`, the client writes a durable cleanup state file atomically before rsync with `rsync_succeeded = false`, and updates the success marker atomically after rsync succeeds. This state records the entry identity per kind (size, mtime, optional SHA-256 for regular files; link target for symlinks; subtree entries for directories) and authorizes cleanup on restart. The client verifies local identity before removing.
 
 Passthrough entries do not appear in:
 - The uploaded server manifest
@@ -147,7 +147,7 @@ When classifying a manifest entry, only rules applicable to its sync group parti
 
 ### Postprocessing requires delete_after_import
 
-If a sync group has one or more applicable postprocess rules, `delete_after_import` must be `true`. This is an intentional conformance tradeoff (see [import semantics](docs/design/import-semantics.md#postprocessing-conformance-and-import-and-retire)). Because Purgery does not retain indefinite source-file metadata, a postprocessed import is import-and-retire: the confirmed local original is removed after successful server-confirmed import.
+If a sync group has one or more applicable postprocess rules, `delete_after_import` must be `true`. This is an intentional conformance tradeoff (see [import semantics](docs/design/import-semantics.md#postprocessing-conformance-and-import-and-retire)). Because Purgery does not retain indefinite source-entry metadata, a postprocessed import is import-and-retire: the confirmed local original is removed after successful server-confirmed import.
 
 ### Sync group classes
 

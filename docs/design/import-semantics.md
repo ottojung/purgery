@@ -86,7 +86,7 @@ The configured `sync.from` path is the source tree root — a traversal boundary
 
 - **Passthrough group**: no applicable postprocess rules. `delete_after_import` may be true or false. The group is handled entirely outside the purgatory lifecycle.
   - `delete_after_import = false`: one direct unfiltered rsync, no walk, no cleanup state.
-  - `delete_after_import = true`: one direct unfiltered rsync plus a durable cleanup ledger. Cleanup identity is captured before rsync. After rsync succeeds, rsync_succeeded is durably set and files whose pre-rsync identity still matches are deleted. No per-entry transfer filters, no server manifest entries.
+  - `delete_after_import = true`: one direct unfiltered rsync plus a durable cleanup ledger. Cleanup identity is captured before rsync. After rsync succeeds, rsync_succeeded is durably set and entries whose pre-rsync identity still matches are removed. No per-entry transfer filters, no server manifest entries.
 - **Purgatory group**: one or more applicable postprocess rules and `delete_after_import = true`. The group participates in walking, manifest building, upload, and server processing.
 
 Passthrough groups are not included in the uploaded run config, server manifest, or status. In mixed invocations, passthrough destinations are resolved separately through the side-effect-free `resolve-destinations` command. The purgatory transfer loop iterates only purgatory groups.

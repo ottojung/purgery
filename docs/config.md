@@ -228,7 +228,7 @@ Passthrough groups do not participate in purgatory run config, server manifest, 
 If a sync group has no applicable postprocess rules:
 
 - `delete_after_import = false` (PassthroughNoDelete): one direct unfiltered rsync to final storage. The source tree is not walked, entries are not classified, metadata is not read, and no bookkeeping is created.
-- `delete_after_import = true` (PassthroughDeleteAfterImport): direct unfiltered rsync plus a durable cleanup ledger. Cleanup identity (size, mtime, optional SHA-256) is captured before rsync. The clean up state is written with `rsync_succeeded = false`. After rsync succeeds, `rsync_succeeded` is durably set to `true`. Only files whose pre-rsync identity still matches are deleted. New or modified files created after cleanup capture are left untouched. No per-entry transfer filters are used.
+- `delete_after_import = true` (PassthroughDeleteAfterImport): direct unfiltered rsync plus a durable cleanup ledger. Cleanup identity is captured per entry kind (size, mtime, optional SHA-256 for regular files; link target for symlinks; subtree entries for directories) before rsync. The cleanup state is written with `rsync_succeeded = false`. After rsync succeeds, `rsync_succeeded` is durably set to `true`. Only entries whose pre-rsync identity still matches are removed. New or modified entries created after cleanup capture are left untouched. No per-entry transfer filters are used.
 
 ### Match patterns and import modes
 
@@ -363,7 +363,7 @@ The state file records:
 - nickname and operation ID
 - per-file entries with local path, size, mtime, optional SHA-256, rsync success flag, and cleanup status
 
-The state file is written atomically (temp file + rename). After each successful deletion, the state is updated atomically. A crashed or interrupted cleanup resumes safely on the next `sync-and-cleanup` invocation: already-deleted files are idempotent, changed files are skipped.
+The state file is written atomically (temp file + rename). After each successful cleanup, the state is updated atomically. A crashed or interrupted cleanup resumes safely on the next `sync-and-cleanup` invocation: already-removed entries are idempotent, changed entries are skipped.
 
 This is the only cleanup mechanism. It is used for both pure passthrough invocations and mixed invocations where some entries are postprocessed.
 
