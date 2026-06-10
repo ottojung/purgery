@@ -122,6 +122,7 @@ mod tests {
     use super::*;
     use camino::Utf8Path;
     use clap::Parser;
+    use crate::cleanup::process_cleanup_state_file;
     use purgery_core::{
         ClientConfig, EntryStatusEntry, FileStatus, ManifestEntry, ManifestEntryKind, RunId,
         RunState, RunStatus,
@@ -654,5 +655,138 @@ steps = ["compress-video"]
             source.join("file.txt").exists(),
             "passthrough file must remain"
         );
+    }
+
+    #[test]
+    #[ignore = "expected to fail until directory cleanup verifies child identity"]
+    fn delete_confirmed_files_skips_directory_with_changed_known_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let dir_path = source.join("photos");
+        fs::create_dir_all(&dir_path).unwrap();
+        fs::write(dir_path.join("file.txt"), "original content").unwrap();
+
+        let config = ClientConfig::from_toml(&format!(
+            r#"
+nickname = "laptop"
+
+[server]
+host = "example.invalid"
+
+[[sync]]
+name = "data"
+from = "{}"
+to = "data"
+delete_after_import = true
+
+[[postprocess.rules]]
+match = "photos"
+steps = ["compress-video"]
+"#,
+            source.display()
+        ))
+        .unwrap();
+
+        let run_id = RunId::new("dir-changed-child".into()).unwrap();
+        let manifest = build_manifest(&config, &run_id).unwrap();
+
+        // After manifest, change a known child's content
+        fs::write(dir_path.join("file.txt"), "changed content").unwrap();
+
+        let dir_entry = manifest
+            .entries
+            .iter()
+            .find(|e| e.kind == ManifestEntryKind::Directory)
+            .expect("must have a directory entry");
+
+        let status_entries = vec![EntryStatusEntry {
+            kind: ManifestEntryKind::Directory,
+            sync_name: dir_entry.sync_name.clone(),
+            local_path: dir_entry.local_path.as_str().to_owned(),
+            relative_path: dir_entry.relative_path.as_str().to_owned(),
+            status: FileStatus::Imported,
+            final_paths: vec![],
+            postprocess: Some(vec!["compress-video".into()]),
+            error: None,
+        }];
+        let status = RunStatus {
+            run_id,
+            nickname: config.nickname.clone(),
+            state: RunState::Done,
+            entries: status_entries,
+            error: None,
+        };
+
+        let count = delete_confirmed_files(&config, &manifest, &status).unwrap();
+        assert_eq!(
+            count, 0,
+            "directory with changed known child must not be deleted"
+        );
+        assert!(dir_path.exists(), "directory must still exist");
+        assert!(
+            dir_path.join("file.txt").exists(),
+            "changed child must still exist"
+        );
+    }
+
+    #[test]
+    #[ignore = "expected to fail until process_cleanup_state_file verifies child identity"]
+    fn process_cleanup_state_file_skips_directory_with_changed_known_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir_path = tmp.path().join("photos");
+        fs::create_dir_all(&dir_path).unwrap();
+        fs::write(dir_path.join("file.txt"), "original").unwrap();
+
+        let state = purgery_core::DurableCleanupState {
+            nickname: "laptop".into(),
+            operation_id: "test-op".into(),
+            entries: vec![
+                purgery_core::CleanupEntry {
+                    sync_name: "data".into(),
+                    relative_path: "photos/file.txt".into(),
+                    local_path: dir_path.join("file.txt").to_string_lossy().into_owned(),
+                    kind: ManifestEntryKind::RegularFile,
+                    size: "original".len() as u64,
+                    mtime_ns: 100,
+                    sha256: None,
+                    link_target: None,
+                    rsync_succeeded: true,
+                    cleaned: false,
+                },
+                purgery_core::CleanupEntry {
+                    sync_name: "data".into(),
+                    relative_path: "photos".into(),
+                    local_path: dir_path.to_string_lossy().into_owned(),
+                    kind: ManifestEntryKind::Directory,
+                    size: 0,
+                    mtime_ns: 0,
+                    sha256: None,
+                    link_target: None,
+                    rsync_succeeded: true,
+                    cleaned: false,
+                },
+            ],
+        };
+
+        // Write cleanup state file
+        let state_dir = tmp.path().join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let state_path = state_dir.join("cleanup-test.toml");
+        let content = toml::to_string(&state).unwrap();
+        fs::write(&state_path, &content).unwrap();
+
+        // Change the child after capture
+        fs::write(dir_path.join("file.txt"), "CHANGED").unwrap();
+
+        // Process should skip the changed child and not delete the directory
+        let state_utf8 = camino::Utf8PathBuf::from_path_buf(state_path).unwrap();
+        process_cleanup_state_file(&state_utf8).unwrap();
+
+        // Verify unchanged - the file was changed, so nothing should be deleted
+        assert!(
+            dir_path.join("file.txt").exists(),
+            "changed child must still exist"
+        );
+        assert!(dir_path.exists(), "directory must still exist");
     }
 }
