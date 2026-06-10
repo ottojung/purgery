@@ -1644,7 +1644,6 @@ steps = ["compress-video"]
     }
 
     #[test]
-    #[ignore = "expected to fail until process_cleanup_state_file requires SHA for regular files"]
     fn cleanup_state_regular_file_without_sha_not_deleted() {
         let tmp = tempfile::tempdir().unwrap();
         let file_path = tmp.path().join("data.txt");
@@ -1681,8 +1680,7 @@ steps = ["compress-video"]
         );
         // Verify state: entry must not be marked cleaned
         let content = fs::read_to_string(state_utf8.as_std_path()).unwrap();
-        let new_state: purgery_core::DurableCleanupState =
-            toml::from_str(&content).unwrap();
+        let new_state: purgery_core::DurableCleanupState = toml::from_str(&content).unwrap();
         assert!(
             !new_state.entries[0].cleaned,
             "entry without SHA must not be marked cleaned"
@@ -1690,7 +1688,6 @@ steps = ["compress-video"]
     }
 
     #[test]
-    #[ignore = "expected to fail until process_cleanup_state_file requires SHA for regular files"]
     fn cleanup_state_regular_file_sha_recompute_fails_not_deleted() {
         let tmp = tempfile::tempdir().unwrap();
         let file_path = tmp.path().join("data.txt");
@@ -1738,7 +1735,6 @@ steps = ["compress-video"]
     }
 
     #[test]
-    #[ignore = "expected to fail until process_cleanup_state_file requires link_target for symlinks"]
     fn cleanup_state_symlink_without_target_not_deleted() {
         let tmp = tempfile::tempdir().unwrap();
         let link_path = tmp.path().join("link.lnk");
@@ -1770,13 +1766,12 @@ steps = ["compress-video"]
         process_cleanup_state_file(&state_utf8).unwrap();
 
         assert!(
-            link_path.exists(),
+            fs::symlink_metadata(&link_path).is_ok(),
             "symlink without target identity must not be deleted"
         );
         // Verify state: entry must not be marked cleaned
         let content = fs::read_to_string(state_utf8.as_std_path()).unwrap();
-        let new_state: purgery_core::DurableCleanupState =
-            toml::from_str(&content).unwrap();
+        let new_state: purgery_core::DurableCleanupState = toml::from_str(&content).unwrap();
         assert!(
             !new_state.entries[0].cleaned,
             "symlink entry without target identity must not be marked cleaned"
@@ -1784,7 +1779,6 @@ steps = ["compress-video"]
     }
 
     #[test]
-    #[ignore = "expected to fail until build_pre_rsync_cleanup_entries skips symlinks with unreadable targets"]
     fn pre_rsync_symlink_read_failure_skips_entry() {
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("source");
@@ -1800,10 +1794,8 @@ steps = ["compress-video"]
         // read_link should succeed here; the entry should have link_target set.
         let sync = purgery_core::SyncMapping {
             name: purgery_core::SyncName::new("data".into()).unwrap(),
-            from_path: purgery_core::LocalSourcePath::new(
-                source.to_string_lossy().into_owned(),
-            )
-            .unwrap(),
+            from_path: purgery_core::LocalSourcePath::new(source.to_string_lossy().into_owned())
+                .unwrap(),
             to_path: purgery_core::RelativeDestinationPath::new("data".into()).unwrap(),
             delete_after_import: true,
         };
@@ -1824,8 +1816,7 @@ delete_after_import = true
             source.display()
         ))
         .unwrap();
-        let entries =
-            crate::cleanup::build_pre_rsync_cleanup_entries(&config, &sync).unwrap();
+        let entries = crate::cleanup::build_pre_rsync_cleanup_entries(&config, &sync).unwrap();
         let sym_entry = entries
             .iter()
             .find(|e| e.kind == ManifestEntryKind::Symlink)
@@ -1837,7 +1828,6 @@ delete_after_import = true
     }
 
     #[test]
-    #[ignore = "expected to fail until process_cleanup_state_file isolates directory with unresolved child"]
     fn cleanup_state_directory_with_child_lacking_sha_remains() {
         let tmp = tempfile::tempdir().unwrap();
         let dir_path = tmp.path().join("photos");
@@ -1885,10 +1875,7 @@ delete_after_import = true
 
         process_cleanup_state_file(&state_utf8).unwrap();
 
-        assert!(
-            file_path.exists(),
-            "child without SHA must not be deleted"
-        );
+        assert!(file_path.exists(), "child without SHA must not be deleted");
         assert!(
             dir_path.exists(),
             "parent directory must remain when child lacks required identity"

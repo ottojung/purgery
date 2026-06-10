@@ -211,9 +211,16 @@ pub(crate) fn build_pre_rsync_cleanup_entries(
             dirs.push((relative_str, local_path_str));
         } else if file_type.is_symlink() {
             // Capture symlink identity (literal target, never follow)
-            let link_target = fs::read_link(local_path)
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned());
+            let link_target = match fs::read_link(local_path) {
+                Ok(p) => Some(p.to_string_lossy().into_owned()),
+                Err(e) => {
+                    warn!(
+                        "failed to read symlink target for '{}': {e}, skipping cleanup entry",
+                        local_path_str
+                    );
+                    continue;
+                }
+            };
             entries.push(CleanupEntry {
                 sync_name: sync.name.as_str().to_owned(),
                 relative_path: relative_str,
@@ -348,18 +355,28 @@ pub(crate) fn process_cleanup_state_file(state_path: &Utf8Path) -> Result<()> {
             ManifestEntryKind::Symlink => {
                 // Verify it's still a symlink
                 if !symmeta.file_type().is_symlink() {
+                    eprintln!("DEBUG symlink: not symlink type={:?}", symmeta.file_type());
                     continue;
                 }
                 // Verify the link target matches
-                if let Some(ref expected_target) = entry.link_target {
-                    if let Ok(current_target) = fs::read_link(local_path) {
-                        let current = current_target.to_string_lossy().into_owned();
-                        if current != *expected_target {
-                            continue;
-                        }
-                    } else {
-                        continue;
-                    }
+                let Some(expected_target) = entry.link_target.as_ref() else {
+                    warn!(
+                        "cleanup entry has no symlink target identity for '{}', not removing",
+                        entry.local_path
+                    );
+                    continue;
+                };
+                eprintln!("DEBUG symlink: target={}", expected_target);
+                let Ok(current_target) = fs::read_link(local_path) else {
+                    warn!(
+                        "failed to read symlink target for '{}', not removing",
+                        entry.local_path
+                    );
+                    continue;
+                };
+                let current = current_target.to_string_lossy().into_owned();
+                if current != expected_target.as_str() {
+                    continue;
                 }
                 // Unlink the symlink (never follow the target)
                 if let Err(e) = fs::remove_file(local_path) {
@@ -388,14 +405,22 @@ pub(crate) fn process_cleanup_state_file(state_path: &Utf8Path) -> Result<()> {
                 if current_mtime != entry.mtime_ns {
                     continue;
                 }
-                if let Some(ref expected_sha) = entry.sha256 {
-                    if let Ok(actual_sha) = compute_sha256(local_path) {
-                        if &actual_sha != expected_sha {
-                            continue;
-                        }
-                    } else {
-                        continue;
-                    }
+                let Some(expected_sha) = entry.sha256.as_ref() else {
+                    warn!(
+                        "cleanup entry has no SHA-256 identity for '{}', not removing",
+                        entry.local_path
+                    );
+                    continue;
+                };
+                let Ok(actual_sha) = compute_sha256(local_path) else {
+                    warn!(
+                        "SHA-256 computation failed for '{}', not removing",
+                        entry.local_path
+                    );
+                    continue;
+                };
+                if actual_sha != *expected_sha {
+                    continue;
                 }
                 if let Err(e) = fs::remove_file(local_path) {
                     warn!(path = %entry.local_path, error = %e, "failed to delete");
