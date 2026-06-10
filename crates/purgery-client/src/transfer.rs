@@ -2,7 +2,7 @@ use crate::cleanup::{
     build_cleanup_entries_from_manifest, build_pre_rsync_cleanup_entries, mark_rsync_succeeded,
     process_cleanup_state_file, write_cleanup_state,
 };
-use crate::run::{build_run_config, delete_confirmed_files, poll_for_status};
+use crate::run::{build_run_config, wait_for_postprocess_run_and_cleanup};
 use crate::ssh::{server_cmd, server_cmd_with_stdin, write_remote_file};
 
 use anyhow::{Context, Result};
@@ -680,6 +680,20 @@ pub(crate) fn run_postprocess_path(
             ],
         )?;
         info!("finish-run accepted");
+
+        // Persist local run state before returning, so waiting/cleanup
+        // can resume after a client crash.
+        let run_config = build_run_config(config, true);
+        crate::run::write_client_run_state(
+            &config.state_dir,
+            config.nickname.as_str(),
+            run_id.as_str(),
+            manifest,
+            &run_config,
+            "finished",
+            false,
+        )?;
+
         Ok(())
     })();
 
@@ -687,30 +701,13 @@ pub(crate) fn run_postprocess_path(
     let _ = hb_handle.join();
     sync_result?;
 
-    // 7. Poll for status (contains postprocess/covered entries only)
-    let status = poll_for_status(host, server_command, &config.nickname, run_id)?;
-
-    // 8. Verify status envelope
-    if status.nickname != manifest.nickname {
-        anyhow::bail!(
-            "status nickname '{}' does not match manifest nickname '{}'; aborting deletion",
-            status.nickname.as_str(),
-            manifest.nickname.as_str()
-        );
-    }
-    if status.run_id != manifest.run_id {
-        anyhow::bail!(
-            "status run_id '{}' does not match manifest run_id '{}'; aborting deletion",
-            status.run_id.as_str(),
-            manifest.run_id.as_str()
-        );
-    }
-
-    // 9. Delete confirmed postprocess files from status
-    let deletion_count = delete_confirmed_files(config, manifest, &status)?;
-    info!(deleted = deletion_count, "cleanup complete");
-
-    info!(state = %status.state.as_str(), "run finished");
-
-    Ok(())
+    // 7. Wait for terminal status and clean up
+    wait_for_postprocess_run_and_cleanup(
+        config,
+        host,
+        server_command,
+        manifest,
+        &config.nickname,
+        run_id,
+    )
 }

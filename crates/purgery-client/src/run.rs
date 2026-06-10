@@ -4,9 +4,10 @@ use crate::ssh::server_cmd;
 use crate::transfer::{run_passthrough_path, run_postprocess_path};
 
 use anyhow::{Context, Result};
+use camino::Utf8PathBuf;
 use purgery_core::{
-    resolve_executable, ClientConfig, ClientPostprocessConfig, Manifest, ManifestEntry, RunConfig,
-    RunConfigSync, RunId, RunStatus, SyncExecutionClass,
+    resolve_executable, ClientConfig, ClientPostprocessConfig, ClientRunState, Manifest,
+    ManifestEntry, RunConfig, RunConfigSync, RunId, RunStatus, SyncExecutionClass,
 };
 use std::fs;
 use std::path::Path;
@@ -83,16 +84,15 @@ pub(crate) fn client_check(config: &ClientConfig, _config_path: &str) -> Result<
 }
 
 pub(crate) fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
-    // 0. Run local checks before any remote operations
-    client_check(config, "")?;
-
     let host = config.server.host.as_str();
     let server_command = &config.server.command;
 
-    // Resume any pending cleanups from previous interrupted runs.
-    // This runs before any new transfers so that partially-completed
-    // cleanup does not accumulate.
+    // 0. Resume pending cleanups before any new operations
     resume_pending_cleanups(config)?;
+    resume_pending_postprocess_runs(config)?;
+
+    // 0a. Run local checks before any remote operations
+    client_check(config, "")?;
 
     // 1. Validate postprocess config before any walking
     let sync_names: Vec<purgery_core::SyncName> =
@@ -182,17 +182,204 @@ pub(crate) fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
     }
 }
 
-/// Poll for status via the server's status command.
-pub(crate) fn poll_for_status(
+/// Persist local run state for a postprocess run so waiting/cleanup can
+/// resume after a client crash.
+pub(crate) fn write_client_run_state(
+    state_dir: &str,
+    nickname: &str,
+    run_id: &str,
+    manifest: &Manifest,
+    run_config: &RunConfig,
+    phase: &str,
+    cleanup_complete: bool,
+) -> Result<()> {
+    let run_state = ClientRunState {
+        protocol_version: 1,
+        nickname: nickname.to_owned(),
+        run_id: run_id.to_owned(),
+        manifest: manifest.to_toml()?,
+        run_config: run_config.to_toml()?,
+        phase: phase.to_owned(),
+        cleanup_complete,
+    };
+    let dir = Utf8PathBuf::from(state_dir)
+        .join("runs")
+        .join(format!("{nickname}-{run_id}"));
+    fs::create_dir_all(dir.as_std_path())
+        .with_context(|| format!("failed to create run state dir: {dir}"))?;
+    let path = dir.join("state.toml");
+    let tmp = dir.join("state.toml.tmp");
+    let content = toml::to_string(&run_state)
+        .map_err(|e| anyhow::anyhow!("failed to serialize run state: {e}"))?;
+    fs::write(&tmp, &content).with_context(|| format!("failed to write run state: {tmp}"))?;
+    fs::rename(&tmp, &path).with_context(|| format!("failed to publish run state: {path}"))?;
+    Ok(())
+}
+
+/// Load persisted client run state.
+#[allow(dead_code)]
+pub(crate) fn load_client_run_state(
+    state_dir: &str,
+    nickname: &str,
+    run_id: &str,
+) -> Option<ClientRunState> {
+    let path = Utf8PathBuf::from(state_dir)
+        .join("runs")
+        .join(format!("{nickname}-{run_id}"))
+        .join("state.toml");
+    if !path.exists() {
+        return None;
+    }
+    let content = fs::read_to_string(path.as_std_path()).ok()?;
+    toml::from_str(&content).ok()
+}
+
+/// Remove persisted client run state after cleanup is complete.
+pub(crate) fn remove_client_run_state(state_dir: &str, nickname: &str, run_id: &str) {
+    let dir = Utf8PathBuf::from(state_dir)
+        .join("runs")
+        .join(format!("{nickname}-{run_id}"));
+    let _ = fs::remove_dir_all(dir.as_std_path());
+}
+
+/// Poll for terminal run phase via `run-state`, waiting indefinitely.
+fn wait_for_terminal_run_state(
     host: &str,
     server_command: &str,
     nickname: &purgery_core::Nickname,
     run_id: &RunId,
-) -> Result<RunStatus> {
-    let max_attempts = 60;
-    let poll_interval = Duration::from_secs(2);
+) -> Result<purgery_core::RunStateResponse> {
+    let poll_interval = Duration::from_secs(5);
+    let mut last_phase = String::new();
+    let mut attempts_since_report = 0u64;
 
-    for attempt in 1..=max_attempts {
+    loop {
+        let response: Result<purgery_core::RunStateResponse> = (|| {
+            let output = server_cmd(
+                host,
+                server_command,
+                &[
+                    "run-state",
+                    "--nickname",
+                    nickname.as_str(),
+                    "--run-id",
+                    run_id.as_str(),
+                ],
+            )?;
+            toml::from_str(&output).with_context(|| "failed to parse run-state response")
+        })();
+
+        match response {
+            Ok(state) => {
+                if state.terminal {
+                    info!(
+                        nickname = %nickname.as_str(),
+                        run_id = %run_id.as_str(),
+                        phase = %state.phase,
+                        "run reached terminal phase"
+                    );
+                    return Ok(state);
+                }
+                if state.phase != last_phase {
+                    info!(
+                        nickname = %nickname.as_str(),
+                        run_id = %run_id.as_str(),
+                        phase = %state.phase,
+                        message = %state.message,
+                        "run phase changed"
+                    );
+                    last_phase = state.phase.clone();
+                    attempts_since_report = 0;
+                }
+                attempts_since_report += 1;
+                if attempts_since_report.is_multiple_of(12u64) {
+                    info!(
+                        nickname = %nickname.as_str(),
+                        run_id = %run_id.as_str(),
+                        phase = %last_phase,
+                        "still waiting for server to process run"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    error = %e,
+                    "run-state query failed, retrying"
+                );
+            }
+        }
+
+        std::thread::sleep(poll_interval);
+    }
+}
+
+/// Wait indefinitely for a postprocess run, then clean up.
+pub(crate) fn wait_for_postprocess_run_and_cleanup(
+    config: &ClientConfig,
+    host: &str,
+    server_command: &str,
+    manifest: &Manifest,
+    nickname: &purgery_core::Nickname,
+    run_id: &RunId,
+) -> Result<()> {
+    // Wait for terminal phase via run-state
+    let _terminal = wait_for_terminal_run_state(host, server_command, nickname, run_id)?;
+
+    // Read terminal status
+    let status = read_terminal_status(host, server_command, nickname, run_id)?;
+
+    // Verify status envelope
+    if status.nickname != *nickname {
+        anyhow::bail!(
+            "status nickname '{}' does not match manifest nickname '{}'; aborting deletion",
+            status.nickname.as_str(),
+            nickname.as_str()
+        );
+    }
+    if status.run_id != *run_id {
+        anyhow::bail!(
+            "status run_id '{}' does not match manifest run_id '{}'; aborting deletion",
+            status.run_id.as_str(),
+            run_id.as_str()
+        );
+    }
+
+    // Delete confirmed postprocess files from status
+    let deletion_count = delete_confirmed_files(config, manifest, &status)?;
+    info!(deleted = deletion_count, "cleanup complete");
+
+    // Mark run state complete
+    if let Err(e) = write_client_run_state(
+        &config.state_dir,
+        nickname.as_str(),
+        run_id.as_str(),
+        manifest,
+        &build_run_config(config, true),
+        "cleanup_done",
+        true,
+    ) {
+        warn!(error = %e, "failed to mark run state complete");
+    }
+
+    // Remove local run state after successful cleanup
+    remove_client_run_state(&config.state_dir, nickname.as_str(), run_id.as_str());
+
+    info!(state = %status.state.as_str(), "run finished");
+
+    Ok(())
+}
+
+/// Read terminal status by polling the `status` command.
+fn read_terminal_status(
+    host: &str,
+    server_command: &str,
+    nickname: &purgery_core::Nickname,
+    run_id: &RunId,
+) -> Result<purgery_core::RunStatus> {
+    let poll_interval = Duration::from_secs(2);
+    for attempt in 1..=30 {
         let output = server_cmd(
             host,
             server_command,
@@ -204,27 +391,97 @@ pub(crate) fn poll_for_status(
                 run_id.as_str(),
             ],
         );
-
         if let Ok(content) = output {
             if !content.trim().is_empty() {
-                let status = RunStatus::from_toml(content.trim())
-                    .with_context(|| "failed to parse status from server")?;
-                return Ok(status);
+                return RunStatus::from_toml(content.trim())
+                    .with_context(|| "failed to parse status from server");
             }
         }
-
-        if attempt % 10 == 0 {
-            info!(
-                attempt,
-                max = max_attempts,
-                "waiting for server to process run"
-            );
+        if attempt == 15 {
+            warn!("terminal status still not available after 30s, retrying...");
         }
-
         std::thread::sleep(poll_interval);
     }
+    anyhow::bail!(
+        "terminal status not available for run {}/{} after 60s",
+        nickname.as_str(),
+        run_id.as_str()
+    );
+}
 
-    anyhow::bail!("timed out waiting for server to process run (checked {max_attempts} times)");
+/// Resume pending postprocess runs from local state.
+pub(crate) fn resume_pending_postprocess_runs(config: &ClientConfig) -> Result<()> {
+    let runs_dir = Utf8PathBuf::from(&config.state_dir).join("runs");
+    if !runs_dir.exists() {
+        return Ok(());
+    }
+    let mut entries: Vec<_> = match fs::read_dir(runs_dir.as_std_path()) {
+        Ok(reader) => reader.filter_map(|e| e.ok()).collect(),
+        Err(_) => return Ok(()),
+    };
+    entries.sort_by_key(|e| e.path());
+
+    for entry in entries {
+        let dir_path = entry.path();
+        if !dir_path.is_dir() {
+            continue;
+        }
+        let state_path = dir_path.join("state.toml");
+        if !state_path.exists() {
+            continue;
+        }
+        let content = match fs::read_to_string(&state_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let run_state: ClientRunState = match toml::from_str(&content) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if run_state.cleanup_complete {
+            let _ = fs::remove_dir_all(&dir_path);
+            continue;
+        }
+
+        let nickname = match purgery_core::Nickname::new(run_state.nickname.clone()) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let run_id = match purgery_core::RunId::new(run_state.run_id.clone()) {
+            Ok(id) => id,
+            Err(_) => continue,
+        };
+        let manifest: Manifest = match Manifest::from_toml(&run_state.manifest) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        info!(
+            nickname = %nickname.as_str(),
+            run_id = %run_id.as_str(),
+            "resuming pending postprocess run"
+        );
+
+        let host = config.server.host.as_str();
+        let server_command = &config.server.command;
+
+        if let Err(e) = wait_for_postprocess_run_and_cleanup(
+            config,
+            host,
+            server_command,
+            &manifest,
+            &nickname,
+            &run_id,
+        ) {
+            warn!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                error = %e,
+                "failed to complete pending postprocess run"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Remove local entries that are confirmed imported and still match their uploaded identity.
