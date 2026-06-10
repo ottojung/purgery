@@ -27,10 +27,13 @@ fn find_config() -> Result<String> {
             }
         }
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    let user_path = format!("{home}/.config/purgery/server.toml");
-    if fs::metadata(&user_path).is_ok() {
-        return Ok(user_path);
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            let user_path = format!("{home}/.config/purgery/server.toml");
+            if fs::metadata(&user_path).is_ok() {
+                return Ok(user_path);
+            }
+        }
     }
     let etc_path = "/etc/purgery/server.toml".to_string();
     if fs::metadata(&etc_path).is_ok() {

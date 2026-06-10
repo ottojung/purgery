@@ -28,10 +28,13 @@ fn find_config() -> Result<String> {
             }
         }
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    let user_path = format!("{home}/.config/purgery/client.toml");
-    if fs::metadata(&user_path).is_ok() {
-        return Ok(user_path);
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            let user_path = format!("{home}/.config/purgery/client.toml");
+            if fs::metadata(&user_path).is_ok() {
+                return Ok(user_path);
+            }
+        }
     }
     anyhow::bail!(
         "no client config found; use --config, $PURGERY_CLIENT_CONFIG_PATH, \
@@ -1523,7 +1526,6 @@ delete_after_import = true
     }
 
     #[test]
-    #[ignore = "expected to fail until build_cleanup_entries_from_manifest includes directories and symlinks"]
     fn cleanup_ledger_includes_symlinks_and_directories() {
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("source");
@@ -1566,7 +1568,9 @@ steps = ["compress-video"]
 
         // Must include directories and symlinks even though they have no SHA
         assert!(
-            entries.iter().any(|e| e.kind == ManifestEntryKind::Directory),
+            entries
+                .iter()
+                .any(|e| e.kind == ManifestEntryKind::Directory),
             "cleanup ledger must include directory entries"
         );
         assert!(
@@ -1586,7 +1590,6 @@ steps = ["compress-video"]
     }
 
     #[test]
-    #[ignore = "expected to fail until verify_manifest_entry_local requires SHA for regular files"]
     fn directory_cleanup_refuses_without_sha_on_descendant() {
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("source");
@@ -1625,8 +1628,7 @@ steps = ["compress-video"]
             .entries
             .iter()
             .find(|e| {
-                e.mode == ManifestEntryMode::Covered
-                    && e.kind == ManifestEntryKind::RegularFile
+                e.mode == ManifestEntryMode::Covered && e.kind == ManifestEntryKind::RegularFile
             })
             .expect("must have a covered regular file");
 
