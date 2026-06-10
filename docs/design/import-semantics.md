@@ -183,6 +183,34 @@ If a `status.toml` exists but is malformed (invalid TOML or missing required fie
       ...
 ```
 
+## Postprocessing conformance and import-and-retire
+
+Postprocessing requires `delete_after_import = true`. This is an intentional conformance tradeoff, not an arbitrary safety constraint.
+
+Purgery does not retain indefinite source-file metadata on the server. After a run completes, the server only keeps a bounded run status — it does not maintain a permanent record of every source file's identity, fingerprints, or processing history.
+
+For passthrough imports, this is fine: the archive contains the same file content that came from the source tree. If the same import runs again, rsync converges the archive toward the source tree using ordinary file replacement.
+
+For postprocessed imports, the archive does **not** contain the original source file. It contains transformed outputs: compressed videos, converted files, renamed outputs, or whatever the postprocess step produced. Purgery cannot use the archive alone to answer whether an unchanged local original:
+
+* was already processed;
+* was processed with the same rule set;
+* was processed with the same step definitions;
+* produced the same expected outputs;
+* should be skipped or reprocessed;
+* or represents a changed source that happens to map to the same archive destination.
+
+Solving this would require persistent server-side source fingerprints, retained manifests, retained source metadata, or an indefinitely growing receipt ledger. Purgery explicitly chooses not to have that model.
+
+Therefore, postprocessing is modeled as an import-and-retire operation:
+
+1. The source entry is uploaded into a server run.
+2. The server transforms and commits outputs.
+3. The server writes a bounded run status.
+4. The client deletes the unchanged local regular-file original after server-confirmed import.
+
+The source original is removed from the source tree after successful import, so it will not be repeatedly reprocessed by later runs.
+
 ## Planned final-path validation
 
 A run is rejected before entry processing if planned final paths conflict, including direct manifest-entry paths and postprocess-derived output roots.

@@ -144,7 +144,7 @@ When classifying a manifest entry, only rules applicable to its sync group parti
 
 ### Postprocessing requires delete_after_import
 
-If a sync group has one or more applicable postprocess rules, `delete_after_import` must be `true`. This is validated statically at config parse time, before any filesystem walking or server operations. A sync group with applicable rules but `delete_after_import = false` is rejected.
+If a sync group has one or more applicable postprocess rules, `delete_after_import` must be `true`. This is an intentional conformance tradeoff (see [import semantics](docs/design/import-semantics.md#postprocessing-conformance-and-import-and-retire)). Because Purgery does not retain indefinite source-file metadata, a postprocessed import is import-and-retire: the confirmed local original is removed after successful server-confirmed import.
 
 ### Sync group classes
 
