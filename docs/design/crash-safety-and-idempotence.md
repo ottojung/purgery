@@ -90,7 +90,7 @@ Postprocessing is import-and-retire. Because the server does not retain indefini
 
 ### Postprocess entries (server-confirmed cleanup)
 
-The client may delete a local postprocessed file only after reading a valid `status.toml` whose envelope matches the uploaded manifest:
+The client may remove a local postprocessed entry only after reading a valid `status.toml` whose envelope matches the uploaded manifest:
 
 ```text
 status.nickname == manifest.nickname
@@ -103,13 +103,13 @@ No status means no deletion. An entry is recorded as `imported` only after all o
 - `partial`: at least one entry was imported and at least one failed or was skipped;
 - `failed`: no entries were imported.
 
-The server commits final outputs before atomically publishing successful status. A crash before status publication therefore cannot authorize client deletion of local regular files.
+The server commits final outputs before atomically publishing successful status. A crash before status publication therefore cannot authorize client cleanup of local entries.
 
 ### Passthrough entries with delete_after_import=true
 
-The client may delete a local passthrough file only after a durable cleanup state file on disk records that rsync succeeded. The cleanup state is written atomically (via temporary file + rename) before rsync, with `rsync_succeeded = false`. After rsync succeeds, the success marker is atomically updated to `true`. A crash before the initial write leaves no cleanup state, so deletion is not authorized. A crash between the initial write and the success marker prevents deletion because `rsync_succeeded` remains `false`.
+The client may remove a local passthrough entry only after a durable cleanup state file on disk records that rsync succeeded. The cleanup state is written atomically (via temporary file + rename) before rsync, with `rsync_succeeded = false`. After rsync succeeds, the success marker is atomically updated to `true`. A crash before the initial write leaves no cleanup state, so removal is not authorized. A crash between the initial write and the success marker prevents removal because `rsync_succeeded` remains `false`.
 
-The client verifies local identity (size, mtime, optional SHA-256) against the cleanup state before deleting. Changed files are skipped. Already-deleted files are idempotent.
+The client verifies local identity against the cleanup state before removing. Entry-kind identity checks apply: size, mtime, optional SHA-256 for regular files; link target for symlinks; subtree identity for directories. Changed entries are skipped. Already-removed entries are idempotent.
 
 ## Idempotent tree-overlay invariant
 
@@ -117,7 +117,7 @@ Uploading the same logical tree again replays the same directory, regular-file, 
 
 With deterministic postprocessing, importing the same input tree repeatedly converges to the same final tree and is a semantic no-op. Non-deterministic postprocessing may produce different regular-file content on a later import; replacing the prior output is allowed.
 
-This property makes crash recovery replay-based. A crash may occur after some entries have committed but before `status.toml` is written. The client retains local regular files because no success status exists. On restart, the server replays the processing run from staged entries and converges on the run's result.
+This property makes crash recovery replay-based. A crash may occur after some entries have committed but before `status.toml` is written. The client retains local entries because no success status exists. On restart, the server replays the processing run from staged entries and converges on the run's result.
 
 ## Per-entry replacement invariant
 
@@ -144,17 +144,18 @@ A run affects only outputs it explicitly commits. Purgery does not use `rsync --
 | During upload | The run remains in `incoming/`; its lease and garbage collection handle abandonment. |
 | After `finish-run`, before status | The run is durable in `ready/` or `processing/`. Rerunning the client may upload the same tree again, which is safe. |
 | After server import, before cleanup | A valid server status exists, but the client may upload again after restart. Atomic replacement makes the repeated import safe. |
-| After cleanup | Confirmed local regular files are gone. If a file is later re-created at the same local path, importing it again safely replaces the regular final file. |
+| After cleanup | Confirmed local originals are gone. If an entry is later re-created at the same local path, importing it again safely replaces the archive entry. |
 
 ### Passthrough-specific crash matrix (pure passthrough groups)
 
 | Crash point | Durable result and restart behavior |
 |---|---|
-| Before rsync | No cleanup state exists. |
-| During passthrough rsync | The rsync may partially transfer files. Rerunning the client rsyncs again (idempotent). |
-| After rsync, before cleanup state write | Files were transferred but cleanup is not authorized. Rerunning rsyncs again (idempotent). |
-| After cleanup state written atomically, before deletion | Cleanup state authorizes deletion. Restart reads cleanup state from stable directory and resumes deletion. |
-| After some deletions, before cleanup state updated | Already-deleted files are idempotent (not found = OK). Remaining files are deleted after identity check. Next cleanup state write will atomically update progress. |
+| Before cleanup state write | No cleanup state exists. |
+| After cleanup state written (rsync_succeeded=false), before rsync | Cleanup state exists but rsync has not run. Restart skips cleanup (rsync_succeeded is false). |
+| During passthrough rsync | The rsync may partially transfer entries. Rerunning the client rsyncs again (idempotent). |
+| After rsync, before success marker update | Entries were transferred but cleanup is not authorized (rsync_succeeded is still false). Restart re-runs rsync (idempotent). |
+| After success marker (rsync_succeeded=true), before deletion | Cleanup state authorizes removal. Restart reads cleanup state from stable directory and resumes deletion. |
+| After some deletions, before cleanup state updated | Already-removed entries are idempotent (not found = OK). Remaining entries are removed after identity check. Next cleanup state write atomically updates progress. |
 | After cleanup state updated, all deletions complete | Cleanup state marks all entries as cleaned. Restart sees no pending cleanup. |
 
 ### Cleanup state discovery

@@ -1,6 +1,6 @@
 # Purgery
 
-Purgery imports generated files from devices into a central archive, optionally transforms them, and only removes local originals when doing so is explicitly configured and safe.
+Purgery imports generated filesystem entries from devices into a central archive, optionally transforms them, and only removes local originals when doing so is explicitly configured and safe.
 
 You have photos, videos, recordings, or other generated files on a laptop, camera SD card, or similar device. They fill up local storage. You want to move them into a central archive — and maybe compress or convert them on the way — without risking data loss.
 
@@ -113,7 +113,7 @@ For this reason, a source tree with transforms **must** also enable cleanup (`de
 1. the source entry is uploaded into a server run;
 2. the server transforms and commits outputs;
 3. the server writes a bounded run status;
-4. the client deletes the unchanged local regular-file original after server-confirmed import.
+4. the client removes the unchanged local original after server-confirmed import.
 
 This prevents repeated reprocessing of the same original on subsequent runs.
 
@@ -125,14 +125,14 @@ Purgery targets Unix/POSIX filesystem semantics and is conservative about data l
 
 - For **passthrough imports**, cleanup is opt-in per source tree (`delete_after_import = true`). A passthrough source tree with `delete_after_import = false` does not clean up local originals.
 - For **transformed imports**, cleanup is required by the conformance model. Because the server does not retain indefinite source-file metadata and transformed outputs are not the original files, the source original must be retired locally after successful import (import-and-retire). See [Transform and cleanup coupling](#transform-and-cleanup-coupling).
-- **Transformed imports**: cleanup is server-confirmed. The client deletes local regular files only after the server confirms the import in a valid status record whose nickname and run ID match the original upload.
-- **Passthrough imports with delete-after-import**: cleanup is transfer-confirmed. A durable local state file is atomically recorded after successful transfer to the archive. The client verifies the local file still matches its uploaded identity before deletion.
-- **Passthrough imports without delete-after-import**: no cleanup occurs. The local file remains after transfer.
-- Before any deletion, the client verifies the local regular file still matches its uploaded identity (size, mtime, optional SHA-256).
+- **Transformed imports**: cleanup is server-confirmed. The client removes local originals only after the server confirms the import in a valid status record whose nickname and run ID match the original upload.
+- **Passthrough imports with delete-after-import**: cleanup is transfer-confirmed. A durable local state file is atomically recorded after successful transfer to the archive. The client verifies the local entry still matches its uploaded identity before removal.
+- **Passthrough imports without delete-after-import**: no cleanup occurs. The local entry remains after transfer.
+- Before any removal, the client verifies the local entry still matches its uploaded identity (size, mtime, optional SHA-256 for regular files; link target for symlinks; subtree identity for directories).
 - The server performs a recursive merge into the archive: directories merge, regular files replace existing ones, symlinks remain symlinks, and absent source entries never delete archive entries.
 - Symlink targets are literal data. The server never follows staged or archive symlinks as directories.
 - Tree imports provide replayable convergence through crash-safe per-entry commits, not an all-or-nothing transaction.
-- Transforms apply to directories, regular files, and symlinks. Client cleanup remains conservative and deletes only confirmed unchanged local regular files.
+- Transforms apply to directories, regular files, and symlinks. Client cleanup remains conservative and removes only confirmed unchanged local originals, respecting entry-kind identity checks (symlinks are unlinked without following the target; directories are removed bottom-up only when safe).
 - Overlapping source trees that would produce the same archive path are rejected rather than resolved by ordering.
 
 ## More documentation

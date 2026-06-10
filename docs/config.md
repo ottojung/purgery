@@ -218,7 +218,7 @@ After config validation, each sync group is classified into one of three executi
 | Class | Applicable rules | delete_after_import | Behavior |
 |-------|-----------------|---------------------|----------|
 | `PassthroughNoDelete` | none | false | Direct unfiltered rsync, no walk, no metadata, no cleanup |
-| `PassthroughDeleteAfterImport` | none | true | Direct unfiltered rsync plus durable cleanup scan for regular files |
+| `PassthroughDeleteAfterImport` | none | true | Direct unfiltered rsync plus durable cleanup capture for all entry kinds |
 | `Purgatory` | non-empty | true | Walk, classify, upload manifest, server processing, status-based cleanup |
 
 Passthrough groups do not participate in purgatory run config, server manifest, status, or processing. In mixed invocations, passthrough destinations are resolved separately from the purgatory run via `resolve-destinations`.
@@ -336,12 +336,19 @@ There are two distinct cleanup authorities:
 
 2. **Server-confirmed cleanup** — applies to transformed/postprocessed entries. Local deletion is authorized by a valid server status file whose nickname and run ID match the original upload. The client verifies the status entry shows `imported` and the local identity still matches before deleting.
 
+### Cleanup by entry kind
+
+Cleanup identity is checked per entry kind:
+
+- **Regular files**: size, mtime, and optional SHA-256 must match the captured identity.
+- **Symlinks**: the literal link target must match the captured identity. The symlink is unlinked without following the target. The target path is never modified.
+- **Directories**: tracked descendants must still match their captured identities. Removal is bottom-up: child entries are removed first, then the directory itself. If new or changed entries appeared inside after identity capture, the directory is left in place.
+
 ### Import modes and cleanup
 
-- **Passthrough regular files with `delete_after_import = false`**: not cleaned locally. No identity bookkeeping.
-- **Passthrough regular files with `delete_after_import = true`**: transfer-confirmed cleanup. Cleaned locally after durable disk-backed state atomically records rsync success. Local identity (size, mtime, optional SHA-256) is verified before deletion.
-- **Postprocessed regular files**: server-confirmed cleanup. Deleted after server status confirms the entry as imported.
-- **Directories and symlinks**: never deleted regardless of mode.
+- **Passthrough entries with `delete_after_import = false`**: not cleaned locally. No identity bookkeeping.
+- **Passthrough entries with `delete_after_import = true`**: transfer-confirmed cleanup. Cleaned locally after durable disk-backed state atomically records rsync success. Entry-kind identity checks apply.
+- **Postprocessed entries**: server-confirmed cleanup. Removed after server status confirms the entry as imported. Entry-kind identity checks apply.
 
 ### Durable cleanup state
 

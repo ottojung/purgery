@@ -249,4 +249,10 @@ Passthrough entries with `delete_after_import = false` are never cleaned.
 
 ### General properties
 
-Deletion is idempotent. If the local file is already gone, it is counted as a successful cleanup. If the file changed since upload, the client leaves it untouched. Directories and symlinks are never deleted.
+Deletion is idempotent. If the local entry is already gone, it is counted as a successful cleanup. If the entry changed since upload, the client leaves it untouched.
+
+Cleanup identity is checked per entry kind:
+
+- **Regular files**: size, mtime, and optional SHA-256 must match.
+- **Symlinks**: the literal link target string must match. The symlink is unlinked without following the target. The target path itself is never modified.
+- **Directories**: the directory must exist and its tracked descendants must still match their captured identities. Directories are removed bottom-up: child entries are removed first, then the directory itself. If new or changed entries appeared inside the directory after identity capture, the directory is left in place.

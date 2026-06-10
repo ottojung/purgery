@@ -47,7 +47,7 @@ server: claim run by renaming ready -> processing
 server: process postprocess entries
 server: publish status for postprocess entries
 server: write status.toml, move to done or failed
-client: poll status, verify envelope, cleanup postprocessed regular files
+client: poll status, verify envelope, cleanup postprocessed entries
 ```
 
 Passthrough groups are handled entirely outside the purgatory run lifecycle.
