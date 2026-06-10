@@ -658,7 +658,6 @@ steps = ["compress-video"]
     }
 
     #[test]
-    #[ignore = "expected to fail until directory cleanup verifies child identity"]
     fn delete_confirmed_files_skips_directory_with_changed_known_child() {
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("source");
@@ -730,7 +729,6 @@ steps = ["compress-video"]
     }
 
     #[test]
-    #[ignore = "expected to fail until process_cleanup_state_file verifies child identity"]
     fn process_cleanup_state_file_skips_directory_with_changed_known_child() {
         let tmp = tempfile::tempdir().unwrap();
         let dir_path = tmp.path().join("photos");
