@@ -541,7 +541,10 @@ pub fn run_state(
 fn dir_modified_at(dir: &camino::Utf8Path) -> Option<u64> {
     let meta = std::fs::symlink_metadata(dir.as_std_path()).ok()?;
     let modified = meta.modified().ok()?;
-    modified.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs())
+    modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
 }
 
 /// Side-effect-free server check: verify config and programs without creating anything.

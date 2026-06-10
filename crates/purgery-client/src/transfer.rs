@@ -669,6 +669,17 @@ pub(crate) fn run_postprocess_path(
         if let Some(err) = hb_error.lock().unwrap().take() {
             anyhow::bail!("{err}");
         }
+        // Persist local run state BEFORE calling finish-run, so a crash
+        // after finish-run succeeds can be resumed with the same run.
+        let run_config = build_run_config(config, true);
+        crate::run::write_client_run_state(
+            &config.state_dir,
+            config.nickname.as_str(),
+            run_id.as_str(),
+            manifest,
+            &run_config,
+            ClientRunPhase::UploadCompleteFinishPending,
+        )?;
         info!("finishing run");
         server_cmd(
             host,
@@ -683,16 +694,14 @@ pub(crate) fn run_postprocess_path(
         )?;
         info!("finish-run accepted");
 
-        // Persist local run state before returning, so waiting/cleanup
-        // can resume after a client crash.
-        let run_config = build_run_config(config, true);
+        // Transition to waiting state after finish-run succeeds
         crate::run::write_client_run_state(
             &config.state_dir,
             config.nickname.as_str(),
             run_id.as_str(),
             manifest,
             &run_config,
-            ClientRunPhase::UploadCompleteFinishPending,
+            ClientRunPhase::WaitingForTerminalState,
         )?;
 
         Ok(())

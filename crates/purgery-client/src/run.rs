@@ -426,13 +426,11 @@ pub(crate) fn resume_pending_postprocess_runs(config: &ClientConfig) -> Result<(
     if !runs_dir.exists() {
         return Ok(());
     }
-    let mut entries: Vec<_> = match fs::read_dir(runs_dir.as_std_path()) {
-        Ok(reader) => reader.filter_map(|e| e.ok()).collect(),
-        Err(_) => return Ok(()),
-    };
-    entries.sort_by_key(|e| e.path());
 
-    for entry in entries {
+    for entry in fs::read_dir(runs_dir.as_std_path())
+        .with_context(|| format!("failed to read runs dir: {runs_dir}"))?
+    {
+        let entry = entry?;
         let dir_path = entry.path();
         if !dir_path.is_dir() {
             continue;
@@ -441,14 +439,10 @@ pub(crate) fn resume_pending_postprocess_runs(config: &ClientConfig) -> Result<(
         if !state_path.exists() {
             continue;
         }
-        let content = match fs::read_to_string(&state_path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let run_state: ClientRunState = match toml::from_str(&content) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
+        let content = fs::read_to_string(&state_path)
+            .with_context(|| format!("failed to read run state: {}", state_path.display()))?;
+        let run_state: ClientRunState = toml::from_str(&content)
+            .with_context(|| format!("failed to parse run state: {}", state_path.display()))?;
 
         match run_state.phase {
             ClientRunPhase::CleanupComplete => {
@@ -456,31 +450,25 @@ pub(crate) fn resume_pending_postprocess_runs(config: &ClientConfig) -> Result<(
                 continue;
             }
             ClientRunPhase::Abandoned => {
+                // Abandoned state is a durable diagnostic tombstone.
+                // Do not auto-remove it. Do not delete originals.
+                // An explicit future command or manual user action must clear it.
                 warn!(
                     nickname = %run_state.nickname,
                     run_id = %run_state.run_id,
-                    "run was previously marked as abandoned, skipping"
+                    "run was previously marked as abandoned; state retained as diagnostic tombstone"
                 );
-                let _ = fs::remove_dir_all(&dir_path);
                 continue;
             }
-            _ => {
-                // Continue to resume below
-            }
+            _ => {}
         }
 
-        let nickname = match purgery_core::Nickname::new(run_state.nickname.clone()) {
-            Ok(n) => n,
-            Err(_) => continue,
-        };
-        let run_id = match purgery_core::RunId::new(run_state.run_id.clone()) {
-            Ok(id) => id,
-            Err(_) => continue,
-        };
-        let manifest: Manifest = match Manifest::from_toml(&run_state.manifest) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
+        let nickname = purgery_core::Nickname::new(run_state.nickname.clone())
+            .with_context(|| format!("invalid nickname in run state: {}", state_path.display()))?;
+        let run_id = purgery_core::RunId::new(run_state.run_id.clone())
+            .with_context(|| format!("invalid run ID in run state: {}", state_path.display()))?;
+        let manifest = Manifest::from_toml(&run_state.manifest)
+            .with_context(|| format!("invalid manifest in run state: {}", state_path.display()))?;
 
         info!(
             nickname = %nickname.as_str(),
@@ -494,7 +482,7 @@ pub(crate) fn resume_pending_postprocess_runs(config: &ClientConfig) -> Result<(
 
         // Handle upload_complete_finish_pending: check server phase
         if run_state.phase == ClientRunPhase::UploadCompleteFinishPending {
-            let run_state_resp = match (|| -> Result<purgery_core::RunStateResponse> {
+            let run_state_resp = (|| -> Result<purgery_core::RunStateResponse> {
                 let output = server_cmd(
                     host,
                     server_command,
@@ -507,18 +495,14 @@ pub(crate) fn resume_pending_postprocess_runs(config: &ClientConfig) -> Result<(
                     ],
                 )?;
                 toml::from_str(&output).with_context(|| "failed to parse run-state")
-            })() {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!(
-                        nickname = %nickname.as_str(),
-                        run_id = %run_id.as_str(),
-                        error = %e,
-                        "run-state query failed during resume, skipping"
-                    );
-                    continue;
-                }
-            };
+            })()
+            .with_context(|| {
+                format!(
+                    "run-state query failed for pending run {}/{}",
+                    nickname.as_str(),
+                    run_id.as_str()
+                )
+            })?;
 
             match run_state_resp.phase.as_str() {
                 "incoming" => {
@@ -527,7 +511,7 @@ pub(crate) fn resume_pending_postprocess_runs(config: &ClientConfig) -> Result<(
                         run_id = %run_id.as_str(),
                         "run still incoming, issuing finish-run"
                     );
-                    if let Err(e) = server_cmd(
+                    server_cmd(
                         host,
                         server_command,
                         &[
@@ -537,15 +521,14 @@ pub(crate) fn resume_pending_postprocess_runs(config: &ClientConfig) -> Result<(
                             "--run-id",
                             run_id.as_str(),
                         ],
-                    ) {
-                        warn!(
-                            nickname = %nickname.as_str(),
-                            run_id = %run_id.as_str(),
-                            error = %e,
-                            "finish-run failed during resume"
-                        );
-                        continue;
-                    }
+                    )
+                    .with_context(|| {
+                        format!(
+                            "finish-run failed during resume for run {}/{}",
+                            nickname.as_str(),
+                            run_id.as_str()
+                        )
+                    })?;
                 }
                 "not_found" => {
                     warn!(
@@ -553,15 +536,19 @@ pub(crate) fn resume_pending_postprocess_runs(config: &ClientConfig) -> Result<(
                         run_id = %run_id.as_str(),
                         "run not found on server, marking as abandoned"
                     );
-                    let _ = write_client_run_state(
+                    write_client_run_state(
                         &config.state_dir,
                         nickname.as_str(),
                         run_id.as_str(),
                         &manifest,
                         &build_run_config(config, true),
                         ClientRunPhase::Abandoned,
+                    )?;
+                    anyhow::bail!(
+                        "run {}/{} not found on server; marked as abandoned without deletion",
+                        nickname.as_str(),
+                        run_id.as_str()
                     );
-                    continue;
                 }
                 _ => {
                     // ready, processing, done, failed — proceed to waiting
@@ -569,21 +556,22 @@ pub(crate) fn resume_pending_postprocess_runs(config: &ClientConfig) -> Result<(
             }
         }
 
-        if let Err(e) = wait_for_postprocess_run_and_cleanup(
+        // For all non-terminal phases, wait and clean up
+        wait_for_postprocess_run_and_cleanup(
             config,
             host,
             server_command,
             &manifest,
             &nickname,
             &run_id,
-        ) {
-            warn!(
-                nickname = %nickname.as_str(),
-                run_id = %run_id.as_str(),
-                error = %e,
-                "failed to complete pending postprocess run"
-            );
-        }
+        )
+        .with_context(|| {
+            format!(
+                "failed to complete pending postprocess run {}/{}",
+                nickname.as_str(),
+                run_id.as_str()
+            )
+        })?;
     }
     Ok(())
 }
