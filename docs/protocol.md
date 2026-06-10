@@ -322,14 +322,37 @@ incoming -> ready -> processing -> done
 | `partial` | Some postprocess entries imported, some failed or skipped |
 | `failed` | No postprocess entries imported |
 
-## Cleanup identity
+### Run phase reporting
 
-Regular files that can authorise local deletion must have SHA-256 identity.
+The server provides two commands for reading run status:
 
-- **Postprocess entries**: SHA-256 is computed during manifest building. SHA failure is fatal.
-- **Passthrough entries with `delete_after_import = true`**: SHA-256 is captured for the cleanup ledger. In pure passthrough capture, an unhashable regular file is silently skipped with a warning. In manifest-included entries, SHA failure is fatal.
-- **Directories**: identity is verified bottom-up through known descendants. A directory is not removed if any known regular-file descendant lacks SHA identity or SHA recomputation fails.
-- **Symlinks**: identity is the literal link target.
+* **`status`** — returns terminal status from `done/` or `failed/`. Fails if the run is not yet terminal.
+* **`run-state --nickname <n> --run-id <id>`** — returns the current filesystem phase without requiring terminal status.
+
+`run-state` returns TOML:
+
+```toml
+protocol_version = 1
+nickname = "laptop"
+run_id = "01ARZ..."
+phase = "processing"       # incoming | ready | processing | done | failed | not_found
+terminal = false
+message = "run phase: processing"
+updated_at_unix_secs = 1234567890
+```
+
+Non-terminal phases (`incoming`, `ready`, `processing`, `not_found`) have `terminal = false`.
+Terminal phases (`done`, `failed`) have `terminal = true`.
+
+### Processing progress
+
+While a run is in `processing/`, the server writes a progress file:
+
+```text
+{purgery_root}/{nickname}/processing/{run_id}/progress.toml
+```
+
+The file is updated atomically when processing starts, before each manifest entry, and after completion. The client can query `run-state` to see that the run is still in `processing`, which tells it the server is still working.
 
 ## Subprocess argv hardening
 

@@ -13,7 +13,7 @@ use crate::commit::{
     commit_directory_entry, commit_output_entry, commit_regular_file_entry, commit_symlink_entry,
 };
 use crate::gc::run_gc;
-use crate::phases::{finalize_processing_run, move_to_failed, write_run_failure};
+use crate::phases::{finalize_processing_run, move_to_failed, write_progress, write_run_failure};
 use crate::postprocess::apply_postprocessing;
 use crate::recover::recover_or_process_processing_run;
 use crate::RunPlan;
@@ -692,6 +692,18 @@ pub fn process_processing_run(
 
     let mut failed_sync_roots: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    // Write initial progress before processing entries
+    let _ = write_progress(
+        &processing_path,
+        nickname,
+        run_id,
+        "processing_started",
+        0,
+        manifest.entries.len(),
+        "",
+        "",
+    );
+
     for sync in run_config.sync.iter() {
         if !used_sync_names.contains(sync.name.as_str()) {
             continue;
@@ -714,7 +726,17 @@ pub fn process_processing_run(
 
     let mut outcomes: Vec<EntryOutcome> = Vec::new();
 
-    for entry in &manifest.entries {
+    for (entry_idx, entry) in manifest.entries.iter().enumerate() {
+        let _ = write_progress(
+            &processing_path,
+            nickname,
+            run_id,
+            "processing_entry",
+            entry_idx,
+            manifest.entries.len(),
+            entry.relative_path.as_str(),
+            "",
+        );
         let sync_name = entry.sync_name.as_str();
         let Some(sync) = sync_map.get(sync_name) else {
             warn!(

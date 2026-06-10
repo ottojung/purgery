@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use camino::Utf8Path;
-use purgery_core::{Nickname, PurgeryRoot, RunId, RunPhase, RunState, RunStatus, ServerConfig};
+use purgery_core::{
+    Nickname, ProcessingProgress, PurgeryRoot, RunId, RunPhase, RunState, RunStatus, ServerConfig,
+};
 use std::fs;
 use tracing::warn;
 
@@ -12,6 +14,45 @@ pub(crate) fn publish_status_atomic(directory: &Utf8Path, status: &RunStatus) ->
         .with_context(|| format!("failed to write temporary status: {}", temporary))?;
     fs::rename(&temporary, &final_path)
         .with_context(|| format!("failed to publish status: {}", final_path))?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_progress(
+    processing_path: &Utf8Path,
+    nickname: &Nickname,
+    run_id: &RunId,
+    state: &str,
+    entry_index: usize,
+    entry_total: usize,
+    current_entry: &str,
+    current_step: &str,
+) -> Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let progress = ProcessingProgress {
+        protocol_version: 1,
+        nickname: nickname.as_str().to_owned(),
+        run_id: run_id.as_str().to_owned(),
+        phase: "processing".to_string(),
+        state: state.to_owned(),
+        entry_index,
+        entry_total,
+        current_entry: current_entry.to_owned(),
+        current_step: current_step.to_owned(),
+        started_at_unix_secs: now,
+        updated_at_unix_secs: now,
+    };
+    let content = toml::to_string(&progress)
+        .map_err(|e| anyhow::anyhow!("failed to serialize progress: {e}"))?;
+    let tmp = processing_path.join("progress.toml.tmp");
+    let final_path = processing_path.join("progress.toml");
+    fs::write(&tmp, &content)
+        .with_context(|| format!("failed to write progress: {}", tmp.as_str()))?;
+    fs::rename(&tmp, &final_path)
+        .with_context(|| format!("failed to publish progress: {}", final_path.as_str()))?;
     Ok(())
 }
 

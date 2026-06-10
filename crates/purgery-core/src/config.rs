@@ -447,3 +447,44 @@ pub struct SyncPassthroughDestination {
     pub sync_name: String,
     pub passthrough_dest: String,
 }
+
+// ── Run State / Progress ─────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunStateResponse {
+    pub protocol_version: u32,
+    pub nickname: String,
+    pub run_id: String,
+    pub phase: String,
+    pub terminal: bool,
+    pub message: String,
+    pub updated_at_unix_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessingProgress {
+    pub protocol_version: u32,
+    pub nickname: String,
+    pub run_id: String,
+    pub phase: String,
+    pub state: String,
+    pub entry_index: usize,
+    pub entry_total: usize,
+    pub current_entry: String,
+    pub current_step: String,
+    pub started_at_unix_secs: u64,
+    pub updated_at_unix_secs: u64,
+}
+
+/// Client-persisted state for a postprocess run, used to resume
+/// waiting and cleanup after a crash.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientRunState {
+    pub protocol_version: u32,
+    pub nickname: String,
+    pub run_id: String,
+    pub manifest: String,
+    pub run_config: String,
+    pub phase: String,
+    pub cleanup_complete: bool,
+}

@@ -443,6 +443,58 @@ pub fn read_run_status(
     );
 }
 
+/// Read the current run phase without requiring terminal status.
+/// Returns a RunStateResponse describing the run's filesystem phase.
+pub fn run_state(
+    config: &ServerConfig,
+    nickname: &Nickname,
+    run_id: &RunId,
+) -> Result<purgery_core::RunStateResponse> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let phases = [
+        (RunPhase::Incoming, "incoming"),
+        (RunPhase::Ready, "ready"),
+        (RunPhase::Processing, "processing"),
+        (RunPhase::Done, "done"),
+        (RunPhase::Failed, "failed"),
+    ];
+
+    for (phase, phase_str) in &phases {
+        let dir = config.purgery_root.run_dir(nickname, run_id, *phase);
+        if !dir.exists() {
+            continue;
+        }
+        let is_terminal = *phase == RunPhase::Done || *phase == RunPhase::Failed;
+        let message = if is_terminal {
+            format!("run is {}", phase_str)
+        } else {
+            format!("run phase: {}", phase_str)
+        };
+        return Ok(purgery_core::RunStateResponse {
+            protocol_version: 1,
+            nickname: nickname.as_str().to_owned(),
+            run_id: run_id.as_str().to_owned(),
+            phase: phase_str.to_string(),
+            terminal: is_terminal,
+            message,
+            updated_at_unix_secs: now,
+        });
+    }
+
+    Ok(purgery_core::RunStateResponse {
+        protocol_version: 1,
+        nickname: nickname.as_str().to_owned(),
+        run_id: run_id.as_str().to_owned(),
+        phase: "not_found".to_string(),
+        terminal: false,
+        message: "no matching run found".to_string(),
+        updated_at_unix_secs: now,
+    })
+}
+
 /// Side-effect-free server check: verify config and programs without creating anything.
 pub fn server_check(config: &ServerConfig) -> Result<()> {
     info!("checking server configuration");
