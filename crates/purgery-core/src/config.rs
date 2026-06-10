@@ -476,6 +476,17 @@ pub struct ProcessingProgress {
     pub updated_at_unix_secs: u64,
 }
 
+/// Client-persisted phases for a postprocess run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientRunPhase {
+    UploadCompleteFinishPending,
+    WaitingForTerminalState,
+    TerminalStatusSeen,
+    CleanupComplete,
+    Abandoned,
+}
+
 /// Client-persisted state for a postprocess run, used to resume
 /// waiting and cleanup after a crash.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -485,6 +496,5 @@ pub struct ClientRunState {
     pub run_id: String,
     pub manifest: String,
     pub run_config: String,
-    pub phase: String,
-    pub cleanup_complete: bool,
+    pub phase: ClientRunPhase,
 }
