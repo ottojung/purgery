@@ -181,7 +181,7 @@ Before a sync group is scanned, the client computes `applicable_rules(sync_name)
 
 A sync group with applicable postprocess rules must set `delete_after_import = true`. This is not an arbitrary safety constraint — it follows from Purgery's import-and-retire model.
 
-Why this rule exists: Purgery does not retain indefinite source-file metadata on the server. Because transformed outputs are not the original source files, the final archive alone cannot tell Purgery whether an unchanged local original has already been processed in a previous run. It cannot know:
+Why this rule exists: Purgery does not retain indefinite source-entry metadata on the server. Because transformed outputs are not the original source entries, the final archive alone cannot tell Purgery whether an unchanged local original has already been processed in a previous run. It cannot know:
 
 * whether the original was already processed;
 * whether it was processed with the same rule set and step definitions;

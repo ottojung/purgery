@@ -64,15 +64,15 @@ For ordinary passthrough entries with `delete_after_import = false`:
 - No cleanup state is written
 - The only operation is direct rsync
 
-For ordinary passthrough regular files with `delete_after_import = true`:
+For ordinary passthrough entries with `delete_after_import = true`:
 
-- Size, mtime_ns, and optional SHA-256 are computed
+- Identity is captured per entry kind: size, mtime_ns, and optional SHA-256 for regular files; link target for symlinks; existence and captured descendants for directories
 - Durable cleanup state is written atomically to the stable state directory
-- Cleanup verifies local identity before deletion
+- Cleanup verifies local identity before removal
 
 ### Durable cleanup state
 
-The cleanup state is stored in the client's state directory, defaulting to `$XDG_STATE_HOME/purgery/` or `~/.local/state/purgery/` (configurable via `state_dir` in the client config). It is never stored in a temporary directory. For a sync group with `delete_after_import = true`, the client writes a durable cleanup state file atomically after confirming rsync success. This state records the file identity (size, mtime, optional SHA-256) and is used on restart to safely delete confirmed files. The cleanup state is replayable and idempotent: already-deleted files are safe, changed files are skipped.
+The cleanup state is stored in the client's state directory, defaulting to `$XDG_STATE_HOME/purgery/` or `~/.local/state/purgery/` (configurable via `state_dir` in the client config). It is never stored in a temporary directory. For a sync group with `delete_after_import = true`, the client writes a durable cleanup state file atomically before rsync, with `rsync_succeeded = false`. After rsync succeeds, the success marker is atomically updated to `true`. The state records identity per entry kind (size, mtime, optional SHA-256 for regular files; link target for symlinks; subtree entries for directories). The cleanup state is replayable and idempotent: already-removed entries are safe, changed entries are skipped.
 
 After each successful deletion, the cleanup state is rewritten atomically (temp file + rename). A crash during cleanup does not make progress ambiguous: already-deleted entries are idempotent, pending entries are retried.
 
@@ -119,7 +119,7 @@ A directory selected for postprocessing is a subtree transformation root:
 - Covered descendants are not independent transfer roots.
 - The purgatory rsync filter includes the entire directory subtree.
 - The server processes the directory root as one postprocess input.
-- Covered descendants are skipped in status and never cleaned locally.
+- Covered descendants are skipped in status and are not independently cleaned from server status. They are retired as part of the postprocessed directory root's all-or-nothing cleanup when the root subtree is verified and removed bottom-up.
 
 ## Postprocessing applies to all entry kinds
 
@@ -187,11 +187,9 @@ If a `status.toml` exists but is malformed (invalid TOML or missing required fie
 
 Postprocessing requires `delete_after_import = true`. This is an intentional conformance tradeoff, not an arbitrary safety constraint.
 
-Purgery does not retain indefinite source-file metadata on the server. After a run completes, the server only keeps a bounded run status — it does not maintain a permanent record of every source file's identity, fingerprints, or processing history.
+Purgery does not retain indefinite source-entry metadata on the server. After a run completes, the server only keeps a bounded run status — it does not maintain a permanent record of every source entry's identity, fingerprints, or processing history.
 
-For passthrough imports, this is fine: the archive contains the same file content that came from the source tree. If the same import runs again, rsync converges the archive toward the source tree using ordinary file replacement.
-
-For postprocessed imports, the archive does **not** contain the original source file. It contains transformed outputs: compressed videos, converted files, renamed outputs, or whatever the postprocess step produced. Purgery cannot use the archive alone to answer whether an unchanged local original:
+For postprocessed imports, the archive does **not** contain the original source entry. It contains transformed outputs: compressed files, converted files, renamed outputs, generated directories, or whatever the postprocess step produced. Purgery cannot use the archive alone to answer whether an unchanged local original:
 
 * was already processed;
 * was processed with the same rule set;
