@@ -1883,11 +1883,9 @@ delete_after_import = true
     }
 
     /// Scan production .rs files for stray debug output (eprintln!, println!, dbg!).
-    /// Test modules (dirs named "tests" or files inside test directories) are excluded.
-    /// Non-test modules inside lib.rs/main.rs are included — debug output there is a
-    /// diagnostics policy violation.
+    /// Test-only directories ("tests") are excluded entirely.
+    /// Within production files, scanning stops at `#[cfg(test)]`.
     #[test]
-    #[ignore = "expected to fail until stray debug output is removed from production code"]
     fn production_code_has_no_stray_debug_output() {
         let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -1899,10 +1897,7 @@ delete_after_import = true
 
         for entry in walkdir::WalkDir::new(&crate_dir)
             .into_iter()
-            .filter_entry(|e| {
-                // Skip test-only directories
-                e.file_name() != "tests"
-            })
+            .filter_entry(|e| e.file_name() != "tests")
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
             .filter(|e| e.path().extension().map(|x| x == "rs").unwrap_or(false))
@@ -1910,6 +1905,10 @@ delete_after_import = true
             let content = std::fs::read_to_string(entry.path()).unwrap();
             for (lineno, line) in content.lines().enumerate() {
                 let trimmed = line.trim();
+                // Stop scanning at test modules
+                if trimmed.starts_with("#[cfg(test)]") {
+                    break;
+                }
                 // Skip commented lines
                 if trimmed.starts_with("//") {
                     continue;

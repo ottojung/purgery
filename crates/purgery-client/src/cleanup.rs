@@ -355,7 +355,6 @@ pub(crate) fn process_cleanup_state_file(state_path: &Utf8Path) -> Result<()> {
             ManifestEntryKind::Symlink => {
                 // Verify it's still a symlink
                 if !symmeta.file_type().is_symlink() {
-                    eprintln!("DEBUG symlink: not symlink type={:?}", symmeta.file_type());
                     continue;
                 }
                 // Verify the link target matches
@@ -366,7 +365,6 @@ pub(crate) fn process_cleanup_state_file(state_path: &Utf8Path) -> Result<()> {
                     );
                     continue;
                 };
-                eprintln!("DEBUG symlink: target={}", expected_target);
                 let Ok(current_target) = fs::read_link(local_path) else {
                     warn!(
                         "failed to read symlink target for '{}', not removing",
