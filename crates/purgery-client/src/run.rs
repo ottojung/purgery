@@ -227,7 +227,7 @@ pub(crate) fn poll_for_status(
     anyhow::bail!("timed out waiting for server to process run (checked {max_attempts} times)");
 }
 
-/// Delete local files that are confirmed imported and still match their uploaded identity.
+/// Remove local entries that are confirmed imported and still match their uploaded identity.
 pub(crate) fn delete_confirmed_files(
     config: &ClientConfig,
     manifest: &Manifest,

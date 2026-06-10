@@ -604,7 +604,7 @@ pub(crate) fn run_postprocess_path(
                 );
             }
 
-            // Process cleanup state: delete files whose identity still matches
+            // Process cleanup state: remove entries whose identity still matches
             if let Some(ref sp) = state_path {
                 process_cleanup_state_file(sp)
                     .with_context(|| "failed to process cleanup state")?;
