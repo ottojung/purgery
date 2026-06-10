@@ -1417,8 +1417,8 @@ impl RunPlan {
             .any(|r| r.applies_to(sync_name) && r.is_match(normalized_path))
     }
 
-    /// Collect postprocess step names from all rules that apply to the given
-    /// sync group and match the given normalized relative path.
+    /// Return step names from the first matching rule for the given sync group
+    /// and normalized relative path. Later matching rules are ignored (first-match-wins).
     pub fn selected_steps_for(&self, sync_name: &str, normalized_path: &str) -> Vec<String> {
         self.rules
             .iter()
