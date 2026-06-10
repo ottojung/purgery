@@ -61,19 +61,35 @@ pub(crate) fn walk_and_classify_sync(
         };
         let postprocess_steps: Vec<String> =
             matched_rule.map(|r| r.steps.clone()).unwrap_or_default();
-        let needs_bookkeeping = matched_rule.is_some() || sync.delete_after_import;
 
         let (kind, size, mtime_ns, sha256, link_target) = if file_type.is_dir() {
             (ManifestEntryKind::Directory, 0, 0, None, None)
         } else if file_type.is_file() {
-            let (mtime_ns, sha256) = if needs_bookkeeping {
+            let (mtime_ns, sha256) = if matched_rule.is_some() {
+                // Postprocess entries require SHA-256 for server-side identity verification
                 let mtime_ns = metadata
                     .modified()
                     .ok()
                     .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
                     .map(|duration| duration.as_nanos() as i64)
                     .unwrap_or(0);
-                (mtime_ns, compute_sha256(path).ok())
+                let sha256 = compute_sha256(path).with_context(|| {
+                    format!(
+                        "failed to compute SHA-256 for postprocess entry: {}",
+                        path.display()
+                    )
+                })?;
+                (mtime_ns, Some(sha256))
+            } else if sync.delete_after_import {
+                // Passthrough entries with delete-after-import: compute SHA for cleanup identity
+                let mtime_ns = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_nanos() as i64)
+                    .unwrap_or(0);
+                let sha256 = compute_sha256(path).ok();
+                (mtime_ns, sha256)
             } else {
                 (0, None)
             };

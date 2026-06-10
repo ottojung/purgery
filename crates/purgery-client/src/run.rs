@@ -471,10 +471,18 @@ pub(crate) fn delete_confirmed_files(
 
                     let matches_size = current_size == manifest_entry.size;
                     let matches_mtime = current_mtime == manifest_entry.mtime_ns;
-                    let matches_sha = if let Some(ref expected_sha) = manifest_entry.sha256 {
-                        compute_sha256(local_path).ok().as_deref() == Some(expected_sha)
-                    } else {
-                        true
+                    let matches_sha = match &manifest_entry.sha256 {
+                        Some(expected_sha) => match compute_sha256(local_path) {
+                            Ok(actual_sha) => &actual_sha == expected_sha,
+                            Err(_) => {
+                                warn!(path = %local_path.display(), "SHA-256 computation failed during cleanup verification, not removing");
+                                false
+                            }
+                        },
+                        None => {
+                            warn!(path = %local_path.display(), "entry has no SHA-256 identity, not removing");
+                            false
+                        }
                     };
 
                     if !matches_size || !matches_mtime || !matches_sha {
