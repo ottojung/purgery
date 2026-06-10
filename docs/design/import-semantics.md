@@ -34,7 +34,7 @@ Per-entry failures produce individual `EntryStatusEntry` records with `status = 
 
 ## Work area
 
-The server creates a hidden work area at `<root>/.purgery-work/<nickname>/<run_id>/`. Entries are placed into the work area before processing.
+The server creates a work area at `<purgery_root>/processing/<nickname>/<run_id>/work/`. Entries are placed into the work area before processing.
 
 Cleanup policy:
 
@@ -66,13 +66,13 @@ For ordinary passthrough entries with `delete_after_import = false`:
 
 For ordinary passthrough entries with `delete_after_import = true`:
 
-- Identity is captured per entry kind: size, mtime_ns, and optional SHA-256 for regular files; link target for symlinks; existence and captured descendants for directories
-- Durable cleanup state is written atomically to the stable state directory
+- Identity is captured per entry kind: size, mtime_ns, and SHA-256 for regular files; link target for symlinks; existence and captured descendants for directories. Regular files without SHA identity are not deletion-authorizing.
+- Durable cleanup state is written atomically to the configured `state_dir`
 - Cleanup verifies local identity before removal
 
 ### Durable cleanup state
 
-The cleanup state is stored in the client's state directory, defaulting to `$XDG_STATE_HOME/purgery/` or `~/.local/state/purgery/` (configurable via `state_dir` in the client config). It is never stored in a temporary directory. For a sync group with `delete_after_import = true`, the client writes a durable cleanup state file atomically before rsync, with `rsync_succeeded = false`. After rsync succeeds, the success marker is atomically updated to `true`. The state records identity per entry kind (size, mtime, optional SHA-256 for regular files; link target for symlinks; subtree entries for directories). The cleanup state is replayable and idempotent: already-removed entries are safe, changed entries are skipped.
+The cleanup state is stored in the client's `state_dir` (a required absolute path in `client.toml`). It is never stored in a temporary directory. For a sync group with `delete_after_import = true`, the client writes a durable cleanup state file atomically before rsync, with `rsync_succeeded = false`. After rsync succeeds, the success marker is atomically updated to `true`. The state records identity per entry kind (size, mtime, SHA-256 for regular files; link target for symlinks; subtree entries for directories). The cleanup state is replayable and idempotent: already-removed entries are safe, changed entries are skipped, and entries lacking required identity are left untouched.
 
 After each successful deletion, the cleanup state is rewritten atomically (temp file + rename). A crash during cleanup does not make progress ambiguous: already-deleted entries are idempotent, pending entries are retried.
 
@@ -179,7 +179,6 @@ If a `status.toml` exists but is malformed (invalid TOML or missing required fie
       ...
 
 <root>/                              # final storage
-  .purgery-work/<nickname>/<run_id>/ # work area (temporary)
   <nickname>/
     <sync.to>/                       # final imported entries
       ...
@@ -232,10 +231,10 @@ For postprocess entries, cleanup authority is the server's `status.toml`:
 2. `status.nickname == manifest.nickname` and `status.run_id == manifest.run_id`.
 3. The manifest entry mode must be exactly `Postprocess`. Entries with mode `Covered` or `Passthrough` are not eligible, even if a status entry incorrectly reports them as `imported`.
 4. The entry's own status is `imported`.
-5. The local entry still matches its captured identity:
-   * **regular files**: size, mtime, optional SHA-256 must match; path must still be a regular file.
-   * **symlinks**: literal link target string must match; path must still be a symlink; target is never followed.
-   * **directories**: path must still be a directory; every present captured descendant must still match its identity; absent captured descendants are treated as already removed; no new or changed entries may exist anywhere under the root.
+  5. The local entry still matches its captured identity:
+     * **regular files**: size, mtime, and SHA-256 must all match; path must still be a regular file. Missing SHA prevents deletion.
+     * **symlinks**: literal link target string must match; path must still be a symlink; target is never followed.
+     * **directories**: path must still be a directory; every present captured descendant must still match its identity; absent captured descendants are treated as already removed; no new or changed entries may exist anywhere under the root.
 6. The sync mapping has `delete_after_import = true`.
 
 Covered descendants are not independently cleaned from server status. They are retired as part of the postprocessed directory root's all-or-nothing cleanup when the root subtree is preflighted and removed bottom-up.
@@ -246,10 +245,10 @@ For passthrough entries, cleanup authority is the durable local cleanup state:
 
 1. A valid cleanup state file exists on disk with a recorded rsync success marker (i.e. `rsync_succeeded = true`).
 2. The cleanup identity was captured **before** rsync — either from a pre-rsync source walk (PassthroughDeleteAfterImport) or from the pre-rsync manifest (purgatory passthrough remainder).
-3. The local entry still matches the recorded identity for its kind:
-   * **regular files**: size, mtime, optional SHA-256 must match.
-   * **symlinks**: literal link target must match; symlink is unlinked without following the target.
-   * **directories**: captured descendants must still match; no new entries may exist inside; removal is bottom-up.
+  3. The local entry still matches the recorded identity for its kind:
+     * **regular files**: size, mtime, and SHA-256 must all match. Missing SHA prevents deletion.
+     * **symlinks**: literal link target must match; symlink is unlinked without following the target.
+     * **directories**: captured descendants must still match; no new entries may exist inside; removal is bottom-up.
 4. The sync mapping has `delete_after_import = true`.
 
 The cleanup state is always written before the passthrough rsync, with `rsync_succeeded = false`. Deletion is authorized only after rsync succeeds and the success marker is durably recorded.
@@ -262,6 +261,6 @@ Deletion is idempotent. If a captured entry is already absent at cleanup time, i
 
 Cleanup identity is checked per entry kind:
 
-- **Regular files**: size, mtime, and optional SHA-256 must match.
+- **Regular files**: size, mtime, and SHA-256 must all match. Missing SHA prevents deletion.
 - **Symlinks**: the literal link target string must match. The symlink is unlinked without following the target. The target path itself is never modified.
-- **Directories**: the directory must exist and its tracked descendants must still match their captured identities. Directories are removed bottom-up: child entries are removed first, then the directory itself. If new or changed entries appeared inside the directory after identity capture, the directory is left in place.
+- **Directories**: the directory must exist and its tracked descendants must still match their captured identities. Directories are removed bottom-up: child entries are removed first, then the directory itself. If new or changed entries appeared inside the directory after identity capture, the directory is left in place. If any regular-file descendant lacks SHA identity or SHA recomputation fails, the directory is not removed.

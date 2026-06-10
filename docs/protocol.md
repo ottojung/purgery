@@ -89,7 +89,7 @@ Passthrough entries are transferred directly from the client source tree to fina
 
 For sync groups with `delete_after_import = false`, no further bookkeeping is needed. The local entry remains.
 
-For sync groups with `delete_after_import = true`, the client writes a durable cleanup state file atomically before rsync with `rsync_succeeded = false`, and updates the success marker atomically after rsync succeeds. This state records the entry identity per kind (size, mtime, optional SHA-256 for regular files; link target for symlinks; subtree entries for directories) and authorizes cleanup on restart. The client verifies local identity before removing.
+For sync groups with `delete_after_import = true`, the client writes a durable cleanup state file atomically before rsync with `rsync_succeeded = false`, and updates the success marker atomically after rsync succeeds. This state records the entry identity per kind (size, mtime, and SHA-256 for regular files; link target for symlinks; subtree entries for directories) and authorizes cleanup on restart. Regular files without SHA identity are not deletion-authorizing. The client verifies local identity before removing.
 
 Passthrough entries do not appear in:
 - The uploaded server manifest

@@ -7,10 +7,10 @@ This document defines the filesystem invariants that make Purgery restart-safe. 
 For passthrough entries with `delete_after_import = true`, the client writes a durable cleanup state file at a stable location:
 
 ```text
-$XDG_STATE_HOME/purgery/  or  ~/.local/state/purgery/
+{state_dir}/
 ```
 
-The location is configurable via the `state_dir` field in `client.toml`. When set, `state_dir` must be a non-empty absolute path.
+The location is the required `state_dir` field in `client.toml`, which must be a non-empty absolute path.
 
 This is the only cleanup mechanism. It is used for all delete-after-import cleanup: pure passthrough invocations, mixed invocations, and purgatory passthrough remainder.
 
@@ -109,7 +109,7 @@ The server commits final outputs before atomically publishing successful status.
 
 The client may remove a local passthrough entry only after a durable cleanup state file on disk records that rsync succeeded. The cleanup state is written atomically (via temporary file + rename) before rsync, with `rsync_succeeded = false`. After rsync succeeds, the success marker is atomically updated to `true`. A crash before the initial write leaves no cleanup state, so removal is not authorized. A crash between the initial write and the success marker prevents removal because `rsync_succeeded` remains `false`.
 
-The client verifies local identity against the cleanup state before removing. Entry-kind identity checks apply: size, mtime, optional SHA-256 for regular files; link target for symlinks; subtree identity for directories. Changed entries are skipped. Already-removed entries are idempotent.
+The client verifies local identity against the cleanup state before removing. Entry-kind identity checks apply: size, mtime, and SHA-256 for regular files; link target for symlinks; subtree identity for directories. Missing required identity prevents deletion. Changed entries are skipped. Already-removed entries are idempotent.
 
 ## Idempotent tree-overlay invariant
 
@@ -160,7 +160,7 @@ A run affects only outputs it explicitly commits. Purgery does not use `rsync --
 
 ### Cleanup state discovery
 
-On startup, the client scans the cleanup state directory (`$XDG_STATE_HOME/purgery/`, `~/.local/state/purgery/`, or the configured `state_dir`) for state files with pending cleanup. If found, cleanup is resumed before any new rsync operation. This ensures that partially-completed cleanup from a previous run does not accumulate indefinitely.
+On startup, the client scans the cleanup state directory (`state_dir` in `client.toml`) for state files with pending cleanup. If found, cleanup is resumed before any new rsync operation. This ensures that partially-completed cleanup from a previous run does not accumulate indefinitely.
 
 The client keeps no local run database. For postprocess entries, verified server status remains the authority for local deletion. For passthrough entries with `delete_after_import=true`, the durable local cleanup state is the authority.
 

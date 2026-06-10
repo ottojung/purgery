@@ -260,7 +260,7 @@ Passthrough groups do not participate in purgatory run config, server manifest, 
 If a sync group has no applicable postprocess rules:
 
 - `delete_after_import = false` (PassthroughNoDelete): one direct unfiltered rsync to final storage. The source tree is not walked, entries are not classified, metadata is not read, and no bookkeeping is created.
-- `delete_after_import = true` (PassthroughDeleteAfterImport): direct unfiltered rsync plus a durable cleanup ledger. Cleanup identity is captured per entry kind (size, mtime, optional SHA-256 for regular files; link target for symlinks; subtree entries for directories) before rsync. The cleanup state is written with `rsync_succeeded = false`. After rsync succeeds, `rsync_succeeded` is durably set to `true`. Only entries whose pre-rsync identity still matches are removed. New or modified entries created after cleanup capture are left untouched. No per-entry transfer filters are used.
+- `delete_after_import = true` (PassthroughDeleteAfterImport): direct unfiltered rsync plus a durable cleanup ledger. Cleanup identity is captured per entry kind (size, mtime, and SHA-256 for regular files; link target for symlinks; subtree entries for directories) before rsync. Regular files without SHA identity are not deletion-authorizing. The cleanup state is written with `rsync_succeeded = false`. After rsync succeeds, `rsync_succeeded` is durably set to `true`. Only entries whose pre-rsync identity still matches are removed. New or modified entries created after cleanup capture are left untouched. No per-entry transfer filters are used.
 
 ### Match patterns and import modes
 
@@ -356,7 +356,7 @@ For ordinary passthrough entries in a sync group with `delete_after_import = fal
 
 For ordinary passthrough regular files with `delete_after_import = true`:
 
-- size, mtime_ns, and optional SHA-256 are computed for cleanup identity verification
+- size, mtime_ns, and SHA-256 are computed for cleanup identity verification (SHA is required for delete-authorizing entries)
 - durable cleanup state is written atomically to a stable state directory
 - cleanup verifies local identity before deleting
 
@@ -364,7 +364,7 @@ For ordinary passthrough regular files with `delete_after_import = true`:
 
 There are two distinct cleanup authorities:
 
-1. **Transfer-confirmed cleanup** — applies to passthrough entries with `delete_after_import = true`. Local deletion is authorized by a durable cleanup state file atomically written after successful rsync. The client rechecks local identity (size, mtime, optional SHA-256) before deleting. This cleanup is not confirmed by server status.
+1. **Transfer-confirmed cleanup** — applies to passthrough entries with `delete_after_import = true`. Local deletion is authorized by a durable cleanup state file atomically written after successful rsync. The client rechecks local identity (size, mtime, SHA-256 for regular files) before deleting. Missing required identity prevents deletion. This cleanup is not confirmed by server status.
 
 2. **Server-confirmed cleanup** — applies to transformed/postprocessed entries. Local deletion is authorized by a valid server status file whose nickname and run ID match the original upload. The client verifies the status entry shows `imported` and the local identity still matches before deleting.
 
@@ -372,7 +372,7 @@ There are two distinct cleanup authorities:
 
 Cleanup identity is checked per entry kind:
 
-- **Regular files**: size, mtime, and optional SHA-256 must match the captured identity.
+- **Regular files**: size, mtime, and SHA-256 must match the captured identity. Missing SHA prevents deletion.
 - **Symlinks**: the literal link target must match the captured identity. The symlink is unlinked without following the target. The target path is never modified.
 - **Directories**: tracked descendants must still match their captured identities. Removal is bottom-up: child entries are removed first, then the directory itself. If new or changed entries appeared inside after identity capture, the directory is left in place.
 
@@ -393,7 +393,7 @@ For `delete_after_import = true` passthrough, the client writes cleanup state to
 The state file records:
 
 - nickname and operation ID
-- per-file entries with local path, size, mtime, optional SHA-256, rsync success flag, and cleanup status
+- per-file entries with local path, size, mtime, SHA-256 (required for regular files), rsync success flag, and cleanup status
 
 The state file is written atomically (temp file + rename). After each successful cleanup, the state is updated atomically. A crashed or interrupted cleanup resumes safely on the next `sync-and-cleanup` invocation: already-removed entries are idempotent, changed entries are skipped.
 
