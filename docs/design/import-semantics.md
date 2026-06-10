@@ -228,10 +228,12 @@ For postprocess entries, cleanup authority is the server's `status.toml`:
 
 1. The server's `status.toml` is valid and parseable.
 2. `status.nickname == manifest.nickname` and `status.run_id == manifest.run_id`.
-3. The file's own status is `imported` (covered/skipped entries are not deleted).
-4. The manifest entry kind is `regular_file`.
-5. The local file still matches the uploaded identity (size, mtime, and optional SHA-256) and is still a regular file (not a symlink replacement).
-6. The sync mapping has `delete_after_import = true`.
+3. The entry's own status is `imported` (covered/skipped entries are not deleted).
+4. The local entry still matches its captured identity:
+   * **regular files**: size, mtime, optional SHA-256 must match; path must still be a regular file.
+   * **symlinks**: literal link target string must match; path must still be a symlink; target is never followed.
+   * **directories**: path must still be a directory; every captured descendant must still match its identity; no new or changed entries may exist inside.
+5. The sync mapping has `delete_after_import = true`.
 
 ### Passthrough entries (transfer-confirmed cleanup)
 
@@ -239,9 +241,11 @@ For passthrough entries, cleanup authority is the durable local cleanup state:
 
 1. A valid cleanup state file exists on disk with a recorded rsync success marker (i.e. `rsync_succeeded = true`).
 2. The cleanup identity was captured **before** rsync — either from a pre-rsync source walk (PassthroughDeleteAfterImport) or from the pre-rsync manifest (purgatory passthrough remainder).
-3. The local file still matches the recorded identity (size, mtime, optional SHA-256).
-4. The local file is still a regular file (not a symlink replacement).
-5. The sync mapping has `delete_after_import = true`.
+3. The local entry still matches the recorded identity for its kind:
+   * **regular files**: size, mtime, optional SHA-256 must match.
+   * **symlinks**: literal link target must match; symlink is unlinked without following the target.
+   * **directories**: captured descendants must still match; no new entries may exist inside; removal is bottom-up.
+4. The sync mapping has `delete_after_import = true`.
 
 The cleanup state is always written before the passthrough rsync, with `rsync_succeeded = false`. Deletion is authorized only after rsync succeeds and the success marker is durably recorded.
 

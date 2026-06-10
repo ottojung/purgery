@@ -148,7 +148,7 @@ steps = ["compress-video"]
 | `name` | — | Unique sync name |
 | `from` | — | Local source path |
 | `to` | — | Relative destination under `root / nickname` |
-| `delete_after_import` | `false` | Delete unchanged local regular files after confirmed import; directories and symlinks remain |
+| `delete_after_import` | `false` | Remove unchanged local originals after confirmed import (regular files by size/mtime/SHA, symlinks by link target, directories bottom-up) |
 
 ### Postprocess rule
 

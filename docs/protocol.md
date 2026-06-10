@@ -11,7 +11,7 @@ client: for each passthrough group:
             run direct unfiltered rsync to final storage
             if PassthroughDeleteAfterImport:
               write durable cleanup state atomically
-              delete confirmed regular files
+              remove confirmed local originals
 ```
 
 There is no per-entry filtered transfer loop in the pure passthrough path.
@@ -38,7 +38,7 @@ client: after prepare-run succeeds, perform all archive-affecting rsyncs:
          for each passthrough-only group:
            direct unfiltered rsync to final storage
            if PassthroughDeleteAfterImport:
-             write durable cleanup state, delete confirmed regular files
+             write durable cleanup state, remove confirmed local originals
          for each purgatory group:
            run passthrough rsync to final storage (non-postprocess entries)
            run purgatory rsync to incoming/files (postprocess entries)
