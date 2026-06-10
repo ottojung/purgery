@@ -224,16 +224,21 @@ There are two distinct cleanup authorities:
 
 ### Postprocess entries (server-confirmed cleanup)
 
+Only manifest entries with mode `Postprocess` are eligible for server-confirmed cleanup.
+
 For postprocess entries, cleanup authority is the server's `status.toml`:
 
 1. The server's `status.toml` is valid and parseable.
 2. `status.nickname == manifest.nickname` and `status.run_id == manifest.run_id`.
-3. The entry's own status is `imported` (covered/skipped entries are not deleted).
-4. The local entry still matches its captured identity:
+3. The manifest entry mode must be exactly `Postprocess`. Entries with mode `Covered` or `Passthrough` are not eligible, even if a status entry incorrectly reports them as `imported`.
+4. The entry's own status is `imported`.
+5. The local entry still matches its captured identity:
    * **regular files**: size, mtime, optional SHA-256 must match; path must still be a regular file.
    * **symlinks**: literal link target string must match; path must still be a symlink; target is never followed.
    * **directories**: path must still be a directory; every captured descendant must still match its identity; no new or changed entries may exist inside.
-5. The sync mapping has `delete_after_import = true`.
+6. The sync mapping has `delete_after_import = true`.
+
+Covered descendants are not independently cleaned from server status. They are retired as part of the postprocessed directory root's all-or-nothing cleanup when the root subtree is preflighted and removed bottom-up.
 
 ### Passthrough entries (transfer-confirmed cleanup)
 
