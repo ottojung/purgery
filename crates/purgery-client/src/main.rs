@@ -1126,4 +1126,80 @@ steps = ["compress-video"]
         );
         assert!(!dir_path.exists(), "directory must be removed");
     }
+
+    #[test]
+    fn delete_confirmed_files_skips_directory_when_child_absent_and_new_entry_present() {
+        // A new entry must still block cleanup even if a captured child is already absent.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let dir_path = source.join("photos");
+        fs::create_dir_all(&dir_path).unwrap();
+        let known_file = dir_path.join("file.txt");
+        fs::write(&known_file, "data").unwrap();
+
+        let config = ClientConfig::from_toml(&format!(
+            r#"
+nickname = "laptop"
+
+[server]
+host = "example.invalid"
+
+[[sync]]
+name = "data"
+from = "{}"
+to = "data"
+delete_after_import = true
+
+[[postprocess.rules]]
+match = "photos"
+steps = ["compress-video"]
+"#,
+            source.display()
+        ))
+        .unwrap();
+
+        let run_id = RunId::new("dir-absent-new".into()).unwrap();
+        let manifest = build_manifest(&config, &run_id).unwrap();
+
+        // Remove the captured child, then add a new entry
+        fs::remove_file(&known_file).unwrap();
+        fs::write(dir_path.join("new_file.txt"), "new data").unwrap();
+
+        let dir_entry = manifest
+            .entries
+            .iter()
+            .find(|e| {
+                e.kind == ManifestEntryKind::Directory && e.mode == ManifestEntryMode::Postprocess
+            })
+            .expect("must have a postprocessed directory entry");
+
+        let status_entries = vec![EntryStatusEntry {
+            kind: ManifestEntryKind::Directory,
+            sync_name: dir_entry.sync_name.clone(),
+            local_path: dir_entry.local_path.as_str().to_owned(),
+            relative_path: dir_entry.relative_path.as_str().to_owned(),
+            status: FileStatus::Imported,
+            final_paths: vec![],
+            postprocess: Some(vec!["compress-video".into()]),
+            error: None,
+        }];
+        let status = RunStatus {
+            run_id,
+            nickname: config.nickname.clone(),
+            state: RunState::Done,
+            entries: status_entries,
+            error: None,
+        };
+
+        let count = delete_confirmed_files(&config, &manifest, &status).unwrap();
+        assert_eq!(
+            count, 0,
+            "directory must not be removed when new entry exists alongside absent child"
+        );
+        assert!(dir_path.exists(), "directory must still exist");
+        assert!(
+            dir_path.join("new_file.txt").exists(),
+            "new entry must still exist"
+        );
+    }
 }
