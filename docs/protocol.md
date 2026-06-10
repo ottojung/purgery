@@ -55,6 +55,8 @@ The purgatory transfer loop operates only on purgatory groups — it never looks
 
 No final-archive rsync happens before `prepare-run` succeeds. The side-effect-free `resolve-destinations` call may happen earlier, but actual archive-affecting transfers are deferred until after the purgatory run passes server validation.
 
+Postprocess entries are transferred to a staging area (`incoming/files/<sync.to>/`), not to final storage. The server processes them in the staging area using isolated work areas, and only commits outputs to final storage after processing succeeds. If processing fails, no output reaches the final archive.
+
 ## Server subcommands
 
 | Subcommand | Purpose |

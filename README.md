@@ -45,18 +45,18 @@ purgery-client sync-and-cleanup --config client.toml
 | **Archive** | The central storage location where imported files accumulate (a path on a server) |
 | **Import** | The act of copying or transforming an entry from a source tree into the archive |
 | **Transform** | An optional server-side postprocessing step (e.g., compress, convert, rename) applied during import |
-| **Passthrough import** | Copying a file directly into the archive without transformation |
-| **Transformed import** | Copying a file into the archive through a server-side transformation step |
-| **Cleanup** | Removing a confirmed local original file after import is complete and verified |
+| **Passthrough import** | Copying an entry directly into the archive without transformation |
+| **Transformed import** | Copying an entry into the archive through a server-side transformation step |
+| **Cleanup** | Removing a confirmed local original entry after import is complete and verified |
 
 ---
 
 1. You configure one or more **source trees** on a device and point each to a destination inside the archive.
 2. The client walks each source tree (never following symlinks) and classifies every entry as either **passthrough** (direct copy to archive) or **transformed** (server-side processing required).
-3. If any source tree has transformed entries, the client creates a server run: it uploads a manifest of only the entries needing transformation, validates the plan on the server, and transfers them to a staging area.
-4. The server processes transformed entries (prepares work areas, runs subprocesses, commits outputs) and writes a status record.
-5. For source trees that are pure passthrough (no transformation), the client skips server bookkeeping entirely and copies files directly to the archive.
-6. Local cleanup of originals depends on how cleanup was configured for each source tree. Passthrough files use locally recorded transfer state as authority. Transformed files are cleaned only after server status confirms the import.
+3. If any source tree has transformed entries, the client creates a server run: it uploads a manifest of only the entries needing transformation, validates the plan on the server, and transfers them to a staging area (not the final archive destination).
+4. The server processes transformed entries in the staging area: it prepares work areas from staged files, runs subprocesses there, and only after processing succeeds commits outputs to the final archive destination. If processing fails, no output reaches the archive.
+5. For source trees that are pure passthrough (no transformation), the client skips server bookkeeping entirely and copies entries directly to the archive.
+6. Local cleanup of originals depends on how cleanup was configured for each source tree. Passthrough entries use locally recorded transfer state as authority. Transformed entries are cleaned only after server status confirms the import.
 
 ## Configuration
 
@@ -132,7 +132,7 @@ Purgery targets Unix/POSIX filesystem semantics and is conservative about data l
 - The server performs a recursive merge into the archive: directories merge, regular files replace existing ones, symlinks remain symlinks, and absent source entries never delete archive entries.
 - Symlink targets are literal data. The server never follows staged or archive symlinks as directories.
 - Tree imports provide replayable convergence through crash-safe per-entry commits, not an all-or-nothing transaction.
-- Transforms apply to directories, regular files, and symlinks. Client cleanup remains conservative and removes only confirmed unchanged local originals, respecting entry-kind identity checks (symlinks are unlinked without following the target; directories are removed bottom-up only when safe).
+- Transforms and cleanup apply to all entry kinds: regular files, directories, and symlinks. Client cleanup remains conservative and removes only confirmed unchanged local originals, respecting entry-kind identity checks (symlinks are unlinked without following the target; directories are removed bottom-up only when safe).
 - Overlapping source trees that would produce the same archive path are rejected rather than resolved by ordering.
 
 ## More documentation

@@ -100,7 +100,7 @@ The client generates transfer sets per sync group according to its class:
 For purgatory groups:
 
 1. **Passthrough transfer set**: exact-path roots for entries with mode `passthrough` (regular files, symlinks, empty directories). Transferred directly to final storage.
-2. **Purgatory transfer set**: exact-path roots for ordinary postprocess entries plus subtree roots for postprocessed directories. Transferred to the staging area.
+2. **Purgatory transfer set**: exact-path roots for ordinary postprocess entries plus subtree roots for postprocessed directories. Transferred to the server's staging area (`<purgery_root>/<nickname>/incoming/<run_id>/files/<sync.to>/`). Postprocess entries remain in staging until the server processes them successfully; only then are they committed to final storage. If processing fails, the run fails and no outputs reach the final archive.
 
 For passthrough groups, the entire source tree is transferred via one direct unfiltered rsync to final storage. No transfer sets, no manifest, no server bookkeeping.
 
