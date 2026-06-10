@@ -789,7 +789,6 @@ steps = ["compress-video"]
     }
 
     #[test]
-    #[ignore = "expected to fail until directory root cleanup recursively preflights subtree"]
     fn delete_confirmed_files_skips_directory_with_nested_new_child() {
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("source");
