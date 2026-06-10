@@ -1056,7 +1056,6 @@ steps = ["compress-video"]
     }
 
     #[test]
-    #[ignore = "expected to fail until absent-descendant idempotence is implemented"]
     fn delete_confirmed_files_directory_root_removed_when_child_absent() {
         // A postprocessed directory root should still be cleaned up if a captured
         // child is already absent (idempotent — treated as already removed).
