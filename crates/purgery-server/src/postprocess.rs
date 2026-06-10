@@ -10,6 +10,7 @@ pub fn apply_postprocessing(
     sync_name: &str,
     normalized_path: &str,
     work_path: &Utf8Path,
+    progress_step: &mut dyn FnMut(&str, &str),
 ) -> Result<Vec<Utf8PathBuf>, String> {
     let mut results: Vec<Utf8PathBuf> = Vec::new();
 
@@ -28,19 +29,37 @@ pub fn apply_postprocessing(
             purgery_core::PostprocessKind::Subprocess => {
                 let args = step_def.build_args(work_path);
                 info!(step = %step.step_name, program = %step_def.program, "running postprocess step");
+                progress_step("step_started", &step.step_name);
 
-                let status = std::process::Command::new(&step_def.program)
+                // Use spawn + try_wait loop for heartbeat, not blocking .status()
+                let mut child = std::process::Command::new(&step_def.program)
                     .args(&args)
-                    .status()
-                    .map_err(|e| format!("failed to run {}: {e}", step.step_name))?;
+                    .spawn()
+                    .map_err(|e| format!("failed to spawn {}: {e}", step.step_name))?;
 
-                if !status.success() {
+                let step_status = loop {
+                    match child.try_wait() {
+                        Ok(Some(status)) => break status,
+                        Ok(None) => {
+                            // Still running — update progress heartbeat
+                            progress_step("step_running", &step.step_name);
+                            std::thread::sleep(std::time::Duration::from_secs(5));
+                        }
+                        Err(e) => {
+                            return Err(format!("failed to wait for {}: {e}", step.step_name));
+                        }
+                    }
+                };
+
+                if !step_status.success() {
                     return Err(format!(
                         "{} failed with exit code {:?}",
                         step.step_name,
-                        status.code()
+                        step_status.code()
                     ));
                 }
+
+                progress_step("step_finished", &step.step_name);
 
                 let expected = step_def
                     .resolve_expected_outputs(work_path)

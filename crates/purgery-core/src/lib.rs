@@ -2612,6 +2612,12 @@ steps = ["pack"]
             message: "testing".into(),
             updated_at_unix_secs: 1000,
             observed_at_unix_secs: 0,
+            progress_state: None,
+            entry_index: None,
+            entry_total: None,
+            current_entry: None,
+            current_step: None,
+            progress_status: None,
         };
         let serialized = toml::to_string(&response).expect("serialize");
         // observed_at_unix_secs must be present in serialized output
@@ -2638,6 +2644,12 @@ steps = ["pack"]
             message: "run phase: processing".into(),
             updated_at_unix_secs: 1000,
             observed_at_unix_secs: 9999,
+            progress_state: None,
+            entry_index: None,
+            entry_total: None,
+            current_entry: None,
+            current_step: None,
+            progress_status: None,
         };
         // When progress is missing, updated_at should not be equal to observed_at
         // (they serve different purposes)

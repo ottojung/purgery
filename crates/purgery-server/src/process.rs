@@ -457,11 +457,24 @@ fn process_manifest_entry(
             Ok(p) => p,
             Err(error) => return failed_entry(entry, error),
         };
+        let mut pp_helper = |state: &str, step: &str| {
+            let _ = write_progress(
+                processing_path,
+                nickname,
+                run_id,
+                state,
+                0,
+                0,
+                entry.relative_path.as_str(),
+                step,
+            );
+        };
         match apply_postprocessing(
             run_plan,
             entry.sync_name.as_str(),
             &normalized_path,
             &work_path,
+            &mut pp_helper,
         ) {
             Ok(outputs) => {
                 let mut final_paths = Vec::new();

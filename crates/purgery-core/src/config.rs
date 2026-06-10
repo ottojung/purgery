@@ -460,6 +460,18 @@ pub struct RunStateResponse {
     pub message: String,
     pub updated_at_unix_secs: u64,
     pub observed_at_unix_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_total: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_entry: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_step: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -486,6 +498,7 @@ pub enum ClientRunPhase {
     TerminalStatusSeen,
     CleanupComplete,
     Abandoned,
+    Corrupt,
 }
 
 /// Client-persisted state for a postprocess run, used to resume

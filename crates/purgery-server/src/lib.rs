@@ -454,77 +454,108 @@ pub fn run_state(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let phases = [
-        (RunPhase::Incoming, "incoming"),
-        (RunPhase::Ready, "ready"),
-        (RunPhase::Processing, "processing"),
-        (RunPhase::Done, "done"),
-        (RunPhase::Failed, "failed"),
-    ];
 
-    for (phase, phase_str) in &phases {
+    // Check non-terminal phases first (incoming, ready, processing)
+    let non_terminal = [
+        (RunPhase::Incoming, "incoming", false),
+        (RunPhase::Ready, "ready", false),
+        (RunPhase::Processing, "processing", false),
+    ];
+    for (phase, phase_str, _) in &non_terminal {
         let dir = config.purgery_root.run_dir(nickname, run_id, *phase);
         if !dir.exists() {
             continue;
         }
-        let is_terminal = *phase == RunPhase::Done || *phase == RunPhase::Failed;
-
-        // For processing phase, try to read progress.toml for richer details
-        let (message, updated_at) = if *phase == RunPhase::Processing {
-            let progress_path = dir.join("progress.toml");
-            match std::fs::read_to_string(&progress_path) {
-                Ok(content) => match toml::from_str::<purgery_core::ProcessingProgress>(&content) {
-                    Ok(prog)
-                        if prog.nickname == nickname.as_str() && prog.run_id == run_id.as_str() =>
-                    {
-                        // Use progress timestamp (actual server-side update time)
-                        (
-                            format!(
-                                "processing: {}/{} entries, current: {} step: {}",
-                                prog.entry_index + 1,
-                                prog.entry_total,
-                                prog.current_entry,
-                                prog.current_step
-                            ),
-                            prog.updated_at_unix_secs,
-                        )
-                    }
-                    Ok(_) => (
-                        "run phase: processing (progress envelope mismatch)".to_string(),
-                        // Use directory mtime as the best available update time
-                        dir_modified_at(&dir).unwrap_or(now),
-                    ),
-                    Err(_) => (
-                        "run phase: processing (malformed progress)".to_string(),
-                        dir_modified_at(&dir).unwrap_or(now),
-                    ),
-                },
-                Err(_) => (
-                    "run phase: processing".to_string(),
-                    dir_modified_at(&dir).unwrap_or(now),
-                ),
-            }
+        let (
+            message,
+            updated_at,
+            progress_state,
+            entry_index,
+            entry_total,
+            current_entry,
+            current_step,
+            progress_status,
+        ) = if *phase == RunPhase::Processing {
+            read_progress_fields(&dir, nickname, run_id, now)
         } else {
-            let msg = if is_terminal {
-                format!("run is {}", phase_str)
-            } else {
-                format!("run phase: {}", phase_str)
-            };
-            (msg, dir_modified_at(&dir).unwrap_or(now))
+            (
+                format!("run phase: {}", phase_str),
+                dir_modified_at(&dir).unwrap_or(0),
+                None::<String>,
+                None::<usize>,
+                None::<usize>,
+                None::<String>,
+                None::<String>,
+                None::<String>,
+            )
         };
-
         return Ok(purgery_core::RunStateResponse {
             protocol_version: 1,
             nickname: nickname.as_str().to_owned(),
             run_id: run_id.as_str().to_owned(),
             phase: phase_str.to_string(),
-            terminal: is_terminal,
+            terminal: false,
             message,
             updated_at_unix_secs: updated_at,
             observed_at_unix_secs: now,
+            progress_state,
+            entry_index,
+            entry_total,
+            current_entry,
+            current_step,
+            progress_status,
         });
     }
 
+    // Check terminal phases (done, failed) — require valid status.toml
+    let terminal_phases = [(RunPhase::Done, "done"), (RunPhase::Failed, "failed")];
+    for (phase, phase_str) in &terminal_phases {
+        let dir = config.purgery_root.run_dir(nickname, run_id, *phase);
+        if !dir.exists() {
+            continue;
+        }
+        let status_path = dir.join("status.toml");
+        match try_read_status(&status_path, nickname, run_id) {
+            Ok(()) => {
+                return Ok(purgery_core::RunStateResponse {
+                    protocol_version: 1,
+                    nickname: nickname.as_str().to_owned(),
+                    run_id: run_id.as_str().to_owned(),
+                    phase: phase_str.to_string(),
+                    terminal: true,
+                    message: format!("run is {}", phase_str),
+                    updated_at_unix_secs: dir_modified_at(&dir).unwrap_or(0),
+                    observed_at_unix_secs: now,
+                    progress_state: None,
+                    entry_index: None,
+                    entry_total: None,
+                    current_entry: None,
+                    current_step: None,
+                    progress_status: None,
+                });
+            }
+            Err(reason) => {
+                return Ok(purgery_core::RunStateResponse {
+                    protocol_version: 1,
+                    nickname: nickname.as_str().to_owned(),
+                    run_id: run_id.as_str().to_owned(),
+                    phase: "corrupt".to_string(),
+                    terminal: false,
+                    message: format!("{} directory exists but status is {reason}", phase_str),
+                    updated_at_unix_secs: dir_modified_at(&dir).unwrap_or(0),
+                    observed_at_unix_secs: now,
+                    progress_state: None,
+                    entry_index: None,
+                    entry_total: None,
+                    current_entry: None,
+                    current_step: None,
+                    progress_status: None,
+                });
+            }
+        }
+    }
+
+    // No phase directory found
     Ok(purgery_core::RunStateResponse {
         protocol_version: 1,
         nickname: nickname.as_str().to_owned(),
@@ -532,9 +563,117 @@ pub fn run_state(
         phase: "not_found".to_string(),
         terminal: false,
         message: "no matching run found".to_string(),
-        updated_at_unix_secs: now,
+        updated_at_unix_secs: 0,
         observed_at_unix_secs: now,
+        progress_state: None,
+        entry_index: None,
+        entry_total: None,
+        current_entry: None,
+        current_step: None,
+        progress_status: None,
     })
+}
+
+/// Try to read and validate a terminal status file.
+/// Returns Ok(()) if the file exists, parses, and envelope matches.
+/// Returns an error string explaining why validation failed.
+fn try_read_status(
+    status_path: &camino::Utf8Path,
+    nickname: &Nickname,
+    run_id: &RunId,
+) -> Result<(), String> {
+    let content = std::fs::read_to_string(status_path.as_std_path())
+        .map_err(|e| format!("missing/unreadable: {e}"))?;
+    let status =
+        purgery_core::RunStatus::from_toml(&content).map_err(|e| format!("malformed: {e}"))?;
+    if status.nickname != *nickname {
+        return Err(format!(
+            "envelope mismatch: expected nickname '{}', got '{}'",
+            nickname.as_str(),
+            status.nickname.as_str()
+        ));
+    }
+    if status.run_id != *run_id {
+        return Err(format!(
+            "envelope mismatch: expected run_id '{}', got '{}'",
+            run_id.as_str(),
+            status.run_id.as_str()
+        ));
+    }
+    Ok(())
+}
+
+/// Read progress.toml fields for a processing-phase response.
+#[allow(clippy::type_complexity)]
+fn read_progress_fields(
+    dir: &camino::Utf8Path,
+    nickname: &Nickname,
+    run_id: &RunId,
+    _now: u64,
+) -> (
+    String,
+    u64,
+    Option<String>,
+    Option<usize>,
+    Option<usize>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    let progress_path = dir.join("progress.toml");
+    match std::fs::read_to_string(&progress_path) {
+        Ok(content) => match toml::from_str::<purgery_core::ProcessingProgress>(&content) {
+            Ok(prog) if prog.nickname == nickname.as_str() && prog.run_id == run_id.as_str() => {
+                let msg = format!(
+                    "processing: {}/{} entries, current: {} step: {}",
+                    prog.entry_index + 1,
+                    prog.entry_total,
+                    prog.current_entry,
+                    prog.current_step
+                );
+                (
+                    msg,
+                    prog.updated_at_unix_secs,
+                    Some(prog.state),
+                    Some(prog.entry_index),
+                    Some(prog.entry_total),
+                    Some(prog.current_entry),
+                    Some(prog.current_step),
+                    Some("valid".to_string()),
+                )
+            }
+            Ok(_) => (
+                "run phase: processing (progress envelope mismatch)".to_string(),
+                dir_modified_at(dir).unwrap_or(0),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("envelope_mismatch".to_string()),
+            ),
+            Err(_) => (
+                "run phase: processing (malformed progress)".to_string(),
+                dir_modified_at(dir).unwrap_or(0),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("malformed".to_string()),
+            ),
+        },
+        Err(_) => (
+            "run phase: processing".to_string(),
+            dir_modified_at(dir).unwrap_or(0),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("missing".to_string()),
+        ),
+    }
 }
 
 /// Get the modification time of a directory in unix seconds.
@@ -722,6 +861,22 @@ mod tests {
         ClientLocalPath, ManifestEntry, NormalizedRelativePath, PostprocessConfig, PostprocessKind,
         PostprocessStepDefinition, ServerRoot, SyncName,
     };
+
+    /// Call apply_postprocessing with a no-op progress callback for testing.
+    fn test_apply_postprocessing(
+        run_plan: &RunPlan,
+        sync_name: &str,
+        normalized_path: &str,
+        work_path: &Utf8Path,
+    ) -> Result<Vec<Utf8PathBuf>, String> {
+        apply_postprocessing(
+            run_plan,
+            sync_name,
+            normalized_path,
+            work_path,
+            &mut |_, _| {},
+        )
+    }
 
     fn test_server_config(purgery_root: &Utf8Path, server_root: &Utf8Path) -> ServerConfig {
         fs::create_dir_all(server_root).unwrap();
@@ -1231,7 +1386,8 @@ delete_after_import = true
         fs::write(&work_path, b"test data").unwrap();
 
         let run_plan = RunPlan::build(&server_config, &run_config).unwrap();
-        let results = apply_postprocessing(&run_plan, "videos", "videos/some file.mp4", &work_path);
+        let results =
+            test_apply_postprocessing(&run_plan, "videos", "videos/some file.mp4", &work_path);
         assert!(results.is_ok(), "postprocess with spaces should succeed");
         let outputs = results.unwrap();
         assert!(!outputs.is_empty());
@@ -1376,7 +1532,8 @@ steps = ["compress-video"]
         };
 
         let pp_run_plan = RunPlan::build(&server_config, &run_config).unwrap();
-        let result = apply_postprocessing(&pp_run_plan, "videos", "videos/video.mp4", &work_path);
+        let result =
+            test_apply_postprocessing(&pp_run_plan, "videos", "videos/video.mp4", &work_path);
         assert!(result.is_ok());
         let outputs = result.unwrap();
         assert!(outputs.contains(&work_path));
@@ -1427,7 +1584,8 @@ steps = ["compress-video"]
         };
 
         let pp_run_plan = RunPlan::build(&server_config, &run_config).unwrap();
-        let result = apply_postprocessing(&pp_run_plan, "videos", "videos/video.mp4", &work_path);
+        let result =
+            test_apply_postprocessing(&pp_run_plan, "videos", "videos/video.mp4", &work_path);
         assert!(result.is_ok());
         let outputs = result.unwrap();
         assert!(
@@ -1485,7 +1643,8 @@ steps = ["compress-video"]
         };
 
         let pp_run_plan = RunPlan::build(&server_config, &run_config).unwrap();
-        let result = apply_postprocessing(&pp_run_plan, "videos", "videos/video.mp4", &work_path);
+        let result =
+            test_apply_postprocessing(&pp_run_plan, "videos", "videos/video.mp4", &work_path);
         assert!(result.is_ok());
         let outputs = result.unwrap();
         assert!(
@@ -3230,7 +3389,7 @@ steps = ["compress-video"]
         fs::write(&work_path, "input").unwrap();
         fs::write(work_path.with_file_name("input.out"), "output").unwrap();
 
-        let outputs = apply_postprocessing(
+        let outputs = test_apply_postprocessing(
             &expected_output_test_plan(),
             "data",
             "data/input.txt",
@@ -3246,7 +3405,7 @@ steps = ["compress-video"]
         let work_path = Utf8PathBuf::from_path_buf(tmp.path().join("input.txt")).unwrap();
         fs::write(&work_path, "input").unwrap();
 
-        let error = apply_postprocessing(
+        let error = test_apply_postprocessing(
             &expected_output_test_plan(),
             "data",
             "data/input.txt",
@@ -3267,7 +3426,7 @@ steps = ["compress-video"]
         // itself must be accepted — Purgery must not follow or reject it.
         std::os::unix::fs::symlink(&target, work_path.with_file_name("input.out")).unwrap();
 
-        let outputs = apply_postprocessing(
+        let outputs = test_apply_postprocessing(
             &expected_output_test_plan(),
             "data",
             "data/input.txt",
@@ -3295,7 +3454,7 @@ steps = ["compress-video"]
         fs::write(&work_path, "input").unwrap();
         fs::create_dir(work_path.with_file_name("input.out")).unwrap();
 
-        let outputs = apply_postprocessing(
+        let outputs = test_apply_postprocessing(
             &expected_output_test_plan(),
             "data",
             "data/input.txt",
@@ -3312,7 +3471,7 @@ steps = ["compress-video"]
         fs::write(&work_path, "input").unwrap();
         std::os::unix::fs::symlink("some-target", work_path.with_file_name("input.out")).unwrap();
 
-        let outputs = apply_postprocessing(
+        let outputs = test_apply_postprocessing(
             &expected_output_test_plan(),
             "data",
             "data/input.txt",
@@ -3333,7 +3492,7 @@ steps = ["compress-video"]
             .status()
             .unwrap();
 
-        let error = apply_postprocessing(
+        let error = test_apply_postprocessing(
             &expected_output_test_plan(),
             "data",
             "data/input.txt",
