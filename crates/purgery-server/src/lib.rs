@@ -578,11 +578,9 @@ fn planned_entry_outputs(
 
     let synthetic_work_path = Utf8Path::new(entry.relative_path.as_str());
 
-    let mut any_rule_matched = false;
     let mut outputs: Vec<String> = Vec::new();
 
-    for rule in run_plan.matching_rules(entry.sync_name.as_str(), &normalized_path) {
-        any_rule_matched = true;
+    if let Some(rule) = run_plan.first_matching_rule(entry.sync_name.as_str(), &normalized_path) {
         for step in &rule.steps {
             if step.step_def.keep_original {
                 outputs.push(entry_final_path.as_str().to_owned());
@@ -605,7 +603,7 @@ fn planned_entry_outputs(
         }
     }
 
-    if !any_rule_matched {
+    if outputs.is_empty() {
         outputs.push(entry_final_path.as_str().to_owned());
     }
 
