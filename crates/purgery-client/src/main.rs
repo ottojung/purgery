@@ -869,7 +869,6 @@ steps = ["compress-video"]
     }
 
     #[test]
-    #[ignore = "expected to fail until directory root preflight includes root itself"]
     fn delete_confirmed_files_skips_directory_with_new_direct_child() {
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("source");
@@ -948,7 +947,6 @@ steps = ["compress-video"]
     }
 
     #[test]
-    #[ignore = "expected to fail until source root is excluded from cleanup state"]
     fn passthrough_cleanup_excludes_source_root() {
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("source");
