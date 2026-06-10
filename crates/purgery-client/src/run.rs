@@ -384,8 +384,13 @@ pub(crate) fn delete_confirmed_files(
                     continue;
                 }
                 // Verify all known descendants still match their identities.
+                // Absent descendants are treated as idempotently already removed.
                 let mut all_verified = true;
                 for desc in &descendants {
+                    let desc_path = Path::new(desc.local_path.as_str());
+                    if !desc_path.exists() {
+                        continue;
+                    }
                     if !verify_manifest_entry_local(desc) {
                         warn!(
                             path = %desc.local_path.as_str(),
