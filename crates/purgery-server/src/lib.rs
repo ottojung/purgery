@@ -891,7 +891,7 @@ fn process_manifest_entry(
                     );
                 }
                 let steps: Vec<String> =
-                    run_plan.postprocess_steps_for(entry.sync_name.as_str(), &normalized_path);
+                    run_plan.selected_steps_for(entry.sync_name.as_str(), &normalized_path);
                 Ok((final_paths, (!steps.is_empty()).then_some(steps)))
             }
             Err(error) => Err(error),
@@ -1419,7 +1419,7 @@ impl RunPlan {
 
     /// Collect postprocess step names from all rules that apply to the given
     /// sync group and match the given normalized relative path.
-    pub fn postprocess_steps_for(&self, sync_name: &str, normalized_path: &str) -> Vec<String> {
+    pub fn selected_steps_for(&self, sync_name: &str, normalized_path: &str) -> Vec<String> {
         self.rules
             .iter()
             .find(|r| r.applies_to(sync_name) && r.is_match(normalized_path))
@@ -1509,7 +1509,7 @@ pub fn apply_postprocessing(
         .ok_or_else(|| "work path has no parent directory".to_string())?;
 
     let Some(compiled) = run_plan.first_matching_rule(sync_name, normalized_path) else {
-        return Ok(results);
+        return Err("no selected postprocess rule for entry".into());
     };
 
     for step in &compiled.steps {
