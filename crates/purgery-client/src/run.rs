@@ -306,66 +306,77 @@ pub(crate) fn delete_confirmed_files(
                     warn!(path = %local_path.display(), "local path is no longer a directory, not removing");
                     continue;
                 }
-                // Check for unexpected entries inside the directory
-                let mut has_unexpected = false;
-                if let Ok(reader) = fs::read_dir(local_path) {
-                    for child in reader {
-                        let child = match child {
-                            Ok(c) => c,
-                            Err(_) => {
-                                has_unexpected = true;
-                                break;
-                            }
-                        };
-                        let child_path = child.path();
-                        if child_path == local_path {
-                            continue;
-                        }
-                        let child_local = child_path.to_string_lossy();
-                        if !manifest
-                            .entries
-                            .iter()
-                            .any(|me| me.local_path.as_str() == child_local.as_ref())
-                        {
-                            has_unexpected = true;
-                        }
-                    }
-                } else {
-                    has_unexpected = true;
-                }
-                if has_unexpected {
-                    warn!(path = %local_path.display(), "directory has new or unexpected entries, not removing");
-                    continue;
-                }
-                // Verify known children still match their identities, then delete bottom-up.
+                // Recursive preflight: check every directory under the root for unexpected children.
+                // First, collect all descendant entries from the manifest.
                 let prefix = format!("{}/", local_path_str);
-                let mut children: Vec<&ManifestEntry> = manifest
+                let mut descendants: Vec<&ManifestEntry> = manifest
                     .entries
                     .iter()
                     .filter(|me| me.local_path.as_str().starts_with(&prefix))
                     .collect();
-                children.sort_by(|a, b| {
+                // Check every directory descendant for unexpected filesystem children.
+                let mut preflight_ok = true;
+                for desc in &descendants {
+                    if desc.kind != purgery_core::ManifestEntryKind::Directory {
+                        continue;
+                    }
+                    let desc_path = Path::new(desc.local_path.as_str());
+                    if let Ok(reader) = fs::read_dir(desc_path) {
+                        for child in reader {
+                            let child = match child {
+                                Ok(c) => c,
+                                Err(_) => {
+                                    preflight_ok = false;
+                                    break;
+                                }
+                            };
+                            let child_path = child.path();
+                            if child_path == desc_path {
+                                continue;
+                            }
+                            let child_local = child_path.to_string_lossy();
+                            if !manifest
+                                .entries
+                                .iter()
+                                .any(|me| me.local_path.as_str() == child_local.as_ref())
+                            {
+                                preflight_ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !preflight_ok {
+                        break;
+                    }
+                }
+                if !preflight_ok {
+                    warn!(path = %local_path.display(), "subtree has new or unexpected entries, not removing");
+                    continue;
+                }
+                // Verify all known descendants still match their identities.
+                let mut all_verified = true;
+                for desc in &descendants {
+                    if !verify_manifest_entry_local(desc) {
+                        warn!(
+                            path = %desc.local_path.as_str(),
+                            "known descendant changed since upload, not removing directory"
+                        );
+                        all_verified = false;
+                        break;
+                    }
+                }
+                if !all_verified {
+                    continue;
+                }
+                // All preflight checks passed - delete bottom-up (deepest first)
+                // Skip the root itself since we handle it separately
+                descendants.sort_by(|a, b| {
                     b.local_path
                         .as_str()
                         .len()
                         .cmp(&a.local_path.as_str().len())
                 });
-                let mut all_children_verified = true;
-                for child in &children {
-                    if !verify_manifest_entry_local(child) {
-                        warn!(
-                            path = %child.local_path.as_str(),
-                            "known child changed since upload, not removing directory"
-                        );
-                        all_children_verified = false;
-                        break;
-                    }
-                }
-                if !all_children_verified {
-                    continue;
-                }
-                // All children verified - delete bottom-up (deepest first)
-                for child in &children {
+                for child in &descendants {
                     let child_path = Path::new(child.local_path.as_str());
                     match child.kind {
                         purgery_core::ManifestEntryKind::Directory => {
