@@ -9,9 +9,9 @@ Purgery supports config file discovery so you don't always need `--config`.
 The server searches for its config in this order:
 
 1. `--config PATH` (explicit CLI argument)
-2. `$PURGERY_SERVER_CONFIG_PATH` environment variable
-3. `$XDG_CONFIG_HOME/purgery/server.toml` (if `XDG_CONFIG_HOME` is set)
-4. `$HOME/.config/purgery/server.toml`
+2. `$PURGERY_SERVER_CONFIG_PATH`, if set and non-empty
+3. `$XDG_CONFIG_HOME/purgery/server.toml`, only when `XDG_CONFIG_HOME` is set and non-empty
+4. `$HOME/.config/purgery/server.toml`, only when `HOME` is set and non-empty
 5. `/etc/purgery/server.toml`
 
 ### Client config lookup
@@ -19,9 +19,11 @@ The server searches for its config in this order:
 The client searches for its config in this order:
 
 1. `--config PATH` (explicit CLI argument)
-2. `$PURGERY_CLIENT_CONFIG_PATH` environment variable
-3. `$XDG_CONFIG_HOME/purgery/client.toml` (if `XDG_CONFIG_HOME` is set)
-4. `$HOME/.config/purgery/client.toml`
+2. `$PURGERY_CLIENT_CONFIG_PATH`, if set and non-empty
+3. `$XDG_CONFIG_HOME/purgery/client.toml`, only when `XDG_CONFIG_HOME` is set and non-empty
+4. `$HOME/.config/purgery/client.toml`, only when `HOME` is set and non-empty
+
+Purgery does not invent `/root` or any other default when `HOME` is absent.
 
 The client does not fall back to `/etc/purgery/client.toml` — client config is per-user only.
 
@@ -132,6 +134,7 @@ Example:
 
 ```toml
 nickname = "laptop"
+state_dir = "/var/lib/purgery"
 
 [server]
 host = "example.com"
@@ -420,3 +423,85 @@ The server validates that every sync in a purgatory run config has `delete_after
 ## Config strictness
 
 All config structs reject unknown fields. Old configs with stale or misspelled fields produce clear errors rather than being silently ignored.
+
+## Cleanup identity requirements
+
+Regular files that can authorize local deletion must have SHA-256 identity.
+
+| Entry kind | Identity fields | SHA required? |
+|------------|----------------|---------------|
+| Regular file | size, mtime, SHA-256 | yes, for delete-authorizing entries |
+| Symlink | literal link target | no |
+| Directory | bottom-up subtree identity | no |
+
+Cleanup behaviour by kind:
+
+- **Regular file with SHA**: deletion is authorised when size, mtime, and SHA-256 all match captured identity. If SHA recomputation fails during verification, deletion is refused.
+- **Regular file without SHA**: deletion is never authorised. The entry is excluded from cleanup ledgers.
+- **Symlink**: deletion is authorised when the literal link target matches. The symlink is unlinked without following the target. The target path is never modified.
+- **Directory**: tracked descendants must still match their captured identities. If any regular-file descendant lacks SHA identity, the directory is not removed.
+
+### SHA computation failure during classification
+
+- Postprocess regular files: SHA failure is fatal during manifest building.
+- Passthrough regular files in `delete_after_import = true` sync groups: SHA failure is fatal during manifest building when the entry is in a manifest that may authorise cleanup.
+- Pure passthrough pre-rsync cleanup ledger capture: a regular file whose SHA cannot be computed is skipped (not added to the ledger) and a warning is logged.
+
+## Trust boundary assumptions
+
+Purgery's security model assumes:
+
+1. **Client config** is trusted local admin configuration.
+2. **Server config** is trusted server admin configuration.
+3. **`server.command`** is a trusted configuration value (not user input).
+4. **Postprocess programs and their argv** are trusted server-side configuration set by the server admin. Clients request steps by name but never upload arbitrary commands.
+5. **Source filenames and paths** may contain arbitrary characters (spaces, special characters, leading `-`) and must not become shell syntax or local subprocess options. Purgery uses argv-style invocation and shell-escaping for remote commands to prevent injection.
+6. **Local filesystem and server storage root** are non-hostile unless documented otherwise.
+
+## Purgery-owned subprocess argv hardening
+
+Purgery hardens its own `ssh` and `rsync` argv to prevent option injection:
+
+| Subprocess | Pattern | Protection |
+|------------|---------|------------|
+| `ssh` | `ssh -- HOST COMMAND` | Prevents host value from being interpreted as an `ssh` option |
+| `rsync` | `rsync [options...] -- SOURCE DEST` | Prevents source/destination paths from being interpreted as `rsync` options |
+
+All `rsync` options, including filter merge files, appear before the `--` separator. Source and destination operands appear after it.
+
+### Postprocess commands
+
+Postprocess argv is trusted server-side configuration and is not rewritten, validated, or auto-fixed by Purgery. Purgery passes the configured `args` vector directly to the subprocess without modification.
+
+Postprocess authors should use tool-appropriate `--` or option-value placement for path operands when their tools accept such syntax:
+
+```toml
+# Recommended: use -- before path operands
+args = ["--input", "--", "{input}"]
+
+# Alternative: prefix with ./ for relative-accepting tools
+args = ["--input", "./{input}"]
+```
+
+## Client temp / filter directory layout
+
+Client rsync filter files and temporary files live under `state_dir`:
+
+```text
+{state_dir}/tmp/{run_id}/filters/passthrough-{sync_name}
+{state_dir}/tmp/{run_id}/filters/purgatory-{sync_name}
+```
+
+The directory is created before writing filters. Creation errors are reported, not silently ignored.
+
+The `run_id` component ensures concurrent invocations with identical sync names do not collide. Leftover directories are harmless after a crash.
+
+## Server work area layout
+
+Server postprocess work areas live under `purgery_root`:
+
+```text
+{purgery_root}/{nickname}/processing/{run_id}/work/
+```
+
+This is inside the run's processing directory. On successful completion (`Done`), the work area is removed before the run moves to `done`. On failure (`Failed` or `Partial`), the work area stays with the run directory as it moves to `failed` or `done`. This ensures work areas are naturally cleaned or recovered with the processing run.

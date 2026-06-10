@@ -321,3 +321,21 @@ incoming -> ready -> processing -> done
 | `done` | All postprocess entries imported or skipped successfully |
 | `partial` | Some postprocess entries imported, some failed or skipped |
 | `failed` | No postprocess entries imported |
+
+## Cleanup identity
+
+Regular files that can authorise local deletion must have SHA-256 identity.
+
+- **Postprocess entries**: SHA-256 is computed during manifest building. SHA failure is fatal.
+- **Passthrough entries with `delete_after_import = true`**: SHA-256 is captured for the cleanup ledger. In pure passthrough capture, an unhashable regular file is silently skipped with a warning. In manifest-included entries, SHA failure is fatal.
+- **Directories**: identity is verified bottom-up through known descendants. A directory is not removed if any known regular-file descendant lacks SHA identity or SHA recomputation fails.
+- **Symlinks**: identity is the literal link target.
+
+## Subprocess argv hardening
+
+Purgery hardens its own `ssh` and `rsync` argv with a literal `--` separator:
+
+- `ssh -- HOST COMMAND` prevents the host value from being parsed as an ssh option.
+- `rsync [options...] -- SOURCE DESTINATION` prevents source and destination paths from being parsed as rsync options.
+
+Postprocess commands are trusted server-side configuration. Purgery does not rewrite, validate, or auto-fix postprocess argv.
