@@ -867,4 +867,125 @@ steps = ["compress-video"]
             "nested new file must still exist"
         );
     }
+
+    #[test]
+    #[ignore = "expected to fail until directory root preflight includes root itself"]
+    fn delete_confirmed_files_skips_directory_with_new_direct_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let dir_path = source.join("photos");
+        fs::create_dir_all(&dir_path).unwrap();
+        let known_file = dir_path.join("file.txt");
+        fs::write(&known_file, "data").unwrap();
+
+        let config = ClientConfig::from_toml(&format!(
+            r#"
+nickname = "laptop"
+
+[server]
+host = "example.invalid"
+
+[[sync]]
+name = "data"
+from = "{}"
+to = "data"
+delete_after_import = true
+
+[[postprocess.rules]]
+match = "photos"
+steps = ["compress-video"]
+"#,
+            source.display()
+        ))
+        .unwrap();
+
+        let run_id = RunId::new("dir-direct-child".into()).unwrap();
+        let manifest = build_manifest(&config, &run_id).unwrap();
+
+        // After manifest, add a new file directly inside the root directory
+        fs::write(dir_path.join("new_file.txt"), "new data").unwrap();
+
+        let dir_entry = manifest
+            .entries
+            .iter()
+            .find(|e| {
+                e.kind == ManifestEntryKind::Directory && e.mode == ManifestEntryMode::Postprocess
+            })
+            .expect("must have a postprocessed directory entry");
+
+        let status_entries = vec![EntryStatusEntry {
+            kind: ManifestEntryKind::Directory,
+            sync_name: dir_entry.sync_name.clone(),
+            local_path: dir_entry.local_path.as_str().to_owned(),
+            relative_path: dir_entry.relative_path.as_str().to_owned(),
+            status: FileStatus::Imported,
+            final_paths: vec![],
+            postprocess: Some(vec!["compress-video".into()]),
+            error: None,
+        }];
+        let status = RunStatus {
+            run_id,
+            nickname: config.nickname.clone(),
+            state: RunState::Done,
+            entries: status_entries,
+            error: None,
+        };
+
+        let count = delete_confirmed_files(&config, &manifest, &status).unwrap();
+        assert_eq!(
+            count, 0,
+            "directory with new direct child must not be deleted"
+        );
+        assert!(dir_path.exists(), "directory must still exist");
+        assert!(
+            known_file.exists(),
+            "known file must not be partially deleted"
+        );
+        assert!(
+            dir_path.join("new_file.txt").exists(),
+            "new direct child must still exist"
+        );
+    }
+
+    #[test]
+    #[ignore = "expected to fail until source root is excluded from cleanup state"]
+    fn passthrough_cleanup_excludes_source_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        fs::create_dir_all(source.join("sub")).unwrap();
+        fs::write(source.join("file.txt"), "data").unwrap();
+
+        let config = ClientConfig::from_toml(&format!(
+            r#"
+nickname = "laptop"
+
+[server]
+host = "example.invalid"
+
+[[sync]]
+name = "data"
+from = "{}"
+to = "data"
+delete_after_import = true
+"#,
+            source.display()
+        ))
+        .unwrap();
+
+        let entries =
+            crate::cleanup::build_pre_rsync_cleanup_entries(&config, &config.sync[0]).unwrap();
+
+        // The source root itself must not be a cleanup entry
+        let root_entry = entries.iter().find(|e| Path::new(&e.local_path) == source);
+        assert!(
+            root_entry.is_none(),
+            "source root must not be in cleanup entries, got: {:?}",
+            root_entry
+        );
+        // Entries under the root should still be present
+        assert!(
+            entries.iter().any(|e| e.relative_path == "file.txt"),
+            "entries under source root must still be captured"
+        );
+    }
 }
