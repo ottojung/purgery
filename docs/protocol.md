@@ -341,23 +341,23 @@ The server provides two commands for reading run status:
 ```toml
 protocol_version = 1
 nickname = "laptop"
-run_id = "01ARZ..."
-phase = "processing"       # incoming | ready | processing | done | failed | not_found
+run_id = "..."
+phase = "processing" # incoming | ready | processing | done | failed | not_found | corrupt
 terminal = false
-message = "run phase: processing"
-updated_at_unix_secs = 1234567890   # last actual server-side phase/progress update time
-observed_at_unix_secs = 1234567890  # query time (wall clock on the server)
+message = "..."
+updated_at_unix_secs = 123 # last server-side phase/progress update time, or 0 if unknown
+observed_at_unix_secs = 456 # query wall-clock time on the server
 ```
 
 Semantics of the fields:
 
-* `phase`: the current filesystem phase (`incoming`, `ready`, `processing`, `done`, `failed`, `not_found`).
-* `terminal`: `true` for `done` and `failed`; `false` for all other phases.
-* `updated_at_unix_secs`: the last actual server-side phase or progress update time. For `processing` with a valid `progress.toml`, this comes from the progress file. For missing/malformed progress, this is the phase transition time, not query time.
+* `phase`: the current filesystem phase (`incoming`, `ready`, `processing`, `done`, `failed`, `not_found`, `corrupt`).
+* `terminal`: `true` only for `done` or `failed` when a valid, envelope-matching `status.toml` exists. All other phases have `terminal = false`.
+* `corrupt`: a terminal phase directory exists but `status.toml` is missing, malformed, or envelope-mismatched. `corrupt` is never cleanup authority.
+* `updated_at_unix_secs`: the last known server-side phase or progress update time. For `processing` with valid `progress.toml`, this comes from the progress file. For missing/malformed progress, this uses the directory modification time. For `not_found`, this is `0`. Never set this to query time if the true update time is unknown.
 * `observed_at_unix_secs`: the wall-clock time when the server evaluated this response.
 * `message`: human-readable phase description, including progress details when processing.
-
-`not_found` means the server has no directory or state for that run. `not_found` is never cleanup authority.
+* `not_found` and `corrupt` are never cleanup authority.
 
 ### Processing progress
 
@@ -384,6 +384,7 @@ The file contains the local phase, the full manifest, and the run config. Local 
 * `terminal_status_seen`: terminal status has been read; cleanup may proceed.
 * `cleanup_complete`: cleanup finished; local state may be removed.
 * `abandoned`: run was lost or abandoned; no deletion authorised.
+* `corrupt`: server state is corrupt; no deletion authorised.
 
 ## Subprocess argv hardening
 

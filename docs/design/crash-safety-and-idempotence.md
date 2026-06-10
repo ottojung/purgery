@@ -157,13 +157,15 @@ A run affects only outputs it explicitly commits. Purgery does not use `rsync --
 | Crash point | Durable result and restart behavior |
 |---|---|
 | Before local state written | Upload not yet complete; no server-side finished run exists. |
-| After upload complete, before `finish-run` | Local state written as `upload_complete_finish_pending`. Resume checks server phase: if `incoming`, re-runs `finish-run`; if later phase, proceeds to waiting; if `not_found`, marks abandoned. |
-| After `finish-run` accepted, before terminal status | Local state is `waiting_for_terminal_state`. Resume calls `run-state` and continues waiting indefinitely. No new upload is needed. |
+| After upload complete, before `finish-run` | Local state written as `upload_complete_finish_pending`. Resume checks server phase: if `incoming`, re-runs `finish-run`; if later phase, proceeds to waiting; if `not_found`, marks abandoned; if `corrupt`, marks corrupt. |
+| After `finish-run` accepted, before terminal status | Local state is `waiting_for_terminal_state`. Resume calls `run-state` and continues waiting indefinitely (ready, processing) or handles terminal/corrupt/not_found. No new upload is needed. |
 | While waiting for terminal state | Resume continues waiting for the same run. |
 | After terminal status seen, before cleanup | Local state is `terminal_status_seen`. Resume re-reads terminal status, verifies envelope, and continues cleanup. |
 | After partial cleanup | Resume repeats cleanup idempotently (already-removed entries are safe, identities are rechecked). |
 | After cleanup complete | Local state cleaned up. |
 | Abandoned/lost | Local state is `abandoned`. No deletion authorised. State remains as durable diagnostic until explicitly cleared. |
+| Server state corrupt | Terminal phase directory exists but status is missing, malformed, or mismatched. Local state is `corrupt`. No deletion. Durable tombstone. |
+| Transport failure while waiting | `run-state` command fails. Local state preserved unchanged. Invocation returns error, new sync work does not start. |
 
 ### Passthrough-specific crash matrix (pure passthrough groups)
 
