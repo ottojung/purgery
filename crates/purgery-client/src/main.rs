@@ -401,7 +401,6 @@ steps = ["compress-video"]
     }
 
     #[test]
-    #[ignore = "expected to fail until all-entry-kind cleanup is implemented"]
     fn delete_confirmed_files_deletes_postprocessed_symlink() {
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("source");
@@ -466,7 +465,6 @@ steps = ["compress-video"]
     }
 
     #[test]
-    #[ignore = "expected to fail until all-entry-kind cleanup is implemented"]
     fn delete_confirmed_files_deletes_postprocessed_directory_bottom_up() {
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("source");

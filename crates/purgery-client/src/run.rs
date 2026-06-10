@@ -312,14 +312,21 @@ pub(crate) fn delete_confirmed_files(
                     for child in reader {
                         let child = match child {
                             Ok(c) => c,
-                            Err(_) => { has_unexpected = true; break; }
+                            Err(_) => {
+                                has_unexpected = true;
+                                break;
+                            }
                         };
                         let child_path = child.path();
                         if child_path == local_path {
                             continue;
                         }
                         let child_local = child_path.to_string_lossy();
-                        if !manifest.entries.iter().any(|me| me.local_path.as_str() == child_local.as_ref()) {
+                        if !manifest
+                            .entries
+                            .iter()
+                            .any(|me| me.local_path.as_str() == child_local.as_ref())
+                        {
                             has_unexpected = true;
                         }
                     }
@@ -332,10 +339,17 @@ pub(crate) fn delete_confirmed_files(
                 }
                 // Delete known children bottom-up (deepest paths first), then the directory
                 let prefix = format!("{}/", local_path_str);
-                let mut children: Vec<&ManifestEntry> = manifest.entries.iter()
+                let mut children: Vec<&ManifestEntry> = manifest
+                    .entries
+                    .iter()
                     .filter(|me| me.local_path.as_str().starts_with(&prefix))
                     .collect();
-                children.sort_by(|a, b| b.local_path.as_str().len().cmp(&a.local_path.as_str().len()));
+                children.sort_by(|a, b| {
+                    b.local_path
+                        .as_str()
+                        .len()
+                        .cmp(&a.local_path.as_str().len())
+                });
                 for child in children {
                     let child_path = Path::new(child.local_path.as_str());
                     match child.kind {
