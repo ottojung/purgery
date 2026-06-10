@@ -3,6 +3,7 @@ use purgery_core::shell_escape;
 
 pub(crate) fn ssh_run(host: &str, cmd: &str) -> Result<String> {
     let output = std::process::Command::new("ssh")
+        .arg("--")
         .arg(host)
         .arg(cmd)
         .output()
@@ -43,6 +44,7 @@ pub(crate) fn server_cmd_with_stdin(
         cmd
     };
     let mut child = std::process::Command::new("ssh")
+        .arg("--")
         .arg(host)
         .arg(&full_cmd)
         .stdin(std::process::Stdio::piped())
@@ -78,6 +80,7 @@ pub(crate) fn read_remote_file(host: &str, path: &str) -> Result<String> {
 pub(crate) fn write_remote_file(host: &str, path: &str, content: &str) -> Result<()> {
     let remote_cmd = format!("cat > {}", purgery_core::shell_escape(path));
     let mut child = std::process::Command::new("ssh")
+        .arg("--")
         .arg(host)
         .arg(&remote_cmd)
         .stdin(std::process::Stdio::piped())
