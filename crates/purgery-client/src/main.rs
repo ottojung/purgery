@@ -120,9 +120,9 @@ fn apply_cli_overrides(log_cfg: &mut purgery_core::LoggingConfig, cli: &Cli) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cleanup::process_cleanup_state_file;
     use camino::Utf8Path;
     use clap::Parser;
-    use crate::cleanup::process_cleanup_state_file;
     use purgery_core::{
         ClientConfig, EntryStatusEntry, FileStatus, ManifestEntry, ManifestEntryKind, RunId,
         RunState, RunStatus,

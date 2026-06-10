@@ -337,7 +337,7 @@ pub(crate) fn delete_confirmed_files(
                     warn!(path = %local_path.display(), "directory has new or unexpected entries, not removing");
                     continue;
                 }
-                // Delete known children bottom-up (deepest paths first), then the directory
+                // Verify known children still match their identities, then delete bottom-up.
                 let prefix = format!("{}/", local_path_str);
                 let mut children: Vec<&ManifestEntry> = manifest
                     .entries
@@ -350,7 +350,22 @@ pub(crate) fn delete_confirmed_files(
                         .len()
                         .cmp(&a.local_path.as_str().len())
                 });
-                for child in children {
+                let mut all_children_verified = true;
+                for child in &children {
+                    if !verify_manifest_entry_local(child) {
+                        warn!(
+                            path = %child.local_path.as_str(),
+                            "known child changed since upload, not removing directory"
+                        );
+                        all_children_verified = false;
+                        break;
+                    }
+                }
+                if !all_children_verified {
+                    continue;
+                }
+                // All children verified - delete bottom-up (deepest first)
+                for child in &children {
                     let child_path = Path::new(child.local_path.as_str());
                     match child.kind {
                         purgery_core::ManifestEntryKind::Directory => {
@@ -435,4 +450,57 @@ pub(crate) fn delete_confirmed_files(
     }
 
     Ok(count)
+}
+
+/// Verify that a manifest entry still matches its captured local identity.
+/// Used by directory cleanup to check children before removal.
+fn verify_manifest_entry_local(entry: &ManifestEntry) -> bool {
+    let path = Path::new(entry.local_path.as_str());
+    let symmeta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    match entry.kind {
+        purgery_core::ManifestEntryKind::RegularFile => {
+            if !symmeta.file_type().is_file() || symmeta.file_type().is_symlink() {
+                return false;
+            }
+            let Ok(meta) = fs::metadata(path) else {
+                return false;
+            };
+            if meta.len() != entry.size {
+                return false;
+            }
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(0);
+            if mtime != entry.mtime_ns {
+                return false;
+            }
+            if let Some(ref expected_sha) = entry.sha256 {
+                if compute_sha256(path).ok().as_deref() != Some(expected_sha) {
+                    return false;
+                }
+            }
+            true
+        }
+        purgery_core::ManifestEntryKind::Symlink => {
+            if !symmeta.file_type().is_symlink() {
+                return false;
+            }
+            if let Some(ref expected_target) = entry.link_target {
+                if let Ok(current) = fs::read_link(path) {
+                    current.to_string_lossy().into_owned() == expected_target.as_str()
+                } else {
+                    false
+                }
+            } else {
+                true
+            }
+        }
+        purgery_core::ManifestEntryKind::Directory => symmeta.file_type().is_dir(),
+    }
 }

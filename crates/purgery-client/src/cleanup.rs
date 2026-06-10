@@ -89,7 +89,6 @@ pub(crate) fn mark_rsync_succeeded(state_path: &Utf8Path, sync_name: &str) -> Re
     Ok(())
 }
 
-#[allow(dead_code)]
 pub(crate) fn resume_pending_cleanups(config: &purgery_core::ClientConfig) -> Result<()> {
     let dir = match cleanup_state_dir(config.state_dir.as_deref()) {
         Ok(d) => d,
@@ -107,62 +106,22 @@ pub(crate) fn resume_pending_cleanups(config: &purgery_core::ClientConfig) -> Re
         if path.extension().and_then(|e| e.to_str()) != Some("toml") {
             continue;
         }
-        let Ok(content) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(state) = toml::from_str::<DurableCleanupState>(&content) else {
-            continue;
-        };
         let state_path = match camino::Utf8PathBuf::from_path_buf(path) {
             Ok(p) => p,
             Err(_) => continue,
         };
-        for entry in &state.entries {
-            if !entry.rsync_succeeded || entry.cleaned {
-                continue;
-            }
-            let local_path = Path::new(&entry.local_path);
-            let symmeta = match fs::symlink_metadata(local_path) {
-                Ok(m) => m,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    let _ = mark_cleaned(&state_path, &entry.sync_name, &entry.local_path);
-                    deleted_total += 1;
-                    continue;
-                }
-                Err(_) => continue,
-            };
-            if !symmeta.file_type().is_file() || symmeta.file_type().is_symlink() {
-                continue;
-            }
-            let Ok(meta) = fs::metadata(local_path) else {
-                continue;
-            };
-            if meta.len() != entry.size {
-                continue;
-            }
-            let current_mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_nanos() as i64)
-                .unwrap_or(0);
-            if current_mtime != entry.mtime_ns {
-                continue;
-            }
-            if let Some(ref expected_sha) = entry.sha256 {
-                if let Ok(actual_sha) = compute_sha256(local_path) {
-                    if &actual_sha != expected_sha {
-                        continue;
+        // Count processed entries before this file
+        if let Ok(content) = fs::read_to_string(state_path.as_std_path()) {
+            if let Ok(state) = toml::from_str::<DurableCleanupState>(&content) {
+                let before = state.entries.iter().filter(|e| e.cleaned).count();
+                if let Err(e) = process_cleanup_state_file(&state_path) {
+                    warn!(path = %state_path, error = %e, "failed to process cleanup state");
+                } else if let Ok(new_content) = fs::read_to_string(state_path.as_std_path()) {
+                    if let Ok(new_state) = toml::from_str::<DurableCleanupState>(&new_content) {
+                        let after = new_state.entries.iter().filter(|e| e.cleaned).count();
+                        deleted_total += after - before;
                     }
-                } else {
-                    continue;
                 }
-            }
-            if let Err(e) = fs::remove_file(local_path) {
-                warn!(path = %entry.local_path, error = %e, "failed to delete");
-            } else {
-                let _ = mark_cleaned(&state_path, &entry.sync_name, &entry.local_path);
-                deleted_total += 1;
             }
         }
     }
