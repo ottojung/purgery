@@ -42,12 +42,18 @@ client: after prepare-run succeeds, perform all archive-affecting rsyncs:
          for each purgatory group:
            run passthrough rsync to final storage (non-postprocess entries)
            run purgatory rsync to incoming/files (postprocess entries)
+client: persist local postprocess run state as upload_complete_finish_pending
 client: finish-run over SSH -> server moves incoming -> ready
+client: persist local state as waiting_for_terminal_state
+client: wait using run-state indefinitely (no timeout)
+client: after terminal run-state, read terminal status via status command
+client: verify status envelope (nickname, run_id, parse)
+client: cleanup only imported postprocess entries whose local identity still matches
+client: mark cleanup complete and remove local run state
 server: claim run by renaming ready -> processing
-server: process postprocess entries
+server: process postprocess entries (writes progress.toml during processing)
 server: publish status for postprocess entries
 server: write status.toml, move to done or failed
-client: poll status, verify envelope, cleanup postprocessed entries
 ```
 
 Passthrough groups are handled entirely outside the purgatory run lifecycle.
@@ -64,8 +70,9 @@ Postprocess entries are transferred to a staging area (`incoming/files/<sync.to>
 | `resolve-destinations --nickname <n>` | Side-effect-free destination resolution for pure passthrough groups |
 | `begin-run --nickname <n> --run-id <id>` | Create incoming directory, write lease file, print TOML response with server paths |
 | `prepare-run --nickname <n> --run-id <id>` | Validate purgatory run config and manifest (postprocess/covered entries only), return transfer destinations |
-| `finish-run --nickname <n> --run-id <id>` | Move run from `incoming` to `ready` |
-| `status --nickname <n> --run-id <id>` | Return `status.toml` from `done` or `failed` |
+| `finish-run --nickname <n> --run-id <id>` | Move run from `incoming` to `ready` (idempotent: safe to call again if already past incoming) |
+| `status --nickname <n> --run-id <id>` | Return `status.toml` from `done` or `failed` (terminal-only; fails if run is not yet terminal) |
+| `run-state --nickname <n> --run-id <id>` | Report current filesystem phase without requiring terminal status. Returns `incoming`, `ready`, `processing`, `done`, `failed`, or `not_found`. When `processing`, may include progress details from `progress.toml` |
 | `heartbeat-run --nickname <n> --run-id <id>` | Update lease file for an incoming run |
 | `check` | Validate config and dependencies (side-effect-free) |
 | `bootstrap` | Create `root` and `purgery_root` directories |
@@ -338,11 +345,19 @@ run_id = "01ARZ..."
 phase = "processing"       # incoming | ready | processing | done | failed | not_found
 terminal = false
 message = "run phase: processing"
-updated_at_unix_secs = 1234567890
+updated_at_unix_secs = 1234567890   # last actual server-side phase/progress update time
+observed_at_unix_secs = 1234567890  # query time (wall clock on the server)
 ```
 
-Non-terminal phases (`incoming`, `ready`, `processing`, `not_found`) have `terminal = false`.
-Terminal phases (`done`, `failed`) have `terminal = true`.
+Semantics of the fields:
+
+* `phase`: the current filesystem phase (`incoming`, `ready`, `processing`, `done`, `failed`, `not_found`).
+* `terminal`: `true` for `done` and `failed`; `false` for all other phases.
+* `updated_at_unix_secs`: the last actual server-side phase or progress update time. For `processing` with a valid `progress.toml`, this comes from the progress file. For missing/malformed progress, this is the phase transition time, not query time.
+* `observed_at_unix_secs`: the wall-clock time when the server evaluated this response.
+* `message`: human-readable phase description, including progress details when processing.
+
+`not_found` means the server has no directory or state for that run. `not_found` is never cleanup authority.
 
 ### Processing progress
 
@@ -352,7 +367,23 @@ While a run is in `processing/`, the server writes a progress file:
 {purgery_root}/{nickname}/processing/{run_id}/progress.toml
 ```
 
-The file is updated atomically when processing starts, before each manifest entry, and after completion. The client can query `run-state` to see that the run is still in `processing`, which tells it the server is still working.
+The file is updated atomically when processing starts, before and after each manifest entry, before and after each postprocess step, and periodically while a long-running subprocess is executing. The client can query `run-state` to see progress details and that the server is still working.
+
+### Client-side durable postprocess state
+
+After all purgatory uploads have completed but before calling `finish-run`, the client persists local run state:
+
+```text
+{state_dir}/runs/{nickname}-{run_id}/state.toml
+```
+
+The file contains the local phase, the full manifest, and the run config. Local phases:
+
+* `upload_complete_finish_pending`: uploads complete, about to call `finish-run`.
+* `waiting_for_terminal_state`: `finish-run` accepted, waiting for server to reach terminal phase.
+* `terminal_status_seen`: terminal status has been read; cleanup may proceed.
+* `cleanup_complete`: cleanup finished; local state may be removed.
+* `abandoned`: run was lost or abandoned; no deletion authorised.
 
 ## Subprocess argv hardening
 

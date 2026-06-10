@@ -55,8 +55,22 @@ manifest.toml
 status.toml
 work area
 final storage
-client cleanup state (local, for delete_after_import passthrough)
+client passthrough cleanup state (local, for delete_after_import passthrough)
+client postprocess run state (local, for resumable postprocess waiting/cleanup)
 ```
+
+The client persists postprocess run metadata under `state_dir`:
+
+```text
+{state_dir}/runs/{nickname}-{run_id}/state.toml
+```
+
+This file contains the manifest, run config, and local phase. It is written before `finish-run` and updated as the run progresses through waiting, cleanup, and completion. It allows the client to resume waiting for a postprocess run after a crash without requiring a fresh upload.
+
+Passthrough cleanup state and postprocess run state are separate:
+
+* Passthrough cleanup state (`cleanup-*.toml` in `state_dir/`) handles transfer-confirmed deletion of passthrough entries.
+* Postprocess run state (`state_dir/runs/{nickname}-{run_id}/`) handles server-confirmed deletion of postprocess entries.
 
 Client and server processes may stop at any instruction. Recovery must follow from these files and directories alone, without remembered process state. Metadata files are written through temporary files and renamed into place where applicable.
 
@@ -138,13 +152,18 @@ A run affects only outputs it explicitly commits. Purgery does not use `rsync --
 
 ## Client crash matrix
 
+### Postprocess run crash matrix
+
 | Crash point | Durable result and restart behavior |
 |---|---|
-| Before `begin-run` | No server state exists. |
-| During upload | The run remains in `incoming/`; its lease and garbage collection handle abandonment. |
-| After `finish-run`, before status | The run is durable in `ready/` or `processing/`. Rerunning the client may upload the same tree again, which is safe. |
-| After server import, before cleanup | A valid server status exists, but the client may upload again after restart. Atomic replacement makes the repeated import safe. |
-| After cleanup | Confirmed local originals are gone. If an entry is later re-created at the same local path, importing it again safely replaces the archive entry. |
+| Before local state written | Upload not yet complete; no server-side finished run exists. |
+| After upload complete, before `finish-run` | Local state written as `upload_complete_finish_pending`. Resume checks server phase: if `incoming`, re-runs `finish-run`; if later phase, proceeds to waiting; if `not_found`, marks abandoned. |
+| After `finish-run` accepted, before terminal status | Local state is `waiting_for_terminal_state`. Resume calls `run-state` and continues waiting indefinitely. No new upload is needed. |
+| While waiting for terminal state | Resume continues waiting for the same run. |
+| After terminal status seen, before cleanup | Local state is `terminal_status_seen`. Resume re-reads terminal status, verifies envelope, and continues cleanup. |
+| After partial cleanup | Resume repeats cleanup idempotently (already-removed entries are safe, identities are rechecked). |
+| After cleanup complete | Local state cleaned up. |
+| Abandoned/lost | Local state is `abandoned`. No deletion authorised. State remains as durable diagnostic until explicitly cleared. |
 
 ### Passthrough-specific crash matrix (pure passthrough groups)
 
@@ -160,9 +179,9 @@ A run affects only outputs it explicitly commits. Purgery does not use `rsync --
 
 ### Cleanup state discovery
 
-On startup, the client scans the cleanup state directory (`state_dir` in `client.toml`) for state files with pending cleanup. If found, cleanup is resumed before any new rsync operation. This ensures that partially-completed cleanup from a previous run does not accumulate indefinitely.
+On startup, the client scans the passthrough cleanup state directory (`state_dir`) for state files with pending cleanup. If found, cleanup is resumed before any new rsync operation. Separately, the client scans `state_dir/runs/` for pending postprocess run state and resumes waiting/cleanup before any new sync work.
 
-The client keeps no local run database. For postprocess entries, verified server status remains the authority for local deletion. For passthrough entries with `delete_after_import=true`, the durable local cleanup state is the authority.
+For postprocess entries, verified server status remains the authority for local deletion. The local run state provides crash recovery for the waiting/cleanup handshake. For passthrough entries with `delete_after_import=true`, the durable local cleanup state is the authority.
 
 ## Tree-overlay recovery guarantee
 
