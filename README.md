@@ -123,7 +123,8 @@ A source tree without transforms may still use `delete_after_import = false` —
 
 Purgery targets Unix/POSIX filesystem semantics and is conservative about data loss:
 
-- Cleanup is opt-in per source tree (`delete_after_import = true`).
+- For **passthrough imports**, cleanup is opt-in per source tree (`delete_after_import = true`). A passthrough source tree with `delete_after_import = false` does not clean up local originals.
+- For **transformed imports**, cleanup is required by the conformance model. Because the server does not retain indefinite source-file metadata and transformed outputs are not the original files, the source original must be retired locally after successful import (import-and-retire). See [Transform and cleanup coupling](#transform-and-cleanup-coupling).
 - **Transformed imports**: cleanup is server-confirmed. The client deletes local regular files only after the server confirms the import in a valid status record whose nickname and run ID match the original upload.
 - **Passthrough imports with delete-after-import**: cleanup is transfer-confirmed. A durable local state file is atomically recorded after successful transfer to the archive. The client verifies the local file still matches its uploaded identity before deletion.
 - **Passthrough imports without delete-after-import**: no cleanup occurs. The local file remains after transfer.

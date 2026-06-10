@@ -26,21 +26,22 @@ client: partition sync groups into execution classes:
          PassthroughNoDelete:  no rules, delete_after_import=false
          PassthroughDeleteAfterImport:  no rules, delete_after_import=true
          Purgatory:  one or more rules, delete_after_import=true
-client: for each passthrough group (both kinds):
-         resolve destination via resolve-destinations (side-effect-free)
-         direct unfiltered rsync to final storage
-         if PassthroughDeleteAfterImport:
-           scan for cleanup state, write durable cleanup state atomically
-           delete confirmed regular files
 client: generate run ID, build manifest with entry classification (purgatory groups only)
+client: if passthrough-only groups exist:
+         resolve destinations via resolve-destinations (side-effect-free)
 client: begin-run over SSH -> server creates incoming directory, returns paths
 client: validate begin-run response envelope
 client: write purgatory-only run.toml + filtered manifest.toml to incoming dir
         run.toml contains only purgatory sync groups and rules applicable to them
 client: prepare-run over SSH -> server validates plan, returns purgatory destinations
-client: for each purgatory group:
-            run passthrough rsync to final storage (non-postprocess entries)
-            run purgatory rsync to incoming/files (postprocess entries)
+client: after prepare-run succeeds, perform all archive-affecting rsyncs:
+         for each passthrough-only group:
+           direct unfiltered rsync to final storage
+           if PassthroughDeleteAfterImport:
+             write durable cleanup state, delete confirmed regular files
+         for each purgatory group:
+           run passthrough rsync to final storage (non-postprocess entries)
+           run purgatory rsync to incoming/files (postprocess entries)
 client: finish-run over SSH -> server moves incoming -> ready
 server: claim run by renaming ready -> processing
 server: process postprocess entries
@@ -51,6 +52,8 @@ client: poll status, verify envelope, cleanup postprocessed regular files
 
 Passthrough groups are handled entirely outside the purgatory run lifecycle.
 The purgatory transfer loop operates only on purgatory groups — it never looks up passthrough groups in the prepare-run destination map.
+
+No final-archive rsync happens before `prepare-run` succeeds. The side-effect-free `resolve-destinations` call may happen earlier, but actual archive-affecting transfers are deferred until after the purgatory run passes server validation.
 
 ## Server subcommands
 

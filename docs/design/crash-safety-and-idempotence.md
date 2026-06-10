@@ -107,7 +107,7 @@ The server commits final outputs before atomically publishing successful status.
 
 ### Passthrough entries with delete_after_import=true
 
-The client may delete a local passthrough file only after a durable cleanup state file on disk records that rsync succeeded. The cleanup state is written atomically (via temporary file + rename) after verifying the rsync process exited successfully. A crash before the rename leaves no cleanup state, so deletion is not authorized.
+The client may delete a local passthrough file only after a durable cleanup state file on disk records that rsync succeeded. The cleanup state is written atomically (via temporary file + rename) before rsync, with `rsync_succeeded = false`. After rsync succeeds, the success marker is atomically updated to `true`. A crash before the initial write leaves no cleanup state, so deletion is not authorized. A crash between the initial write and the success marker prevents deletion because `rsync_succeeded` remains `false`.
 
 The client verifies local identity (size, mtime, optional SHA-256) against the cleanup state before deleting. Changed files are skipped. Already-deleted files are idempotent.
 
