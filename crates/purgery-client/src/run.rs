@@ -243,7 +243,7 @@ pub(crate) fn delete_confirmed_files(
         .collect();
 
     for entry_status in &status.entries {
-        // Only delete files with status "imported"
+        // Only process entries with status "imported"
         if entry_status.status != purgery_core::FileStatus::Imported {
             continue;
         }
@@ -264,10 +264,6 @@ pub(crate) fn delete_confirmed_files(
             continue;
         }
 
-        if manifest_entry.kind != purgery_core::ManifestEntryKind::RegularFile {
-            continue;
-        }
-
         // Find the corresponding sync mapping
         let Some(sync) = config
             .sync
@@ -276,7 +272,7 @@ pub(crate) fn delete_confirmed_files(
         else {
             warn!(
                 sync_name = %manifest_entry.sync_name.as_str(),
-                "no sync mapping for file"
+                "no sync mapping for entry"
             );
             continue;
         };
@@ -289,68 +285,138 @@ pub(crate) fn delete_confirmed_files(
         let local_path_str = manifest_entry.local_path.as_str();
         let local_path = Path::new(local_path_str);
 
-        // Use symlink_metadata to detect post-upload symlink replacements.
+        // Use symlink_metadata to detect post-upload replacements.
         let symmeta = match fs::symlink_metadata(local_path) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // File already gone — idempotent, count as success
+                // Entry already gone — idempotent, count as success
                 count += 1;
                 continue;
             }
             Err(_) => {
-                warn!(path = %local_path.display(), "cannot read metadata, not deleting");
+                warn!(path = %local_path.display(), "cannot read metadata, not removing");
                 continue;
             }
         };
 
-        // Refuse to delete if the current path is not a regular file.
-        // This prevents cleanup from deleting a symlink that replaced the
-        // original regular file after upload.
-        if !symmeta.file_type().is_file() || symmeta.file_type().is_symlink() {
-            warn!(
-                path = %local_path.display(),
-                "local path is no longer a regular file, not deleting"
-            );
-            continue;
-        }
-
-        if let Ok(metadata) = fs::metadata(local_path) {
-            let current_size = metadata.len();
-            let current_mtime = metadata
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                .map(|d| d.as_nanos() as i64)
-                .unwrap_or(0);
-
-            let matches_size = current_size == manifest_entry.size;
-            let matches_mtime = current_mtime == manifest_entry.mtime_ns;
-            let matches_sha = if let Some(ref expected_sha) = manifest_entry.sha256 {
-                compute_sha256(local_path).ok().as_deref() == Some(expected_sha)
-            } else {
-                true // SHA not available, skip check
-            };
-
-            if !matches_size || !matches_mtime || !matches_sha {
-                warn!(
-                    path = %local_path.display(),
-                    "file changed since upload, not deleting"
-                );
-                continue;
+        match manifest_entry.kind {
+            purgery_core::ManifestEntryKind::Directory => {
+                // Verify the current path is still a directory
+                if !symmeta.file_type().is_dir() {
+                    warn!(path = %local_path.display(), "local path is no longer a directory, not removing");
+                    continue;
+                }
+                // Check for unexpected entries inside the directory
+                let mut has_unexpected = false;
+                if let Ok(reader) = fs::read_dir(local_path) {
+                    for child in reader {
+                        let child = match child {
+                            Ok(c) => c,
+                            Err(_) => { has_unexpected = true; break; }
+                        };
+                        let child_path = child.path();
+                        if child_path == local_path {
+                            continue;
+                        }
+                        let child_local = child_path.to_string_lossy();
+                        if !manifest.entries.iter().any(|me| me.local_path.as_str() == child_local.as_ref()) {
+                            has_unexpected = true;
+                        }
+                    }
+                } else {
+                    has_unexpected = true;
+                }
+                if has_unexpected {
+                    warn!(path = %local_path.display(), "directory has new or unexpected entries, not removing");
+                    continue;
+                }
+                // Delete known children bottom-up (deepest paths first), then the directory
+                let prefix = format!("{}/", local_path_str);
+                let mut children: Vec<&ManifestEntry> = manifest.entries.iter()
+                    .filter(|me| me.local_path.as_str().starts_with(&prefix))
+                    .collect();
+                children.sort_by(|a, b| b.local_path.as_str().len().cmp(&a.local_path.as_str().len()));
+                for child in children {
+                    let child_path = Path::new(child.local_path.as_str());
+                    match child.kind {
+                        purgery_core::ManifestEntryKind::Directory => {
+                            let _ = fs::remove_dir(child_path);
+                        }
+                        _ => {
+                            let _ = fs::remove_file(child_path);
+                        }
+                    }
+                }
+                if let Err(e) = fs::remove_dir(local_path) {
+                    warn!(path = %local_path.display(), error = %e, "failed to remove directory");
+                } else {
+                    count += 1;
+                }
             }
-        } else {
-            warn!(
-                path = %local_path.display(),
-                "cannot read metadata, not deleting"
-            );
-            continue;
-        }
+            purgery_core::ManifestEntryKind::Symlink => {
+                // Verify it's still a symlink
+                if !symmeta.file_type().is_symlink() {
+                    warn!(path = %local_path.display(), "local path is no longer a symlink, not removing");
+                    continue;
+                }
+                // Verify the link target matches
+                if let Some(ref expected_target) = manifest_entry.link_target {
+                    if let Ok(current_target) = fs::read_link(local_path) {
+                        let current = current_target.to_string_lossy().into_owned();
+                        if current != expected_target.as_str() {
+                            warn!(path = %local_path.display(), "symlink target changed, not removing");
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                // Unlink the symlink (never follow the target)
+                if let Err(e) = fs::remove_file(local_path) {
+                    warn!(path = %local_path.display(), error = %e, "failed to unlink symlink");
+                } else {
+                    count += 1;
+                }
+            }
+            purgery_core::ManifestEntryKind::RegularFile => {
+                // Verify it's still a regular file (not replaced by symlink)
+                if !symmeta.file_type().is_file() || symmeta.file_type().is_symlink() {
+                    warn!(path = %local_path.display(), "local path is no longer a regular file, not removing");
+                    continue;
+                }
 
-        // Safe to delete
-        if let Err(e) = fs::remove_file(local_path) {
-            warn!(path = %local_path.display(), error = %e, "failed to delete file");
-        } else {
-            count += 1;
+                if let Ok(metadata) = fs::metadata(local_path) {
+                    let current_size = metadata.len();
+                    let current_mtime = metadata
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                        .map(|d| d.as_nanos() as i64)
+                        .unwrap_or(0);
+
+                    let matches_size = current_size == manifest_entry.size;
+                    let matches_mtime = current_mtime == manifest_entry.mtime_ns;
+                    let matches_sha = if let Some(ref expected_sha) = manifest_entry.sha256 {
+                        compute_sha256(local_path).ok().as_deref() == Some(expected_sha)
+                    } else {
+                        true
+                    };
+
+                    if !matches_size || !matches_mtime || !matches_sha {
+                        warn!(path = %local_path.display(), "file changed since upload, not removing");
+                        continue;
+                    }
+                } else {
+                    warn!(path = %local_path.display(), "cannot read metadata, not removing");
+                    continue;
+                }
+
+                if let Err(e) = fs::remove_file(local_path) {
+                    warn!(path = %local_path.display(), error = %e, "failed to delete file");
+                } else {
+                    count += 1;
+                }
+            }
         }
     }
 

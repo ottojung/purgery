@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::ManifestEntryKind;
+
 // ── Durable Cleanup State ────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,10 +16,14 @@ pub struct CleanupEntry {
     pub sync_name: String,
     pub relative_path: String,
     pub local_path: String,
+    #[serde(default)]
+    pub kind: ManifestEntryKind,
     pub size: u64,
     pub mtime_ns: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    #[serde(default)]
+    pub link_target: Option<String>,
     pub rsync_succeeded: bool,
     pub cleaned: bool,
 }
