@@ -1202,4 +1202,100 @@ steps = ["compress-video"]
             "new entry must still exist"
         );
     }
+
+    #[test]
+    fn delete_confirmed_files_cleans_all_entry_kinds() {
+        // Verify that regular files, symlinks, and directories
+        // are all cleaned by status-based cleanup when configured
+        // as postprocess entries.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let dir_path = source.join("a_dir");
+        let file_path = source.join("file.txt");
+        let link_path = source.join("link.lnk");
+        let target = tmp.path().join("target");
+        fs::create_dir_all(&dir_path).unwrap();
+        fs::write(&file_path, "data").unwrap();
+        fs::write(&target, "target").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link_path).unwrap();
+
+        let config = ClientConfig::from_toml(&format!(
+            r#"
+nickname = "laptop"
+
+[server]
+host = "example.invalid"
+
+[[sync]]
+name = "data"
+from = "{}"
+to = "data"
+delete_after_import = true
+
+[[postprocess.rules]]
+match = "file.txt"
+steps = ["compress-video"]
+
+[[postprocess.rules]]
+match = "link.lnk"
+steps = ["compress-video"]
+
+[[postprocess.rules]]
+match = "a_dir"
+steps = ["compress-video"]
+"#,
+            source.display()
+        ))
+        .unwrap();
+
+        let run_id = RunId::new("all-kinds-cleanup".into()).unwrap();
+        let manifest = build_manifest(&config, &run_id).unwrap();
+
+        // Build status entries for all three
+        let mut status_entries = Vec::new();
+        for entry in &manifest.entries {
+            if entry.mode == ManifestEntryMode::Postprocess {
+                status_entries.push(EntryStatusEntry {
+                    kind: entry.kind,
+                    sync_name: entry.sync_name.clone(),
+                    local_path: entry.local_path.as_str().to_owned(),
+                    relative_path: entry.relative_path.as_str().to_owned(),
+                    status: FileStatus::Imported,
+                    final_paths: vec![],
+                    postprocess: Some(vec!["compress-video".into()]),
+                    error: None,
+                });
+            } else if entry.mode == ManifestEntryMode::Covered {
+                // Covered children get skipped status
+                status_entries.push(EntryStatusEntry {
+                    kind: entry.kind,
+                    sync_name: entry.sync_name.clone(),
+                    local_path: entry.local_path.as_str().to_owned(),
+                    relative_path: entry.relative_path.as_str().to_owned(),
+                    status: FileStatus::Skipped,
+                    final_paths: vec![],
+                    postprocess: None,
+                    error: Some("covered by postprocessed ancestor directory".into()),
+                });
+            }
+        }
+        let status = RunStatus {
+            run_id,
+            nickname: config.nickname.clone(),
+            state: RunState::Done,
+            entries: status_entries,
+            error: None,
+        };
+
+        let count = delete_confirmed_files(&config, &manifest, &status).unwrap();
+        assert_eq!(count, 3, "all three entry kinds must be cleaned");
+        assert!(!file_path.exists(), "regular file must be removed");
+        assert!(
+            !link_path.exists(),
+            "symlink must be removed (target stays)"
+        );
+        assert!(target.exists(), "symlink target must not be affected");
+        assert!(!dir_path.exists(), "directory must be removed bottom-up");
+    }
 }
