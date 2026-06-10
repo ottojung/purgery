@@ -259,8 +259,10 @@ pub(crate) fn delete_confirmed_files(
 
         // Status-based cleanup is for postprocess entries only.
         // Passthrough entries are cleaned via the durable cleanup ledger,
-        // not from server status.
-        if manifest_entry.mode == purgery_core::ManifestEntryMode::Passthrough {
+        // not from server status. Covered entries must not be independently
+        // cleaned from status — they are retired as part of the postprocessed
+        // directory-root cleanup.
+        if manifest_entry.mode != purgery_core::ManifestEntryMode::Postprocess {
             continue;
         }
 
