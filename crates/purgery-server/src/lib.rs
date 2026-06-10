@@ -5199,4 +5199,71 @@ steps = ["pack"]
             .run_dir(&nickname, &run_id, RunPhase::Failed);
         assert!(failed.exists(), "failed run dir must exist");
     }
+
+    #[test]
+    #[ignore = "expected to fail until error messages are improved with conformance reason"]
+    fn prepare_run_rejection_mentions_conformance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&purgery_root, &server_root);
+        let config = ServerConfig {
+            postprocess: PostprocessConfig {
+                steps: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "pack".to_owned(),
+                        PostprocessStepDefinition {
+                            kind: PostprocessKind::Subprocess,
+                            program: "true".into(),
+                            args: vec![],
+                            expected_outputs: vec![],
+                            keep_original: true,
+                        },
+                    );
+                    m
+                },
+            },
+            ..config
+        };
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("conformance-test".into()).unwrap();
+        let incoming = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Incoming);
+        fs::create_dir_all(&incoming).unwrap();
+
+        fs::write(
+            incoming.join("run.toml"),
+            r#"
+nickname = "laptop"
+
+[[sync]]
+name = "videos"
+to = "videos"
+delete_after_import = false
+
+[[postprocess.rules]]
+match = "*.mp4"
+steps = ["pack"]
+"#,
+        )
+        .unwrap();
+
+        let manifest = Manifest {
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![],
+        };
+        fs::write(incoming.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+
+        let result = prepare_run(&config, &nickname, &run_id);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("conformance")
+                || err.contains("import-and-retire")
+                || err.contains("indefinite"),
+            "rejection must explain conformance tradeoff, got: {err}"
+        );
+    }
 }

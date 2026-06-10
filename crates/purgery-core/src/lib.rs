@@ -2348,4 +2348,116 @@ for = ["missing-sync"]
         assert_eq!(plan.sync_name.as_str(), "data");
         assert_eq!(plan.relative_path.as_str(), "f.txt");
     }
+
+    #[test]
+    #[ignore = "expected to fail until state_dir validation is implemented"]
+    fn client_config_rejects_empty_state_dir() {
+        let toml = r#"
+nickname = "laptop"
+state_dir = ""
+
+[server]
+host = "example.com"
+
+[[sync]]
+name = "videos"
+from = "/home/user/Videos"
+to = "videos"
+"#;
+        let result = ClientConfig::from_toml(toml);
+        assert!(result.is_err(), "empty state_dir must be rejected");
+    }
+
+    #[test]
+    #[ignore = "expected to fail until state_dir validation is implemented"]
+    fn client_config_rejects_relative_state_dir() {
+        let toml = r#"
+nickname = "laptop"
+state_dir = "relative/path"
+
+[server]
+host = "example.com"
+
+[[sync]]
+name = "videos"
+from = "/home/user/Videos"
+to = "videos"
+"#;
+        let result = ClientConfig::from_toml(toml);
+        assert!(result.is_err(), "relative state_dir must be rejected");
+    }
+
+    #[test]
+    #[ignore = "expected to fail until state_dir validation is implemented"]
+    fn client_config_accepts_absolute_state_dir() {
+        let toml = r#"
+nickname = "laptop"
+state_dir = "/custom/state/purgery"
+
+[server]
+host = "example.com"
+
+[[sync]]
+name = "videos"
+from = "/home/user/Videos"
+to = "videos"
+"#;
+        let config = ClientConfig::from_toml(toml).unwrap();
+        assert_eq!(config.state_dir.as_deref(), Some("/custom/state/purgery"));
+    }
+
+    #[test]
+    #[ignore = "expected to fail until error messages are improved with conformance reason"]
+    fn client_config_rejection_mentions_conformance() {
+        let toml = r#"
+nickname = "laptop"
+
+[server]
+host = "example.com"
+
+[[sync]]
+name = "videos"
+from = "/home/user/Videos"
+to = "videos"
+delete_after_import = false
+
+[[postprocess.rules]]
+match = "*.mp4"
+steps = ["compress-video"]
+"#;
+        let result = ClientConfig::from_toml(toml);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("conformance")
+                || err.contains("import-and-retire")
+                || err.contains("indefinite"),
+            "rejection must explain conformance tradeoff, got: {err}"
+        );
+    }
+
+    #[test]
+    #[ignore = "expected to fail until error messages are improved with conformance reason"]
+    fn run_config_rejection_mentions_conformance() {
+        let toml = r#"
+nickname = "laptop"
+
+[[sync]]
+name = "videos"
+to = "videos"
+delete_after_import = false
+
+[[postprocess.rules]]
+match = "*.mp4"
+steps = ["pack"]
+"#;
+        let config = RunConfig::from_toml(toml).unwrap();
+        let result = config.validate_uploaded_purgatory_run();
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("conformance")
+                || err.contains("import-and-retire")
+                || err.contains("indefinite"),
+            "rejection must explain conformance tradeoff, got: {err}"
+        );
+    }
 }
