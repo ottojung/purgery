@@ -212,7 +212,15 @@ Each entry is classified as **passthrough** or **postprocessed** (purgatory) usi
 - Postprocessed entries are transferred to the server's staging area, where subprocesses run before final commit. They are tracked in the server manifest and status.
 - Covered entries are descendants of a postprocessed directory. They are not transferred independently. They appear in the server manifest and status as skipped.
 
-The `match` value is an rsync include/exclude pattern. Rules are evaluated in order. The first matching rule selects the entry for postprocessing with that rule's steps. If no rule matches, the entry is passthrough.
+The `match` value is an rsync include/exclude pattern. Rules are evaluated in order. **The first matching rule selects the entry for postprocessing with that rule's steps.** Later matching rules are ignored for that entry. If no rule matches, the entry is passthrough.
+
+This first-match-wins selection applies consistently in:
+
+- Client classification (manifest `postprocess_steps`)
+- Server prepare-run validation
+- Server postprocessing execution
+- Planned output (path) validation
+- Status `postprocess` step reporting
 
 ### Sync group classes
 
