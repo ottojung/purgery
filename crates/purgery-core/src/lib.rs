@@ -1347,6 +1347,10 @@ pub struct ClientConfig {
     pub postprocess: ClientPostprocessConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    /// Override for the client state directory (cleanup bookkeeping).
+    /// Defaults to `$XDG_STATE_HOME/purgery/` or `~/.local/state/purgery/`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_dir: Option<String>,
 }
 
 impl ClientConfig {

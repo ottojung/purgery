@@ -480,7 +480,7 @@ fn run_passthrough_path(
                 .to_string(),
             entries: cleanup_entries,
         };
-        let state_path = write_cleanup_state(&cleanup_state)
+        let state_path = write_cleanup_state(&cleanup_state, config.state_dir.as_deref())
             .with_context(|| "failed to write pre-rsync cleanup state")?;
 
         // 2. Direct unfiltered rsync
@@ -668,7 +668,7 @@ fn run_postprocess_path(
                 .to_string(),
             entries: cleanup_entries,
         };
-        let state_path = write_cleanup_state(&cleanup_state)
+        let state_path = write_cleanup_state(&cleanup_state, config.state_dir.as_deref())
             .with_context(|| "failed to write pre-rsync cleanup state")?;
 
         // 2. Direct unfiltered rsync
@@ -945,7 +945,7 @@ fn run_postprocess_path(
 
             let state_path = match &maybe_cleanup_state {
                 Some(state) => Some(
-                    write_cleanup_state(state)
+                    write_cleanup_state(state, config.state_dir.as_deref())
                         .with_context(|| "failed to write pre-rsync cleanup state")?,
                 ),
                 None => None,
@@ -1302,26 +1302,37 @@ fn build_manifest(config: &ClientConfig, run_id: &RunId) -> Result<Manifest> {
 }
 
 /// Return the stable client state directory for cleanup bookkeeping.
-fn cleanup_state_dir() -> Result<Utf8PathBuf> {
-    // Prefer XDG_STATE_HOME, fall back to ~/.local/state/purgery/
-    if let Ok(dir) = std::env::var("XDG_STATE_HOME") {
-        if !dir.is_empty() {
-            let path = Utf8PathBuf::from(dir).join("purgery");
-            fs::create_dir_all(path.as_std_path())
-                .with_context(|| format!("failed to create state dir: {path}"))?;
-            return Ok(path);
+///
+/// Uses the config override if set, otherwise follows XDG defaults:
+/// `$XDG_STATE_HOME/purgery/` or `~/.local/state/purgery/`.
+fn cleanup_state_dir(state_dir_override: Option<&str>) -> Result<Utf8PathBuf> {
+    let path = match state_dir_override {
+        Some(d) => Utf8PathBuf::from(d),
+        None => {
+            if let Ok(dir) = std::env::var("XDG_STATE_HOME") {
+                if !dir.is_empty() {
+                    Utf8PathBuf::from(dir).join("purgery")
+                } else {
+                    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+                    Utf8PathBuf::from(format!("{home}/.local/state/purgery"))
+                }
+            } else {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+                Utf8PathBuf::from(format!("{home}/.local/state/purgery"))
+            }
         }
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    let path = Utf8PathBuf::from(format!("{home}/.local/state/purgery"));
+    };
     fs::create_dir_all(path.as_std_path())
         .with_context(|| format!("failed to create state dir: {path}"))?;
     Ok(path)
 }
 
 /// Write cleanup state atomically to a file in the cleanup state directory.
-fn write_cleanup_state(state: &purgery_core::DurableCleanupState) -> Result<Utf8PathBuf> {
-    let dir = cleanup_state_dir()?;
+fn write_cleanup_state(
+    state: &purgery_core::DurableCleanupState,
+    state_dir_override: Option<&str>,
+) -> Result<Utf8PathBuf> {
+    let dir = cleanup_state_dir(state_dir_override)?;
     let filename = format!("cleanup-{}-{}.toml", state.nickname, state.operation_id);
     let final_path = dir.join(&filename);
     let tmp_path = dir.join(format!("{filename}.tmp"));
@@ -1379,8 +1390,8 @@ fn mark_rsync_succeeded(state_path: &Utf8Path, sync_name: &str) -> Result<()> {
 /// Scan for pending cleanup state files and process them.
 /// Called at the start of sync_and_cleanup before any new transfers.
 #[allow(dead_code)]
-fn resume_pending_cleanups(_config: &ClientConfig) -> Result<()> {
-    let dir = match cleanup_state_dir() {
+fn resume_pending_cleanups(config: &ClientConfig) -> Result<()> {
+    let dir = match cleanup_state_dir(config.state_dir.as_deref()) {
         Ok(d) => d,
         Err(_) => return Ok(()),
     };
