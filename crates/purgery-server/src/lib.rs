@@ -5201,7 +5201,6 @@ steps = ["pack"]
     }
 
     #[test]
-    #[ignore = "expected to fail until error messages are improved with conformance reason"]
     fn prepare_run_rejection_mentions_conformance() {
         let tmp = tempfile::tempdir().unwrap();
         let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();

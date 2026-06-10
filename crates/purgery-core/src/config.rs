@@ -188,6 +188,16 @@ pub struct ClientConfig {
 impl ClientConfig {
     pub fn from_toml(input: &str) -> Result<Self, ConfigError> {
         let config: ClientConfig = toml::from_str(input)?;
+        if let Some(ref dir) = config.state_dir {
+            if dir.is_empty() {
+                return Err(ConfigError::StateDir("must be non-empty when set".into()));
+            }
+            if !dir.starts_with('/') {
+                return Err(ConfigError::StateDir(
+                    "must be an absolute path when set".into(),
+                ));
+            }
+        }
         let sync_names: Vec<SyncName> = config.sync.iter().map(|s| s.name.clone()).collect();
         config
             .postprocess

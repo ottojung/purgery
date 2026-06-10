@@ -40,6 +40,8 @@ pub enum ConfigError {
     RunId(#[from] RunIdError),
     #[error("postprocess config: {0}")]
     PostprocessConfig(String),
+    #[error("state dir: {0}")]
+    StateDir(String),
 }
 
 #[derive(Error, Debug)]
@@ -2350,7 +2352,6 @@ for = ["missing-sync"]
     }
 
     #[test]
-    #[ignore = "expected to fail until state_dir validation is implemented"]
     fn client_config_rejects_empty_state_dir() {
         let toml = r#"
 nickname = "laptop"
@@ -2369,7 +2370,6 @@ to = "videos"
     }
 
     #[test]
-    #[ignore = "expected to fail until state_dir validation is implemented"]
     fn client_config_rejects_relative_state_dir() {
         let toml = r#"
 nickname = "laptop"
@@ -2388,7 +2388,6 @@ to = "videos"
     }
 
     #[test]
-    #[ignore = "expected to fail until state_dir validation is implemented"]
     fn client_config_accepts_absolute_state_dir() {
         let toml = r#"
 nickname = "laptop"
@@ -2407,7 +2406,6 @@ to = "videos"
     }
 
     #[test]
-    #[ignore = "expected to fail until error messages are improved with conformance reason"]
     fn client_config_rejection_mentions_conformance() {
         let toml = r#"
 nickname = "laptop"
@@ -2436,7 +2434,6 @@ steps = ["compress-video"]
     }
 
     #[test]
-    #[ignore = "expected to fail until error messages are improved with conformance reason"]
     fn run_config_rejection_mentions_conformance() {
         let toml = r#"
 nickname = "laptop"
