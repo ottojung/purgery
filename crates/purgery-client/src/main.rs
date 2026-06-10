@@ -986,4 +986,73 @@ delete_after_import = true
             "entries under source root must still be captured"
         );
     }
+
+    #[test]
+    #[ignore = "expected to fail until covered entry status cleanup is rejected"]
+    fn delete_confirmed_files_rejects_covered_entry_from_status() {
+        // Covered descendants must not be independently deleted from server status,
+        // even if a status entry incorrectly reports them as imported.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let dir_path = source.join("photos");
+        let file_path = dir_path.join("file.txt");
+        fs::create_dir_all(&dir_path).unwrap();
+        fs::write(&file_path, "data").unwrap();
+
+        let config = ClientConfig::from_toml(&format!(
+            r#"
+nickname = "laptop"
+
+[server]
+host = "example.invalid"
+
+[[sync]]
+name = "data"
+from = "{}"
+to = "data"
+delete_after_import = true
+
+[[postprocess.rules]]
+match = "photos"
+steps = ["compress-video"]
+"#,
+            source.display()
+        ))
+        .unwrap();
+
+        let run_id = RunId::new("covered-status-safety".into()).unwrap();
+        let manifest = build_manifest(&config, &run_id).unwrap();
+
+        // Find a covered (non-directory) entry
+        let covered_entry = manifest
+            .entries
+            .iter()
+            .find(|e| {
+                e.mode == ManifestEntryMode::Covered && e.kind == ManifestEntryKind::RegularFile
+            })
+            .expect("must have a covered regular file entry");
+
+        // Create a status that falsely marks the covered entry as imported
+        let status_entries = vec![EntryStatusEntry {
+            kind: ManifestEntryKind::RegularFile,
+            sync_name: covered_entry.sync_name.clone(),
+            local_path: covered_entry.local_path.as_str().to_owned(),
+            relative_path: covered_entry.relative_path.as_str().to_owned(),
+            status: FileStatus::Imported,
+            final_paths: vec![],
+            postprocess: None,
+            error: None,
+        }];
+        let status = RunStatus {
+            run_id,
+            nickname: config.nickname.clone(),
+            state: RunState::Done,
+            entries: status_entries,
+            error: None,
+        };
+
+        let count = delete_confirmed_files(&config, &manifest, &status).unwrap();
+        assert_eq!(count, 0, "covered entry must not be deleted from status");
+        assert!(file_path.exists(), "covered file must remain");
+    }
 }
