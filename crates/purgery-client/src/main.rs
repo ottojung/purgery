@@ -1054,4 +1054,77 @@ steps = ["compress-video"]
         assert_eq!(count, 0, "covered entry must not be deleted from status");
         assert!(file_path.exists(), "covered file must remain");
     }
+
+    #[test]
+    #[ignore = "expected to fail until absent-descendant idempotence is implemented"]
+    fn delete_confirmed_files_directory_root_removed_when_child_absent() {
+        // A postprocessed directory root should still be cleaned up if a captured
+        // child is already absent (idempotent — treated as already removed).
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let dir_path = source.join("photos");
+        let file_path = dir_path.join("file.txt");
+        fs::create_dir_all(&dir_path).unwrap();
+        fs::write(&file_path, "data").unwrap();
+
+        let config = ClientConfig::from_toml(&format!(
+            r#"
+nickname = "laptop"
+
+[server]
+host = "example.invalid"
+
+[[sync]]
+name = "data"
+from = "{}"
+to = "data"
+delete_after_import = true
+
+[[postprocess.rules]]
+match = "photos"
+steps = ["compress-video"]
+"#,
+            source.display()
+        ))
+        .unwrap();
+
+        let run_id = RunId::new("dir-child-absent".into()).unwrap();
+        let manifest = build_manifest(&config, &run_id).unwrap();
+
+        // Remove the child before cleanup (simulates prior partial cleanup)
+        fs::remove_file(&file_path).unwrap();
+
+        let dir_entry = manifest
+            .entries
+            .iter()
+            .find(|e| {
+                e.kind == ManifestEntryKind::Directory && e.mode == ManifestEntryMode::Postprocess
+            })
+            .expect("must have a postprocessed directory entry");
+
+        let status_entries = vec![EntryStatusEntry {
+            kind: ManifestEntryKind::Directory,
+            sync_name: dir_entry.sync_name.clone(),
+            local_path: dir_entry.local_path.as_str().to_owned(),
+            relative_path: dir_entry.relative_path.as_str().to_owned(),
+            status: FileStatus::Imported,
+            final_paths: vec![],
+            postprocess: Some(vec!["compress-video".into()]),
+            error: None,
+        }];
+        let status = RunStatus {
+            run_id,
+            nickname: config.nickname.clone(),
+            state: RunState::Done,
+            entries: status_entries,
+            error: None,
+        };
+
+        let count = delete_confirmed_files(&config, &manifest, &status).unwrap();
+        assert_eq!(
+            count, 1,
+            "directory root must be removed even with absent child"
+        );
+        assert!(!dir_path.exists(), "directory must be removed");
+    }
 }
