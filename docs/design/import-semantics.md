@@ -264,3 +264,11 @@ Cleanup identity is checked per entry kind:
 - **Regular files**: size, mtime, and SHA-256 must all match. Missing SHA prevents deletion.
 - **Symlinks**: the literal link target string must match. The symlink is unlinked without following the target. The target path itself is never modified.
 - **Directories**: the directory must exist and its tracked descendants must still match their captured identities. Directories are removed bottom-up: child entries are removed first, then the directory itself. If new or changed entries appeared inside the directory after identity capture, the directory is left in place. If any regular-file descendant lacks SHA identity or SHA recomputation fails, the directory is not removed.
+
+## Diagnostics policy
+
+Production/library code must use `tracing` macros (`tracing::warn!`, `tracing::info!`, etc.) for diagnostics.
+
+Production code must not contain `println!`, `eprintln!`, or `dbg!` calls. These are for temporary debugging only and must be removed before committing.
+
+Cleanup-safety diagnostics (missing identity, identity mismatch, recomputation failure) should use `tracing::warn!` with structured context so they are visible during normal operation without relying on stderr capture.
