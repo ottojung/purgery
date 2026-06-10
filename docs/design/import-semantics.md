@@ -72,7 +72,7 @@ For ordinary passthrough regular files with `delete_after_import = true`:
 
 ### Durable cleanup state
 
-The cleanup state is stored at `$XDG_STATE_HOME/purgery/` or `~/.local/state/purgery/`. It is never stored in a temporary directory. For a sync group with `delete_after_import = true`, the client writes a durable cleanup state file atomically after confirming rsync success. This state records the file identity (size, mtime, optional SHA-256) and is used on restart to safely delete confirmed files. The cleanup state is replayable and idempotent: already-deleted files are safe, changed files are skipped.
+The cleanup state is stored in the client's state directory, defaulting to `$XDG_STATE_HOME/purgery/` or `~/.local/state/purgery/` (configurable via `state_dir` in the client config). It is never stored in a temporary directory. For a sync group with `delete_after_import = true`, the client writes a durable cleanup state file atomically after confirming rsync success. This state records the file identity (size, mtime, optional SHA-256) and is used on restart to safely delete confirmed files. The cleanup state is replayable and idempotent: already-deleted files are safe, changed files are skipped.
 
 After each successful deletion, the cleanup state is rewritten atomically (temp file + rename). A crash during cleanup does not make progress ambiguous: already-deleted entries are idempotent, pending entries are retried.
 
@@ -189,7 +189,12 @@ A run is rejected before entry processing if planned final paths conflict, inclu
 
 ## Cleanup authority by entry type
 
-### Postprocess entries
+There are two distinct cleanup authorities:
+
+1. **Server-confirmed cleanup** — applies to postprocess/transformed entries. Local deletion is authorized by a valid server status file.
+2. **Transfer-confirmed cleanup** — applies to passthrough entries with `delete_after_import = true`. Local deletion is authorized by a durable local cleanup state file.
+
+### Postprocess entries (server-confirmed cleanup)
 
 For postprocess entries, cleanup authority is the server's `status.toml`:
 
@@ -200,7 +205,7 @@ For postprocess entries, cleanup authority is the server's `status.toml`:
 5. The local file still matches the uploaded identity (size, mtime, and optional SHA-256) and is still a regular file (not a symlink replacement).
 6. The sync mapping has `delete_after_import = true`.
 
-### Passthrough entries
+### Passthrough entries (transfer-confirmed cleanup)
 
 For passthrough entries, cleanup authority is the durable local cleanup state:
 

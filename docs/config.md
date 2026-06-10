@@ -83,6 +83,20 @@ keep_original = true
 
 A subprocess step must produce at least one committed output. If `keep_original = false`, then `expected_outputs` must be non-empty. This is validated at server boot time.
 
+### Subprocess safety
+
+Postprocess commands are always represented as argv-style argument vectors (the `args` list), never as shell strings. There is no shell interpolation, no `sh -c` invocation, and no concatenation of user-derived paths into shell snippets. This prevents shell injection from filenames or paths containing shell metacharacters.
+
+Placeholder expansion substitutes resolved paths into the argument vector directly as separate argv elements. User-derived paths (source filenames, directory names) are never spliced into shell syntax.
+
+When invoking tools that parse their own options (e.g., ffmpeg, ImageMagick), filenames beginning with `-` may be misinterpreted as option flags by the subprocess. Recommended mitigations:
+
+- Use `--` before the filename argument if the tool supports it (e.g., `args = ["--input", "--", "{input}"]`).
+- Prefix the filename with `./` when the tool accepts relative paths.
+- Document any tool-specific safe argument placement in your step definitions.
+
+Filenames containing spaces, newlines, or non-ASCII characters are handled correctly because argv-style invocation passes each argument as a separate C string without shell word splitting.
+
 ## Client config
 
 Example:
@@ -118,6 +132,7 @@ steps = ["compress-video"]
 | `server` | yes | Server connection details |
 | `sync` | `[]` | List of sync mappings |
 | `postprocess` | | Postprocess rule configuration |
+| `state_dir` | no | Writable state directory for cleanup bookkeeping. Defaults to `$XDG_STATE_HOME/purgery/` or `~/.local/state/purgery/` |
 
 ### Server connection
 
@@ -302,11 +317,19 @@ For ordinary passthrough regular files with `delete_after_import = true`:
 - durable cleanup state is written atomically to a stable state directory
 - cleanup verifies local identity before deleting
 
+### Cleanup authority
+
+There are two distinct cleanup authorities:
+
+1. **Transfer-confirmed cleanup** — applies to passthrough entries with `delete_after_import = true`. Local deletion is authorized by a durable cleanup state file atomically written after successful rsync. The client rechecks local identity (size, mtime, optional SHA-256) before deleting. This cleanup is not confirmed by server status.
+
+2. **Server-confirmed cleanup** — applies to transformed/postprocessed entries. Local deletion is authorized by a valid server status file whose nickname and run ID match the original upload. The client verifies the status entry shows `imported` and the local identity still matches before deleting.
+
 ### Import modes and cleanup
 
 - **Passthrough regular files with `delete_after_import = false`**: not cleaned locally. No identity bookkeeping.
-- **Passthrough regular files with `delete_after_import = true`**: cleaned locally after durable disk-backed state atomically records rsync success. Local identity (size, mtime, optional SHA-256) is verified before deletion.
-- **Postprocessed regular files**: deleted after server status confirms the entry as imported.
+- **Passthrough regular files with `delete_after_import = true`**: transfer-confirmed cleanup. Cleaned locally after durable disk-backed state atomically records rsync success. Local identity (size, mtime, optional SHA-256) is verified before deletion.
+- **Postprocessed regular files**: server-confirmed cleanup. Deleted after server status confirms the entry as imported.
 - **Directories and symlinks**: never deleted regardless of mode.
 
 ### Durable cleanup state

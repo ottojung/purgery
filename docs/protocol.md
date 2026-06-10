@@ -122,7 +122,7 @@ Identity bookkeeping is separated from path planning:
 
 ### Durable cleanup state
 
-Cleanup state is stored at `$XDG_STATE_HOME/purgery/` or `~/.local/state/purgery/`. It is never stored in the temporary filter directory. The state file is written atomically and updated atomically after each deletion.
+Cleanup state is stored in the client's configurable state directory (`state_dir` in `client.toml`, defaulting to `$XDG_STATE_HOME/purgery/` or `~/.local/state/purgery/`). It is never stored in the temporary filter directory. The state file is written atomically and updated atomically after each deletion.
 
 ### Scoped postprocess rules
 
