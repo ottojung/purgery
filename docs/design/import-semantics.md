@@ -235,7 +235,7 @@ For postprocess entries, cleanup authority is the server's `status.toml`:
 5. The local entry still matches its captured identity:
    * **regular files**: size, mtime, optional SHA-256 must match; path must still be a regular file.
    * **symlinks**: literal link target string must match; path must still be a symlink; target is never followed.
-   * **directories**: path must still be a directory; every captured descendant must still match its identity; no new or changed entries may exist inside.
+   * **directories**: path must still be a directory; every present captured descendant must still match its identity; absent captured descendants are treated as already removed; no new or changed entries may exist anywhere under the root.
 6. The sync mapping has `delete_after_import = true`.
 
 Covered descendants are not independently cleaned from server status. They are retired as part of the postprocessed directory root's all-or-nothing cleanup when the root subtree is preflighted and removed bottom-up.
@@ -258,7 +258,7 @@ Passthrough entries with `delete_after_import = false` are never cleaned.
 
 ### General properties
 
-Deletion is idempotent. If the local entry is already gone, it is counted as a successful cleanup. If the entry changed since upload, the client leaves it untouched.
+Deletion is idempotent. If a captured entry is already absent at cleanup time, it is treated as already removed (provided the cleanup authority exists). This applies to regular files, symlinks, and directories. If the entry is present but changed since upload, the client leaves it untouched.
 
 Cleanup identity is checked per entry kind:
 
