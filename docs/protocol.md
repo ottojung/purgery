@@ -506,11 +506,17 @@ Validated invariants:
 
 All progress writes go through `write_progress_best_effort` in production code. Direct `write_progress` calls in test code will receive validation errors for invalid updates.
 
+### Progress file retention
+
+`progress.toml` is written inside the run's `processing/` directory. When the run is finalized, the `processing/` directory is renamed to `done/` or `failed/` as a whole, so the progress file may be visible in the terminal directory. This retention is diagnostic only — it is not a protocol guarantee. Tests must not rely on terminal progress-file retention.
+
 ### Progress write failure
 
 If a progress file write fails (I/O error after validation), the server logs a warning with structured context and continues processing. A progress write failure must not fail an otherwise successful import. Progress is observational only and never authorizes cleanup.
 
-All progress writes use a best-effort helper that logs a warning on failure. Silent failures (`let _ = write_progress(...)`) are replaced with explicit warning-level logging.
+All progress writes use a best-effort helper that logs a warning on failure. The warning includes all progress fields: `nickname`, `run_id`, `state`, `entry_index`, `entry_total`, `current_entry`, `current_step`, and the error. Silent failures (`let _ = write_progress(...)`) are replaced with explicit warning-level logging.
+
+An invalid best-effort progress update must not overwrite an existing valid `progress.toml`. Because validation runs before writing, an invalid update returns an error before any file mutation occurs, leaving the last valid progress intact.
 
 ### Tombstone persistence failure messages
 

@@ -230,9 +230,15 @@ Run-level progress has empty `current_entry` and `current_step`. This is not a s
 
 `write_progress_best_effort` catches validation errors, logs a warning, and continues. Invalid progress never fails an otherwise valid import.
 
+### Progress file retention
+
+`progress.toml` lives inside the `processing/` directory and moves to `done/` or `failed/` as part of the run directory rename. Terminal retention is diagnostic only, not a protocol guarantee. Tests must not rely on terminal progress-file retention.
+
 ### Progress write failure
 
 Progress is observational only. It never authorizes cleanup. A progress file write failure (I/O error after validation) is warning-level and must not fail an otherwise successful import.
+
+All progress writes use a best-effort helper. On failure the warning includes all progress fields. Invalid best-effort progress does not clobber the last valid progress file because validation rejects it before any file write.
 
 The server writes `publishing_status` progress before atomically publishing terminal `status.toml`. If this write fails, processing continues — it is best-effort.
 
