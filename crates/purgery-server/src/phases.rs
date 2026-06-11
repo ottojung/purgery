@@ -48,10 +48,18 @@ pub(crate) fn write_progress_best_effort(
     }
 }
 
-/// Read `started_at_unix_secs` from an existing progress file, if present.
-fn existing_progress_started_at(progress_path: &Utf8Path) -> Option<u64> {
+/// Read `started_at_unix_secs` from an existing progress file, if present
+/// and the envelope (nickname, run_id) matches the current run.
+fn existing_progress_started_at(
+    progress_path: &Utf8Path,
+    nickname: &Nickname,
+    run_id: &RunId,
+) -> Option<u64> {
     let content = std::fs::read_to_string(progress_path.as_std_path()).ok()?;
     let progress: ProcessingProgress = toml::from_str(&content).ok()?;
+    if progress.nickname != nickname.as_str() || progress.run_id != run_id.as_str() {
+        return None;
+    }
     Some(progress.started_at_unix_secs)
 }
 
@@ -71,7 +79,7 @@ pub(crate) fn write_progress(
         .unwrap_or_default()
         .as_secs();
     let final_path = processing_path.join("progress.toml");
-    let started_at = existing_progress_started_at(&final_path).unwrap_or(now);
+    let started_at = existing_progress_started_at(&final_path, nickname, run_id).unwrap_or(now);
     let progress = ProcessingProgress {
         protocol_version: 1,
         nickname: nickname.as_str().to_owned(),

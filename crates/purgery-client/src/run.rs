@@ -194,6 +194,37 @@ fn persist_client_run_state_or_stop(
     )
 }
 
+/// Attempt to write an Abandoned tombstone and return an error.
+/// If the tombstone write fails, the returned error still mentions the
+/// original condition. No deletion occurs regardless.
+fn persist_abandoned_or_error(
+    state_dir: &str,
+    nickname: &str,
+    run_id: &str,
+    manifest: &Manifest,
+    run_config: &RunConfig,
+    original_condition: &str,
+) -> anyhow::Error {
+    if let Err(ts_err) = write_client_run_state(
+        state_dir,
+        nickname,
+        run_id,
+        manifest,
+        run_config,
+        ClientRunPhase::Abandoned,
+    ) {
+        anyhow::anyhow!(
+            "{original_condition}; additionally, failed to persist abandoned tombstone: {ts_err:#}; \
+             no deletion authorised. Manual intervention required at: {state_dir}"
+        )
+    } else {
+        anyhow::anyhow!(
+            "{original_condition}; marked as abandoned without deletion. \
+             Manual intervention required at: {state_dir}"
+        )
+    }
+}
+
 /// Attempt to write a Corrupt tombstone and return an error.
 /// If the tombstone write fails, the returned error still mentions the
 /// original condition. No deletion occurs regardless.
@@ -360,43 +391,39 @@ pub(crate) fn wait_for_terminal_run_state(
                         warn!(
                             nickname = %nickname.as_str(),
                             run_id = %run_id.as_str(),
-                            "run not found on server, marking as abandoned"
+                            "run not found on server"
                         );
-                        persist_client_run_state_or_stop(
+                        return Err(persist_abandoned_or_error(
                             &config.state_dir,
                             nickname.as_str(),
                             run_id.as_str(),
                             manifest,
                             &build_run_config(config, true),
-                            ClientRunPhase::Abandoned,
-                        )?;
-                        anyhow::bail!(
-                            "run {}/{} not found on server; marked as abandoned without deletion",
-                            nickname.as_str(),
-                            run_id.as_str()
-                        );
+                            &format!(
+                                "run {}/{} not found on server",
+                                nickname.as_str(),
+                                run_id.as_str()
+                            ),
+                        ));
                     }
                     "corrupt" => {
                         warn!(
                             nickname = %nickname.as_str(),
                             run_id = %run_id.as_str(),
-                            "run state is corrupt, marking corrupt on client"
+                            "run state is corrupt"
                         );
-                        persist_client_run_state_or_stop(
+                        return Err(persist_corrupt_or_error(
                             &config.state_dir,
                             nickname.as_str(),
                             run_id.as_str(),
                             manifest,
                             &build_run_config(config, true),
-                            ClientRunPhase::Corrupt,
-                        )?;
-                        anyhow::bail!(
-                            "run {}/{} server state is corrupt; no deletion authorised. \
-                             Manual intervention required at: {}",
-                            nickname.as_str(),
-                            run_id.as_str(),
-                            config.state_dir
-                        );
+                            &format!(
+                                "run {}/{} server state is corrupt",
+                                nickname.as_str(),
+                                run_id.as_str()
+                            ),
+                        ));
                     }
                     other => {
                         anyhow::bail!(
@@ -716,41 +743,39 @@ pub(crate) fn resume_pending_postprocess_runs(config: &ClientConfig) -> Result<(
                     warn!(
                         nickname = %nickname.as_str(),
                         run_id = %run_id.as_str(),
-                        "run not found on server, marking as abandoned"
+                        "run not found on server"
                     );
-                    write_client_run_state(
+                    return Err(persist_abandoned_or_error(
                         &config.state_dir,
                         nickname.as_str(),
                         run_id.as_str(),
                         &manifest,
                         &build_run_config(config, true),
-                        ClientRunPhase::Abandoned,
-                    )?;
-                    anyhow::bail!(
-                        "run {}/{} not found on server; marked as abandoned without deletion",
-                        nickname.as_str(),
-                        run_id.as_str()
-                    );
+                        &format!(
+                            "run {}/{} not found on server",
+                            nickname.as_str(),
+                            run_id.as_str()
+                        ),
+                    ));
                 }
                 "corrupt" => {
                     warn!(
                         nickname = %nickname.as_str(),
                         run_id = %run_id.as_str(),
-                        "run state is corrupt on server, marking corrupt locally"
+                        "run state is corrupt on server"
                     );
-                    write_client_run_state(
+                    return Err(persist_corrupt_or_error(
                         &config.state_dir,
                         nickname.as_str(),
                         run_id.as_str(),
                         &manifest,
                         &build_run_config(config, true),
-                        ClientRunPhase::Corrupt,
-                    )?;
-                    anyhow::bail!(
-                        "run {}/{} server state is corrupt; no deletion authorised",
-                        nickname.as_str(),
-                        run_id.as_str()
-                    );
+                        &format!(
+                            "run {}/{} server state is corrupt",
+                            nickname.as_str(),
+                            run_id.as_str()
+                        ),
+                    ));
                 }
                 "ready" | "processing" => {}
                 phase @ ("done" | "failed") => {

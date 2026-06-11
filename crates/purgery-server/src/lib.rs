@@ -6011,7 +6011,6 @@ delete_after_import = true
     // ── Entry index and progress invariant tests ──
 
     #[test]
-    #[ignore = "expected failure until per-entry entry_index=0 is documented as valid"]
     fn per_entry_first_entry_allows_index_zero() {
         // A manifest with at least one postprocessed entry should have
         // step_started/step_running/step_finished with entry_index=0 for
@@ -6092,10 +6091,7 @@ delete_after_import = true
                         !ce.is_empty(),
                         "current_entry must be non-empty for per-entry state '{state}'"
                     );
-                    assert!(
-                        ei < et,
-                        "entry_index ({ei}) must be < entry_total ({et})"
-                    );
+                    assert!(ei < et, "entry_index ({ei}) must be < entry_total ({et})");
                     // entry_index = 0 is valid for the first entry
                     if *ei == 0 {
                         // This is fine — 0 is the valid index for the first entry.
@@ -6116,7 +6112,6 @@ delete_after_import = true
     }
 
     #[test]
-    #[ignore = "expected failure until per-entry sentinel values are explicitly rejected"]
     fn per_entry_progress_rejects_sentinel_values() {
         // Per-entry progress must not have entry_total = 0 or empty current_entry.
         let tmp = tempfile::tempdir().unwrap();
@@ -6133,7 +6128,7 @@ delete_after_import = true
             &run_id,
             "step_started",
             0,
-            0,  // entry_total = 0 — invalid for per-entry
+            0, // entry_total = 0 — invalid for per-entry
             "a.txt",
             "compress",
         )
@@ -6146,7 +6141,10 @@ delete_after_import = true
         // We just verify it was written (confirms the current behavior) and
         // document that this should not occur.
         assert_eq!(p.state, "step_started");
-        assert_eq!(p.entry_total, 0, "per-entry progress with entry_total=0 is a sentinel violation");
+        assert_eq!(
+            p.entry_total, 0,
+            "per-entry progress with entry_total=0 is a sentinel violation"
+        );
     }
 
     #[test]
@@ -6185,7 +6183,6 @@ delete_after_import = true
     // ── Progress start-time preservation tests ──
 
     #[test]
-    #[ignore = "expected failure until existing_progress_started_at checks envelope"]
     fn progress_start_time_preserved_only_when_envelope_matches() {
         let tmp = tempfile::tempdir().unwrap();
         let processing_path = Utf8PathBuf::from_path_buf(tmp.path().join("processing")).unwrap();
@@ -6231,7 +6228,6 @@ delete_after_import = true
     }
 
     #[test]
-    #[ignore = "expected failure until existing_progress_started_at checks envelope"]
     fn progress_start_time_not_preserved_with_mismatched_envelope() {
         let tmp = tempfile::tempdir().unwrap();
         let processing_path = Utf8PathBuf::from_path_buf(tmp.path().join("processing")).unwrap();
@@ -6283,7 +6279,6 @@ delete_after_import = true
     }
 
     #[test]
-    #[ignore = "expected failure until existing_progress_started_at handles malformed files"]
     fn malformed_existing_progress_does_not_preserve_start_time() {
         let tmp = tempfile::tempdir().unwrap();
         let processing_path = Utf8PathBuf::from_path_buf(tmp.path().join("processing")).unwrap();
@@ -6292,11 +6287,7 @@ delete_after_import = true
         let run_id = RunId::new("ts-malformed".into()).unwrap();
 
         // Write invalid TOML to progress.toml
-        fs::write(
-            processing_path.join("progress.toml"),
-            "not valid toml {{{",
-        )
-        .unwrap();
+        fs::write(processing_path.join("progress.toml"), "not valid toml {{{").unwrap();
 
         let before = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
