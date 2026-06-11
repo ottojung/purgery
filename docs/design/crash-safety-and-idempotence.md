@@ -162,6 +162,7 @@ A run affects only outputs it explicitly commits. Purgery does not use `rsync --
 | While waiting for terminal state | Resume continues waiting for the same run. Only `ready` and `processing` justify indefinite waiting. |
 | Transport failure while waiting | `run-state` command fails. Local state preserved unchanged (e.g. `WaitingForTerminalState`). Invocation returns error. No infinite retry. |
 | Malformed `run-state` response | Response is unparseable TOML. Local state preserved. Invocation returns error. No infinite retry. |
+| `run-state` returns `incoming` (while in `WaitingForTerminalState`) | Protocol inconsistency. Local state preserved unchanged. Invocation returns error. No infinite retry. No deletion. |
 | `run-state` returns `corrupt` | Server has terminal-phase directory but invalid status. Client writes `ClientRunPhase::Corrupt` tombstone. No deletion. Invocation returns error. |
 | `run-state` returns `not_found` | Server has no record of this run. Client writes `ClientRunPhase::Abandoned` tombstone. No deletion. Invocation returns error. |
 | After terminal `run-state`, before status | Client preserves `TerminalStatusSeen` phase. |
@@ -203,6 +204,10 @@ When resuming from `TerminalStatusSeen`, the client must not re-enter the `wait_
 Progress is observational only. It never authorizes cleanup. A progress file write failure is warning-level and must not fail an otherwise successful import.
 
 The server writes `publishing_status` progress before atomically publishing terminal `status.toml`. If this write fails, processing continues — it is best-effort.
+
+Progress updates never use sentinel values. Every per-entry progress update (`processing_entry`, `step_started`, `step_running`, `step_finished`) carries accurate `entry_index`, `entry_total`, and `current_entry`. No field is left as `0` to mean "the caller should fill this in later."
+
+All progress writes use a best-effort helper that logs a `tracing::warn!` on failure with structured context. Silent `let _ = write_progress(...)` patterns are replaced with explicit warning-level logging.
 
 ### Cleanup state discovery
 

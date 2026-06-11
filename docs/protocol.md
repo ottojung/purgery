@@ -400,11 +400,12 @@ When the client calls `run-state` while waiting for a terminal state, it maps th
 | `done` or `failed` with `terminal = true` | Proceed to read terminal status. |
 | `not_found` | Write `ClientRunPhase::Abandoned` tombstone. Return error. No deletion. |
 | `corrupt` | Write `ClientRunPhase::Corrupt` tombstone. Return error. No deletion. |
+| `incoming` | Return error with state preserved. Not a normal wait phase after `finish-run`. |
 | Any other phase | Return error with local state preserved. No deletion. |
 | Transport/SSH/command failure | Return error with local state preserved. Do not retry forever. |
 | Malformed response (unparseable TOML) | Return error with local state preserved. Do not retry forever. |
 
-Only `ready` and `processing` justify indefinite waiting. `incoming` is valid only during `UploadCompleteFinishPending` resume. All other phases or errors terminate the current invocation.
+Only `ready` and `processing` are indefinite wait phases in the general wait loop. `incoming` is accepted only during `UploadCompleteFinishPending` resume — seeing it while in `WaitingForTerminalState` is a protocol inconsistency and the client stops. All other phases or errors terminate the current invocation.
 
 ### Terminal status handling
 
@@ -465,9 +466,15 @@ The `state` field transitions:
 
 For real manifest entry processing, `entry_total` is the total number of entries and `entry_index` is the current position. These are never `0` for real entries. Initial `processing_started` may have `entry_index = 0, entry_total = N` and no `current_entry`.
 
+Progress updates never use sentinel values. Every `step_started`, `step_running`, and `step_finished` update carries the real `entry_index`, `entry_total`, and `current_entry` for the entry being processed. The `publishing_status` update may have no current entry, but it must still carry a coherent `entry_total`.
+
+`ProgressUpdate` is always fully populated. No field is left as `0` to mean "the caller should fill this in later."
+
 ### Progress write failure
 
-If a progress file write fails, the server logs a warning and continues processing. A progress write failure must not fail an otherwise successful import. Progress is observational only and never authorizes cleanup.
+If a progress file write fails, the server logs a warning with structured context and continues processing. A progress write failure must not fail an otherwise successful import. Progress is observational only and never authorizes cleanup.
+
+All progress writes use a best-effort helper that logs a warning on failure. Silent failures (`let _ = write_progress(...)`) are replaced with explicit warning-level logging.
 
 ### Subprocess heartbeat interval
 
