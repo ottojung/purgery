@@ -150,9 +150,8 @@ mod tests {
     use camino::Utf8Path;
     use clap::Parser;
     use purgery_core::{
-        ClientConfig, ClientRunPhase, ClientRunState, EntryStatusEntry, FileStatus, Manifest,
-        ManifestEntry, ManifestEntryKind, ManifestEntryMode, Nickname, RunConfig, RunId, RunState,
-        RunStatus,
+        ClientConfig, EntryStatusEntry, FileStatus, ManifestEntry, ManifestEntryKind,
+        ManifestEntryMode, RunId, RunState, RunStatus,
     };
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -1884,7 +1883,6 @@ delete_after_import = true
     }
 
     #[test]
-    #[ignore = "expected failure until tombstone blocking is implemented"]
     fn existing_abandoned_tombstone_blocks_sync() {
         let tmp = tempfile::tempdir().unwrap();
         let state_dir = tmp.path().join("purgery-state");
@@ -1934,7 +1932,6 @@ host = "example.invalid"
     }
 
     #[test]
-    #[ignore = "expected failure until tombstone blocking is implemented"]
     fn existing_corrupt_tombstone_blocks_sync() {
         let tmp = tempfile::tempdir().unwrap();
         let state_dir = tmp.path().join("purgery-state");

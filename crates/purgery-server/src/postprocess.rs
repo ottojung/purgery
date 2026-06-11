@@ -51,7 +51,11 @@ pub fn apply_postprocessing_with_heartbeat(
                 let args = step_def.build_args(work_path);
                 info!(step = %step.step_name, program = %step_def.program, "running postprocess step");
                 progress_step(&purgery_core::ProgressUpdate::new(
-                    "step_started", 0, 0, normalized_path, &step.step_name,
+                    "step_started",
+                    0,
+                    0,
+                    normalized_path,
+                    &step.step_name,
                 ));
 
                 // Use spawn + try_wait loop for heartbeat, not blocking .status()
@@ -66,7 +70,11 @@ pub fn apply_postprocessing_with_heartbeat(
                         Ok(None) => {
                             // Still running — update progress heartbeat
                             progress_step(&purgery_core::ProgressUpdate::new(
-                                "step_running", 0, 0, normalized_path, &step.step_name,
+                                "step_running",
+                                0,
+                                0,
+                                normalized_path,
+                                &step.step_name,
                             ));
                             std::thread::sleep(heartbeat_interval);
                         }
@@ -85,7 +93,11 @@ pub fn apply_postprocessing_with_heartbeat(
                 }
 
                 progress_step(&purgery_core::ProgressUpdate::new(
-                    "step_finished", 0, 0, normalized_path, &step.step_name,
+                    "step_finished",
+                    0,
+                    0,
+                    normalized_path,
+                    &step.step_name,
                 ));
 
                 let expected = step_def

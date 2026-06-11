@@ -42,9 +42,7 @@ pub(crate) fn build_run_config(config: &ClientConfig, purgatory_only: bool) -> R
             .postprocess
             .rules
             .iter()
-            .filter(|r| {
-                purgatory_names.iter().any(|name| r.applies_to(name))
-            })
+            .filter(|r| purgatory_names.iter().any(|name| r.applies_to(name)))
             .cloned()
             .collect()
     } else {
@@ -511,7 +509,8 @@ pub(crate) fn wait_for_postprocess_run_and_cleanup(
     run_id: &RunId,
 ) -> Result<()> {
     wait_for_terminal_run_state(config, host, server_command, manifest, nickname, run_id)?;
-    let status = read_and_verify_terminal_status(config, host, server_command, manifest, nickname, run_id)?;
+    let status =
+        read_and_verify_terminal_status(config, host, server_command, manifest, nickname, run_id)?;
     cleanup_from_verified_status(config, manifest, &status, nickname, run_id)?;
     Ok(())
 }
@@ -570,14 +569,13 @@ pub(crate) fn resume_pending_postprocess_runs(config: &ClientConfig) -> Result<(
                     .with_context(|| {
                         format!("invalid nickname in run state: {}", state_path.display())
                     })?;
-                let run_id = purgery_core::RunId::new(run_state.run_id.clone())
-                    .with_context(|| {
+                let run_id =
+                    purgery_core::RunId::new(run_state.run_id.clone()).with_context(|| {
                         format!("invalid run ID in run state: {}", state_path.display())
                     })?;
-                let manifest = Manifest::from_toml(&run_state.manifest)
-                    .with_context(|| {
-                        format!("invalid manifest in run state: {}", state_path.display())
-                    })?;
+                let manifest = Manifest::from_toml(&run_state.manifest).with_context(|| {
+                    format!("invalid manifest in run state: {}", state_path.display())
+                })?;
                 let status = read_and_verify_terminal_status(
                     config,
                     config.server.host.as_str(),
@@ -710,7 +708,12 @@ pub(crate) fn resume_pending_postprocess_runs(config: &ClientConfig) -> Result<(
                 phase @ ("done" | "failed") => {
                     if run_state_resp.terminal {
                         let status = read_and_verify_terminal_status(
-                            config, host, server_command, &manifest, &nickname, &run_id,
+                            config,
+                            host,
+                            server_command,
+                            &manifest,
+                            &nickname,
+                            &run_id,
                         )?;
                         cleanup_from_verified_status(
                             config, &manifest, &status, &nickname, &run_id,
