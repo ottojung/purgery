@@ -13,7 +13,9 @@ use crate::commit::{
     commit_directory_entry, commit_output_entry, commit_regular_file_entry, commit_symlink_entry,
 };
 use crate::gc::run_gc;
-use crate::phases::{finalize_processing_run, move_to_failed, write_progress, write_run_failure};
+use crate::phases::{
+    finalize_processing_run, move_to_failed, write_progress_best_effort, write_run_failure,
+};
 use crate::postprocess::apply_postprocessing;
 use crate::recover::recover_or_process_processing_run;
 use crate::RunPlan;
@@ -460,26 +462,13 @@ fn process_manifest_entry(
             Err(error) => return failed_entry(entry, error),
         };
         let mut pp_helper = |update: &purgery_core::ProgressUpdate| {
-            // Use the real entry index/total from the manifest, but allow
-            // the progress update to override them (for step-level progress
-            // that comes from apply_postprocessing with 0,0).
-            let ei = if update.entry_index == 0 && update.entry_total == 0 {
-                entry_index
-            } else {
-                update.entry_index
-            };
-            let et = if update.entry_index == 0 && update.entry_total == 0 {
-                entry_total
-            } else {
-                update.entry_total
-            };
-            let _ = write_progress(
+            write_progress_best_effort(
                 processing_path,
                 nickname,
                 run_id,
                 update.state,
-                ei,
-                et,
+                update.entry_index,
+                update.entry_total,
                 update.current_entry,
                 update.current_step,
             );
@@ -490,6 +479,9 @@ fn process_manifest_entry(
             &normalized_path,
             &work_path,
             &mut pp_helper,
+            entry_index,
+            entry_total,
+            entry.relative_path.as_str(),
         ) {
             Ok(outputs) => {
                 let mut final_paths = Vec::new();
@@ -721,7 +713,7 @@ pub fn process_processing_run(
     let mut failed_sync_roots: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Write initial progress before processing entries
-    let _ = write_progress(
+    write_progress_best_effort(
         &processing_path,
         nickname,
         run_id,
@@ -755,7 +747,7 @@ pub fn process_processing_run(
     let mut outcomes: Vec<EntryOutcome> = Vec::new();
 
     for (entry_idx, entry) in manifest.entries.iter().enumerate() {
-        let _ = write_progress(
+        write_progress_best_effort(
             &processing_path,
             nickname,
             run_id,
@@ -846,7 +838,7 @@ pub fn process_processing_run(
     }
 
     // Best-effort publishing_status progress before terminal status publication
-    let _ = write_progress(
+    write_progress_best_effort(
         &processing_path,
         nickname,
         run_id,

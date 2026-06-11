@@ -17,6 +17,36 @@ pub(crate) fn publish_status_atomic(directory: &Utf8Path, status: &RunStatus) ->
     Ok(())
 }
 
+pub(crate) fn write_progress_best_effort(
+    processing_path: &Utf8Path,
+    nickname: &Nickname,
+    run_id: &RunId,
+    state: &str,
+    entry_index: usize,
+    entry_total: usize,
+    current_entry: &str,
+    current_step: &str,
+) {
+    if let Err(error) = write_progress(
+        processing_path,
+        nickname,
+        run_id,
+        state,
+        entry_index,
+        entry_total,
+        current_entry,
+        current_step,
+    ) {
+        warn!(
+            nickname = %nickname.as_str(),
+            run_id = %run_id.as_str(),
+            state = state,
+            %error,
+            "failed to write progress"
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_progress(
     processing_path: &Utf8Path,

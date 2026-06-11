@@ -875,6 +875,9 @@ mod tests {
             normalized_path,
             work_path,
             &mut |_: &purgery_core::ProgressUpdate| {},
+            0,
+            1,
+            normalized_path,
         )
     }
 
@@ -5708,9 +5711,6 @@ delete_after_import = true
             ));
         };
 
-        // After implementation, apply_postprocessing_with_heartbeat should accept
-        // entry context (entry_index, entry_total, current_entry) and pass it
-        // through to ProgressUpdate. Currently it uses (0, 0, normalized_path).
         let _ = apply_postprocessing_with_heartbeat(
             &run_plan,
             "data",
@@ -5718,6 +5718,9 @@ delete_after_import = true
             &work_path,
             std::time::Duration::from_millis(1),
             &mut callback,
+            0,
+            1,
+            "data/input.txt",
         );
 
         let updates = captured.lock().unwrap();

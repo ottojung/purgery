@@ -14,6 +14,9 @@ pub fn apply_postprocessing(
     normalized_path: &str,
     work_path: &Utf8Path,
     progress_step: &mut dyn FnMut(&purgery_core::ProgressUpdate),
+    entry_index: usize,
+    entry_total: usize,
+    current_entry: &str,
 ) -> Result<Vec<Utf8PathBuf>, String> {
     apply_postprocessing_with_heartbeat(
         run_plan,
@@ -22,6 +25,9 @@ pub fn apply_postprocessing(
         work_path,
         std::time::Duration::from_secs(DEFAULT_HEARTBEAT_SECS),
         progress_step,
+        entry_index,
+        entry_total,
+        current_entry,
     )
 }
 
@@ -32,6 +38,9 @@ pub fn apply_postprocessing_with_heartbeat(
     work_path: &Utf8Path,
     heartbeat_interval: std::time::Duration,
     progress_step: &mut dyn FnMut(&purgery_core::ProgressUpdate),
+    entry_index: usize,
+    entry_total: usize,
+    current_entry: &str,
 ) -> Result<Vec<Utf8PathBuf>, String> {
     let mut results: Vec<Utf8PathBuf> = Vec::new();
 
@@ -52,9 +61,9 @@ pub fn apply_postprocessing_with_heartbeat(
                 info!(step = %step.step_name, program = %step_def.program, "running postprocess step");
                 progress_step(&purgery_core::ProgressUpdate::new(
                     "step_started",
-                    0,
-                    0,
-                    normalized_path,
+                    entry_index,
+                    entry_total,
+                    current_entry,
                     &step.step_name,
                 ));
 
@@ -71,9 +80,9 @@ pub fn apply_postprocessing_with_heartbeat(
                             // Still running — update progress heartbeat
                             progress_step(&purgery_core::ProgressUpdate::new(
                                 "step_running",
-                                0,
-                                0,
-                                normalized_path,
+                                entry_index,
+                                entry_total,
+                                current_entry,
                                 &step.step_name,
                             ));
                             std::thread::sleep(heartbeat_interval);
@@ -94,9 +103,9 @@ pub fn apply_postprocessing_with_heartbeat(
 
                 progress_step(&purgery_core::ProgressUpdate::new(
                     "step_finished",
-                    0,
-                    0,
-                    normalized_path,
+                    entry_index,
+                    entry_total,
+                    current_entry,
                     &step.step_name,
                 ));
 

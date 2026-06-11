@@ -276,7 +276,7 @@ pub(crate) fn wait_for_terminal_run_state(
                 }
 
                 match state.phase.as_str() {
-                    "ready" | "processing" | "incoming" => {
+                    "ready" | "processing" => {
                         if state.phase != last_phase {
                             info!(
                                 nickname = %nickname.as_str(),
@@ -297,6 +297,17 @@ pub(crate) fn wait_for_terminal_run_state(
                                 "still waiting for server to process run"
                             );
                         }
+                    }
+                    "incoming" => {
+                        // incoming is not a normal wait phase after finish-run.
+                        // It should only appear during UploadCompleteFinishPending resume.
+                        anyhow::bail!(
+                            "run {}/{} is still 'incoming' but client state is \
+                             'waiting_for_terminal_state'; protocol inconsistency. \
+                             Local state preserved, no deletion.",
+                            nickname.as_str(),
+                            run_id.as_str()
+                        );
                     }
                     "not_found" => {
                         warn!(
