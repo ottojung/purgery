@@ -1980,6 +1980,177 @@ host = "example.invalid"
         );
     }
 
+    #[test]
+    #[ignore = "expected failure until SSH mock infrastructure exists"]
+    fn wait_loop_rejects_incoming_in_general_wait() {
+        // A run in WaitingForTerminalState that gets 'incoming' from run-state
+        // must return an error with state preserved (not treat it as waitable).
+        // This test requires a fake server_cmd that returns phase='incoming'.
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().join("purgery-state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let run_id = RunId::new("test-incoming-reject".into()).unwrap();
+        let runs_dir = state_dir
+            .join("runs")
+            .join(format!("laptop-{}", run_id.as_str()));
+        fs::create_dir_all(&runs_dir).unwrap();
+        let manifest = purgery_core::Manifest {
+            run_id: run_id.clone(),
+            nickname: purgery_core::Nickname::new("laptop".into()).unwrap(),
+            entries: vec![],
+        };
+        let run_config = purgery_core::RunConfig {
+            nickname: purgery_core::Nickname::new("laptop".into()).unwrap(),
+            sync: vec![],
+            postprocess: Default::default(),
+        };
+        let state = purgery_core::ClientRunState {
+            protocol_version: 1,
+            nickname: "laptop".into(),
+            run_id: run_id.as_str().to_owned(),
+            manifest: manifest.to_toml().unwrap(),
+            run_config: run_config.to_toml().unwrap(),
+            phase: purgery_core::ClientRunPhase::WaitingForTerminalState,
+        };
+        let content = toml::to_string(&state).unwrap();
+        fs::write(runs_dir.join("state.toml"), &content).unwrap();
+
+        let config = ClientConfig::from_toml(&format!(
+            r#"
+nickname = "laptop"
+state_dir = "{}"
+
+[server]
+host = "localhost"
+"#,
+            state_dir.display()
+        ))
+        .unwrap();
+
+        // wait_for_terminal_run_state currently treats "incoming" as waitable.
+        // After fix, it must return an error instead.
+        // Without mock SSH, this test connects to localhost and fails with connection refused.
+        let result = wait_for_terminal_run_state(
+            &config,
+            "localhost",
+            "true",
+            &manifest,
+            &purgery_core::Nickname::new("laptop".into()).unwrap(),
+            &run_id,
+        );
+        assert!(
+            result.is_err(),
+            "incoming phase in general wait must return error"
+        );
+        let err = result.unwrap_err().to_string().to_lowercase();
+        assert!(
+            err.contains("incoming"),
+            "error must mention incoming: {err}"
+        );
+    }
+
+    #[test]
+    #[ignore = "expected failure until SSH mock infrastructure exists"]
+    fn upload_complete_finish_pending_accepts_incoming() {
+        // Resume from UploadCompleteFinishPending with phase=incoming must
+        // call finish-run. This test requires a fake server_cmd that
+        // returns phase='incoming' for run-state and accepts finish-run.
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().join("purgery-state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let run_id = RunId::new("test-incoming-accept".into()).unwrap();
+        let runs_dir = state_dir
+            .join("runs")
+            .join(format!("laptop-{}", run_id.as_str()));
+        fs::create_dir_all(&runs_dir).unwrap();
+        let manifest = purgery_core::Manifest {
+            run_id: run_id.clone(),
+            nickname: purgery_core::Nickname::new("laptop".into()).unwrap(),
+            entries: vec![],
+        };
+        let run_config = purgery_core::RunConfig {
+            nickname: purgery_core::Nickname::new("laptop".into()).unwrap(),
+            sync: vec![],
+            postprocess: Default::default(),
+        };
+        let state = purgery_core::ClientRunState {
+            protocol_version: 1,
+            nickname: "laptop".into(),
+            run_id: run_id.as_str().to_owned(),
+            manifest: manifest.to_toml().unwrap(),
+            run_config: run_config.to_toml().unwrap(),
+            phase: purgery_core::ClientRunPhase::UploadCompleteFinishPending,
+        };
+        let content = toml::to_string(&state).unwrap();
+        fs::write(runs_dir.join("state.toml"), &content).unwrap();
+        let config = ClientConfig::from_toml(&format!(
+            r#"
+nickname = "laptop"
+state_dir = "{}"
+
+[server]
+host = "localhost"
+command = "true"
+"#,
+            state_dir.display()
+        ))
+        .unwrap();
+        // After implementation, this must accept incoming phase.
+        // With current code, the run-state query tries SSH to localhost.
+        let result = resume_pending_postprocess_runs(&config);
+        // For now, we expect an error because we can't SSH.
+        // After implementation with mock, it should:
+        //   1. Query run-state (fake returns "incoming")
+        //   2. Call finish-run (fake accepts)
+        //   3. Write WaitingForTerminalState
+        assert!(result.is_err(), "needs mock SSH infrastructure");
+    }
+
+    #[test]
+    #[ignore = "expected failure until SSH mock infrastructure exists"]
+    fn ready_processing_remain_waitable() {
+        // ready and processing phases must be treated as waitable.
+        // This test needs a fake server that returns 'processing' then 'done'.
+        // With current code it tries real SSH and fails.
+    }
+
+    #[test]
+    #[ignore = "expected failure until SSH mock infrastructure exists"]
+    fn transport_failure_stops_invocation_not_retry_forever() {
+        // When run-state command fails, the wait loop must stop immediately
+        // (not retry forever). With current code the outer function returns error.
+        // After implementation, the wait loop must also stop on first failure.
+    }
+
+    #[test]
+    #[ignore = "expected failure until SSH mock infrastructure exists"]
+    fn malformed_run_state_stops_invocation_not_retry_forever() {
+        // When run-state returns unparseable TOML, the wait loop must stop.
+    }
+
+    #[test]
+    #[ignore = "expected failure until SSH mock infrastructure exists"]
+    fn terminal_status_transport_failure_preserves_terminal_status_seen() {
+        // After terminal run-state, if status command fails, TerminalStatusSeen
+        // state must be preserved and the invocation must stop.
+    }
+
+    #[test]
+    #[ignore = "expected failure until read_and_verify_terminal_status is testable"]
+    fn malformed_terminal_status_writes_corrupt_tombstone() {
+        // When status returns malformed TOML, read_and_verify_terminal_status
+        // must write a Corrupt tombstone and return error.
+        // This test needs a fake server_cmd or direct access to the function
+        // with a controllable response.
+    }
+
+    #[test]
+    #[ignore = "expected failure until read_and_verify_terminal_status is testable"]
+    fn envelope_mismatched_terminal_status_writes_corrupt_tombstone() {
+        // When status returns valid TOML but mismatched nickname/run_id,
+        // read_and_verify_terminal_status must write Corrupt tombstone.
+    }
+
     /// Scan production .rs files for stray debug output (eprintln!, println!, dbg!).
     /// Test-only directories ("tests") are excluded entirely.
     /// Within production files, scanning stops at `#[cfg(test)]`.

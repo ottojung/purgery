@@ -19,7 +19,7 @@ mod recover;
 
 pub use gc::run_gc;
 pub use phases::{begin_run, find_processing_runs, find_ready_runs, finish_run, move_to_failed};
-pub use postprocess::apply_postprocessing;
+pub use postprocess::{apply_postprocessing, apply_postprocessing_with_heartbeat};
 pub use process::{process_once_raw, process_processing_run, process_ready_run};
 pub use recover::recover_or_process_processing_run;
 
@@ -5649,6 +5649,176 @@ delete_after_import = true
             );
         }
         // If progress was cleaned up, the test documents expected behavior
+    }
+
+    // ── Progress sentinel and write-failure tests ──
+
+    #[test]
+    #[ignore = "expected failure until apply_postprocessing receives entry context"]
+    fn progress_update_has_no_sentinel_placeholders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_path = Utf8PathBuf::from_path_buf(tmp.path().join("input.txt")).unwrap();
+        fs::write(&work_path, b"input").unwrap();
+        let compressed = work_path.with_file_name("input.out");
+        fs::write(&compressed, b"output").unwrap();
+
+        let server_config = ServerConfig {
+            root: ServerRoot::new("/data".into()).unwrap(),
+            purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
+            gc: Default::default(),
+            postprocess: PostprocessConfig {
+                steps: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "compress".to_owned(),
+                        PostprocessStepDefinition {
+                            kind: PostprocessKind::Subprocess,
+                            program: "true".into(),
+                            args: vec![],
+                            expected_outputs: vec!["{stem}.out".into()],
+                            keep_original: false,
+                        },
+                    );
+                    m
+                },
+            },
+            logging: Default::default(),
+        };
+        let run_config = RunConfig {
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            sync: vec![],
+            postprocess: purgery_core::ClientPostprocessConfig {
+                rules: vec![purgery_core::PostprocessRule {
+                    pattern: "*.txt".into(),
+                    steps: vec!["compress".into()],
+                    sync_names: None,
+                }],
+            },
+        };
+        let run_plan = RunPlan::build(&server_config, &run_config).unwrap();
+
+        let captured = std::sync::Mutex::new(Vec::new());
+        let mut callback = |update: &purgery_core::ProgressUpdate| {
+            captured.lock().unwrap().push((
+                update.state.to_owned(),
+                update.entry_index,
+                update.entry_total,
+                update.current_entry.to_owned(),
+                update.current_step.to_owned(),
+            ));
+        };
+
+        // After implementation, apply_postprocessing_with_heartbeat should accept
+        // entry context (entry_index, entry_total, current_entry) and pass it
+        // through to ProgressUpdate. Currently it uses (0, 0, normalized_path).
+        let _ = apply_postprocessing_with_heartbeat(
+            &run_plan,
+            "data",
+            "data/input.txt",
+            &work_path,
+            std::time::Duration::from_millis(1),
+            &mut callback,
+        );
+
+        let updates = captured.lock().unwrap();
+        for (state, _ei, et, _ce, _cs) in updates.iter() {
+            assert!(
+                *et > 0,
+                "step '{state}' must have entry_total > 0, got {et}"
+            );
+        }
+        // Publishing_status may have entry_total=0 (no active entry) but
+        // step_started/running/finished must all have >0 entry_total
+    }
+
+    #[test]
+    #[ignore = "expected failure until progress writes use best-effort logging"]
+    fn progress_write_failure_logs_warning_and_does_not_fail_import() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root =
+            Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("progress-fail".into()).unwrap();
+
+        // Use a ready run with one file
+        let ready_path = Utf8PathBuf::from_path_buf(tmp.path().join("purgery"))
+            .unwrap()
+            .join("laptop")
+            .join("ready")
+            .join(run_id.as_str());
+        fs::create_dir_all(ready_path.join("files/data")).unwrap();
+        fs::write(ready_path.join("files/data/file.txt"), b"content").unwrap();
+
+        fs::write(
+            ready_path.join("run.toml"),
+            r#"nickname = "laptop"
+
+[[sync]]
+name = "data"
+to = "data"
+delete_after_import = true
+"#,
+        )
+        .unwrap();
+
+        let manifest = Manifest {
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![ManifestEntry {
+                sync_name: SyncName::new("data".into()).unwrap(),
+                local_path: ClientLocalPath::new("/src/file.txt".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/data/file.txt".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("file.txt".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
+                size: 7,
+                mtime_ns: 100,
+                sha256: None,
+                link_target: None,
+                mode: Default::default(),
+                postprocess_steps: Vec::new(),
+                covered_by: None,
+            }],
+        };
+        fs::write(
+            ready_path.join("manifest.toml"),
+            manifest.to_toml().unwrap(),
+        )
+        .unwrap();
+
+        let config = test_server_config(
+            &Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
+            &server_root,
+        );
+
+        // Move from ready to processing
+        let processing_path = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        fs::create_dir_all(processing_path.parent().unwrap()).unwrap();
+        fs::rename(&ready_path, &processing_path).unwrap();
+
+        // Pre-create a directory at the progress temp path so the progress write fails
+        // (fs::write to an existing directory fails on Unix).
+        // This simulates a progress write failure without blocking status writes.
+        let progress_tmp = processing_path.join("progress.toml.tmp");
+        fs::create_dir(&progress_tmp).unwrap();
+
+        // Processing must still succeed despite progress write failure
+        let result = process_processing_run(&config, &nickname, &run_id);
+        assert!(
+            result.is_ok(),
+            "import must succeed even with progress write failure: {:?}",
+            result.err()
+        );
+
+        // The final file must exist
+        let final_path = server_root.join("laptop/data/file.txt");
+        assert_eq!(
+            fs::read_to_string(&final_path).unwrap(),
+            "content",
+            "file must be imported despite progress failure"
+        );
     }
 
     #[test]
