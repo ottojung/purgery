@@ -42,6 +42,10 @@ pub(crate) fn write_progress_best_effort(
             nickname = %nickname.as_str(),
             run_id = %run_id.as_str(),
             state = state,
+            entry_index = entry_index,
+            entry_total = entry_total,
+            current_entry = current_entry,
+            current_step = current_step,
             %error,
             "failed to write progress"
         );

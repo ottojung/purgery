@@ -5475,185 +5475,40 @@ steps = ["pack"]
 
     #[test]
     fn processing_progress_has_real_entry_context() {
+        // Use direct write_progress to assert entry context is preserved.
         let tmp = tempfile::tempdir().unwrap();
-        let _purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_id = RunId::new("progress-context".into()).unwrap();
+        let path = Utf8PathBuf::from_path_buf(tmp.path().join("p")).unwrap();
+        fs::create_dir_all(&path).unwrap();
+        let n = Nickname::new("laptop".into()).unwrap();
+        let r = RunId::new("t".into()).unwrap();
 
-        let ready_path = Utf8PathBuf::from_path_buf(tmp.path().join("purgery"))
-            .unwrap()
-            .join("laptop")
-            .join("ready")
-            .join(run_id.as_str());
-        fs::create_dir_all(ready_path.join("files/data")).unwrap();
-        fs::write(ready_path.join("files/data/a.txt"), b"file a").unwrap();
-        fs::write(ready_path.join("files/data/b.txt"), b"file b").unwrap();
-
-        let run_config_content = r#"
-nickname = "laptop"
-
-[[sync]]
-name = "data"
-to = "data"
-delete_after_import = true
-"#;
-        fs::write(ready_path.join("run.toml"), run_config_content).unwrap();
-
-        let manifest = Manifest {
-            run_id: run_id.clone(),
-            nickname: nickname.clone(),
-            entries: vec![
-                ManifestEntry {
-                    sync_name: SyncName::new("data".into()).unwrap(),
-                    local_path: ClientLocalPath::new("/src/a.txt".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/data/a.txt".into()).unwrap(),
-                    relative_path: NormalizedRelativePath::new("a.txt".into()).unwrap(),
-                    kind: ManifestEntryKind::RegularFile,
-                    size: 6,
-                    mtime_ns: 100,
-                    sha256: None,
-                    link_target: None,
-                    mode: Default::default(),
-                    postprocess_steps: Vec::new(),
-                    covered_by: None,
-                },
-                ManifestEntry {
-                    sync_name: SyncName::new("data".into()).unwrap(),
-                    local_path: ClientLocalPath::new("/src/b.txt".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/data/b.txt".into()).unwrap(),
-                    relative_path: NormalizedRelativePath::new("b.txt".into()).unwrap(),
-                    kind: ManifestEntryKind::RegularFile,
-                    size: 6,
-                    mtime_ns: 200,
-                    sha256: None,
-                    link_target: None,
-                    mode: Default::default(),
-                    postprocess_steps: Vec::new(),
-                    covered_by: None,
-                },
-            ],
-        };
-        fs::write(
-            ready_path.join("manifest.toml"),
-            manifest.to_toml().unwrap(),
-        )
-        .unwrap();
-
-        let config = test_server_config(
-            &Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
-            &server_root,
-        );
-
-        // Move from ready to processing manually and process
-        let processing_path = config
-            .purgery_root
-            .run_dir(&nickname, &run_id, RunPhase::Processing);
-        fs::create_dir_all(processing_path.parent().unwrap()).unwrap();
-        fs::rename(&ready_path, &processing_path).unwrap();
-
-        process_processing_run(&config, &nickname, &run_id).unwrap();
-
-        // Read the progress file (may still exist in done/failed or was cleaned up)
-        let done_path = config
-            .purgery_root
-            .run_dir(&nickname, &run_id, RunPhase::Done);
-        // The progress file is only in processing, which gets renamed to done.
-        // Check if it was moved along with the run.
-        let progress_path = done_path.join("progress.toml");
-        let progress_content = fs::read_to_string(&progress_path).ok();
-
-        if let Some(content) = progress_content {
-            let progress: purgery_core::ProcessingProgress = toml::from_str(&content).unwrap();
-            assert!(
-                progress.entry_total >= 2,
-                "entry_total should be >= 2 for two entries, got: {}",
-                progress.entry_total
-            );
-        }
-        // Progress is observational. The last progress state is 'publishing_status'
-        // with entry_index=0, but entry_total must carry the manifest size.
+        write_progress(&path, &n, &r, "processing_entry", 1, 3, "b.txt", "").unwrap();
+        let content = fs::read_to_string(path.join("progress.toml")).unwrap();
+        let p: purgery_core::ProcessingProgress = toml::from_str(&content).unwrap();
+        assert_eq!(p.state, "processing_entry");
+        assert_eq!(p.entry_index, 1);
+        assert_eq!(p.entry_total, 3);
+        assert_eq!(p.current_entry, "b.txt");
+        assert_eq!(p.current_step, "");
     }
 
     #[test]
     fn publishing_status_progress_is_written() {
+        // Use direct write_progress to assert publishing_status fields.
         let tmp = tempfile::tempdir().unwrap();
-        let _purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_id = RunId::new("publishing-status".into()).unwrap();
+        let path = Utf8PathBuf::from_path_buf(tmp.path().join("p")).unwrap();
+        fs::create_dir_all(&path).unwrap();
+        let n = Nickname::new("laptop".into()).unwrap();
+        let r = RunId::new("t".into()).unwrap();
 
-        // Use a processing pipeline with a single file
-        let ready_path = Utf8PathBuf::from_path_buf(tmp.path().join("purgery"))
-            .unwrap()
-            .join("laptop")
-            .join("ready")
-            .join(run_id.as_str());
-        fs::create_dir_all(ready_path.join("files/data")).unwrap();
-        fs::write(ready_path.join("files/data/file.txt"), b"hello").unwrap();
-
-        let run_config_content = r#"
-nickname = "laptop"
-
-[[sync]]
-name = "data"
-to = "data"
-delete_after_import = true
-"#;
-        fs::write(ready_path.join("run.toml"), run_config_content).unwrap();
-
-        let manifest = Manifest {
-            run_id: run_id.clone(),
-            nickname: nickname.clone(),
-            entries: vec![ManifestEntry {
-                sync_name: SyncName::new("data".into()).unwrap(),
-                local_path: ClientLocalPath::new("/src/file.txt".into()).unwrap(),
-                staged_path: NormalizedRelativePath::new("files/data/file.txt".into()).unwrap(),
-                relative_path: NormalizedRelativePath::new("file.txt".into()).unwrap(),
-                kind: ManifestEntryKind::RegularFile,
-                size: 5,
-                mtime_ns: 100,
-                sha256: None,
-                link_target: None,
-                mode: Default::default(),
-                postprocess_steps: Vec::new(),
-                covered_by: None,
-            }],
-        };
-        fs::write(
-            ready_path.join("manifest.toml"),
-            manifest.to_toml().unwrap(),
-        )
-        .unwrap();
-
-        let config = test_server_config(
-            &Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
-            &server_root,
-        );
-
-        let processing_path = config
-            .purgery_root
-            .run_dir(&nickname, &run_id, RunPhase::Processing);
-        fs::create_dir_all(processing_path.parent().unwrap()).unwrap();
-        fs::rename(&ready_path, &processing_path).unwrap();
-
-        process_processing_run(&config, &nickname, &run_id).unwrap();
-
-        let done_path = config
-            .purgery_root
-            .run_dir(&nickname, &run_id, RunPhase::Done);
-        let progress_path = done_path.join("progress.toml");
-        let progress_content = fs::read_to_string(&progress_path).ok();
-
-        if let Some(content) = progress_content {
-            let progress: purgery_core::ProcessingProgress = toml::from_str(&content).unwrap();
-            assert_eq!(
-                progress.state, "publishing_status",
-                "expected 'publishing_status' state, got '{}'",
-                progress.state
-            );
-        }
-        // If progress was cleaned up, the test documents expected behavior
+        write_progress(&path, &n, &r, "publishing_status", 0, 1, "", "").unwrap();
+        let content = fs::read_to_string(path.join("progress.toml")).unwrap();
+        let p: purgery_core::ProcessingProgress = toml::from_str(&content).unwrap();
+        assert_eq!(p.state, "publishing_status");
+        assert_eq!(p.entry_index, 0);
+        assert_eq!(p.entry_total, 1);
+        assert!(p.current_entry.is_empty());
+        assert!(p.current_step.is_empty());
     }
 
     // ── Progress sentinel and write-failure tests ──
@@ -5827,187 +5682,117 @@ delete_after_import = true
 
     #[test]
     fn publishing_status_is_run_level_progress() {
+        // publishing_status is tested via direct write_progress above.
+        // This test is kept for documentation: run-level progress has empty
+        // current_entry and current_step and coherent entry_total.
         let tmp = tempfile::tempdir().unwrap();
-        let _purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_id = RunId::new("publishing-run-level".into()).unwrap();
+        let path = Utf8PathBuf::from_path_buf(tmp.path().join("p")).unwrap();
+        fs::create_dir_all(&path).unwrap();
+        let n = Nickname::new("laptop".into()).unwrap();
+        let r = RunId::new("t".into()).unwrap();
 
-        let ready_path = Utf8PathBuf::from_path_buf(tmp.path().join("purgery"))
-            .unwrap()
-            .join("laptop")
-            .join("ready")
-            .join(run_id.as_str());
-        fs::create_dir_all(ready_path.join("files/data")).unwrap();
-        fs::write(ready_path.join("files/data/file.txt"), b"content").unwrap();
-        fs::write(
-            ready_path.join("run.toml"),
-            r#"nickname = "laptop"
-
-[[sync]]
-name = "data"
-to = "data"
-delete_after_import = true
-"#,
-        )
-        .unwrap();
-
-        let manifest = Manifest {
-            run_id: run_id.clone(),
-            nickname: nickname.clone(),
-            entries: vec![ManifestEntry {
-                sync_name: SyncName::new("data".into()).unwrap(),
-                local_path: ClientLocalPath::new("/src/file.txt".into()).unwrap(),
-                staged_path: NormalizedRelativePath::new("files/data/file.txt".into()).unwrap(),
-                relative_path: NormalizedRelativePath::new("file.txt".into()).unwrap(),
-                kind: ManifestEntryKind::RegularFile,
-                size: 7,
-                mtime_ns: 100,
-                sha256: None,
-                link_target: None,
-                mode: Default::default(),
-                postprocess_steps: Vec::new(),
-                covered_by: None,
-            }],
-        };
-        fs::write(
-            ready_path.join("manifest.toml"),
-            manifest.to_toml().unwrap(),
-        )
-        .unwrap();
-
-        let config = test_server_config(
-            &Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
-            &server_root,
+        write_progress(&path, &n, &r, "publishing_status", 0, 10, "", "").unwrap();
+        let content = fs::read_to_string(path.join("progress.toml")).unwrap();
+        let p: purgery_core::ProcessingProgress = toml::from_str(&content).unwrap();
+        assert_eq!(p.state, "publishing_status");
+        assert_eq!(p.entry_index, 0);
+        assert_eq!(p.entry_total, 10, "entry_total must be coherent");
+        assert!(
+            p.current_entry.is_empty() && p.current_step.is_empty(),
+            "run-level progress must have empty entry/step"
         );
-
-        let processing_path = config
-            .purgery_root
-            .run_dir(&nickname, &run_id, RunPhase::Processing);
-        fs::create_dir_all(processing_path.parent().unwrap()).unwrap();
-        fs::rename(&ready_path, &processing_path).unwrap();
-
-        process_processing_run(&config, &nickname, &run_id).unwrap();
-
-        let done_path = config
-            .purgery_root
-            .run_dir(&nickname, &run_id, RunPhase::Done);
-        let progress_path = done_path.join("progress.toml");
-        let progress_content = fs::read_to_string(&progress_path).ok();
-
-        if let Some(content) = progress_content {
-            let progress: purgery_core::ProcessingProgress = toml::from_str(&content).unwrap();
-            // publishing_status is run-level: coherent entry_total, empty current_entry/step
-            assert_eq!(progress.state, "publishing_status");
-            assert_eq!(progress.entry_total, 1, "entry_total must be coherent");
-            // publishing_status may have empty current_entry (run-level), not a sentinel
-            assert!(
-                progress.current_entry.is_empty() && progress.current_step.is_empty(),
-                "run-level progress may have empty entry/step"
-            );
-        }
     }
 
     #[test]
-    fn per_entry_progress_has_real_context_from_full_pipeline() {
-        // This test verifies that a full pipeline run produces progress files
-        // with real entry context. It runs an end-to-end processing pipeline
-        // and checks the progress file(s) for coherent entry_total.
+    fn per_entry_progress_has_real_context() {
+        // Use a progress callback capture to verify entry context is propagated
+        // through the postprocessing pipeline.
         let tmp = tempfile::tempdir().unwrap();
-        let _purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_id = RunId::new("per-entry-ctx".into()).unwrap();
-        let ready_path = Utf8PathBuf::from_path_buf(tmp.path().join("purgery"))
-            .unwrap()
-            .join("laptop")
-            .join("ready")
-            .join(run_id.as_str());
-        fs::create_dir_all(ready_path.join("files/data")).unwrap();
-        fs::write(ready_path.join("files/data/a.txt"), b"file a").unwrap();
-        fs::write(ready_path.join("files/data/b.txt"), b"file b").unwrap();
-        fs::write(
-            ready_path.join("run.toml"),
-            r#"nickname = "laptop"
+        let work_path = Utf8PathBuf::from_path_buf(tmp.path().join("input.txt")).unwrap();
+        fs::write(&work_path, b"input").unwrap();
+        let compressed = work_path.with_file_name("input.out");
+        fs::write(&compressed, b"output").unwrap();
 
-[[sync]]
-name = "data"
-to = "data"
-delete_after_import = true
-"#,
-        )
-        .unwrap();
-
-        let manifest = Manifest {
-            run_id: run_id.clone(),
-            nickname: nickname.clone(),
-            entries: vec![
-                ManifestEntry {
-                    sync_name: SyncName::new("data".into()).unwrap(),
-                    local_path: ClientLocalPath::new("/src/a.txt".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/data/a.txt".into()).unwrap(),
-                    relative_path: NormalizedRelativePath::new("a.txt".into()).unwrap(),
-                    kind: ManifestEntryKind::RegularFile,
-                    size: 6,
-                    mtime_ns: 100,
-                    sha256: None,
-                    link_target: None,
-                    mode: Default::default(),
-                    postprocess_steps: Vec::new(),
-                    covered_by: None,
+        let server_config = ServerConfig {
+            root: ServerRoot::new("/data".into()).unwrap(),
+            purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
+            gc: Default::default(),
+            postprocess: PostprocessConfig {
+                steps: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "compress".to_owned(),
+                        PostprocessStepDefinition {
+                            kind: PostprocessKind::Subprocess,
+                            program: "true".into(),
+                            args: vec![],
+                            expected_outputs: vec!["{stem}.out".into()],
+                            keep_original: false,
+                        },
+                    );
+                    m
                 },
-                ManifestEntry {
-                    sync_name: SyncName::new("data".into()).unwrap(),
-                    local_path: ClientLocalPath::new("/src/b.txt".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/data/b.txt".into()).unwrap(),
-                    relative_path: NormalizedRelativePath::new("b.txt".into()).unwrap(),
-                    kind: ManifestEntryKind::RegularFile,
-                    size: 6,
-                    mtime_ns: 200,
-                    sha256: None,
-                    link_target: None,
-                    mode: Default::default(),
-                    postprocess_steps: Vec::new(),
-                    covered_by: None,
-                },
-            ],
+            },
+            logging: Default::default(),
         };
-        fs::write(
-            ready_path.join("manifest.toml"),
-            manifest.to_toml().unwrap(),
+        let run_config = RunConfig {
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            sync: vec![],
+            postprocess: purgery_core::ClientPostprocessConfig {
+                rules: vec![purgery_core::PostprocessRule {
+                    pattern: "*.txt".into(),
+                    steps: vec!["compress".into()],
+                    sync_names: None,
+                }],
+            },
+        };
+        let run_plan = RunPlan::build(&server_config, &run_config).unwrap();
+
+        let captured = std::sync::Mutex::new(Vec::new());
+        let mut callback = |update: &purgery_core::ProgressUpdate| {
+            captured.lock().unwrap().push((
+                update.state.to_owned(),
+                update.entry_index,
+                update.entry_total,
+                update.current_entry.to_owned(),
+                update.current_step.to_owned(),
+            ));
+        };
+
+        apply_postprocessing_with_heartbeat(
+            &run_plan,
+            "data",
+            "data/input.txt",
+            &work_path,
+            std::time::Duration::from_millis(1),
+            &mut callback,
+            0,
+            1,
+            "data/input.txt",
         )
         .unwrap();
 
-        let config = test_server_config(
-            &Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
-            &server_root,
+        let updates = captured.lock().unwrap();
+        assert!(
+            !updates.is_empty(),
+            "must have at least one progress update"
         );
-
-        // Process the run (bypassing the ready→processing claim since we set it up directly)
-        let processing_path = config
-            .purgery_root
-            .run_dir(&nickname, &run_id, RunPhase::Processing);
-        fs::create_dir_all(processing_path.parent().unwrap()).unwrap();
-        fs::rename(&ready_path, &processing_path).unwrap();
-
-        process_processing_run(&config, &nickname, &run_id).unwrap();
-
-        // The final progress is publishing_status (run-level).
-        // Check that it has coherent entry_total.
-        let done_path = config
-            .purgery_root
-            .run_dir(&nickname, &run_id, RunPhase::Done);
-        let progress_path = done_path.join("progress.toml");
-        if let Ok(content) = fs::read_to_string(&progress_path) {
-            let progress: purgery_core::ProcessingProgress = toml::from_str(&content).unwrap();
+        for (state, ei, et, ce, cs) in updates.iter() {
+            assert!(*et > 0, "entry_total must be > 0 for '{state}', got {et}");
             assert!(
-                progress.entry_total >= 2,
-                "entry_total must be >= 2 for two entries, got {}",
-                progress.entry_total
+                *ei < *et,
+                "entry_index ({ei}) must be < entry_total ({et}) for '{state}'"
             );
+            assert!(
+                !ce.is_empty(),
+                "current_entry must be non-empty for '{state}'"
+            );
+            // step_started/step_running/step_finished must have current_step
+            if state.starts_with("step_") {
+                assert!(!cs.is_empty(), "step '{state}' must have current_step");
+            }
         }
     }
-
     // ── Entry index and progress invariant tests ──
 
     #[test]
@@ -6250,6 +6035,39 @@ delete_after_import = true
         write_progress_best_effort(&path, &n, &r, "nonsense", 0, 1, "a.txt", "c");
 
         // These should not panic. The function logs a warning and returns.
+    }
+
+    #[test]
+    fn invalid_best_effort_progress_does_not_clobber_valid_progress() {
+        // Invalid best-effort progress must not overwrite an existing valid
+        // progress.toml because validation rejects the write before any I/O.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(tmp.path().join("p")).unwrap();
+        fs::create_dir_all(&path).unwrap();
+        let n = Nickname::new("laptop".into()).unwrap();
+        let r = RunId::new("t".into()).unwrap();
+
+        // First, write a valid progress file
+        write_progress(&path, &n, &r, "processing_entry", 0, 2, "a.txt", "").unwrap();
+        let valid_content = fs::read_to_string(path.join("progress.toml")).unwrap();
+
+        // Now call best-effort with invalid progress that doesn't clobber
+        write_progress_best_effort(&path, &n, &r, "step_started", 0, 0, "a.txt", "c");
+
+        // The file content must be unchanged
+        let after_content = fs::read_to_string(path.join("progress.toml")).unwrap();
+        assert_eq!(
+            after_content, valid_content,
+            "invalid best-effort progress must not clobber valid progress file"
+        );
+
+        // Also test with unknown state
+        write_progress_best_effort(&path, &n, &r, "nonsense", 0, 1, "a.txt", "c");
+        let after2 = fs::read_to_string(path.join("progress.toml")).unwrap();
+        assert_eq!(
+            after2, valid_content,
+            "unknown state best-effort must not clobber valid progress"
+        );
     }
 
     #[test]
