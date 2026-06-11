@@ -137,20 +137,20 @@ This property makes crash recovery replay-based. A crash may occur after some en
 
 ## Per-entry replacement invariant
 
-Regular-file outputs are copied from their work-area location directly to their final path. Symlinks are created directly at their final path after removing any conflicting destination. Directories are created or retained directly. No sibling temp files are created under the final storage root.
+Regular-file outputs are copied from their work-area location directly to their final path. Symlinks are created directly at their final path after removing any conflicting destination. Directories are created or retained directly.
 
 ```text
 regular work output → direct copy to final path
 literal link target → create symlink at final path
 ```
 
-The final destination tree (`root`) is output-only. All staging, temporary commit helpers, and intermediate artifacts live under `purgery_root`.
+The final destination tree (`root`) is output-only. All staging and intermediate artifacts live under `purgery_root`.
 
 A present source directory replaces a conflicting final file or symlink and then allows descendants to merge. A present source regular file or symlink replaces a final file, symlink, or empty directory, but fails rather than deleting a non-empty final directory. Existing ancestors must be real directories; final-storage symlinks are never followed as directory components. Every derived path must remain inside the configured storage root.
 
 A crash during a direct copy to final storage may leave the exact final path with partial contents. This is acceptable because `status.toml` has not been published. On recovery, `process-once` replays the run from staged files and overwrites any partial remnants.
 
-Without sibling temp files under `root`, replacement is not an atomic same-directory rename. Purgery relies on replay and convergence: a later failure does not restore entries already committed by the same run. The run remains recoverable and is replayed if it did not publish terminal status.
+Direct final-path writes are not atomic same-directory renames. Purgery relies on replay and convergence: a later failure does not restore entries already committed by the same run. The run remains recoverable and is replayed if it did not publish terminal status.
 
 ## No implicit delete invariant
 

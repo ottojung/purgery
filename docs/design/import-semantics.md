@@ -6,9 +6,9 @@ Purgery maintains two distinct storage locations:
 
 * **`root`** (final archive): Output-only storage. The only paths Purgery may create or modify under `root` are the actual final imported files, directories, and symlinks and their final postprocessed output versions. No operational, temporary, intermediate, progress, status, lock, staging, partial, or helper files are ever created under `root`.
 
-* **`purgery_root`** (Purgery-owned operational state): All operational state lives here, including incoming runs, ready/processing/done/failed run directories, manifests, status/progress files, work areas, postprocess staging, temporary commit helpers, and any staging needed for safe commits.
+* **`purgery_root`** (Purgery-owned operational state): All operational state lives here, including incoming runs, ready/processing/done/failed run directories, manifests, status/progress files, work areas, and postprocess staging.
 
-The rule is: nothing non-final may appear under `root`. A partially written exact final file path is allowed during interrupted transfer or materialization — the path is still the actual final file being transferred. A sibling helper path (such as `.purgery-commit.<run_id>.<filename>.tmp`) is not, because it is not a final user-data path. Sibling helper paths under `root` are forbidden regardless of naming convention.
+The rule is: nothing non-final may appear under `root`. A partially written exact final file path is allowed during interrupted transfer or materialization — the path is still the actual final file being transferred. Sibling helper paths under `root` are forbidden because they are not final user-data paths.
 
 ## Commit path by output kind
 
@@ -22,7 +22,7 @@ work output → direct copy to final path
 
 The source (staged file or work-area output) is a complete file already verified against the manifest. A crash during the copy to final storage may leave a partial file at the exact final path. This is acceptable because the run has not published `status.toml` and will be replayed from staged data on recovery, overwriting the partial file.
 
-No sibling temp file (such as `.purgery-commit.*.tmp`) is created in the final parent directory during commit. The copy writes directly to the final path.
+The copy writes directly to the final path. No intermediate helper files are created in the final parent directory.
 
 ### Directory roots
 
@@ -34,11 +34,13 @@ Purgery uses recursive no-delete overlay semantics for commits. Existing directo
 
 Commits are not all-or-nothing. A crash during commit may leave some outputs already written to final storage, and a crash during a direct file copy may leave the exact final path with partial contents. This is acceptable because `status.toml` has not been published yet, `processing/` still exists, and `process-once` replays from staged files with idempotent commits, overwriting any partial remnants.
 
-## Rsync and `--partial` / `--mkpath`
+## Transfer and materialization consequences
 
-All rsync invocations include `--partial` and `--mkpath`. `--partial` ensures that interrupted transfers (whether to staging or directly to final storage) can resume without re-transferring already-received data. A partially transferred file at an exact final path is still the actual final file being transferred — it is not an operational helper path. `--mkpath` lets rsync create destination directories as needed, so Purgery does not eagerly create final archive directory skeletons before a transfer begins. A failed run should not leave empty `root/<nickname>/<sync.to>/` directories merely because Purgery pre-created them.
+Interrupted transfers can resume without re-transferring already-received data. A partially transferred file at an exact final path is still the actual final file being transferred — it is not an operational helper path.
 
-The invariant is that `root` contains only final user-data paths, not that every byte under `root` is always complete during transfer. Operational files (status, progress, lock, staging, filter, cleanup, or commit-helper files) must never appear under `root` under any circumstance.
+Purgery does not eagerly create final archive directory skeletons as run setup. Directories under `root` are created only when an actual final entry is materialized. A failed run with no successfully materialized entries should not leave empty `root/<nickname>/<sync.to>/` directories.
+
+The invariant is that `root` contains only final user-data paths, not that every byte under `root` is always complete during transfer. Operational files (status, progress, lock, staging, filter, cleanup, or helper files) must never appear under `root` under any circumstance.
 
 ## `final_paths` (plural)
 
@@ -198,8 +200,8 @@ If a `status.toml` exists but is malformed (invalid TOML or missing required fie
       files/                         # uploaded entries by sync mapping (staging)
     ready/<run_id>/                  # upload complete, pending processing
     processing/<run_id>/             # actively being processed
-      work/                          # per-run work area (staging, temp commit helpers,
-      |                              #   postprocess inputs/outputs, intermediate artifacts)
+      work/                          # per-run work area (staging, postprocess
+      |                              #   inputs/outputs, intermediate artifacts)
       status.toml
       progress.toml
       run.toml

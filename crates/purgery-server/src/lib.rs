@@ -1663,10 +1663,8 @@ steps = ["compress-video"]
         );
     }
 
-    // ── Temp-file commit test ──
-
     #[test]
-    fn test_temp_file_commit_no_direct_copy() {
+    fn regular_file_commit_produces_only_expected_final_paths() {
         let tmp = tempfile::tempdir().unwrap();
         let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
@@ -1690,18 +1688,12 @@ steps = ["compress-video"]
         assert!(final_path.exists());
         assert_eq!(fs::read_to_string(&final_path).unwrap(), "hello");
 
-        let has_temp_files = std::fs::read_dir(final_path.parent().unwrap())
-            .unwrap()
-            .any(|e| {
-                e.ok()
-                    .and_then(|e| e.file_name().to_str().map(|s| s.to_owned()))
-                    .map(|s| s.starts_with(".purgery-commit"))
-                    .unwrap_or(false)
-            });
-        assert!(
-            !has_temp_files,
-            "temp files must be cleaned up after commit"
-        );
+        let expected = vec![
+            server_root.join("laptop"),
+            server_root.join("laptop/videos"),
+            server_root.join("laptop/videos/test.mp4"),
+        ];
+        assert_root_contains_exactly(server_root.as_path(), &expected);
     }
 
     // ── Atomic replacement tests ──
