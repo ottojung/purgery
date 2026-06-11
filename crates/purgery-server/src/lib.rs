@@ -858,12 +858,12 @@ pub fn build_remote_command(program: &str, args: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commit::commit_directory_tree;
     use camino::Utf8PathBuf;
     use purgery_core::{
         ClientLocalPath, ManifestEntry, ManifestEntryMode, NormalizedRelativePath,
         PostprocessConfig, PostprocessKind, PostprocessStepDefinition, ServerRoot, SyncName,
     };
-    use crate::commit::commit_directory_tree;
 
     /// Call apply_postprocessing with a no-op progress callback for testing.
     fn test_apply_postprocessing(
@@ -6524,9 +6524,8 @@ steps = ["pack"]
                 Err(_) => continue,
             };
             for entry in entries.flatten() {
-                let path = Utf8PathBuf::from_path_buf(entry.path()).unwrap_or_else(|p| {
-                    Utf8PathBuf::from(p.to_string_lossy().as_ref())
-                });
+                let path = Utf8PathBuf::from_path_buf(entry.path())
+                    .unwrap_or_else(|p| Utf8PathBuf::from(p.to_string_lossy().as_ref()));
                 let name = path.file_name().unwrap_or("");
                 let is_hidden = name.starts_with('.');
                 let is_tmp = name.ends_with(".tmp");
@@ -6535,7 +6534,7 @@ steps = ["pack"]
                 if is_hidden || is_tmp || is_partial || is_staging {
                     offenders.push(path.clone());
                 }
-                if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+                if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
                     // Only recurse into non-hidden dirs
                     if !is_hidden {
                         queue.push(path);
@@ -6561,12 +6560,7 @@ steps = ["pack"]
         fs::create_dir_all(final_path.parent().unwrap()).unwrap();
         fs::write(&source, b"hello").unwrap();
 
-        let _ = commit_regular_file_entry(
-            &source,
-            &final_path,
-            root.as_path(),
-            &run_id,
-        );
+        let _ = commit_regular_file_entry(&source, &final_path, root.as_path(), &run_id);
 
         // After the commit, root must only contain the final file and its
         // parent directories — no .purgery-commit.*.tmp, .tmp, .partial, or
@@ -6590,14 +6584,14 @@ steps = ["pack"]
         fs::create_dir_all(final_path.parent().unwrap()).unwrap();
         let target = Utf8PathBuf::from("/some/target");
 
-        let _ = commit_symlink_entry(
-            &target,
-            &final_path,
-            root.as_path(),
-            &run_id,
-        );
+        let result = commit_symlink_entry(&target, &final_path, root.as_path(), &run_id);
 
-        assert!(final_path.exists());
+        assert!(result.is_ok(), "symlink commit failed: {result:?}");
+        // Use symlink_metadata: exists() returns false for dangling symlinks
+        assert!(
+            std::fs::symlink_metadata(final_path.as_std_path()).is_ok(),
+            "symlink was not created at final_path"
+        );
         let offenders = collect_non_final_paths(root.as_path());
         assert!(
             offenders.is_empty(),
@@ -6622,12 +6616,7 @@ steps = ["pack"]
         std::os::unix::fs::symlink("/tmp/target", source_dir.join("c").as_std_path()).unwrap();
         fs::create_dir_all(final_dir.parent().unwrap()).unwrap();
 
-        let _ = commit_directory_tree(
-            &source_dir,
-            &final_dir,
-            root.as_path(),
-            &run_id,
-        );
+        let _ = commit_directory_tree(&source_dir, &final_dir, root.as_path(), &run_id);
 
         assert!(final_dir.exists());
         assert!(final_dir.join("a.txt").exists());
@@ -6683,14 +6672,11 @@ steps = ["pack"]
         let mut queue = vec![server_root.to_owned()];
         while let Some(dir) = queue.pop() {
             for entry in std::fs::read_dir(dir.as_std_path()).unwrap().flatten() {
-                let path = Utf8PathBuf::from_path_buf(entry.path()).unwrap_or_else(|p| {
-                    Utf8PathBuf::from(p.to_string_lossy().as_ref())
-                });
+                let path = Utf8PathBuf::from_path_buf(entry.path())
+                    .unwrap_or_else(|p| Utf8PathBuf::from(p.to_string_lossy().as_ref()));
                 actual.push(path.clone());
                 let name = path.file_name().unwrap_or("");
-                if entry.file_type().map_or(false, |ft| ft.is_dir())
-                    && !name.starts_with('.')
-                {
+                if entry.file_type().is_ok_and(|ft| ft.is_dir()) && !name.starts_with('.') {
                     queue.push(path);
                 }
             }
@@ -6698,10 +6684,7 @@ steps = ["pack"]
         actual.sort();
 
         let _actual_set: HashSet<Utf8PathBuf> = actual.clone().into_iter().collect();
-        let unexpected: Vec<_> = actual
-            .iter()
-            .filter(|p| !expected.contains(*p))
-            .collect();
+        let unexpected: Vec<_> = actual.iter().filter(|p| !expected.contains(*p)).collect();
         assert!(
             unexpected.is_empty(),
             "root contains unexpected paths: {unexpected:?}\nExpected: {expected:?}"
@@ -6838,8 +6821,7 @@ steps = ["always-fail"]
                 ManifestEntry {
                     sync_name: SyncName::new("videos".into()).unwrap(),
                     local_path: ClientLocalPath::new("/home/user/a.mp4".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/videos/a.mp4".into())
-                        .unwrap(),
+                    staged_path: NormalizedRelativePath::new("files/videos/a.mp4".into()).unwrap(),
                     relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
                     kind: ManifestEntryKind::RegularFile,
                     size: 13,
@@ -6853,8 +6835,7 @@ steps = ["always-fail"]
                 ManifestEntry {
                     sync_name: SyncName::new("videos".into()).unwrap(),
                     local_path: ClientLocalPath::new("/home/user/b.mp4".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/videos/b.mp4".into())
-                        .unwrap(),
+                    staged_path: NormalizedRelativePath::new("files/videos/b.mp4".into()).unwrap(),
                     relative_path: NormalizedRelativePath::new("b.mp4".into()).unwrap(),
                     kind: ManifestEntryKind::RegularFile,
                     size: 13,
@@ -6931,8 +6912,7 @@ steps = ["always-fail"]
                             args: vec![
                                 "-c".to_owned(),
                                 // Write into a subdirectory to verify the cwd
-                                "mkdir -p _outputs && echo done > _outputs/result.txt"
-                                    .to_owned(),
+                                "mkdir -p _outputs && echo done > _outputs/result.txt".to_owned(),
                             ],
                             expected_outputs: vec!["_outputs".to_owned()],
                             keep_original: false,
@@ -6998,10 +6978,7 @@ steps = ["echo-args"]
         .unwrap();
 
         let result = process_run(&server_config, &nickname, &run_id);
-        assert!(
-            result.is_ok(),
-            "postprocess run should succeed: {result:?}"
-        );
+        assert!(result.is_ok(), "postprocess run should succeed: {result:?}");
 
         let done_path = server_config
             .purgery_root

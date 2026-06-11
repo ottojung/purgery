@@ -21,22 +21,23 @@ pub(crate) fn remove_destination_for_non_directory(
             })?;
             Ok(CommitDisposition::Replaced)
         }
-        Ok(_) => Ok(CommitDisposition::Replaced),
+        Ok(_) => {
+            // Remove any non-directory entry (file or symlink) so that
+            // the direct commit (copy or symlink creation) can proceed.
+            // The old temp+rename design handled replacement implicitly
+            // through the rename; direct writes must remove explicitly.
+            fs::remove_file(final_path.as_std_path()).map_err(|error| {
+                format!(
+                    "failed to remove conflicting destination '{}': {error}",
+                    final_path.as_str()
+                )
+            })?;
+            Ok(CommitDisposition::Replaced)
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             Ok(CommitDisposition::Created)
         }
         Err(error) => Err(format!("failed to inspect final destination: {error}")),
-    }
-}
-
-pub(crate) fn remove_stale_temp(temp_path: &Utf8Path) -> Result<(), String> {
-    match fs::symlink_metadata(temp_path.as_std_path()) {
-        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(temp_path.as_std_path())
-            .map_err(|error| format!("failed to remove stale temporary directory: {error}")),
-        Ok(_) => fs::remove_file(temp_path.as_std_path())
-            .map_err(|error| format!("failed to remove stale temporary entry: {error}")),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("failed to inspect temporary entry: {error}")),
     }
 }
 
@@ -107,18 +108,12 @@ pub(crate) fn commit_regular_file_entry(
     source: &Utf8Path,
     final_path: &Utf8Path,
     root: &Utf8Path,
-    run_id: &purgery_core::RunId,
+    _run_id: &purgery_core::RunId,
 ) -> Result<CommitDisposition, String> {
     ensure_final_parent(final_path, root)?;
     let disposition = remove_destination_for_non_directory(final_path)?;
-    let temp_path = purgery_core::commit_temp_path(final_path, run_id);
-    remove_stale_temp(&temp_path)?;
-    fs::copy(source.as_std_path(), temp_path.as_std_path())
-        .map_err(|error| format!("failed to copy regular file to temporary path: {error}"))?;
-    if let Err(error) = fs::rename(temp_path.as_std_path(), final_path.as_std_path()) {
-        let _ = fs::remove_file(temp_path.as_std_path());
-        return Err(format!("failed to commit regular file: {error}"));
-    }
+    fs::copy(source.as_std_path(), final_path.as_std_path())
+        .map_err(|error| format!("failed to commit regular file: {error}"))?;
     Ok(disposition)
 }
 
@@ -127,22 +122,24 @@ fn create_symlink(target: &Utf8Path, link: &Utf8Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(target.as_std_path(), link.as_std_path())
 }
 
+#[cfg(not(unix))]
+fn create_symlink(_target: &Utf8Path, _link: &Utf8Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "symlink creation is only supported on Unix",
+    ))
+}
+
 pub(crate) fn commit_symlink_entry(
     target: &Utf8Path,
     final_path: &Utf8Path,
     root: &Utf8Path,
-    run_id: &purgery_core::RunId,
+    _run_id: &purgery_core::RunId,
 ) -> Result<CommitDisposition, String> {
     ensure_final_parent(final_path, root)?;
     let disposition = remove_destination_for_non_directory(final_path)?;
-    let temp_path = purgery_core::commit_temp_path(final_path, run_id);
-    remove_stale_temp(&temp_path)?;
-    create_symlink(target, &temp_path)
-        .map_err(|error| format!("failed to create temporary symlink: {error}"))?;
-    if let Err(error) = fs::rename(temp_path.as_std_path(), final_path.as_std_path()) {
-        let _ = fs::remove_file(temp_path.as_std_path());
-        return Err(format!("failed to commit symlink: {error}"));
-    }
+    create_symlink(target, final_path)
+        .map_err(|error| format!("failed to commit symlink: {error}"))?;
     Ok(disposition)
 }
 

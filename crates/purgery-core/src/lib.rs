@@ -177,6 +177,24 @@ pub fn resolve_executable(program: &str) -> Result<ResolvedExecutable, Executabl
 pub fn build_rsync_args(source: &str, destination: &str) -> Vec<String> {
     vec![
         "--recursive".to_string(),
+        "--archive".to_string(),
+        "--no-inc-recursive".to_string(),
+        "--protect-args".to_string(),
+        "--".to_string(),
+        format!("{}/", source),
+        destination.to_string(),
+    ]
+}
+
+/// Build rsync args for purgatory (staging) transfers only.
+///
+/// Includes `--partial` so interrupted transfers to the staging area
+/// under `purgery_root` can resume. Must not be used for transfers
+/// to final storage (`root`), where partials would violate the
+/// output-only final destination invariant.
+pub fn build_purgatory_rsync_args(source: &str, destination: &str) -> Vec<String> {
+    vec![
+        "--recursive".to_string(),
         "--partial".to_string(),
         "--archive".to_string(),
         "--no-inc-recursive".to_string(),
@@ -213,12 +231,22 @@ pub fn work_dir(purgery_root: &PurgeryRoot, nickname: &Nickname, run_id: &RunId)
         .join("work")
 }
 
-pub fn commit_temp_path(final_path: &Utf8Path, run_id: &RunId) -> Utf8PathBuf {
-    let filename = final_path.file_name().unwrap_or("unknown");
-    let tmp_name = format!(".purgery-commit.{}.{}.tmp", run_id.as_str(), filename);
-    final_path
-        .parent()
-        .map_or_else(|| Utf8PathBuf::from(&tmp_name), |p| p.join(&tmp_name))
+/// Return a staging path for commit helpers under a per-run work area.
+///
+/// Commit staging files live under `purgery_root`, never under the final
+/// destination root. The work area is disposable and is cleaned before a
+/// processing run starts, so stale staging files do not accumulate.
+///
+/// This replaces the old `commit_temp_path` which placed temp files in the
+/// final parent directory alongside the destination — a design that violated
+/// the output-only final destination invariant.
+pub fn commit_staging_path(
+    staging_dir: &Utf8Path,
+    final_filename: &str,
+    run_id: &RunId,
+) -> Utf8PathBuf {
+    let tmp_name = format!(".purgery-commit.{}.{}.tmp", run_id.as_str(), final_filename);
+    staging_dir.join(tmp_name)
 }
 
 // ── Envelope Validation ─────────────────────────────────────────────
@@ -1526,7 +1554,6 @@ files = []
             args,
             vec![
                 "--recursive",
-                "--partial",
                 "--archive",
                 "--no-inc-recursive",
                 "--protect-args",
@@ -1538,6 +1565,18 @@ files = []
     }
 
     #[test]
+    fn build_purgatory_rsync_args_includes_partial() {
+        let args = build_purgatory_rsync_args("/src", "host:/staging");
+        assert!(args.contains(&"--partial".to_string()));
+    }
+
+    #[test]
+    fn build_rsync_args_excludes_partial() {
+        let args = build_rsync_args("/src", "host:/dst");
+        assert!(!args.contains(&"--partial".to_string()));
+    }
+
+    #[test]
     fn build_rsync_args_includes_protect_args() {
         let args = build_rsync_args("/src", "host:/dst");
         assert!(args.contains(&"--protect-args".to_string()));
@@ -1546,7 +1585,7 @@ files = []
     #[test]
     fn build_rsync_args_with_spaces_in_source() {
         let args = build_rsync_args("/home/user/My Videos", "host:/dst");
-        assert_eq!(args[6], "/home/user/My Videos/");
+        assert_eq!(args[5], "/home/user/My Videos/");
     }
 
     #[test]
@@ -1694,25 +1733,25 @@ files = []
         assert!(result.unwrap_err().contains("symlink detected"));
     }
 
-    // ── Commit temp path tests ──
+    // ── Commit staging path tests ──
 
     #[test]
-    fn commit_temp_path_basic() {
-        let final_path = Utf8Path::new("/data/laptop/videos/a.mp4");
+    fn commit_staging_path_uses_staging_dir_not_final_parent() {
+        let staging = Utf8Path::new("/tmp/purgery/laptop/processing/run1/work/commit");
         let run_id = RunId::new("01ARZ3NDEKTSV4RRFFQ69G5FAV".into()).unwrap();
-        let tmp = commit_temp_path(final_path, &run_id);
+        let tmp = commit_staging_path(staging, "a.mp4", &run_id);
         assert_eq!(
             tmp.as_str(),
-            "/data/laptop/videos/.purgery-commit.01ARZ3NDEKTSV4RRFFQ69G5FAV.a.mp4.tmp"
+            "/tmp/purgery/laptop/processing/run1/work/commit/.purgery-commit.01ARZ3NDEKTSV4RRFFQ69G5FAV.a.mp4.tmp"
         );
     }
 
     #[test]
-    fn commit_temp_path_same_filesystem_as_parent() {
-        let final_path = Utf8Path::new("/root/sub/file.txt");
+    fn commit_staging_path_is_under_staging_dir() {
+        let staging = Utf8Path::new("/tmp/purgery/work");
         let run_id = RunId::new("run-1".into()).unwrap();
-        let tmp = commit_temp_path(final_path, &run_id);
-        assert_eq!(tmp.parent(), final_path.parent());
+        let tmp = commit_staging_path(staging, "file.txt", &run_id);
+        assert!(tmp.as_str().starts_with(staging.as_str()));
     }
 
     // ── Work Dir tests ──
