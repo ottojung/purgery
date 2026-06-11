@@ -5567,7 +5567,7 @@ steps = ["pack"]
             ));
         };
 
-        let _ = apply_postprocessing_with_heartbeat(
+        apply_postprocessing_with_heartbeat(
             &run_plan,
             "data",
             "data/input.txt",
@@ -5577,17 +5577,20 @@ steps = ["pack"]
             0,
             1,
             "data/input.txt",
-        );
+        )
+        .expect("postprocessing must succeed");
 
         let updates = captured.lock().unwrap();
+        assert!(
+            !updates.is_empty(),
+            "must have captured at least one progress update"
+        );
         for (state, _ei, et, _ce, _cs) in updates.iter() {
             assert!(
                 *et > 0,
                 "step '{state}' must have entry_total > 0, got {et}"
             );
         }
-        // Publishing_status may have entry_total=0 (no active entry) but
-        // step_started/running/finished must all have >0 entry_total
     }
 
     #[test]
@@ -5796,17 +5799,21 @@ delete_after_import = true
     // ── Entry index and progress invariant tests ──
 
     #[test]
-    #[ignore = "expected failure until progress test patterns are cleaned up"]
     fn progress_tests_do_not_ignore_postprocess_result() {
         // Regression guard: progress tests must not discard the result of
         // apply_postprocessing_with_heartbeat with let _ = .
-        // Remove this source-level test once all such patterns are gone.
         let source = include_str!("lib.rs");
-        assert!(
-            !source.contains("let _ = apply_postprocessing_with_heartbeat"),
-            "progress tests must not ignore apply_postprocessing_with_heartbeat results;\n\
-             use .unwrap() or .expect() instead"
-        );
+        // Check each line for the bad pattern, skipping this test's own assertion text.
+        for (lineno, line) in source.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed == "let _ = apply_postprocessing_with_heartbeat(" {
+                panic!(
+                    "line {}: progress tests must not ignore apply_postprocessing_with_heartbeat results;\n\
+                     use .unwrap() or .expect() instead",
+                    lineno + 1
+                );
+            }
+        }
     }
 
     #[test]
@@ -5865,7 +5872,7 @@ delete_after_import = true
             ));
         };
 
-        let _ = apply_postprocessing_with_heartbeat(
+        apply_postprocessing_with_heartbeat(
             &run_plan,
             "data",
             "data/input.txt",
@@ -5875,7 +5882,8 @@ delete_after_import = true
             0,
             1,
             "data/input.txt",
-        );
+        )
+        .expect("postprocessing must succeed");
 
         let updates = captured.lock().unwrap();
         for (state, ei, et, ce, _cs) in updates.iter() {
