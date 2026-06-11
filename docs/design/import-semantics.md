@@ -8,21 +8,21 @@ Purgery maintains two distinct storage locations:
 
 * **`purgery_root`** (Purgery-owned operational state): All operational state lives here, including incoming runs, ready/processing/done/failed run directories, manifests, status/progress files, work areas, postprocess staging, temporary commit helpers, and any staging needed for safe commits.
 
-The final destination tree is not a staging area. A same-directory atomic-rename temp file such as `.purgery-commit.<run_id>.<filename>.tmp` in the final parent directory is forbidden. If exact same-directory atomic replacement would require writing a sibling temp file under final storage, the output-only storage invariant wins.
+The rule is: nothing non-final may appear under `root`. A partially written exact final file path is allowed during interrupted transfer or materialization — the path is still the actual final file being transferred. A sibling helper path (such as `.purgery-commit.<run_id>.<filename>.tmp`) is not, because it is not a final user-data path. Sibling helper paths under `root` are forbidden regardless of naming convention.
 
 ## Commit path by output kind
 
 ### Regular files and symlinks
 
-Committed from a staging location under `purgery_root` directly to the final path under `root`:
+Committed directly from their work-area location to the final path under `root`:
 
 ```
-work output → copy to final path
+work output → direct copy to final path
 ```
 
-The source (staged file or work-area output) is a complete file already verified against the manifest. A crash during the copy to final storage leaves a partial file at the final path, but the run has not published `status.toml` and will be replayed from staged data on recovery, overwriting the partial file.
+The source (staged file or work-area output) is a complete file already verified against the manifest. A crash during the copy to final storage may leave a partial file at the exact final path. This is acceptable because the run has not published `status.toml` and will be replayed from staged data on recovery, overwriting the partial file.
 
-Temp commit helpers live under the per-run work area (`<purgery_root>/<nickname>/processing/<run_id>/work/`), not under `root`.
+No sibling temp file (such as `.purgery-commit.*.tmp`) is created in the final parent directory during commit. The copy writes directly to the final path.
 
 ### Directory roots
 
@@ -32,7 +32,13 @@ Directory output roots are created, kept, or replaced directly via `commit_direc
 
 Purgery uses recursive no-delete overlay semantics for commits. Existing directories are kept and merged. Regular files and symlinks replace existing conflicting entries (files, symlinks, or empty directories). Non-empty directories are not replaced — the operator must resolve them.
 
-Commits are not all-or-nothing. A crash during commit may leave some outputs already written to final storage. This is acceptable because `status.toml` has not been published yet, `processing/` still exists, and `process-once` replays from staged files with idempotent commits.
+Commits are not all-or-nothing. A crash during commit may leave some outputs already written to final storage, and a crash during a direct file copy may leave the exact final path with partial contents. This is acceptable because `status.toml` has not been published yet, `processing/` still exists, and `process-once` replays from staged files with idempotent commits, overwriting any partial remnants.
+
+## Rsync and `--partial`
+
+All rsync invocations include `--partial`. This ensures that interrupted transfers (whether to staging or directly to final storage) can resume without re-transferring already-received data. A partially transferred file at an exact final path is still the actual final file being transferred — it is not an operational helper path.
+
+The invariant is that `root` contains only final user-data paths, not that every byte under `root` is always complete during transfer. Operational files (status, progress, lock, staging, filter, cleanup, or commit-helper files) must never appear under `root` under any circumstance.
 
 ## `final_paths` (plural)
 
@@ -46,9 +52,9 @@ Per-entry failures produce individual `EntryStatusEntry` records with `status = 
 
 ## Work area
 
-The server creates a work area at `<purgery_root>/<nickname>/processing/<run_id>/work/`. Entries are placed into the work area before processing. All commit staging (temporary files, helper paths, and intermediate outputs) lives under this work area, never under `root`.
+The server creates a work area at `<purgery_root>/<nickname>/processing/<run_id>/work/`. Entries are placed into the work area before processing. All staging, temporary files, helper paths, and intermediate artifacts live under this work area, never under `root`.
 
-Postprocess subprocesses run with their current directory set to the work-area parent of the input entry, so relative-path outputs land inside the work area, not in an arbitrary inherited server cwd.
+Postprocess subprocesses run with their current directory set to the work-area parent of the input entry. This is work-area discipline: it makes relative-path outputs land inside the work area, not in an arbitrary inherited server cwd. Purgery validates that expected output paths resolve under the work area before committing them to final storage. This is not a security sandbox — a malicious subprocess can still write anywhere the process has permissions.
 
 Cleanup policy:
 
