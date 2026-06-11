@@ -30,7 +30,7 @@ pub(crate) use commit::{
     commit_directory_entry, commit_regular_file_entry, commit_symlink_entry, CommitDisposition,
 };
 #[cfg_attr(not(test), allow(unused_imports))]
-pub(crate) use phases::write_progress;
+pub(crate) use phases::{write_progress, write_progress_best_effort};
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use process::planned_entry_outputs;
 
@@ -6112,39 +6112,134 @@ delete_after_import = true
     }
 
     #[test]
-    fn per_entry_progress_rejects_sentinel_values() {
-        // Per-entry progress must not have entry_total = 0 or empty current_entry.
+    // ── Progress validation tests ──
+
+    #[test]
+    #[ignore = "expected failure until progress validation is implemented"]
+    fn per_entry_progress_rejects_entry_total_zero() {
         let tmp = tempfile::tempdir().unwrap();
-        let processing_path = Utf8PathBuf::from_path_buf(tmp.path().join("processing")).unwrap();
-        fs::create_dir_all(&processing_path).unwrap();
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_id = RunId::new("sentinel-reject".into()).unwrap();
+        let path = Utf8PathBuf::from_path_buf(tmp.path().join("p")).unwrap();
+        fs::create_dir_all(&path).unwrap();
+        let n = Nickname::new("laptop".into()).unwrap();
+        let r = RunId::new("t".into()).unwrap();
+        let result = write_progress(&path, &n, &r, "step_started", 0, 0, "a.txt", "c");
+        assert!(result.is_err(), "entry_total=0 must be rejected");
+    }
 
-        // Write a per-entry progress state with entry_total=0 — this should
-        // never happen for real per-entry progress.
-        write_progress(
-            &processing_path,
-            &nickname,
-            &run_id,
-            "step_started",
-            0,
-            0, // entry_total = 0 — invalid for per-entry
-            "a.txt",
-            "compress",
-        )
-        .unwrap();
+    #[test]
+    #[ignore = "expected failure until progress validation is implemented"]
+    fn per_entry_progress_rejects_empty_current_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(tmp.path().join("p")).unwrap();
+        fs::create_dir_all(&path).unwrap();
+        let n = Nickname::new("laptop".into()).unwrap();
+        let r = RunId::new("t".into()).unwrap();
+        let result = write_progress(&path, &n, &r, "step_started", 0, 1, "", "c");
+        assert!(result.is_err(), "empty current_entry must be rejected");
+    }
 
-        let content = fs::read_to_string(processing_path.join("progress.toml")).unwrap();
-        let p: purgery_core::ProcessingProgress = toml::from_str(&content).unwrap();
-        // The test documents what should NOT happen: entry_total = 0 for per-entry.
-        // This is a documentation/invariant test, not an enforcement assertion.
-        // We just verify it was written (confirms the current behavior) and
-        // document that this should not occur.
-        assert_eq!(p.state, "step_started");
-        assert_eq!(
-            p.entry_total, 0,
-            "per-entry progress with entry_total=0 is a sentinel violation"
-        );
+    #[test]
+    #[ignore = "expected failure until progress validation is implemented"]
+    fn per_entry_step_progress_rejects_empty_current_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(tmp.path().join("p")).unwrap();
+        fs::create_dir_all(&path).unwrap();
+        let n = Nickname::new("laptop".into()).unwrap();
+        let r = RunId::new("t".into()).unwrap();
+        let result = write_progress(&path, &n, &r, "step_started", 0, 1, "a.txt", "");
+        assert!(result.is_err(), "step state with empty current_step must be rejected");
+    }
+
+    #[test]
+    #[ignore = "expected failure until progress validation is implemented"]
+    fn per_entry_progress_rejects_index_out_of_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(tmp.path().join("p")).unwrap();
+        fs::create_dir_all(&path).unwrap();
+        let n = Nickname::new("laptop".into()).unwrap();
+        let r = RunId::new("t".into()).unwrap();
+        let result = write_progress(&path, &n, &r, "step_running", 5, 1, "a.txt", "c");
+        assert!(result.is_err(), "entry_index >= entry_total must be rejected");
+    }
+
+    #[test]
+    #[ignore = "expected failure until progress validation is implemented"]
+    fn processing_entry_rejects_empty_current_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(tmp.path().join("p")).unwrap();
+        fs::create_dir_all(&path).unwrap();
+        let n = Nickname::new("laptop".into()).unwrap();
+        let r = RunId::new("t".into()).unwrap();
+        let result = write_progress(&path, &n, &r, "processing_entry", 0, 1, "", "");
+        assert!(result.is_err(), "processing_entry with empty current_entry must be rejected");
+    }
+
+    #[test]
+    fn processing_entry_with_empty_step_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(tmp.path().join("p")).unwrap();
+        fs::create_dir_all(&path).unwrap();
+        let n = Nickname::new("laptop".into()).unwrap();
+        let r = RunId::new("t".into()).unwrap();
+        let result = write_progress(&path, &n, &r, "processing_entry", 0, 1, "a.txt", "");
+        assert!(result.is_ok(), "processing_entry with empty step must succeed");
+    }
+
+    #[test]
+    fn per_entry_first_entry_index_zero_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(tmp.path().join("p")).unwrap();
+        fs::create_dir_all(&path).unwrap();
+        let n = Nickname::new("laptop".into()).unwrap();
+        let r = RunId::new("t".into()).unwrap();
+        let result = write_progress(&path, &n, &r, "step_started", 0, 1, "a.txt", "c");
+        assert!(result.is_ok(), "entry_index=0 for first entry must succeed");
+    }
+
+    #[test]
+    fn run_level_progress_with_empty_fields_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(tmp.path().join("p")).unwrap();
+        fs::create_dir_all(&path).unwrap();
+        let n = Nickname::new("laptop".into()).unwrap();
+        let r = RunId::new("t".into()).unwrap();
+
+        let r1 = write_progress(&path, &n, &r, "processing_started", 0, 2, "", "");
+        assert!(r1.is_ok(), "processing_started with empty fields must succeed");
+
+        let r2 = write_progress(&path, &n, &r, "publishing_status", 0, 2, "", "");
+        assert!(r2.is_ok(), "publishing_status with empty fields must succeed");
+    }
+
+    #[test]
+    #[ignore = "expected failure until progress validation is implemented"]
+    fn unknown_progress_state_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(tmp.path().join("p")).unwrap();
+        fs::create_dir_all(&path).unwrap();
+        let n = Nickname::new("laptop".into()).unwrap();
+        let r = RunId::new("t".into()).unwrap();
+        let result = write_progress(&path, &n, &r, "nonsense", 0, 1, "a.txt", "c");
+        assert!(result.is_err(), "unknown state must be rejected");
+    }
+
+    #[test]
+    fn write_progress_best_effort_with_invalid_state_does_not_panic() {
+        // Even with invalid progress, write_progress_best_effort must
+        // log a warning and continue, not panic or propagate the error.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(tmp.path().join("p")).unwrap();
+        fs::create_dir_all(&path).unwrap();
+        let n = Nickname::new("laptop".into()).unwrap();
+        let r = RunId::new("t".into()).unwrap();
+
+        // Invalid: entry_total=0 for per-entry
+        write_progress_best_effort(&path, &n, &r, "step_started", 0, 0, "a.txt", "c");
+
+        // Invalid: unknown state
+        write_progress_best_effort(&path, &n, &r, "nonsense", 0, 1, "a.txt", "c");
+
+        // These should not panic. The function logs a warning and returns.
     }
 
     #[test]
