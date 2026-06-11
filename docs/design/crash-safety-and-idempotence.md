@@ -221,30 +221,26 @@ Run-level progress has empty `current_entry` and `current_step`. This is not a s
 
 ### Progress write validation
 
-`write_progress` validates progress state semantics before writing. Invalid updates return an error:
+Progress producers validate progress state semantics before publishing progress. Invalid progress is not published and does not affect import correctness.
 
 - **Run-level states** (`processing_started`, `publishing_status`): `current_entry` and `current_step` must be empty.
 - **Per-entry state** (`processing_entry`): `entry_total > 0`, `entry_index < entry_total`, `current_entry` non-empty, `current_step` empty.
 - **Per-entry step states** (`step_started`, `step_running`, `step_finished`): `entry_total > 0`, `entry_index < entry_total`, `current_entry` non-empty, `current_step` non-empty.
 - Unknown states are rejected.
 
-`write_progress_best_effort` catches validation errors, logs a warning, and continues. Invalid progress never fails an otherwise valid import.
-
 ### Progress file retention
 
-`progress.toml` lives inside the `processing/` directory and moves to `done/` or `failed/` as part of the run directory rename. Terminal retention is diagnostic only, not a protocol guarantee. Tests must not rely on terminal progress-file retention.
+`progress.toml` lives inside the `processing/` directory and moves to `done/` or `failed/` as part of the run directory rename. Terminal retention is diagnostic only and is not a protocol guarantee. Clients must not use retained progress as cleanup authority.
 
 ### Progress write failure
 
 Progress is observational only. It never authorizes cleanup. A progress file write failure (I/O error after validation) is warning-level and must not fail an otherwise successful import.
 
-All progress writes use a best-effort helper. On failure the warning includes all progress fields. Invalid best-effort progress does not clobber the last valid progress file because validation rejects it before any file write.
+All progress writes use a best-effort helper. On failure the warning includes all progress fields. Invalid progress does not clobber the last valid `progress.toml` because validation rejects it before any file mutation.
 
 The server writes `publishing_status` progress before atomically publishing terminal `status.toml`. If this write fails, processing continues — it is best-effort.
 
 Progress updates never use sentinel values. Every per-entry progress update (`processing_entry`, `step_started`, `step_running`, `step_finished`) carries accurate `entry_index`, `entry_total`, and `current_entry`. No field is left as `0` to mean "the caller should fill this in later."
-
-All progress writes use a best-effort helper that logs a `tracing::warn!` on failure with structured context. Silent `let _ = write_progress(...)` patterns are replaced with explicit warning-level logging.
 
 ### Tombstone persistence failure errors
 

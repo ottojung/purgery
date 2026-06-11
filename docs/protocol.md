@@ -493,7 +493,7 @@ For per-entry progress:
 
 ### Progress write validation
 
-`write_progress` validates progress state semantics before writing. Invalid updates return an error.
+Progress producers validate progress state semantics before publishing progress. Invalid progress is not published. Progress publication failures are warning-level and do not affect import correctness.
 
 Validated invariants:
 
@@ -502,13 +502,9 @@ Validated invariants:
 - **Per-entry step states** (`step_started`, `step_running`, `step_finished`): `entry_total > 0`, `entry_index < entry_total`, `current_entry` non-empty, `current_step` non-empty.
 - Unknown states are rejected.
 
-`write_progress_best_effort` catches validation errors, logs a warning, and continues. Invalid progress never fails an otherwise valid import.
-
-All progress writes go through `write_progress_best_effort` in production code. Direct `write_progress` calls in test code will receive validation errors for invalid updates.
-
 ### Progress file retention
 
-`progress.toml` is written inside the run's `processing/` directory. When the run is finalized, the `processing/` directory is renamed to `done/` or `failed/` as a whole, so the progress file may be visible in the terminal directory. This retention is diagnostic only — it is not a protocol guarantee. Tests must not rely on terminal progress-file retention.
+`progress.toml` is written inside the run's `processing/` directory. When the run is finalized, the `processing/` directory is renamed to `done/` or `failed/` as a whole, so the progress file may be visible in the terminal directory. This retention is diagnostic only and is not a protocol guarantee. Clients must not use retained progress as cleanup authority.
 
 ### Progress write failure
 
@@ -516,7 +512,7 @@ If a progress file write fails (I/O error after validation), the server logs a w
 
 All progress writes use a best-effort helper that logs a warning on failure. The warning includes all progress fields: `nickname`, `run_id`, `state`, `entry_index`, `entry_total`, `current_entry`, `current_step`, and the error. Silent failures (`let _ = write_progress(...)`) are replaced with explicit warning-level logging.
 
-An invalid best-effort progress update must not overwrite an existing valid `progress.toml`. Because validation runs before writing, an invalid update returns an error before any file mutation occurs, leaving the last valid progress intact.
+An invalid progress update must not overwrite an existing valid `progress.toml`. Validation runs before writing, so an invalid update is rejected before any file mutation occurs, leaving the last valid progress intact.
 
 ### Tombstone persistence failure messages
 
@@ -538,16 +534,9 @@ Client-persisted run state (`state_dir/runs/{nickname}-{run_id}/state.toml`) fol
 
 Safety-state writes are not best-effort. If a safety-state write fails and deletion could follow, the client does not proceed. Progress writes remain best-effort (observational only).
 
-### Test discipline for progress tests
-
-- Progress tests must not rely on terminal progress-file retention (see [Progress file retention](#progress-file-retention)).
-- Progress-capture tests must assert the capture is non-empty and at least one expected event was captured.
-- Successful `apply_postprocessing_with_heartbeat` calls must use `.unwrap()` or `.expect(...)`, not `let _ = ...`.
-- Test names must describe what is actually asserted. A test named `logs_warning` must actually verify a warning was emitted.
-
 ### Subprocess heartbeat interval
 
-The heartbeat interval for `step_running` progress updates is configurable through an internal parameter. Production default is 5 seconds. Tests may use a shorter interval. See `apply_postprocessing` for the mechanism.
+The heartbeat interval for `step_running` progress updates is configurable through an internal parameter. Production default is 5 seconds.
 
 ## Subprocess argv hardening
 
