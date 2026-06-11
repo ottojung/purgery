@@ -2151,6 +2151,140 @@ command = "true"
         // read_and_verify_terminal_status must write Corrupt tombstone.
     }
 
+    #[test]
+    #[ignore = "expected failure until safety-state writes are non-optional"]
+    fn failing_to_persist_terminal_status_seen_stops_before_deletion() {
+        // When write_client_run_state for TerminalStatusSeen fails,
+        // the client must NOT proceed to deletion.
+        // This test needs a scenario where the state_dir is readable for
+        // initial resume but the state.toml write fails.
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().join("purgery-state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let run_id = RunId::new("ts-seen-fail".into()).unwrap();
+        let runs_dir = state_dir
+            .join("runs")
+            .join(format!("laptop-{}", run_id.as_str()));
+        fs::create_dir_all(&runs_dir).unwrap();
+
+        // Create a valid manifest + run config
+        let manifest = purgery_core::Manifest {
+            run_id: run_id.clone(),
+            nickname: purgery_core::Nickname::new("laptop".into()).unwrap(),
+            entries: vec![],
+        };
+        let run_config = purgery_core::RunConfig {
+            nickname: purgery_core::Nickname::new("laptop".into()).unwrap(),
+            sync: vec![],
+            postprocess: Default::default(),
+        };
+        let state = purgery_core::ClientRunState {
+            protocol_version: 1,
+            nickname: "laptop".into(),
+            run_id: run_id.as_str().to_owned(),
+            manifest: manifest.to_toml().unwrap(),
+            run_config: run_config.to_toml().unwrap(),
+            phase: purgery_core::ClientRunPhase::WaitingForTerminalState,
+        };
+        let content = toml::to_string(&state).unwrap();
+        fs::write(runs_dir.join("state.toml"), &content).unwrap();
+
+        // Make the runs_dir unwritable so write_client_run_state fails
+        // when trying to write TerminalStatusSeen.
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            runs_dir.as_path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o555),
+        )
+        .unwrap();
+
+        let config = ClientConfig::from_toml(&format!(
+            r#"
+nickname = "laptop"
+state_dir = "{}"
+
+[server]
+host = "localhost"
+command = "true"
+"#,
+            state_dir.display()
+        ))
+        .unwrap();
+
+        // wait_for_terminal_run_state will try to write WaitingForTerminalState (fails)
+        // and then try to connect to SSH (also fails).
+        // After implementation, it should fail on the state write, not on SSH.
+        let result = resume_pending_postprocess_runs(&config);
+
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            runs_dir.as_path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
+        assert!(
+            result.is_err(),
+            "must return error when TerminalStatusSeen cannot be persisted"
+        );
+        let err = result.unwrap_err().to_string().to_lowercase();
+        assert!(
+            err.contains("terminal_status_seen") || err.contains("WaitingForTerminalState") || err.contains("state")
+                || err.contains("persist"),
+            "error must mention state persistence failure: {err}"
+        );
+    }
+
+    #[test]
+    #[ignore = "expected failure until tombstone writes are non-optional"]
+    fn failing_to_persist_abandoned_tombstone_does_not_delete() {
+        // When write_client_run_state for Abandoned fails,
+        // the client must still stop without deletion and report the failure.
+        // This test is SSH-dependent because the abandoned tombstone is written
+        // inside wait_for_terminal_run_state when server returns not_found.
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().join("purgery-state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let run_id = RunId::new("abandoned-fail".into()).unwrap();
+        let runs_dir = state_dir
+            .join("runs")
+            .join(format!("laptop-{}", run_id.as_str()));
+        fs::create_dir_all(&runs_dir).unwrap();
+        let manifest = purgery_core::Manifest {
+            run_id: run_id.clone(),
+            nickname: purgery_core::Nickname::new("laptop".into()).unwrap(),
+            entries: vec![],
+        };
+        let run_config = purgery_core::RunConfig {
+            nickname: purgery_core::Nickname::new("laptop".into()).unwrap(),
+            sync: vec![],
+            postprocess: Default::default(),
+        };
+        let state = purgery_core::ClientRunState {
+            protocol_version: 1,
+            nickname: "laptop".into(),
+            run_id: run_id.as_str().to_owned(),
+            manifest: manifest.to_toml().unwrap(),
+            run_config: run_config.to_toml().unwrap(),
+            phase: purgery_core::ClientRunPhase::WaitingForTerminalState,
+        };
+        let content = toml::to_string(&state).unwrap();
+        fs::write(runs_dir.join("state.toml"), &content).unwrap();
+
+        // After implementation, if the state dir is unwritable when trying to
+        // write the Abandoned tombstone, the error must describe the problem.
+        // Requires a fake server that returns 'not_found' to trigger the write.
+    }
+
+    #[test]
+    #[ignore = "expected failure until tombstone writes are non-optional"]
+    fn failing_to_persist_corrupt_tombstone_does_not_delete() {
+        // When write_client_run_state for Corrupt fails,
+        // the client must still stop without deletion and report the failure.
+        // SSH-dependent: needs a fake server that returns 'corrupt' or
+        // malformed terminal status to trigger the corrupt tombstone write.
+    }
+
     /// Scan production .rs files for stray debug output (eprintln!, println!, dbg!).
     /// Test-only directories ("tests") are excluded entirely.
     /// Within production files, scanning stops at `#[cfg(test)]`.
