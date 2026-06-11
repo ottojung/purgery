@@ -1775,6 +1775,7 @@ steps = ["compress-video"]
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_regular_file_replaces_existing_symlink_like_rsync() {
         let tmp = tempfile::tempdir().unwrap();
         let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
@@ -6512,11 +6513,9 @@ steps = ["pack"]
 
     // ── Output-only final destination tests ──────────────────────────
 
-    /// Collect all non-final hidden/temp paths under a root directory.
-    /// Returns paths that start with "." or end with ".tmp", ".partial",
-    /// or match known staging patterns.
-    fn collect_non_final_paths(root: &Utf8Path) -> Vec<Utf8PathBuf> {
-        let mut offenders = Vec::new();
+    /// Collect every path recursively under a root directory.
+    fn collect_all_paths_under(root: &Utf8Path) -> Vec<Utf8PathBuf> {
+        let mut paths = Vec::new();
         let mut queue = vec![root.to_owned()];
         while let Some(dir) = queue.pop() {
             let entries = match std::fs::read_dir(dir.as_std_path()) {
@@ -6526,29 +6525,32 @@ steps = ["pack"]
             for entry in entries.flatten() {
                 let path = Utf8PathBuf::from_path_buf(entry.path())
                     .unwrap_or_else(|p| Utf8PathBuf::from(p.to_string_lossy().as_ref()));
-                let name = path.file_name().unwrap_or("");
-                let is_hidden = name.starts_with('.');
-                let is_tmp = name.ends_with(".tmp");
-                let is_partial = name.ends_with(".partial");
-                let is_staging = name.starts_with(".purgery-commit");
-                if is_hidden || is_tmp || is_partial || is_staging {
-                    offenders.push(path.clone());
-                }
                 if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
-                    // Only recurse into non-hidden dirs
-                    if !is_hidden {
-                        queue.push(path);
-                    }
+                    queue.push(path.clone());
                 }
+                paths.push(path);
             }
         }
-        offenders.sort();
-        offenders
+        paths.sort();
+        paths
+    }
+
+    /// Assert that the tree under root contains exactly the expected paths.
+    fn assert_root_contains_exactly(root: &Utf8Path, expected: &[Utf8PathBuf]) {
+        let actual = collect_all_paths_under(root);
+        let expected_sorted = {
+            let mut v = expected.to_vec();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            actual, expected_sorted,
+            "root paths mismatch.\nExpected: {expected_sorted:?}\nActual:   {actual:?}"
+        );
     }
 
     #[test]
-    #[allow(non_snake_case)]
-    fn TDD_regular_file_commit_must_not_create_temp_or_hidden_paths_under_root() {
+    fn regular_file_commit_must_not_create_operational_paths_under_root() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
         let staging = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
@@ -6560,22 +6562,38 @@ steps = ["pack"]
         fs::create_dir_all(final_path.parent().unwrap()).unwrap();
         fs::write(&source, b"hello").unwrap();
 
-        let _ = commit_regular_file_entry(&source, &final_path, root.as_path(), &run_id);
-
-        // After the commit, root must only contain the final file and its
-        // parent directories — no .purgery-commit.*.tmp, .tmp, .partial, or
-        // hidden paths anywhere under root.
+        let result = commit_regular_file_entry(&source, &final_path, root.as_path(), &run_id);
+        assert!(result.is_ok(), "regular file commit failed: {result:?}");
         assert!(final_path.exists());
-        let offenders = collect_non_final_paths(root.as_path());
-        assert!(
-            offenders.is_empty(),
-            "expected no operational paths under root, found: {offenders:?}"
-        );
+
+        let expected = vec![root.join("subdir"), root.join("subdir/file.txt")];
+        assert_root_contains_exactly(root.as_path(), &expected);
     }
 
     #[test]
-    #[allow(non_snake_case)]
-    fn TDD_symlink_commit_must_not_create_temp_or_hidden_paths_under_root() {
+    fn regular_file_commit_allows_final_dotfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
+        let staging = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        let final_path = root.join(".hidden-file");
+        let source = staging.join("source.txt");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::create_dir_all(root.as_std_path()).unwrap();
+        fs::write(&source, b"secret").unwrap();
+
+        let result = commit_regular_file_entry(&source, &final_path, root.as_path(), &run_id);
+        assert!(result.is_ok(), "dotfile commit failed: {result:?}");
+        assert!(final_path.exists());
+
+        let expected = vec![root.join(".hidden-file")];
+        assert_root_contains_exactly(root.as_path(), &expected);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlink_commit_must_not_create_operational_paths_under_root() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
         let run_id = RunId::new("test-run".into()).unwrap();
@@ -6585,23 +6603,19 @@ steps = ["pack"]
         let target = Utf8PathBuf::from("/some/target");
 
         let result = commit_symlink_entry(&target, &final_path, root.as_path(), &run_id);
-
         assert!(result.is_ok(), "symlink commit failed: {result:?}");
-        // Use symlink_metadata: exists() returns false for dangling symlinks
         assert!(
             std::fs::symlink_metadata(final_path.as_std_path()).is_ok(),
             "symlink was not created at final_path"
         );
-        let offenders = collect_non_final_paths(root.as_path());
-        assert!(
-            offenders.is_empty(),
-            "expected no operational paths under root, found: {offenders:?}"
-        );
+
+        let expected = vec![root.join("subdir"), root.join("subdir/link")];
+        assert_root_contains_exactly(root.as_path(), &expected);
     }
 
     #[test]
-    #[allow(non_snake_case)]
-    fn TDD_directory_tree_commit_must_not_create_temp_or_hidden_paths_under_root() {
+    #[cfg(unix)]
+    fn directory_tree_commit_must_not_create_operational_paths_under_root() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
         let staging = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
@@ -6616,24 +6630,24 @@ steps = ["pack"]
         std::os::unix::fs::symlink("/tmp/target", source_dir.join("c").as_std_path()).unwrap();
         fs::create_dir_all(final_dir.parent().unwrap()).unwrap();
 
-        let _ = commit_directory_tree(&source_dir, &final_dir, root.as_path(), &run_id);
+        let result = commit_directory_tree(&source_dir, &final_dir, root.as_path(), &run_id);
+        assert!(result.is_ok(), "directory tree commit failed: {result:?}");
 
         assert!(final_dir.exists());
         assert!(final_dir.join("a.txt").exists());
         assert!(final_dir.join("b.txt").exists());
 
-        let offenders = collect_non_final_paths(root.as_path());
-        assert!(
-            offenders.is_empty(),
-            "expected no operational paths under root after directory tree commit, found: {offenders:?}"
-        );
+        let expected = vec![
+            root.join("dst"),
+            root.join("dst/a.txt"),
+            root.join("dst/b.txt"),
+            root.join("dst/c"),
+        ];
+        assert_root_contains_exactly(root.as_path(), &expected);
     }
 
     #[test]
-    #[allow(non_snake_case)]
-    fn TDD_full_processing_run_leaves_only_expected_paths_under_root() {
-        use std::collections::HashSet;
-
+    fn full_processing_run_leaves_only_expected_paths_under_root() {
         let tmp = tempfile::tempdir().unwrap();
         let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
@@ -6653,53 +6667,21 @@ steps = ["pack"]
 
         process_run(&config, &nickname, &run_id).unwrap();
 
-        // Verify the run completed
         let done_path = config
             .purgery_root
             .run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(done_path.exists());
 
-        // Inspect root — only final paths expected
-        let expected: HashSet<Utf8PathBuf> = [
+        let expected = vec![
             server_root.join("laptop"),
             server_root.join("laptop/videos"),
             server_root.join("laptop/videos/test.mp4"),
-        ]
-        .into_iter()
-        .collect();
-
-        let mut actual = Vec::new();
-        let mut queue = vec![server_root.to_owned()];
-        while let Some(dir) = queue.pop() {
-            for entry in std::fs::read_dir(dir.as_std_path()).unwrap().flatten() {
-                let path = Utf8PathBuf::from_path_buf(entry.path())
-                    .unwrap_or_else(|p| Utf8PathBuf::from(p.to_string_lossy().as_ref()));
-                actual.push(path.clone());
-                let name = path.file_name().unwrap_or("");
-                if entry.file_type().is_ok_and(|ft| ft.is_dir()) && !name.starts_with('.') {
-                    queue.push(path);
-                }
-            }
-        }
-        actual.sort();
-
-        let _actual_set: HashSet<Utf8PathBuf> = actual.clone().into_iter().collect();
-        let unexpected: Vec<_> = actual.iter().filter(|p| !expected.contains(*p)).collect();
-        assert!(
-            unexpected.is_empty(),
-            "root contains unexpected paths: {unexpected:?}\nExpected: {expected:?}"
-        );
-
-        let offenders = collect_non_final_paths(server_root.as_path());
-        assert!(
-            offenders.is_empty(),
-            "root contains operational/temp/hidden files: {offenders:?}"
-        );
+        ];
+        assert_root_contains_exactly(server_root.as_path(), &expected);
     }
 
     #[test]
-    #[allow(non_snake_case)]
-    fn TDD_failed_run_must_not_leave_operational_files_under_root() {
+    fn failed_run_must_not_leave_operational_paths_under_root() {
         let tmp = tempfile::tempdir().unwrap();
         let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
@@ -6745,17 +6727,17 @@ steps = ["pack"]
             .run_dir(&nickname, &run_id, RunPhase::Failed);
         assert!(failed_path.exists(), "run should be in failed phase");
 
-        // Root must not contain operational files even after a failed run
-        let offenders = collect_non_final_paths(server_root.as_path());
-        assert!(
-            offenders.is_empty(),
-            "root contains operational/temp/hidden files after failed run: {offenders:?}"
-        );
+        // Root may contain ancestor directories created during processing
+        // but no actual entry files since the staged file was missing
+        let expected = vec![
+            server_root.join("laptop"),
+            server_root.join("laptop/videos"),
+        ];
+        assert_root_contains_exactly(server_root.as_path(), &expected);
     }
 
     #[test]
-    #[allow(non_snake_case)]
-    fn TDD_partial_run_work_area_preserved_under_purgery_root_only() {
+    fn partial_run_work_area_preserved_under_purgery_root_only() {
         let tmp = tempfile::tempdir().unwrap();
         let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
@@ -6861,19 +6843,17 @@ steps = ["always-fail"]
             .run_dir(&nickname, &run_id, RunPhase::Failed);
         assert!(failed_path.exists());
 
+        // Root may contain ancestor directories from processing setup
+        // but no entry files since all entries failed
+        let expected = vec![
+            server_root.join("laptop"),
+            server_root.join("laptop/videos"),
+        ];
+        assert_root_contains_exactly(server_root.as_path(), &expected);
+
         // Work area should be preserved under purgery_root for diagnostics
         let work_area = purgery_core::work_dir(&config.purgery_root, &nickname, &run_id);
         let work_exists = work_area.exists();
-
-        // Root must have no operational files
-        let offenders = collect_non_final_paths(server_root.as_path());
-        assert!(
-            offenders.is_empty(),
-            "root must not contain operational files after partial run, found: {offenders:?}"
-        );
-
-        // Work area may or may not exist depending on when the failure happened,
-        // but if it does exist it must be under purgery_root only
         if work_exists {
             assert!(
                 work_area.as_str().starts_with(purgery_root.as_str()),
@@ -6884,11 +6864,10 @@ steps = ["always-fail"]
     }
 
     #[test]
-    #[allow(non_snake_case)]
-    fn TDD_postprocess_outputs_produced_in_work_area_before_commit_to_final() {
-        // This test uses a subprocess that creates output files.
-        // The subprocess cwd should be the work-area parent so outputs
-        // land inside the work area, not in the final storage root.
+    fn postprocess_outputs_produced_in_work_area_before_commit_to_final() {
+        // A subprocess creates output files; cwd is the work-area parent so
+        // relative-path outputs land inside the work area. Purgery validates
+        // expected outputs are under the work area before committing.
         let tmp = tempfile::tempdir().unwrap();
         let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
@@ -6911,7 +6890,6 @@ steps = ["always-fail"]
                             program: "sh".to_owned(),
                             args: vec![
                                 "-c".to_owned(),
-                                // Write into a subdirectory to verify the cwd
                                 "mkdir -p _outputs && echo done > _outputs/result.txt".to_owned(),
                             ],
                             expected_outputs: vec!["_outputs".to_owned()],
@@ -6927,7 +6905,6 @@ steps = ["always-fail"]
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-pp-cwd".into()).unwrap();
 
-        // Set up a ready run with a postprocess entry
         let ready_path = server_config
             .purgery_root
             .run_dir(&nickname, &run_id, RunPhase::Ready);
@@ -6985,20 +6962,432 @@ steps = ["echo-args"]
             .run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(done_path.exists());
 
-        // Root must only contain final output files — no subprocess cwd
-        // artifacts, temp files, or helper paths
-        let offenders = collect_non_final_paths(server_root.as_path());
-        assert!(
-            offenders.is_empty(),
-            "root must not contain any operational files after postprocess run, found: {offenders:?}"
+        // Root must contain only the expected final output paths
+        let expected = vec![
+            server_root.join("laptop"),
+            server_root.join("laptop/data"),
+            server_root.join("laptop/data/_outputs"),
+            server_root.join("laptop/data/_outputs/result.txt"),
+        ];
+        assert_root_contains_exactly(server_root.as_path(), &expected);
+    }
+
+    // ── Replacement and replay tests ─────────────────────────────────
+
+    #[test]
+    fn commit_regular_file_replaces_existing_file_without_sibling_temp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
+        let staging = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        let final_path = root.join("subdir/file.txt");
+        let source = staging.join("source.txt");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::create_dir_all(final_path.parent().unwrap()).unwrap();
+        fs::write(&final_path, b"old content").unwrap();
+        fs::write(&source, b"new content").unwrap();
+
+        let result = commit_regular_file_entry(&source, &final_path, root.as_path(), &run_id);
+        assert!(result.is_ok(), "replace failed: {result:?}");
+        assert_eq!(fs::read_to_string(&final_path).unwrap(), "new content");
+
+        let expected = vec![root.join("subdir"), root.join("subdir/file.txt")];
+        assert_root_contains_exactly(root.as_path(), &expected);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn commit_symlink_replaces_existing_symlink_without_sibling_temp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        let final_path = root.join("subdir/link");
+        fs::create_dir_all(final_path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("/old/target", final_path.as_std_path()).unwrap();
+
+        let target = Utf8PathBuf::from("/new/target");
+        let result = commit_symlink_entry(&target, &final_path, root.as_path(), &run_id);
+        assert!(result.is_ok(), "replace failed: {result:?}");
+
+        let actual_target = std::fs::read_link(final_path.as_std_path()).unwrap();
+        assert_eq!(
+            Utf8PathBuf::from_path_buf(actual_target).unwrap().as_str(),
+            "/new/target"
         );
 
-        // Verify the expected final output exists
-        let expected_final = server_root.join("laptop/data/_outputs/result.txt");
+        let expected = vec![root.join("subdir"), root.join("subdir/link")];
+        assert_root_contains_exactly(root.as_path(), &expected);
+    }
+
+    #[test]
+    fn commit_regular_file_replaces_empty_directory_without_sibling_temp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
+        let staging = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        let final_path = root.join("subdir/file.txt");
+        let source = staging.join("source.txt");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::create_dir_all(&final_path).unwrap(); // empty directory at final path
+        fs::write(&source, b"content").unwrap();
+
+        let result = commit_regular_file_entry(&source, &final_path, root.as_path(), &run_id);
+        assert!(result.is_ok(), "replace failed: {result:?}");
+        assert!(final_path.is_file());
+        assert_eq!(fs::read_to_string(&final_path).unwrap(), "content");
+
+        let expected = vec![root.join("subdir"), root.join("subdir/file.txt")];
+        assert_root_contains_exactly(root.as_path(), &expected);
+    }
+
+    #[test]
+    fn commit_regular_file_refuses_non_empty_directory_without_mutation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
+        let staging = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        let final_path = root.join("subdir/file.txt");
+        let source = staging.join("source.txt");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::create_dir_all(&final_path).unwrap();
+        fs::write(final_path.join("child.txt"), b"child").unwrap(); // non-empty dir
+        fs::write(&source, b"content").unwrap();
+
+        let result = commit_regular_file_entry(&source, &final_path, root.as_path(), &run_id);
         assert!(
-            expected_final.exists(),
-            "expected final output at {}, but it does not exist",
-            expected_final.as_str()
+            result.is_err(),
+            "non-empty directory replace must be rejected"
         );
+        assert!(result
+            .unwrap_err()
+            .contains("non-empty destination directory"));
+
+        // The non-empty directory must remain intact
+        assert!(final_path.is_dir());
+        assert!(final_path.join("child.txt").exists());
+        assert_eq!(
+            fs::read_to_string(final_path.join("child.txt")).unwrap(),
+            "child"
+        );
+    }
+
+    #[test]
+    fn partial_final_file_after_interrupted_materialization_is_overwritten_by_replay() {
+        // Simulate the exact-final-path allowance: an interrupted previous
+        // materialization left a partial file at the final path. Replay must
+        // overwrite it without creating sibling helpers.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
+        let staging = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        let final_path = root.join("subdir/file.txt");
+        let source = staging.join("source.txt");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::create_dir_all(final_path.parent().unwrap()).unwrap();
+        fs::write(&source, b"complete content here").unwrap();
+
+        // Simulate a partial remnant from an interrupted prior attempt
+        fs::write(&final_path, b"partial").unwrap();
+
+        let result = commit_regular_file_entry(&source, &final_path, root.as_path(), &run_id);
+        assert!(result.is_ok(), "replay commit failed: {result:?}");
+        assert_eq!(
+            fs::read_to_string(&final_path).unwrap(),
+            "complete content here"
+        );
+
+        let expected = vec![root.join("subdir"), root.join("subdir/file.txt")];
+        assert_root_contains_exactly(root.as_path(), &expected);
+    }
+
+    #[test]
+    fn replay_from_processing_rebuilds_work_area_and_converges() {
+        // A run in processing/ with a missing status.toml simulates an
+        // interrupted processing attempt. process-once must rebuild the
+        // work area from staged files and converge to the correct result.
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("test-replay".into()).unwrap();
+
+        let (config, _staged) = setup_single_file_ready(
+            &purgery_root,
+            &server_root,
+            &nickname,
+            &run_id,
+            "videos",
+            "videos",
+            "files/videos/test.mp4",
+            b"replay content",
+        );
+
+        // Move from Ready to Processing and write a partial final file to
+        // simulate interrupted materialization.
+        let processing_path = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        let ready_path = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        fs::create_dir_all(processing_path.parent().unwrap()).unwrap();
+        fs::rename(&ready_path, &processing_path).unwrap();
+
+        // Write a partial file at the final path to simulate an interrupted
+        // direct copy from the previous attempt.
+        let final_path = server_root.join("laptop/videos/test.mp4");
+        fs::create_dir_all(final_path.parent().unwrap()).unwrap();
+        fs::write(&final_path, b"partial remnant").unwrap();
+
+        // Replay: process_once_raw handles recovery from processing/ directory
+        process_once_raw(&config).unwrap();
+
+        let done_path = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Done);
+        assert!(
+            done_path.exists(),
+            "run should be in done phase after replay"
+        );
+        assert_eq!(
+            fs::read_to_string(&final_path).unwrap(),
+            "replay content",
+            "replay must overwrite partial remnant with correct content"
+        );
+
+        let expected = vec![
+            server_root.join("laptop"),
+            server_root.join("laptop/videos"),
+            server_root.join("laptop/videos/test.mp4"),
+        ];
+        assert_root_contains_exactly(server_root.as_path(), &expected);
+
+        let status_content = fs::read_to_string(done_path.join("status.toml")).unwrap();
+        let status = RunStatus::from_toml(&status_content).unwrap();
+        assert_eq!(status.state, RunState::Done);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn postprocess_symlink_output_committed_without_operational_paths() {
+        // A postprocess subprocess produces a symlink as output.
+        // The symlink target is read and recreated at the final path.
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let server_str = server_root.as_str();
+
+        fs::create_dir_all(&purgery_root).unwrap();
+        fs::create_dir_all(&server_root).unwrap();
+
+        let server_config = ServerConfig {
+            root: ServerRoot::new(server_str.into()).unwrap(),
+            purgery_root: PurgeryRoot::new(purgery_root.to_owned()).unwrap(),
+            gc: Default::default(),
+            postprocess: PostprocessConfig {
+                steps: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "make-symlink".to_owned(),
+                        PostprocessStepDefinition {
+                            kind: PostprocessKind::Subprocess,
+                            program: "sh".to_owned(),
+                            args: vec!["-c".to_owned(), "ln -sf /etc/hostname the-link".to_owned()],
+                            expected_outputs: vec!["the-link".to_owned()],
+                            keep_original: false,
+                        },
+                    );
+                    m
+                },
+            },
+            logging: Default::default(),
+        };
+
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("test-pp-symlink".into()).unwrap();
+
+        let ready_path = server_config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        fs::create_dir_all(ready_path.join("files/data")).unwrap();
+        fs::write(ready_path.join("files/data/input.dat"), b"data").unwrap();
+
+        fs::write(
+            ready_path.join("run.toml"),
+            format!(
+                r#"nickname = "{}"
+
+[[sync]]
+name = "data"
+to = "data"
+delete_after_import = true
+
+[[postprocess.rules]]
+match = "*.dat"
+steps = ["make-symlink"]
+"#,
+                nickname.as_str()
+            ),
+        )
+        .unwrap();
+
+        let manifest = Manifest {
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![ManifestEntry {
+                sync_name: SyncName::new("data".into()).unwrap(),
+                local_path: ClientLocalPath::new("/home/user/input.dat".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/data/input.dat".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("input.dat".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
+                size: 4,
+                mtime_ns: 1000000,
+                sha256: None,
+                link_target: None,
+                mode: ManifestEntryMode::Postprocess,
+                postprocess_steps: vec!["make-symlink".into()],
+                covered_by: None,
+            }],
+        };
+        fs::write(
+            ready_path.join("manifest.toml"),
+            manifest.to_toml().unwrap(),
+        )
+        .unwrap();
+
+        let result = process_run(&server_config, &nickname, &run_id);
+        assert!(
+            result.is_ok(),
+            "postprocess symlink run should succeed: {result:?}"
+        );
+
+        let done_path = server_config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Done);
+        assert!(done_path.exists());
+
+        let expected = vec![
+            server_root.join("laptop"),
+            server_root.join("laptop/data"),
+            server_root.join("laptop/data/the-link"),
+        ];
+        assert_root_contains_exactly(server_root.as_path(), &expected);
+    }
+
+    #[test]
+    fn postprocess_directory_output_with_recursive_descendants() {
+        // A postprocess subprocess produces a directory tree as output.
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let server_str = server_root.as_str();
+
+        fs::create_dir_all(&purgery_root).unwrap();
+        fs::create_dir_all(&server_root).unwrap();
+
+        let server_config = ServerConfig {
+            root: ServerRoot::new(server_str.into()).unwrap(),
+            purgery_root: PurgeryRoot::new(purgery_root.to_owned()).unwrap(),
+            gc: Default::default(),
+            postprocess: PostprocessConfig {
+                steps: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "make-tree".to_owned(),
+                        PostprocessStepDefinition {
+                            kind: PostprocessKind::Subprocess,
+                            program: "sh".to_owned(),
+                            args: vec![
+                                "-c".to_owned(),
+                                "mkdir -p out/sub && echo a > out/sub/a.txt && echo b > out/b.txt"
+                                    .to_owned(),
+                            ],
+                            expected_outputs: vec!["out".to_owned()],
+                            keep_original: false,
+                        },
+                    );
+                    m
+                },
+            },
+            logging: Default::default(),
+        };
+
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("test-pp-dir".into()).unwrap();
+
+        let ready_path = server_config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        fs::create_dir_all(ready_path.join("files/data")).unwrap();
+        fs::write(ready_path.join("files/data/input.dat"), b"data").unwrap();
+
+        fs::write(
+            ready_path.join("run.toml"),
+            format!(
+                r#"nickname = "{}"
+
+[[sync]]
+name = "data"
+to = "data"
+delete_after_import = true
+
+[[postprocess.rules]]
+match = "*.dat"
+steps = ["make-tree"]
+"#,
+                nickname.as_str()
+            ),
+        )
+        .unwrap();
+
+        let manifest = Manifest {
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![ManifestEntry {
+                sync_name: SyncName::new("data".into()).unwrap(),
+                local_path: ClientLocalPath::new("/home/user/input.dat".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/data/input.dat".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("input.dat".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
+                size: 4,
+                mtime_ns: 1000000,
+                sha256: None,
+                link_target: None,
+                mode: ManifestEntryMode::Postprocess,
+                postprocess_steps: vec!["make-tree".into()],
+                covered_by: None,
+            }],
+        };
+        fs::write(
+            ready_path.join("manifest.toml"),
+            manifest.to_toml().unwrap(),
+        )
+        .unwrap();
+
+        let result = process_run(&server_config, &nickname, &run_id);
+        assert!(
+            result.is_ok(),
+            "postprocess dir run should succeed: {result:?}"
+        );
+
+        let done_path = server_config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Done);
+        assert!(done_path.exists());
+
+        let expected = vec![
+            server_root.join("laptop"),
+            server_root.join("laptop/data"),
+            server_root.join("laptop/data/out"),
+            server_root.join("laptop/data/out/b.txt"),
+            server_root.join("laptop/data/out/sub"),
+            server_root.join("laptop/data/out/sub/a.txt"),
+        ];
+        assert_root_contains_exactly(server_root.as_path(), &expected);
     }
 }
