@@ -24,8 +24,8 @@ pub(crate) fn remove_destination_for_non_directory(
         Ok(_) => {
             // Remove any non-directory entry (file or symlink) so that
             // the direct commit (copy or symlink creation) can proceed.
-            // The old temp+rename design handled replacement implicitly
-            // through the rename; direct writes must remove explicitly.
+            // Direct writes require explicit removal of the conflicting
+            // destination because there is no intermediate temp file.
             fs::remove_file(final_path.as_std_path()).map_err(|error| {
                 format!(
                     "failed to remove conflicting destination '{}': {error}",
