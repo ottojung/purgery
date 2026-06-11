@@ -5591,7 +5591,7 @@ steps = ["pack"]
     }
 
     #[test]
-    fn progress_write_failure_logs_warning_and_does_not_fail_import() {
+    fn progress_write_failure_does_not_fail_import() {
         let tmp = tempfile::tempdir().unwrap();
         let _purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
@@ -5794,6 +5794,20 @@ delete_after_import = true
         }
     }
     // ── Entry index and progress invariant tests ──
+
+    #[test]
+    #[ignore = "expected failure until progress test patterns are cleaned up"]
+    fn progress_tests_do_not_ignore_postprocess_result() {
+        // Regression guard: progress tests must not discard the result of
+        // apply_postprocessing_with_heartbeat with let _ = .
+        // Remove this source-level test once all such patterns are gone.
+        let source = include_str!("lib.rs");
+        assert!(
+            !source.contains("let _ = apply_postprocessing_with_heartbeat"),
+            "progress tests must not ignore apply_postprocessing_with_heartbeat results;\n\
+             use .unwrap() or .expect() instead"
+        );
+    }
 
     #[test]
     fn per_entry_first_entry_allows_index_zero() {
