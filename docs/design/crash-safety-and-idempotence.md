@@ -158,14 +158,21 @@ A run affects only outputs it explicitly commits. Purgery does not use `rsync --
 |---|---|
 | Before local state written | Upload not yet complete; no server-side finished run exists. |
 | After upload complete, before `finish-run` | Local state written as `upload_complete_finish_pending`. Resume checks server phase: if `incoming`, re-runs `finish-run`; if later phase, proceeds to waiting; if `not_found`, marks abandoned; if `corrupt`, marks corrupt. |
-| After `finish-run` accepted, before terminal status | Local state is `waiting_for_terminal_state`. Resume calls `run-state` and continues waiting indefinitely (ready, processing) or handles terminal/corrupt/not_found. No new upload is needed. |
-| While waiting for terminal state | Resume continues waiting for the same run. |
-| After terminal status seen, before cleanup | Local state is `terminal_status_seen`. Resume re-reads terminal status, verifies envelope, and continues cleanup. |
+| After `finish-run` accepted, before terminal status | Local state is `waiting_for_terminal_state`. Resume calls `run-state` and continues waiting (ready, processing) or handles terminal/corrupt/not_found. No new upload is needed. |
+| While waiting for terminal state | Resume continues waiting for the same run. Only `ready` and `processing` justify indefinite waiting. |
+| Transport failure while waiting | `run-state` command fails. Local state preserved unchanged (e.g. `WaitingForTerminalState`). Invocation returns error. No infinite retry. |
+| Malformed `run-state` response | Response is unparseable TOML. Local state preserved. Invocation returns error. No infinite retry. |
+| `run-state` returns `corrupt` | Server has terminal-phase directory but invalid status. Client writes `ClientRunPhase::Corrupt` tombstone. No deletion. Invocation returns error. |
+| `run-state` returns `not_found` | Server has no record of this run. Client writes `ClientRunPhase::Abandoned` tombstone. No deletion. Invocation returns error. |
+| After terminal `run-state`, before status | Client preserves `TerminalStatusSeen` phase. |
+| Status command fails (transport) | Local state is `TerminalStatusSeen`. Invocation returns error preserving this phase. No infinite retry. No deletion. |
+| Status command returns malformed | Client writes `ClientRunPhase::Corrupt` tombstone. No deletion. |
+| Status envelope mismatches | Client writes `ClientRunPhase::Corrupt` tombstone. No deletion. |
+| After terminal status seen, before cleanup | Local state is `terminal_status_seen`. Resume goes **directly** to terminal status verification/cleanup — does not rewrite to `WaitingForTerminalState` and does not call the wait loop. |
 | After partial cleanup | Resume repeats cleanup idempotently (already-removed entries are safe, identities are rechecked). |
 | After cleanup complete | Local state cleaned up. |
-| Abandoned/lost | Local state is `abandoned`. No deletion authorised. State remains as durable diagnostic until explicitly cleared. |
-| Server state corrupt | Terminal phase directory exists but status is missing, malformed, or mismatched. Local state is `corrupt`. No deletion. Durable tombstone. |
-| Transport failure while waiting | `run-state` command fails. Local state preserved unchanged. Invocation returns error, new sync work does not start. |
+| Abandoned/lost | Local state is `abandoned`. No deletion authorised. State remains as durable diagnostic tombstone until explicitly cleared. Blocks new sync. |
+| Server state corrupt | Terminal phase directory exists but status is missing, malformed, or mismatched. Local state is `corrupt`. No deletion. Durable tombstone. Blocks new sync. |
 
 ### Passthrough-specific crash matrix (pure passthrough groups)
 
@@ -178,6 +185,24 @@ A run affects only outputs it explicitly commits. Purgery does not use `rsync --
 | After success marker (rsync_succeeded=true), before deletion | Cleanup state authorizes removal. Restart reads cleanup state from stable directory and resumes deletion. |
 | After some deletions, before cleanup state updated | Already-removed entries are idempotent (not found = OK). Remaining entries are removed after identity check. Next cleanup state write atomically updates progress. |
 | After cleanup state updated, all deletions complete | Cleanup state marks all entries as cleaned. Restart sees no pending cleanup. |
+
+### Abandoned/corrupt tombstones block new sync
+
+Normal `sync-and-cleanup` must not start new sync work while any `Abandoned` or `Corrupt` postprocess tombstone exists under `state_dir/runs/`. This prevents silent data loss from an unresolved server-side corruption.
+
+The client scans for tombstones during startup resume, before any new scan, rsync, or server interaction. If found, the invocation returns an error indicating the tombstone path. The user must manually clear the tombstone (remove the directory) or use a future explicit command.
+
+Tombstones are durable diagnostics. They are never auto-removed.
+
+### TerminalStatusSeen resume bypasses wait loop
+
+When resuming from `TerminalStatusSeen`, the client must not re-enter the `wait_for_postprocess_run_and_cleanup` wait loop. It must go directly to reading terminal status and performing cleanup. This prevents rewriting state to `WaitingForTerminalState` when the run is already past waiting.
+
+### Processing progress semantics
+
+Progress is observational only. It never authorizes cleanup. A progress file write failure is warning-level and must not fail an otherwise successful import.
+
+The server writes `publishing_status` progress before atomically publishing terminal `status.toml`. If this write fails, processing continues — it is best-effort.
 
 ### Cleanup state discovery
 

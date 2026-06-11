@@ -45,14 +45,17 @@ client: after prepare-run succeeds, perform all archive-affecting rsyncs:
 client: persist local postprocess run state as upload_complete_finish_pending
 client: finish-run over SSH -> server moves incoming -> ready
 client: persist local state as waiting_for_terminal_state
-client: wait using run-state indefinitely (no timeout)
+client: wait using run-state; retry only on ready/processing/incoming
+client: on corrupt → write local corrupt tombstone, stop, do not delete
+client: on not_found → write local abandoned tombstone, stop, do not delete
+client: on transport failure or malformed response → stop with state preserved
 client: after terminal run-state, read terminal status via status command
-client: verify status envelope (nickname, run_id, parse)
+client: if status fails (transport/parse/envelope) → write corrupt, stop, do not delete
 client: cleanup only imported postprocess entries whose local identity still matches
 client: mark cleanup complete and remove local run state
 server: claim run by renaming ready -> processing
 server: process postprocess entries (writes progress.toml during processing)
-server: publish status for postprocess entries
+server: before publishing terminal status, best-effort write state=publishing_status
 server: write status.toml, move to done or failed
 ```
 
@@ -385,6 +388,90 @@ The file contains the local phase, the full manifest, and the run config. Local 
 * `cleanup_complete`: cleanup finished; local state may be removed.
 * `abandoned`: run was lost or abandoned; no deletion authorised.
 * `corrupt`: server state is corrupt; no deletion authorised.
+
+### Client wait-loop phase handling
+
+When the client calls `run-state` while waiting for a terminal state, it maps the returned phase as follows:
+
+| `run-state` phase | Client action |
+|---|---|
+| `ready` | Wait (poll again). |
+| `processing` | Wait (poll again). |
+| `done` or `failed` with `terminal = true` | Proceed to read terminal status. |
+| `not_found` | Write `ClientRunPhase::Abandoned` tombstone. Return error. No deletion. |
+| `corrupt` | Write `ClientRunPhase::Corrupt` tombstone. Return error. No deletion. |
+| Any other phase | Return error with local state preserved. No deletion. |
+| Transport/SSH/command failure | Return error with local state preserved. Do not retry forever. |
+| Malformed response (unparseable TOML) | Return error with local state preserved. Do not retry forever. |
+
+Only `ready` and `processing` justify indefinite waiting. `incoming` is valid only during `UploadCompleteFinishPending` resume. All other phases or errors terminate the current invocation.
+
+### Terminal status handling
+
+After `run-state` returns a terminal phase with `terminal = true`, the client calls `status`:
+
+| `status` result | Client action |
+|---|---|
+| Success, parseable, envelope matches | Cleanup may proceed. |
+| Transport/SSH/command failure | Return error with `TerminalStatusSeen` state preserved. No infinite retry. |
+| Malformed (unparseable) | Write `ClientRunPhase::Corrupt` tombstone. No deletion. |
+| Envelope mismatch | Write `ClientRunPhase::Corrupt` tombstone. No deletion. |
+
+### Client resume behavior
+
+`resume_pending_postprocess_runs` handles each persisted `ClientRunPhase`:
+
+| Phase | Action |
+|---|---|
+| `CleanupComplete` | Remove local state silently. |
+| `Abandoned` | Return error blocking new sync. Tombstone persists until explicit clearing. |
+| `Corrupt` | Return error blocking new sync. Tombstone persists until explicit clearing. |
+| `UploadCompleteFinishPending` | Query server: if `incoming`, call `finish-run` then wait; if `ready`/`processing`, proceed to waiting; if `done`/`failed` with terminal, read status/cleanup; if `not_found`, mark abandoned; if `corrupt`, mark corrupt; on transport/malformed, error with state preserved. |
+| `WaitingForTerminalState` | Wait via `run-state`. |
+| `TerminalStatusSeen` | Go directly to terminal status verification/cleanup. Do not call wait loop. Do not rewrite to `WaitingForTerminalState`. |
+
+### Abandoned/corrupt tombstones block normal sync
+
+If any `Abandoned` or `Corrupt` tombstone exists under `state_dir/runs/`, a normal `sync-and-cleanup` invocation returns an error before starting any new sync work. The user must manually clear the tombstone or use a future explicit command.
+
+Tombstones are never auto-removed. They are durable diagnostics.
+
+### Processing progress fields
+
+Progress updates carry the following context:
+
+```toml
+protocol_version = 1
+nickname = "laptop"
+run_id = "..."
+phase = "processing"
+state = "step_running"       # processing_started | processing_entry | step_started | step_running | step_finished | publishing_status
+entry_index = 3              # current entry index (0-based)
+entry_total = 10             # total entries in manifest
+current_entry = "videos/a.mp4"  # relative path of current entry
+current_step = "compress-video" # current postprocess step name
+started_at_unix_secs = ...
+updated_at_unix_secs = ...
+```
+
+The `state` field transitions:
+
+- `processing_started` — written before any entries are processed
+- `processing_entry` — written before each manifest entry
+- `step_started` — before a postprocess step subprocess is spawned
+- `step_running` — periodically while a long-running subprocess executes
+- `step_finished` — after a postprocess step succeeds
+- `publishing_status` — before terminal `status.toml` is published (best-effort)
+
+For real manifest entry processing, `entry_total` is the total number of entries and `entry_index` is the current position. These are never `0` for real entries. Initial `processing_started` may have `entry_index = 0, entry_total = N` and no `current_entry`.
+
+### Progress write failure
+
+If a progress file write fails, the server logs a warning and continues processing. A progress write failure must not fail an otherwise successful import. Progress is observational only and never authorizes cleanup.
+
+### Subprocess heartbeat interval
+
+The heartbeat interval for `step_running` progress updates is configurable through an internal parameter. Production default is 5 seconds. Tests may use a shorter interval. See `apply_postprocessing` for the mechanism.
 
 ## Subprocess argv hardening
 
