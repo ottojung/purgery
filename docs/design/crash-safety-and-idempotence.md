@@ -129,6 +129,8 @@ The client verifies local identity against the cleanup state before removing. En
 
 Uploading the same logical tree again replays the same directory, regular-file, and symlink entries. The server keeps no deduplication database. Existing directories are retained and merged, regular files and symlinks are replaced according to the characterized rsync rules, and unrelated final descendants remain.
 
+Final archive directories are created only as needed for actual materialized entries. Purgery does not eagerly create empty directory skeletons under `root` as run setup. For direct rsync transfers, `--mkpath` lets rsync create the destination path. For server-side materialization, parent directories are created inline by the commit functions only when an entry is actually being written to final storage.
+
 With deterministic postprocessing, importing the same input tree repeatedly converges to the same final tree and is a semantic no-op. Non-deterministic postprocessing may produce different regular-file content on a later import; replacing the prior output is allowed.
 
 This property makes crash recovery replay-based. A crash may occur after some entries have committed but before `status.toml` is written. The client retains local entries because no success status exists. On restart, the server replays the processing run from staged entries and converges on the run's result.

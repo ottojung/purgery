@@ -704,14 +704,6 @@ pub fn process_processing_run(
         anyhow::bail!("{msg}");
     }
 
-    let used_sync_names: std::collections::HashSet<&str> = manifest
-        .entries
-        .iter()
-        .map(|e| e.sync_name.as_str())
-        .collect();
-
-    let mut failed_sync_roots: std::collections::HashSet<String> = std::collections::HashSet::new();
-
     // Write initial progress before processing entries
     write_progress_best_effort(
         &processing_path,
@@ -723,26 +715,6 @@ pub fn process_processing_run(
         "",
         "",
     );
-
-    for sync in run_config.sync.iter() {
-        if !used_sync_names.contains(sync.name.as_str()) {
-            continue;
-        }
-        let root_dir = config
-            .root
-            .as_path()
-            .join(nickname.as_str())
-            .join(sync.to_path.as_str());
-        if let Err(error) = commit_directory_entry(&root_dir, config.root.as_path()) {
-            warn!(
-                sync_name = %sync.name.as_str(),
-                path = %root_dir.as_str(),
-                error = %error,
-                "sync root directory setup failed"
-            );
-            failed_sync_roots.insert(sync.name.as_str().to_owned());
-        }
-    }
 
     let mut outcomes: Vec<EntryOutcome> = Vec::new();
 
@@ -772,17 +744,6 @@ pub fn process_processing_run(
             });
             continue;
         };
-
-        if failed_sync_roots.contains(sync.name.as_str()) {
-            outcomes.push(EntryOutcome::Skipped {
-                kind: entry.kind,
-                sync_name: entry.sync_name.clone(),
-                local_path: entry.local_path.as_str().to_owned(),
-                relative_path: entry.relative_path.as_str().to_owned(),
-                error: format!("sync root setup failed for '{}'", sync.to_path.as_str()),
-            });
-            continue;
-        }
 
         let np = entry.relative_path.as_str().to_owned();
         let entry_sync = entry.sync_name.as_str();

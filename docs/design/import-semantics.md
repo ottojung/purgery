@@ -34,9 +34,9 @@ Purgery uses recursive no-delete overlay semantics for commits. Existing directo
 
 Commits are not all-or-nothing. A crash during commit may leave some outputs already written to final storage, and a crash during a direct file copy may leave the exact final path with partial contents. This is acceptable because `status.toml` has not been published yet, `processing/` still exists, and `process-once` replays from staged files with idempotent commits, overwriting any partial remnants.
 
-## Rsync and `--partial`
+## Rsync and `--partial` / `--mkpath`
 
-All rsync invocations include `--partial`. This ensures that interrupted transfers (whether to staging or directly to final storage) can resume without re-transferring already-received data. A partially transferred file at an exact final path is still the actual final file being transferred — it is not an operational helper path.
+All rsync invocations include `--partial` and `--mkpath`. `--partial` ensures that interrupted transfers (whether to staging or directly to final storage) can resume without re-transferring already-received data. A partially transferred file at an exact final path is still the actual final file being transferred — it is not an operational helper path. `--mkpath` lets rsync create destination directories as needed, so Purgery does not eagerly create final archive directory skeletons before a transfer begins. A failed run should not leave empty `root/<nickname>/<sync.to>/` directories merely because Purgery pre-created them.
 
 The invariant is that `root` contains only final user-data paths, not that every byte under `root` is always complete during transfer. Operational files (status, progress, lock, staging, filter, cleanup, or commit-helper files) must never appear under `root` under any circumstance.
 

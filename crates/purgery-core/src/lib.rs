@@ -177,15 +177,19 @@ pub fn resolve_executable(program: &str) -> Result<ResolvedExecutable, Executabl
 /// Build rsync arguments for Purgery transfers.
 ///
 /// Includes `--partial` so interrupted transfers can resume without
-/// re-transferring already-received data. A partially transferred file
-/// at an exact final path is the actual file being transferred — it is
-/// not an operational helper path. The output-only final destination
-/// invariant forbids non-final scaffold paths under `root`, not partial
-/// contents at exact final paths.
+/// re-transferring already-received data. Includes `--mkpath` so rsync
+/// creates destination directories as needed — Purgery does not eagerly
+/// create final archive directory skeletons before a transfer begins.
+///
+/// A partially transferred file at an exact final path is the actual file
+/// being transferred — it is not an operational helper path. The output-only
+/// final destination invariant forbids non-final scaffold paths under `root`,
+/// not partial contents at exact final paths.
 pub fn build_rsync_args(source: &str, destination: &str) -> Vec<String> {
     vec![
         "--recursive".to_string(),
         "--partial".to_string(),
+        "--mkpath".to_string(),
         "--archive".to_string(),
         "--no-inc-recursive".to_string(),
         "--protect-args".to_string(),
@@ -1536,6 +1540,7 @@ files = []
             vec![
                 "--recursive",
                 "--partial",
+                "--mkpath",
                 "--archive",
                 "--no-inc-recursive",
                 "--protect-args",
@@ -1550,6 +1555,12 @@ files = []
     fn build_rsync_args_includes_partial() {
         let args = build_rsync_args("/src", "host:/dst");
         assert!(args.contains(&"--partial".to_string()));
+    }
+
+    #[test]
+    fn build_rsync_args_includes_mkpath() {
+        let args = build_rsync_args("/src", "host:/dst");
+        assert!(args.contains(&"--mkpath".to_string()));
     }
 
     #[test]

@@ -6727,12 +6727,7 @@ steps = ["pack"]
             .run_dir(&nickname, &run_id, RunPhase::Failed);
         assert!(failed_path.exists(), "run should be in failed phase");
 
-        // Root may contain ancestor directories created during processing
-        // but no actual entry files since the staged file was missing
-        let expected = vec![
-            server_root.join("laptop"),
-            server_root.join("laptop/videos"),
-        ];
+        let expected: Vec<Utf8PathBuf> = vec![];
         assert_root_contains_exactly(server_root.as_path(), &expected);
     }
 
@@ -6843,12 +6838,8 @@ steps = ["always-fail"]
             .run_dir(&nickname, &run_id, RunPhase::Failed);
         assert!(failed_path.exists());
 
-        // Root may contain ancestor directories from processing setup
-        // but no entry files since all entries failed
-        let expected = vec![
-            server_root.join("laptop"),
-            server_root.join("laptop/videos"),
-        ];
+        // Root must be empty: no entry was successfully committed.
+        let expected: Vec<Utf8PathBuf> = vec![];
         assert_root_contains_exactly(server_root.as_path(), &expected);
 
         // Work area should be preserved under purgery_root for diagnostics
