@@ -538,6 +538,13 @@ Client-persisted run state (`state_dir/runs/{nickname}-{run_id}/state.toml`) fol
 
 Safety-state writes are not best-effort. If a safety-state write fails and deletion could follow, the client does not proceed. Progress writes remain best-effort (observational only).
 
+### Test discipline for progress tests
+
+- Progress tests must not rely on terminal progress-file retention (see [Progress file retention](#progress-file-retention)).
+- Progress-capture tests must assert the capture is non-empty and at least one expected event was captured.
+- Successful `apply_postprocessing_with_heartbeat` calls must use `.unwrap()` or `.expect(...)`, not `let _ = ...`.
+- Test names must describe what is actually asserted. A test named `logs_warning` must actually verify a warning was emitted.
+
 ### Subprocess heartbeat interval
 
 The heartbeat interval for `step_running` progress updates is configurable through an internal parameter. Production default is 5 seconds. Tests may use a shorter interval. See `apply_postprocessing` for the mechanism.
