@@ -6111,11 +6111,8 @@ delete_after_import = true
         );
     }
 
-    #[test]
     // ── Progress validation tests ──
-
     #[test]
-    #[ignore = "expected failure until progress validation is implemented"]
     fn per_entry_progress_rejects_entry_total_zero() {
         let tmp = tempfile::tempdir().unwrap();
         let path = Utf8PathBuf::from_path_buf(tmp.path().join("p")).unwrap();
@@ -6127,7 +6124,6 @@ delete_after_import = true
     }
 
     #[test]
-    #[ignore = "expected failure until progress validation is implemented"]
     fn per_entry_progress_rejects_empty_current_entry() {
         let tmp = tempfile::tempdir().unwrap();
         let path = Utf8PathBuf::from_path_buf(tmp.path().join("p")).unwrap();
@@ -6139,7 +6135,6 @@ delete_after_import = true
     }
 
     #[test]
-    #[ignore = "expected failure until progress validation is implemented"]
     fn per_entry_step_progress_rejects_empty_current_step() {
         let tmp = tempfile::tempdir().unwrap();
         let path = Utf8PathBuf::from_path_buf(tmp.path().join("p")).unwrap();
@@ -6147,11 +6142,13 @@ delete_after_import = true
         let n = Nickname::new("laptop".into()).unwrap();
         let r = RunId::new("t".into()).unwrap();
         let result = write_progress(&path, &n, &r, "step_started", 0, 1, "a.txt", "");
-        assert!(result.is_err(), "step state with empty current_step must be rejected");
+        assert!(
+            result.is_err(),
+            "step state with empty current_step must be rejected"
+        );
     }
 
     #[test]
-    #[ignore = "expected failure until progress validation is implemented"]
     fn per_entry_progress_rejects_index_out_of_range() {
         let tmp = tempfile::tempdir().unwrap();
         let path = Utf8PathBuf::from_path_buf(tmp.path().join("p")).unwrap();
@@ -6159,11 +6156,13 @@ delete_after_import = true
         let n = Nickname::new("laptop".into()).unwrap();
         let r = RunId::new("t".into()).unwrap();
         let result = write_progress(&path, &n, &r, "step_running", 5, 1, "a.txt", "c");
-        assert!(result.is_err(), "entry_index >= entry_total must be rejected");
+        assert!(
+            result.is_err(),
+            "entry_index >= entry_total must be rejected"
+        );
     }
 
     #[test]
-    #[ignore = "expected failure until progress validation is implemented"]
     fn processing_entry_rejects_empty_current_entry() {
         let tmp = tempfile::tempdir().unwrap();
         let path = Utf8PathBuf::from_path_buf(tmp.path().join("p")).unwrap();
@@ -6171,7 +6170,10 @@ delete_after_import = true
         let n = Nickname::new("laptop".into()).unwrap();
         let r = RunId::new("t".into()).unwrap();
         let result = write_progress(&path, &n, &r, "processing_entry", 0, 1, "", "");
-        assert!(result.is_err(), "processing_entry with empty current_entry must be rejected");
+        assert!(
+            result.is_err(),
+            "processing_entry with empty current_entry must be rejected"
+        );
     }
 
     #[test]
@@ -6182,7 +6184,10 @@ delete_after_import = true
         let n = Nickname::new("laptop".into()).unwrap();
         let r = RunId::new("t".into()).unwrap();
         let result = write_progress(&path, &n, &r, "processing_entry", 0, 1, "a.txt", "");
-        assert!(result.is_ok(), "processing_entry with empty step must succeed");
+        assert!(
+            result.is_ok(),
+            "processing_entry with empty step must succeed"
+        );
     }
 
     #[test]
@@ -6205,14 +6210,19 @@ delete_after_import = true
         let r = RunId::new("t".into()).unwrap();
 
         let r1 = write_progress(&path, &n, &r, "processing_started", 0, 2, "", "");
-        assert!(r1.is_ok(), "processing_started with empty fields must succeed");
+        assert!(
+            r1.is_ok(),
+            "processing_started with empty fields must succeed"
+        );
 
         let r2 = write_progress(&path, &n, &r, "publishing_status", 0, 2, "", "");
-        assert!(r2.is_ok(), "publishing_status with empty fields must succeed");
+        assert!(
+            r2.is_ok(),
+            "publishing_status with empty fields must succeed"
+        );
     }
 
     #[test]
-    #[ignore = "expected failure until progress validation is implemented"]
     fn unknown_progress_state_is_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let path = Utf8PathBuf::from_path_buf(tmp.path().join("p")).unwrap();

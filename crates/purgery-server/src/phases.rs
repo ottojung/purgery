@@ -63,6 +63,59 @@ fn existing_progress_started_at(
     Some(progress.started_at_unix_secs)
 }
 
+/// Validate progress state semantics before writing.
+/// Returns an error for invalid combinations.
+fn validate_progress_update(
+    state: &str,
+    entry_index: usize,
+    entry_total: usize,
+    current_entry: &str,
+    current_step: &str,
+) -> Result<()> {
+    match state {
+        "processing_started" | "publishing_status" => {
+            if !current_entry.is_empty() {
+                anyhow::bail!("run-level progress state {state} must not have current_entry");
+            }
+            if !current_step.is_empty() {
+                anyhow::bail!("run-level progress state {state} must not have current_step");
+            }
+            Ok(())
+        }
+        "processing_entry" => {
+            if entry_total == 0 {
+                anyhow::bail!("per-entry progress state {state} must have entry_total > 0");
+            }
+            if entry_index >= entry_total {
+                anyhow::bail!("entry_index must be less than entry_total");
+            }
+            if current_entry.is_empty() {
+                anyhow::bail!("per-entry progress state {state} must have current_entry");
+            }
+            if !current_step.is_empty() {
+                anyhow::bail!("processing_entry must not have current_step");
+            }
+            Ok(())
+        }
+        "step_started" | "step_running" | "step_finished" => {
+            if entry_total == 0 {
+                anyhow::bail!("per-entry progress state {state} must have entry_total > 0");
+            }
+            if entry_index >= entry_total {
+                anyhow::bail!("entry_index must be less than entry_total");
+            }
+            if current_entry.is_empty() {
+                anyhow::bail!("per-entry progress state {state} must have current_entry");
+            }
+            if current_step.is_empty() {
+                anyhow::bail!("step progress state {state} must have current_step");
+            }
+            Ok(())
+        }
+        _ => anyhow::bail!("unknown progress state: {state}"),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_progress(
     processing_path: &Utf8Path,
@@ -74,6 +127,8 @@ pub(crate) fn write_progress(
     current_entry: &str,
     current_step: &str,
 ) -> Result<()> {
+    validate_progress_update(state, entry_index, entry_total, current_entry, current_step)?;
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
