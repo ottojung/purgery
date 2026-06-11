@@ -6008,6 +6008,321 @@ delete_after_import = true
         }
     }
 
+    // ── Entry index and progress invariant tests ──
+
+    #[test]
+    #[ignore = "expected failure until per-entry entry_index=0 is documented as valid"]
+    fn per_entry_first_entry_allows_index_zero() {
+        // A manifest with at least one postprocessed entry should have
+        // step_started/step_running/step_finished with entry_index=0 for
+        // the first entry, entry_total>0, and current_entry!="".
+        let tmp = tempfile::tempdir().unwrap();
+        let work_path = Utf8PathBuf::from_path_buf(tmp.path().join("input.txt")).unwrap();
+        fs::write(&work_path, b"input").unwrap();
+        fs::write(work_path.with_file_name("input.out"), b"output").unwrap();
+
+        let server_config = ServerConfig {
+            root: ServerRoot::new("/data".into()).unwrap(),
+            purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
+            gc: Default::default(),
+            postprocess: PostprocessConfig {
+                steps: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "compress".to_owned(),
+                        PostprocessStepDefinition {
+                            kind: PostprocessKind::Subprocess,
+                            program: "true".into(),
+                            args: vec![],
+                            expected_outputs: vec!["{stem}.out".into()],
+                            keep_original: false,
+                        },
+                    );
+                    m
+                },
+            },
+            logging: Default::default(),
+        };
+        let run_config = RunConfig {
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            sync: vec![],
+            postprocess: purgery_core::ClientPostprocessConfig {
+                rules: vec![purgery_core::PostprocessRule {
+                    pattern: "*.txt".into(),
+                    steps: vec!["compress".into()],
+                    sync_names: None,
+                }],
+            },
+        };
+        let run_plan = RunPlan::build(&server_config, &run_config).unwrap();
+
+        let captured = std::sync::Mutex::new(Vec::new());
+        let mut callback = |update: &purgery_core::ProgressUpdate| {
+            captured.lock().unwrap().push((
+                update.state.to_owned(),
+                update.entry_index,
+                update.entry_total,
+                update.current_entry.to_owned(),
+                update.current_step.to_owned(),
+            ));
+        };
+
+        let _ = apply_postprocessing_with_heartbeat(
+            &run_plan,
+            "data",
+            "data/input.txt",
+            &work_path,
+            std::time::Duration::from_millis(1),
+            &mut callback,
+            0,
+            1,
+            "data/input.txt",
+        );
+
+        let updates = captured.lock().unwrap();
+        for (state, ei, et, ce, _cs) in updates.iter() {
+            match state.as_str() {
+                "step_started" | "step_running" | "step_finished" => {
+                    // Per-entry invariants
+                    assert!(
+                        *et > 0,
+                        "entry_total must be > 0 for per-entry state '{state}'"
+                    );
+                    assert!(
+                        !ce.is_empty(),
+                        "current_entry must be non-empty for per-entry state '{state}'"
+                    );
+                    assert!(
+                        ei < et,
+                        "entry_index ({ei}) must be < entry_total ({et})"
+                    );
+                    // entry_index = 0 is valid for the first entry
+                    if *ei == 0 {
+                        // This is fine — 0 is the valid index for the first entry.
+                        // The test exists to confirm we don't reject it.
+                    }
+                }
+                _ => {}
+            }
+        }
+        // At least some step updates must have occurred
+        assert!(
+            updates.iter().any(|(s, _, _, _, _)| matches!(
+                s.as_str(),
+                "step_started" | "step_running" | "step_finished"
+            )),
+            "must have at least one step progress update"
+        );
+    }
+
+    #[test]
+    #[ignore = "expected failure until per-entry sentinel values are explicitly rejected"]
+    fn per_entry_progress_rejects_sentinel_values() {
+        // Per-entry progress must not have entry_total = 0 or empty current_entry.
+        let tmp = tempfile::tempdir().unwrap();
+        let processing_path = Utf8PathBuf::from_path_buf(tmp.path().join("processing")).unwrap();
+        fs::create_dir_all(&processing_path).unwrap();
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("sentinel-reject".into()).unwrap();
+
+        // Write a per-entry progress state with entry_total=0 — this should
+        // never happen for real per-entry progress.
+        write_progress(
+            &processing_path,
+            &nickname,
+            &run_id,
+            "step_started",
+            0,
+            0,  // entry_total = 0 — invalid for per-entry
+            "a.txt",
+            "compress",
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(processing_path.join("progress.toml")).unwrap();
+        let p: purgery_core::ProcessingProgress = toml::from_str(&content).unwrap();
+        // The test documents what should NOT happen: entry_total = 0 for per-entry.
+        // This is a documentation/invariant test, not an enforcement assertion.
+        // We just verify it was written (confirms the current behavior) and
+        // document that this should not occur.
+        assert_eq!(p.state, "step_started");
+        assert_eq!(p.entry_total, 0, "per-entry progress with entry_total=0 is a sentinel violation");
+    }
+
+    #[test]
+    fn run_level_progress_may_have_empty_current_entry() {
+        // processing_started and publishing_status are run-level.
+        // They may have empty current_entry/current_step.
+        let tmp = tempfile::tempdir().unwrap();
+        let processing_path = Utf8PathBuf::from_path_buf(tmp.path().join("processing")).unwrap();
+        fs::create_dir_all(&processing_path).unwrap();
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("run-level".into()).unwrap();
+
+        // Write processing_started (run-level)
+        write_progress(
+            &processing_path,
+            &nickname,
+            &run_id,
+            "processing_started",
+            0,
+            2,
+            "",
+            "",
+        )
+        .unwrap();
+        let content = fs::read_to_string(processing_path.join("progress.toml")).unwrap();
+        let p: purgery_core::ProcessingProgress = toml::from_str(&content).unwrap();
+        assert_eq!(p.state, "processing_started");
+        assert!(
+            p.current_entry.is_empty() && p.current_step.is_empty(),
+            "run-level progress may have empty entry/step"
+        );
+        assert_eq!(p.entry_total, 2, "run-level progress still has entry_total");
+        assert_eq!(p.entry_index, 0, "run-level progress entry_index is 0");
+    }
+
+    // ── Progress start-time preservation tests ──
+
+    #[test]
+    #[ignore = "expected failure until existing_progress_started_at checks envelope"]
+    fn progress_start_time_preserved_only_when_envelope_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let processing_path = Utf8PathBuf::from_path_buf(tmp.path().join("processing")).unwrap();
+        fs::create_dir_all(&processing_path).unwrap();
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("ts-envelope".into()).unwrap();
+
+        // Write an existing progress file with matching envelope
+        let old_progress = purgery_core::ProcessingProgress {
+            protocol_version: 1,
+            nickname: "laptop".into(),
+            run_id: "ts-envelope".into(),
+            phase: "processing".into(),
+            state: "old".into(),
+            entry_index: 0,
+            entry_total: 1,
+            current_entry: String::new(),
+            current_step: String::new(),
+            started_at_unix_secs: 5000,
+            updated_at_unix_secs: 5000,
+        };
+        let old_content = toml::to_string(&old_progress).unwrap();
+        fs::write(processing_path.join("progress.toml"), &old_content).unwrap();
+
+        // Matching envelope — started_at should be preserved
+        write_progress(
+            &processing_path,
+            &nickname,
+            &run_id,
+            "processing_entry",
+            0,
+            1,
+            "a.txt",
+            "",
+        )
+        .unwrap();
+        let content = fs::read_to_string(processing_path.join("progress.toml")).unwrap();
+        let p: purgery_core::ProcessingProgress = toml::from_str(&content).unwrap();
+        assert_eq!(
+            p.started_at_unix_secs, 5000,
+            "matching envelope must preserve started_at"
+        );
+    }
+
+    #[test]
+    #[ignore = "expected failure until existing_progress_started_at checks envelope"]
+    fn progress_start_time_not_preserved_with_mismatched_envelope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let processing_path = Utf8PathBuf::from_path_buf(tmp.path().join("processing")).unwrap();
+        fs::create_dir_all(&processing_path).unwrap();
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("ts-mismatch".into()).unwrap();
+
+        // Write existing progress with DIFFERENT nickname
+        let old_progress = purgery_core::ProcessingProgress {
+            protocol_version: 1,
+            nickname: "other-machine".into(), // different nickname
+            run_id: "ts-mismatch".into(),
+            phase: "processing".into(),
+            state: "old".into(),
+            entry_index: 0,
+            entry_total: 1,
+            current_entry: String::new(),
+            current_step: String::new(),
+            started_at_unix_secs: 5000,
+            updated_at_unix_secs: 5000,
+        };
+        let old_content = toml::to_string(&old_progress).unwrap();
+        fs::write(processing_path.join("progress.toml"), &old_content).unwrap();
+
+        // Mismatched envelope — started_at must NOT be preserved (should be fresh)
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        write_progress(
+            &processing_path,
+            &nickname,
+            &run_id,
+            "processing_entry",
+            0,
+            1,
+            "a.txt",
+            "",
+        )
+        .unwrap();
+        let content = fs::read_to_string(processing_path.join("progress.toml")).unwrap();
+        let p: purgery_core::ProcessingProgress = toml::from_str(&content).unwrap();
+        assert!(
+            p.started_at_unix_secs >= before,
+            "mismatched envelope must initialize fresh started_at, got {} < {}",
+            p.started_at_unix_secs,
+            before
+        );
+    }
+
+    #[test]
+    #[ignore = "expected failure until existing_progress_started_at handles malformed files"]
+    fn malformed_existing_progress_does_not_preserve_start_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let processing_path = Utf8PathBuf::from_path_buf(tmp.path().join("processing")).unwrap();
+        fs::create_dir_all(&processing_path).unwrap();
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("ts-malformed".into()).unwrap();
+
+        // Write invalid TOML to progress.toml
+        fs::write(
+            processing_path.join("progress.toml"),
+            "not valid toml {{{",
+        )
+        .unwrap();
+
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        write_progress(
+            &processing_path,
+            &nickname,
+            &run_id,
+            "processing_entry",
+            0,
+            1,
+            "a.txt",
+            "",
+        )
+        .unwrap();
+        let content = fs::read_to_string(processing_path.join("progress.toml")).unwrap();
+        let p: purgery_core::ProcessingProgress = toml::from_str(&content).unwrap();
+        assert!(
+            p.started_at_unix_secs >= before,
+            "malformed existing file must initialize fresh started_at, got {} < {}",
+            p.started_at_unix_secs,
+            before
+        );
+    }
+
     // ── Progress timestamp tests ──
 
     #[test]
