@@ -1,20 +1,32 @@
 # Import Semantics
 
+## Storage location invariants
+
+Purgery maintains two distinct storage locations:
+
+* **`root`** (final archive): Output-only storage. The only paths Purgery may create or modify under `root` are the actual final imported files, directories, and symlinks and their final postprocessed output versions. No operational, temporary, intermediate, progress, status, lock, staging, partial, or helper files are ever created under `root`.
+
+* **`purgery_root`** (Purgery-owned operational state): All operational state lives here, including incoming runs, ready/processing/done/failed run directories, manifests, status/progress files, work areas, postprocess staging, temporary commit helpers, and any staging needed for safe commits.
+
+The final destination tree is not a staging area. A same-directory atomic-rename temp file such as `.purgery-commit.<run_id>.<filename>.tmp` in the final parent directory is forbidden. If exact same-directory atomic replacement would require writing a sibling temp file under final storage, the output-only storage invariant wins.
+
 ## Commit path by output kind
 
 ### Regular files and symlinks
 
-Committed through a same-directory temp entry followed by atomic rename:
+Committed from a staging location under `purgery_root` directly to the final path under `root`:
 
 ```
-work output → final parent dir / .purgery-commit.<run_id>.<filename>.tmp → rename → final path
+work output → copy to final path
 ```
 
-The temp entry is on the same filesystem as the final path, so the rename is atomic against readers. Temp entries are cleaned up after a successful commit.
+The source (staged file or work-area output) is a complete file already verified against the manifest. A crash during the copy to final storage leaves a partial file at the final path, but the run has not published `status.toml` and will be replayed from staged data on recovery, overwriting the partial file.
+
+Temp commit helpers live under the per-run work area (`<purgery_root>/<nickname>/processing/<run_id>/work/`), not under `root`.
 
 ### Directory roots
 
-Directory output roots are created, kept, or replaced directly via `commit_directory_entry`. Their descendants are then recursively overlaid using no-delete semantics. Subdirectories are created/kept directly; regular-file and symlink descendants use temp-entry + rename.
+Directory output roots are created, kept, or replaced directly via `commit_directory_entry`. Their descendants are then recursively overlaid using no-delete semantics. Subdirectories are created/kept directly; regular-file and symlink descendants are committed directly from their work-area sources to their final paths.
 
 ## Directory overlay semantics
 
@@ -34,7 +46,9 @@ Per-entry failures produce individual `EntryStatusEntry` records with `status = 
 
 ## Work area
 
-The server creates a work area at `<purgery_root>/processing/<nickname>/<run_id>/work/`. Entries are placed into the work area before processing.
+The server creates a work area at `<purgery_root>/<nickname>/processing/<run_id>/work/`. Entries are placed into the work area before processing. All commit staging (temporary files, helper paths, and intermediate outputs) lives under this work area, never under `root`.
+
+Postprocess subprocesses run with their current directory set to the work-area parent of the input entry, so relative-path outputs land inside the work area, not in an arbitrary inherited server cwd.
 
 Cleanup policy:
 
@@ -43,6 +57,8 @@ Cleanup policy:
 | `done`    | removed         |
 | `partial` | kept            |
 | `failed`  | kept            |
+
+Stale work areas from interrupted runs are removed on processing start. The work area is rebuilt from staged files for each processing attempt.
 
 ## Run plan validation
 
@@ -145,8 +161,8 @@ Expected outputs are file-name templates for output entry roots in the same work
 
 After a subprocess runs, each expected output path is inspected with `symlink_metadata` to determine its kind:
 * **Directory**: committed recursively using no-delete overlay semantics.
-* **Regular file**: committed via temp-file + atomic rename.
-* **Symlink**: committed via temp symlink + atomic rename.
+* **Regular file**: committed from its work-area location directly to the final path.
+* **Symlink**: the symlink target is read and the symlink is recreated at the final path.
 * **Unsupported or missing**: input entry fails.
 
 `keep_original = true` commits the original work-area input entry/root as one output. For directories this commits the subtree recursively.
@@ -162,25 +178,36 @@ If a `status.toml` exists but is malformed (invalid TOML or missing required fie
 ## Directory layout
 
 ```
-<purgery_root>/                      # staging area
+<root>/                              # output-only final archive storage
+  <nickname>/
+    <sync.to>/                       # final imported entries, postprocessed outputs
+      ...                            # (only final files/dirs/symlinks — no temp/helper files)
+
+<purgery_root>/                      # Purgery-owned operational state
   <nickname>/
     incoming/<run_id>/               # client uploads here
       lease.toml
       run.toml
       manifest.toml
-      files/                         # uploaded entries by sync mapping
+      files/                         # uploaded entries by sync mapping (staging)
     ready/<run_id>/                  # upload complete, pending processing
     processing/<run_id>/             # actively being processed
-    done/<run_id>/                   # successfully processed
-    failed/<run_id>/                 # failed runs
+      work/                          # per-run work area (staging, temp commit helpers,
+      |                              #   postprocess inputs/outputs, intermediate artifacts)
+      status.toml
+      progress.toml
+      run.toml
+      manifest.toml
+      files/                         # staged entry files
+    done/<run_id>/                   # successfully processed (work/ removed if Done)
       status.toml
       run.toml
       manifest.toml
       ...
-
-<root>/                              # final storage
-  <nickname>/
-    <sync.to>/                       # final imported entries
+    failed/<run_id>/                 # failed runs (work/ preserved for diagnostics)
+      status.toml
+      run.toml
+      manifest.toml
       ...
 ```
 

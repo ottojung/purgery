@@ -135,12 +135,14 @@ This property makes crash recovery replay-based. A crash may occur after some en
 
 ## Per-entry replacement invariant
 
-Regular-file outputs are copied to a temporary file in their final directory and renamed into place. Symlinks are created at a temporary name in their final directory and renamed into place. Directories are created or retained directly:
+Regular-file outputs are copied from their work-area location directly to their final path. Symlinks are created directly at their final path after removing any conflicting destination. Directories are created or retained directly. No temporary files are created under the final storage root.
 
 ```text
-regular work output -> final parent/.purgery-commit.<run_id>.<filename>.tmp -> final path
-literal link target -> final parent/.purgery-commit.<run_id>.<filename>.tmp -> final symlink
+regular work output → copy to final path
+literal link target → create symlink at final path
 ```
+
+The final destination tree (`root`) is output-only. All staging, temporary commit helpers, and intermediate artifacts live under `purgery_root`.
 
 A present source directory replaces a conflicting final file or symlink and then allows descendants to merge. A present source regular file or symlink replaces a final file, symlink, or empty directory, but fails rather than deleting a non-empty final directory. Existing ancestors must be real directories; final-storage symlinks are never followed as directory components. Every derived path must remain inside the configured storage root.
 
@@ -270,6 +272,6 @@ For postprocess entries, verified server status remains the authority for local 
 
 ## Tree-overlay recovery guarantee
 
-Purgery provides replayable convergence, not an all-or-nothing tree transaction. A crash may leave some directories, regular files, or symlinks committed while later entries remain pending. Until every manifest entry completes, `status.toml` is not published and the run remains recoverable in `processing/`. `process-once` rebuilds regular-file work outputs from immutable staged data and replays every entry. Directory merge, same-directory regular-file replacement, and same-directory symlink replacement are idempotent, so replay converges while preserving unrelated final descendants.
+Purgery provides replayable convergence, not an all-or-nothing tree transaction. A crash may leave some directories, regular files, or symlinks committed in final storage while later entries remain pending. A crash during a direct copy to final storage may leave a partial file; this is acceptable because `status.toml` has not been published and `process-once` replays the run from staged files, overwriting any partial remnants. Until every manifest entry completes, `status.toml` is not published and the run remains recoverable in `processing/`. Directory merge, direct regular-file replacement, and direct symlink replacement are idempotent, so replay converges while preserving unrelated final descendants.
 
 Per-entry commits are crash-safe and replay-safe. A terminal success status is published only after the complete manifest has been processed.
