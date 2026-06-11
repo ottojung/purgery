@@ -2229,7 +2229,9 @@ command = "true"
         );
         let err = result.unwrap_err().to_string().to_lowercase();
         assert!(
-            err.contains("terminal_status_seen") || err.contains("WaitingForTerminalState") || err.contains("state")
+            err.contains("terminal_status_seen")
+                || err.contains("WaitingForTerminalState")
+                || err.contains("state")
                 || err.contains("persist"),
             "error must mention state persistence failure: {err}"
         );

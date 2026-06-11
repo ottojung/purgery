@@ -178,6 +178,53 @@ pub(crate) fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
     }
 }
 
+/// Persist client run state, propagating errors.
+/// Safety-state writes are not best-effort — if deletion could follow,
+/// failure must stop the invocation.
+fn persist_client_run_state_or_stop(
+    state_dir: &str,
+    nickname: &str,
+    run_id: &str,
+    manifest: &Manifest,
+    run_config: &RunConfig,
+    phase: ClientRunPhase,
+) -> Result<()> {
+    write_client_run_state(state_dir, nickname, run_id, manifest, run_config, phase).with_context(
+        || format!("failed to persist client run state phase {phase:?}; refusing to continue"),
+    )
+}
+
+/// Attempt to write a Corrupt tombstone and return an error.
+/// If the tombstone write fails, the returned error still mentions the
+/// original condition. No deletion occurs regardless.
+fn persist_corrupt_or_error(
+    state_dir: &str,
+    nickname: &str,
+    run_id: &str,
+    manifest: &Manifest,
+    run_config: &RunConfig,
+    original_error: &str,
+) -> anyhow::Error {
+    if let Err(ts_err) = write_client_run_state(
+        state_dir,
+        nickname,
+        run_id,
+        manifest,
+        run_config,
+        ClientRunPhase::Corrupt,
+    ) {
+        anyhow::anyhow!(
+            "{original_error}; additionally, failed to persist corrupt tombstone: {ts_err:#}; \
+             no deletion authorised. Manual intervention required at: {state_dir}"
+        )
+    } else {
+        anyhow::anyhow!(
+            "{original_error}; marked as corrupt without deletion. \
+             Manual intervention required at: {state_dir}"
+        )
+    }
+}
+
 /// Persist local run state for a postprocess run so waiting/cleanup can
 /// resume after a client crash.
 pub(crate) fn write_client_run_state(
@@ -315,14 +362,14 @@ pub(crate) fn wait_for_terminal_run_state(
                             run_id = %run_id.as_str(),
                             "run not found on server, marking as abandoned"
                         );
-                        let _ = write_client_run_state(
+                        persist_client_run_state_or_stop(
                             &config.state_dir,
                             nickname.as_str(),
                             run_id.as_str(),
                             manifest,
                             &build_run_config(config, true),
                             ClientRunPhase::Abandoned,
-                        );
+                        )?;
                         anyhow::bail!(
                             "run {}/{} not found on server; marked as abandoned without deletion",
                             nickname.as_str(),
@@ -335,14 +382,14 @@ pub(crate) fn wait_for_terminal_run_state(
                             run_id = %run_id.as_str(),
                             "run state is corrupt, marking corrupt on client"
                         );
-                        let _ = write_client_run_state(
+                        persist_client_run_state_or_stop(
                             &config.state_dir,
                             nickname.as_str(),
                             run_id.as_str(),
                             manifest,
                             &build_run_config(config, true),
                             ClientRunPhase::Corrupt,
-                        );
+                        )?;
                         anyhow::bail!(
                             "run {}/{} server state is corrupt; no deletion authorised. \
                              Manual intervention required at: {}",
@@ -388,14 +435,14 @@ pub(crate) fn read_and_verify_terminal_status(
     nickname: &purgery_core::Nickname,
     run_id: &RunId,
 ) -> Result<RunStatus> {
-    let _ = write_client_run_state(
+    persist_client_run_state_or_stop(
         &config.state_dir,
         nickname.as_str(),
         run_id.as_str(),
         manifest,
         &build_run_config(config, true),
         ClientRunPhase::TerminalStatusSeen,
-    );
+    )?;
 
     let output = server_cmd(
         host,
@@ -417,27 +464,25 @@ pub(crate) fn read_and_verify_terminal_status(
     })?;
 
     let trimmed = output.trim();
-    let status = RunStatus::from_toml(trimmed).map_err(|e| {
-        let msg = format!(
-            "malformed terminal status for run {}/{}: {e}",
-            nickname.as_str(),
-            run_id.as_str()
-        );
-        warn!("{msg}");
-        let _ = write_client_run_state(
-            &config.state_dir,
-            nickname.as_str(),
-            run_id.as_str(),
-            manifest,
-            &build_run_config(config, true),
-            ClientRunPhase::Corrupt,
-        );
-        anyhow::anyhow!(
-            "{msg}; marked as corrupt without deletion. \
-             Manual intervention required at: {}",
-            config.state_dir
-        )
-    })?;
+    let status = match RunStatus::from_toml(trimmed) {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!(
+                "malformed terminal status for run {}/{}: {e}",
+                nickname.as_str(),
+                run_id.as_str()
+            );
+            warn!("{msg}");
+            return Err(persist_corrupt_or_error(
+                &config.state_dir,
+                nickname.as_str(),
+                run_id.as_str(),
+                manifest,
+                &build_run_config(config, true),
+                &msg,
+            ));
+        }
+    };
 
     if status.nickname != *nickname {
         let msg = format!(
@@ -446,19 +491,14 @@ pub(crate) fn read_and_verify_terminal_status(
             nickname.as_str()
         );
         warn!("{msg}");
-        let _ = write_client_run_state(
+        return Err(persist_corrupt_or_error(
             &config.state_dir,
             nickname.as_str(),
             run_id.as_str(),
             manifest,
             &build_run_config(config, true),
-            ClientRunPhase::Corrupt,
-        );
-        anyhow::bail!(
-            "{msg}; marked as corrupt without deletion. \
-             Manual intervention required at: {}",
-            config.state_dir
-        );
+            &msg,
+        ));
     }
     if status.run_id != *run_id {
         let msg = format!(
@@ -467,19 +507,14 @@ pub(crate) fn read_and_verify_terminal_status(
             run_id.as_str()
         );
         warn!("{msg}");
-        let _ = write_client_run_state(
+        return Err(persist_corrupt_or_error(
             &config.state_dir,
             nickname.as_str(),
             run_id.as_str(),
             manifest,
             &build_run_config(config, true),
-            ClientRunPhase::Corrupt,
-        );
-        anyhow::bail!(
-            "{msg}; marked as corrupt without deletion. \
-             Manual intervention required at: {}",
-            config.state_dir
-        );
+            &msg,
+        ));
     }
 
     Ok(status)
@@ -496,14 +531,16 @@ pub(crate) fn cleanup_from_verified_status(
     let deletion_count = delete_confirmed_files(config, manifest, status)?;
     info!(deleted = deletion_count, "cleanup complete");
 
-    let _ = write_client_run_state(
+    // Persist CleanupComplete durably. If this fails, leave old state in
+    // place so recovery can distinguish complete from interrupted cleanup.
+    write_client_run_state(
         &config.state_dir,
         nickname.as_str(),
         run_id.as_str(),
         manifest,
         &build_run_config(config, true),
         ClientRunPhase::CleanupComplete,
-    );
+    )?;
     remove_client_run_state(&config.state_dir, nickname.as_str(), run_id.as_str());
 
     info!(state = %status.state.as_str(), "run finished");
