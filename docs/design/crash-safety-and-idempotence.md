@@ -219,9 +219,20 @@ Progress states are classified:
 
 Run-level progress has empty `current_entry` and `current_step`. This is not a sentinel — it means the progress describes the run as a whole, not a specific entry. Per-entry progress always has real `entry_index`, `entry_total > 0`, and non-empty `current_entry`.
 
+### Progress write validation
+
+`write_progress` validates progress state semantics before writing. Invalid updates return an error:
+
+- **Run-level states** (`processing_started`, `publishing_status`): `current_entry` and `current_step` must be empty.
+- **Per-entry state** (`processing_entry`): `entry_total > 0`, `entry_index < entry_total`, `current_entry` non-empty, `current_step` empty.
+- **Per-entry step states** (`step_started`, `step_running`, `step_finished`): `entry_total > 0`, `entry_index < entry_total`, `current_entry` non-empty, `current_step` non-empty.
+- Unknown states are rejected.
+
+`write_progress_best_effort` catches validation errors, logs a warning, and continues. Invalid progress never fails an otherwise valid import.
+
 ### Progress write failure
 
-Progress is observational only. It never authorizes cleanup. A progress file write failure is warning-level and must not fail an otherwise successful import.
+Progress is observational only. It never authorizes cleanup. A progress file write failure (I/O error after validation) is warning-level and must not fail an otherwise successful import.
 
 The server writes `publishing_status` progress before atomically publishing terminal `status.toml`. If this write fails, processing continues — it is best-effort.
 

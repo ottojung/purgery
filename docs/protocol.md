@@ -475,7 +475,8 @@ The `state` field transitions:
 | Type | `state` | `entry_index` | `entry_total` | `current_entry` | `current_step` |
 |------|---------|---------------|---------------|-----------------|----------------|
 | Run-level | `processing_started`, `publishing_status` | May be 0 | Coherent total (N) | Empty `""` | Empty `""` |
-| Per-entry | `processing_entry`, `step_started`, `step_running`, `step_finished` | Real position | Coherent total (N) | Real relative path | Real step name or empty |
+| Per-entry | `processing_entry` | Real position | Coherent total (N) | Real relative path | Empty `""` |
+| Per-entry | `step_started`, `step_running`, `step_finished` | Real position | Coherent total (N) | Real relative path | Real step name |
 
 Run-level progress has no current entry. Empty `current_entry` and `current_step` are not sentinel values — they mean the progress is about the run as a whole, not a specific entry.
 
@@ -490,9 +491,24 @@ For per-entry progress:
 
 `ProgressUpdate` is always fully populated. No field is left as `0` to mean "the caller should fill this in later."
 
+### Progress write validation
+
+`write_progress` validates progress state semantics before writing. Invalid updates return an error.
+
+Validated invariants:
+
+- **Run-level states** (`processing_started`, `publishing_status`): `current_entry` and `current_step` must be empty.
+- **Per-entry state** (`processing_entry`): `entry_total > 0`, `entry_index < entry_total`, `current_entry` non-empty, `current_step` empty.
+- **Per-entry step states** (`step_started`, `step_running`, `step_finished`): `entry_total > 0`, `entry_index < entry_total`, `current_entry` non-empty, `current_step` non-empty.
+- Unknown states are rejected.
+
+`write_progress_best_effort` catches validation errors, logs a warning, and continues. Invalid progress never fails an otherwise valid import.
+
+All progress writes go through `write_progress_best_effort` in production code. Direct `write_progress` calls in test code will receive validation errors for invalid updates.
+
 ### Progress write failure
 
-If a progress file write fails, the server logs a warning with structured context and continues processing. A progress write failure must not fail an otherwise successful import. Progress is observational only and never authorizes cleanup.
+If a progress file write fails (I/O error after validation), the server logs a warning with structured context and continues processing. A progress write failure must not fail an otherwise successful import. Progress is observational only and never authorizes cleanup.
 
 All progress writes use a best-effort helper that logs a warning on failure. Silent failures (`let _ = write_progress(...)`) are replaced with explicit warning-level logging.
 
