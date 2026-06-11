@@ -359,6 +359,8 @@ fn process_manifest_entry(
     run_id: &RunId,
     processing_path: &Utf8Path,
     work_area: &Utf8Path,
+    entry_index: usize,
+    entry_total: usize,
 ) -> EntryOutcome {
     let expected_staged = Utf8Path::new("files")
         .join(sync.to_path.as_str())
@@ -457,16 +459,29 @@ fn process_manifest_entry(
             Ok(p) => p,
             Err(error) => return failed_entry(entry, error),
         };
-        let mut pp_helper = |state: &str, step: &str| {
+        let mut pp_helper = |update: &purgery_core::ProgressUpdate| {
+            // Use the real entry index/total from the manifest, but allow
+            // the progress update to override them (for step-level progress
+            // that comes from apply_postprocessing with 0,0).
+            let ei = if update.entry_index == 0 && update.entry_total == 0 {
+                entry_index
+            } else {
+                update.entry_index
+            };
+            let et = if update.entry_index == 0 && update.entry_total == 0 {
+                entry_total
+            } else {
+                update.entry_total
+            };
             let _ = write_progress(
                 processing_path,
                 nickname,
                 run_id,
-                state,
-                0,
-                0,
-                entry.relative_path.as_str(),
-                step,
+                update.state,
+                ei,
+                et,
+                update.current_entry,
+                update.current_step,
             );
         };
         match apply_postprocessing(
@@ -807,6 +822,8 @@ pub fn process_processing_run(
             run_id,
             &processing_path,
             &work_area,
+            entry_idx,
+            manifest.entries.len(),
         ));
     }
 
@@ -827,6 +844,18 @@ pub fn process_processing_run(
     if run_state == RunState::Done {
         let _ = fs::remove_dir_all(&work_area);
     }
+
+    // Best-effort publishing_status progress before terminal status publication
+    let _ = write_progress(
+        &processing_path,
+        nickname,
+        run_id,
+        "publishing_status",
+        0,
+        manifest.entries.len(),
+        "",
+        "",
+    );
 
     info!(state = %run_state.as_str(), "run complete");
     let run_status = RunStatus {

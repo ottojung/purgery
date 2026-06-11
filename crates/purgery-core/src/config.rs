@@ -489,6 +489,35 @@ pub struct ProcessingProgress {
     pub updated_at_unix_secs: u64,
 }
 
+/// Progress update passed into postprocess callbacks.
+/// Carries full entry context for progress reporting.
+#[derive(Debug, Clone)]
+pub struct ProgressUpdate<'a> {
+    pub state: &'a str,
+    pub entry_index: usize,
+    pub entry_total: usize,
+    pub current_entry: &'a str,
+    pub current_step: &'a str,
+}
+
+impl<'a> ProgressUpdate<'a> {
+    pub fn new(
+        state: &'a str,
+        entry_index: usize,
+        entry_total: usize,
+        current_entry: &'a str,
+        current_step: &'a str,
+    ) -> Self {
+        ProgressUpdate {
+            state,
+            entry_index,
+            entry_total,
+            current_entry,
+            current_step,
+        }
+    }
+}
+
 /// Client-persisted phases for a postprocess run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

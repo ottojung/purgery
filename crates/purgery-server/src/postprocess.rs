@@ -5,12 +5,33 @@ use tracing::info;
 
 use crate::RunPlan;
 
+/// Default heartbeat interval for subprocess progress updates (5 seconds).
+const DEFAULT_HEARTBEAT_SECS: u64 = 5;
+
 pub fn apply_postprocessing(
     run_plan: &RunPlan,
     sync_name: &str,
     normalized_path: &str,
     work_path: &Utf8Path,
-    progress_step: &mut dyn FnMut(&str, &str),
+    progress_step: &mut dyn FnMut(&purgery_core::ProgressUpdate),
+) -> Result<Vec<Utf8PathBuf>, String> {
+    apply_postprocessing_with_heartbeat(
+        run_plan,
+        sync_name,
+        normalized_path,
+        work_path,
+        std::time::Duration::from_secs(DEFAULT_HEARTBEAT_SECS),
+        progress_step,
+    )
+}
+
+pub fn apply_postprocessing_with_heartbeat(
+    run_plan: &RunPlan,
+    sync_name: &str,
+    normalized_path: &str,
+    work_path: &Utf8Path,
+    heartbeat_interval: std::time::Duration,
+    progress_step: &mut dyn FnMut(&purgery_core::ProgressUpdate),
 ) -> Result<Vec<Utf8PathBuf>, String> {
     let mut results: Vec<Utf8PathBuf> = Vec::new();
 
@@ -29,7 +50,9 @@ pub fn apply_postprocessing(
             purgery_core::PostprocessKind::Subprocess => {
                 let args = step_def.build_args(work_path);
                 info!(step = %step.step_name, program = %step_def.program, "running postprocess step");
-                progress_step("step_started", &step.step_name);
+                progress_step(&purgery_core::ProgressUpdate::new(
+                    "step_started", 0, 0, normalized_path, &step.step_name,
+                ));
 
                 // Use spawn + try_wait loop for heartbeat, not blocking .status()
                 let mut child = std::process::Command::new(&step_def.program)
@@ -42,8 +65,10 @@ pub fn apply_postprocessing(
                         Ok(Some(status)) => break status,
                         Ok(None) => {
                             // Still running — update progress heartbeat
-                            progress_step("step_running", &step.step_name);
-                            std::thread::sleep(std::time::Duration::from_secs(5));
+                            progress_step(&purgery_core::ProgressUpdate::new(
+                                "step_running", 0, 0, normalized_path, &step.step_name,
+                            ));
+                            std::thread::sleep(heartbeat_interval);
                         }
                         Err(e) => {
                             return Err(format!("failed to wait for {}: {e}", step.step_name));
@@ -59,7 +84,9 @@ pub fn apply_postprocessing(
                     ));
                 }
 
-                progress_step("step_finished", &step.step_name);
+                progress_step(&purgery_core::ProgressUpdate::new(
+                    "step_finished", 0, 0, normalized_path, &step.step_name,
+                ));
 
                 let expected = step_def
                     .resolve_expected_outputs(work_path)

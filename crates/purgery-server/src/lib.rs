@@ -874,7 +874,7 @@ mod tests {
             sync_name,
             normalized_path,
             work_path,
-            &mut |_, _| {},
+            &mut |_: &purgery_core::ProgressUpdate| {},
         )
     }
 
