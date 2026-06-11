@@ -6474,4 +6474,38 @@ steps = ["pack"]
             "rejection must explain conformance tradeoff, got: {err}"
         );
     }
+
+    /// Spec and design docs must describe protocol, behavior, and invariants,
+    /// not test process, development process, or agent workflow.
+    #[test]
+    fn spec_docs_do_not_contain_test_process_guidance() {
+        let docs = [
+            (
+                "docs/protocol.md",
+                include_str!("../../../docs/protocol.md"),
+            ),
+            (
+                "docs/design/crash-safety-and-idempotence.md",
+                include_str!("../../../docs/design/crash-safety-and-idempotence.md"),
+            ),
+        ];
+
+        let banned = [
+            "Tests must not",
+            "tests must not",
+            "expected-failing",
+            "expected failure",
+            "Do not switch branches",
+            "agent",
+        ];
+
+        for (path, content) in docs {
+            for phrase in banned {
+                assert!(
+                    !content.contains(phrase),
+                    "{path} contains process/test guidance phrase: {phrase:?}"
+                );
+            }
+        }
+    }
 }
