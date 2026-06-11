@@ -199,7 +199,27 @@ Tombstones are durable diagnostics. They are never auto-removed.
 
 When resuming from `TerminalStatusSeen`, the client must not re-enter the `wait_for_postprocess_run_and_cleanup` wait loop. It must go directly to reading terminal status and performing cleanup. This prevents rewriting state to `WaitingForTerminalState` when the run is already past waiting.
 
-### Processing progress semantics
+### Processing progress timestamp semantics
+
+Progress timestamps have two distinct fields:
+
+- `started_at_unix_secs`: The stable wall-clock time when the server began processing this run. It is set once on the first progress write and preserved across all subsequent writes. If an existing `progress.toml` is found, it is read from the previous file rather than recomputed. This value never changes for a given run.
+- `updated_at_unix_secs`: The wall-clock time of the current progress update. It is always set to `now` and never preserved from a prior update.
+
+The first progress write for a run initializes both fields to the current time. All subsequent writes preserve `started_at` and update only `updated_at`. This allows observers to distinguish run duration from staleness.
+
+### Run-level vs per-entry progress
+
+Progress states are classified:
+
+| Type | States |
+|------|--------|
+| **Run-level** | `processing_started`, `publishing_status` |
+| **Per-entry** | `processing_entry`, `step_started`, `step_running`, `step_finished` |
+
+Run-level progress has empty `current_entry` and `current_step`. This is not a sentinel — it means the progress describes the run as a whole, not a specific entry. Per-entry progress always has real `entry_index`, `entry_total > 0`, and non-empty `current_entry`.
+
+### Progress write failure
 
 Progress is observational only. It never authorizes cleanup. A progress file write failure is warning-level and must not fail an otherwise successful import.
 
@@ -208,6 +228,17 @@ The server writes `publishing_status` progress before atomically publishing term
 Progress updates never use sentinel values. Every per-entry progress update (`processing_entry`, `step_started`, `step_running`, `step_finished`) carries accurate `entry_index`, `entry_total`, and `current_entry`. No field is left as `0` to mean "the caller should fill this in later."
 
 All progress writes use a best-effort helper that logs a `tracing::warn!` on failure with structured context. Silent `let _ = write_progress(...)` patterns are replaced with explicit warning-level logging.
+
+### Safety-state persistence
+
+Client-persisted run state (under `state_dir/runs/`) follows different rules from progress:
+
+- **`WaitingForTerminalState`**: Persisted before entering the wait loop. Failure stops before waiting.
+- **`TerminalStatusSeen`**: Persisted before reading server status. Failure stops before potential deletion.
+- **`CleanupComplete`**: Persisted after successful deletion. Failure leaves old state in place for recovery.
+- **`Abandoned`** / **`Corrupt`** (tombstones): Persisted before returning error. If the tombstone write fails, the client returns an error that says the tombstone could not be persisted, and still does not delete.
+
+Safety-state writes are not best-effort. If a safety-state write fails and deletion could follow, the client does not proceed. Progress writes remain best-effort.
 
 ### Cleanup state discovery
 

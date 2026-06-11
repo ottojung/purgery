@@ -455,18 +455,31 @@ started_at_unix_secs = ...
 updated_at_unix_secs = ...
 ```
 
+### Timestamp semantics
+
+- `started_at_unix_secs`: the stable wall-clock time when the server began processing the current run. This value is set once on the first progress write and preserved across all subsequent updates for the same run. It is never reset. If an existing `progress.toml` is present, `started_at_unix_secs` is read from it rather than recomputed.
+- `updated_at_unix_secs`: the wall-clock time of the current progress update. This value advances independently on every write. It is always set to `now` and never preserved from a prior update.
+- The first progress write for a run initializes both `started_at` and `updated_at` to the current time. All subsequent writes preserve `started_at` and update only `updated_at`.
+
 The `state` field transitions:
 
-- `processing_started` — written before any entries are processed
-- `processing_entry` — written before each manifest entry
-- `step_started` — before a postprocess step subprocess is spawned
-- `step_running` — periodically while a long-running subprocess executes
-- `step_finished` — after a postprocess step succeeds
-- `publishing_status` — before terminal `status.toml` is published (best-effort)
+- `processing_started` — written before any entries are processed (run-level)
+- `processing_entry` — written before each manifest entry (per-entry)
+- `step_started` — before a postprocess step subprocess is spawned (per-entry)
+- `step_running` — periodically while a long-running subprocess executes (per-entry)
+- `step_finished` — after a postprocess step succeeds (per-entry)
+- `publishing_status` — before terminal `status.toml` is published, best-effort (run-level)
 
-For real manifest entry processing, `entry_total` is the total number of entries and `entry_index` is the current position. These are never `0` for real entries. Initial `processing_started` may have `entry_index = 0, entry_total = N` and no `current_entry`.
+### Run-level vs per-entry progress
 
-Progress updates never use sentinel values. Every `step_started`, `step_running`, and `step_finished` update carries the real `entry_index`, `entry_total`, and `current_entry` for the entry being processed. The `publishing_status` update may have no current entry, but it must still carry a coherent `entry_total`.
+| Type | `state` | `entry_index` | `entry_total` | `current_entry` | `current_step` |
+|------|---------|---------------|---------------|-----------------|----------------|
+| Run-level | `processing_started`, `publishing_status` | May be 0 | Coherent total (N) | Empty `""` | Empty `""` |
+| Per-entry | `processing_entry`, `step_started`, `step_running`, `step_finished` | Real position | Coherent total (N) | Real relative path | Real step name or empty |
+
+Run-level progress has no current entry. Empty `current_entry` and `current_step` are not sentinel values — they mean the progress is about the run as a whole, not a specific entry.
+
+For per-entry progress, `entry_total` is the total number of entries and `entry_index` is the current position. These are never `0` for real entry processing, and `current_entry` is never empty.
 
 `ProgressUpdate` is always fully populated. No field is left as `0` to mean "the caller should fill this in later."
 
@@ -475,6 +488,17 @@ Progress updates never use sentinel values. Every `step_started`, `step_running`
 If a progress file write fails, the server logs a warning with structured context and continues processing. A progress write failure must not fail an otherwise successful import. Progress is observational only and never authorizes cleanup.
 
 All progress writes use a best-effort helper that logs a warning on failure. Silent failures (`let _ = write_progress(...)`) are replaced with explicit warning-level logging.
+
+### Safety-state persistence
+
+Client-persisted run state (`state_dir/runs/{nickname}-{run_id}/state.toml`) follows different rules from progress:
+
+- **`WaitingForTerminalState`**: Must be persisted before entering the wait loop. Failure to persist stops the invocation before any waiting or deletion.
+- **`TerminalStatusSeen`**: Must be persisted before calling the server status command. Failure to persist stops the invocation before any deletion.
+- **`CleanupComplete`**: Must be persisted after deletion. Failure to persist leaves the old state in place so recovery can distinguish complete from interrupted cleanup.
+- **`Abandoned`** and **`Corrupt`** (tombstones): Must be persisted before returning the error. Failure to persist returns an error that clearly says the tombstone could not be written. In all cases the client stops without deletion.
+
+Safety-state writes are not best-effort. If a safety-state write fails and deletion could follow, the client does not proceed. Progress writes remain best-effort (observational only).
 
 ### Subprocess heartbeat interval
 
