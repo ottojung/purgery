@@ -457,7 +457,7 @@ updated_at_unix_secs = ...
 
 ### Timestamp semantics
 
-- `started_at_unix_secs`: the stable wall-clock time when the server began processing the current run. This value is set once on the first progress write and preserved across all subsequent updates for the same run. It is never reset. If an existing `progress.toml` is present, `started_at_unix_secs` is read from it rather than recomputed.
+- `started_at_unix_secs`: the stable wall-clock time when the server began processing the current run. This value is set once on the first progress write and preserved across all subsequent updates for the same run. It is never reset. If an existing `progress.toml` is present and its envelope (`nickname`, `run_id`) matches the current run, `started_at_unix_secs` is read from it rather than recomputed. If the existing file is missing, malformed, or envelope-mismatched, a fresh `started_at_unix_secs` is initialized to the current time.
 - `updated_at_unix_secs`: the wall-clock time of the current progress update. This value advances independently on every write. It is always set to `now` and never preserved from a prior update.
 - The first progress write for a run initializes both `started_at` and `updated_at` to the current time. All subsequent writes preserve `started_at` and update only `updated_at`.
 
@@ -479,7 +479,14 @@ The `state` field transitions:
 
 Run-level progress has no current entry. Empty `current_entry` and `current_step` are not sentinel values — they mean the progress is about the run as a whole, not a specific entry.
 
-For per-entry progress, `entry_total` is the total number of entries and `entry_index` is the current position. These are never `0` for real entry processing, and `current_entry` is never empty.
+For per-entry progress:
+
+- `entry_total > 0`
+- `current_entry != ""`
+- `entry_index < entry_total`
+- `entry_index` is zero-based: the first real manifest entry has `entry_index = 0`.
+
+`entry_total` is never `0` for per-entry progress. `entry_index = 0` is valid (first entry).
 
 `ProgressUpdate` is always fully populated. No field is left as `0` to mean "the caller should fill this in later."
 
@@ -488,6 +495,15 @@ For per-entry progress, `entry_total` is the total number of entries and `entry_
 If a progress file write fails, the server logs a warning with structured context and continues processing. A progress write failure must not fail an otherwise successful import. Progress is observational only and never authorizes cleanup.
 
 All progress writes use a best-effort helper that logs a warning on failure. Silent failures (`let _ = write_progress(...)`) are replaced with explicit warning-level logging.
+
+### Tombstone persistence failure messages
+
+If writing an `Abandoned` or `Corrupt` tombstone fails, the returned error includes both:
+
+- the original condition that triggered the tombstone (`not_found`, server `corrupt`, malformed terminal status, envelope mismatch);
+- the fact that the tombstone could not be persisted.
+
+Even if the tombstone write fails, the client still does not delete anything. The error message directs the user to the state directory for manual resolution.
 
 ### Safety-state persistence
 

@@ -203,7 +203,7 @@ When resuming from `TerminalStatusSeen`, the client must not re-enter the `wait_
 
 Progress timestamps have two distinct fields:
 
-- `started_at_unix_secs`: The stable wall-clock time when the server began processing this run. It is set once on the first progress write and preserved across all subsequent writes. If an existing `progress.toml` is found, it is read from the previous file rather than recomputed. This value never changes for a given run.
+- `started_at_unix_secs`: The stable wall-clock time when the server began processing this run. It is set once on the first progress write and preserved across all subsequent writes. If an existing `progress.toml` is found whose envelope (`nickname`, `run_id`) matches the current run, `started_at` is read from it rather than recomputed. If the existing file is missing, malformed, or envelope-mismatched, a fresh `started_at` is initialized to the current time. This value never changes for a given run.
 - `updated_at_unix_secs`: The wall-clock time of the current progress update. It is always set to `now` and never preserved from a prior update.
 
 The first progress write for a run initializes both fields to the current time. All subsequent writes preserve `started_at` and update only `updated_at`. This allows observers to distinguish run duration from staleness.
@@ -228,6 +228,15 @@ The server writes `publishing_status` progress before atomically publishing term
 Progress updates never use sentinel values. Every per-entry progress update (`processing_entry`, `step_started`, `step_running`, `step_finished`) carries accurate `entry_index`, `entry_total`, and `current_entry`. No field is left as `0` to mean "the caller should fill this in later."
 
 All progress writes use a best-effort helper that logs a `tracing::warn!` on failure with structured context. Silent `let _ = write_progress(...)` patterns are replaced with explicit warning-level logging.
+
+### Tombstone persistence failure errors
+
+When an `Abandoned` or `Corrupt` tombstone write fails, the returned error combines:
+
+- the original condition (`not_found`, server `corrupt`, malformed terminal status, envelope mismatch);
+- the fact that the tombstone could not be persisted.
+
+The client still does not delete anything. The error message directs the user to the state directory.
 
 ### Safety-state persistence
 
