@@ -8,6 +8,7 @@ use crate::RunPlan;
 /// Default heartbeat interval for subprocess progress updates (5 seconds).
 const DEFAULT_HEARTBEAT_SECS: u64 = 5;
 
+#[allow(clippy::too_many_arguments)]
 pub fn apply_postprocessing(
     run_plan: &RunPlan,
     sync_name: &str,
@@ -31,6 +32,7 @@ pub fn apply_postprocessing(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn apply_postprocessing_with_heartbeat(
     run_plan: &RunPlan,
     sync_name: &str,

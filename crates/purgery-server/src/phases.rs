@@ -17,6 +17,7 @@ pub(crate) fn publish_status_atomic(directory: &Utf8Path, status: &RunStatus) ->
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn write_progress_best_effort(
     processing_path: &Utf8Path,
     nickname: &Nickname,

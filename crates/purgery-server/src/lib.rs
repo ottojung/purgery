@@ -5657,7 +5657,6 @@ delete_after_import = true
     // ── Progress sentinel and write-failure tests ──
 
     #[test]
-    #[ignore = "expected failure until apply_postprocessing receives entry context"]
     fn progress_update_has_no_sentinel_placeholders() {
         let tmp = tempfile::tempdir().unwrap();
         let work_path = Utf8PathBuf::from_path_buf(tmp.path().join("input.txt")).unwrap();
@@ -5735,12 +5734,10 @@ delete_after_import = true
     }
 
     #[test]
-    #[ignore = "expected failure until progress writes use best-effort logging"]
     fn progress_write_failure_logs_warning_and_does_not_fail_import() {
         let tmp = tempfile::tempdir().unwrap();
         let _purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root =
-            Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("progress-fail".into()).unwrap();
 
