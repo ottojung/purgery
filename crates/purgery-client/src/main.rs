@@ -150,8 +150,9 @@ mod tests {
     use camino::Utf8Path;
     use clap::Parser;
     use purgery_core::{
-        ClientConfig, EntryStatusEntry, FileStatus, ManifestEntry, ManifestEntryKind,
-        ManifestEntryMode, RunId, RunState, RunStatus,
+        ClientConfig, ClientRunPhase, ClientRunState, EntryStatusEntry, FileStatus, Manifest,
+        ManifestEntry, ManifestEntryKind, ManifestEntryMode, Nickname, RunConfig, RunId, RunState,
+        RunStatus,
     };
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -1879,6 +1880,106 @@ delete_after_import = true
         assert!(
             dir_path.exists(),
             "parent directory must remain when child lacks required identity"
+        );
+    }
+
+    #[test]
+    #[ignore = "expected failure until tombstone blocking is implemented"]
+    fn existing_abandoned_tombstone_blocks_sync() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().join("purgery-state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let run_id = RunId::new("test-run".into()).unwrap();
+        let runs_dir = state_dir
+            .join("runs")
+            .join(format!("laptop-{}", run_id.as_str()));
+        fs::create_dir_all(&runs_dir).unwrap();
+        let manifest = purgery_core::Manifest {
+            run_id: run_id.clone(),
+            nickname: purgery_core::Nickname::new("laptop".into()).unwrap(),
+            entries: vec![],
+        };
+        let run_config = purgery_core::RunConfig {
+            nickname: purgery_core::Nickname::new("laptop".into()).unwrap(),
+            sync: vec![],
+            postprocess: Default::default(),
+        };
+        let state = purgery_core::ClientRunState {
+            protocol_version: 1,
+            nickname: "laptop".into(),
+            run_id: run_id.as_str().to_owned(),
+            manifest: manifest.to_toml().unwrap(),
+            run_config: run_config.to_toml().unwrap(),
+            phase: purgery_core::ClientRunPhase::Abandoned,
+        };
+        let content = toml::to_string(&state).unwrap();
+        fs::write(runs_dir.join("state.toml"), &content).unwrap();
+        let config = ClientConfig::from_toml(&format!(
+            r#"
+nickname = "laptop"
+state_dir = "{}"
+
+[server]
+host = "example.invalid"
+"#,
+            state_dir.display()
+        ))
+        .unwrap();
+        let result = resume_pending_postprocess_runs(&config);
+        let err = result.unwrap_err().to_string().to_lowercase();
+        assert!(
+            err.contains("abandoned"),
+            "expected error about abandoned tombstone, got: {err}"
+        );
+    }
+
+    #[test]
+    #[ignore = "expected failure until tombstone blocking is implemented"]
+    fn existing_corrupt_tombstone_blocks_sync() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().join("purgery-state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let run_id = RunId::new("test-run".into()).unwrap();
+        let runs_dir = state_dir
+            .join("runs")
+            .join(format!("laptop-{}", run_id.as_str()));
+        fs::create_dir_all(&runs_dir).unwrap();
+        let manifest = purgery_core::Manifest {
+            run_id: run_id.clone(),
+            nickname: purgery_core::Nickname::new("laptop".into()).unwrap(),
+            entries: vec![],
+        };
+        let run_config = purgery_core::RunConfig {
+            nickname: purgery_core::Nickname::new("laptop".into()).unwrap(),
+            sync: vec![],
+            postprocess: Default::default(),
+        };
+        let state = purgery_core::ClientRunState {
+            protocol_version: 1,
+            nickname: "laptop".into(),
+            run_id: run_id.as_str().to_owned(),
+            manifest: manifest.to_toml().unwrap(),
+            run_config: run_config.to_toml().unwrap(),
+            phase: purgery_core::ClientRunPhase::Corrupt,
+        };
+        let content = toml::to_string(&state).unwrap();
+        fs::write(runs_dir.join("state.toml"), &content).unwrap();
+        let config = ClientConfig::from_toml(&format!(
+            r#"
+nickname = "laptop"
+state_dir = "{}"
+
+[server]
+host = "example.invalid"
+"#,
+            state_dir.display()
+        ))
+        .unwrap();
+        let result = resume_pending_postprocess_runs(&config);
+        let err = result.unwrap_err().to_string().to_lowercase();
+        assert!(
+            err.contains("corrupt"),
+            "expected error about corrupt tombstone, got: {err}"
         );
     }
 

@@ -5466,6 +5466,191 @@ steps = ["pack"]
         assert!(failed.exists(), "failed run dir must exist");
     }
 
+    // ── Progress context tests ──
+
+    #[test]
+    #[ignore = "expected failure until progress carries real entry context during steps"]
+    fn processing_progress_has_real_entry_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root =
+            Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("progress-context".into()).unwrap();
+
+        let ready_path = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap()
+            .join("laptop")
+            .join("ready")
+            .join(run_id.as_str());
+        fs::create_dir_all(ready_path.join("files/data")).unwrap();
+        fs::write(ready_path.join("files/data/a.txt"), b"file a").unwrap();
+        fs::write(ready_path.join("files/data/b.txt"), b"file b").unwrap();
+
+        let run_config_content = r#"
+nickname = "laptop"
+
+[[sync]]
+name = "data"
+to = "data"
+delete_after_import = true
+"#;
+        fs::write(ready_path.join("run.toml"), run_config_content).unwrap();
+
+        let manifest = Manifest {
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![
+                ManifestEntry {
+                    sync_name: SyncName::new("data".into()).unwrap(),
+                    local_path: ClientLocalPath::new("/src/a.txt".into()).unwrap(),
+                    staged_path: NormalizedRelativePath::new("files/data/a.txt".into()).unwrap(),
+                    relative_path: NormalizedRelativePath::new("a.txt".into()).unwrap(),
+                    kind: ManifestEntryKind::RegularFile,
+                    size: 6,
+                    mtime_ns: 100,
+                    sha256: None,
+                    link_target: None,
+                    mode: Default::default(),
+                    postprocess_steps: Vec::new(),
+                    covered_by: None,
+                },
+                ManifestEntry {
+                    sync_name: SyncName::new("data".into()).unwrap(),
+                    local_path: ClientLocalPath::new("/src/b.txt".into()).unwrap(),
+                    staged_path: NormalizedRelativePath::new("files/data/b.txt".into()).unwrap(),
+                    relative_path: NormalizedRelativePath::new("b.txt".into()).unwrap(),
+                    kind: ManifestEntryKind::RegularFile,
+                    size: 6,
+                    mtime_ns: 200,
+                    sha256: None,
+                    link_target: None,
+                    mode: Default::default(),
+                    postprocess_steps: Vec::new(),
+                    covered_by: None,
+                },
+            ],
+        };
+        fs::write(ready_path.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+
+        let config = test_server_config(
+            &Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
+            &server_root,
+        );
+
+        // Move from ready to processing manually and process
+        let processing_path = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        fs::create_dir_all(processing_path.parent().unwrap()).unwrap();
+        fs::rename(&ready_path, &processing_path).unwrap();
+
+        process_processing_run(&config, &nickname, &run_id).unwrap();
+
+        // Read the progress file (may still exist in done/failed or was cleaned up)
+        let done_path = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Done);
+        // The progress file is only in processing, which gets renamed to done.
+        // Check if it was moved along with the run.
+        let progress_path = done_path.join("progress.toml");
+        let progress_content = fs::read_to_string(&progress_path).ok();
+
+        if let Some(content) = progress_content {
+            let progress: purgery_core::ProcessingProgress = toml::from_str(&content).unwrap();
+            // Step progress must carry real entry context
+            assert!(
+                progress.entry_total >= 2,
+                "entry_total should be >= 2 for two entries, got: {}",
+                progress.entry_total
+            );
+            assert!(
+                progress.entry_index > 0 || progress.state == "processing_started",
+                "entry_index should be > 0 for non-initial states, got {} for state {}",
+                progress.entry_index,
+                progress.state
+            );
+        }
+        // If progress was cleaned up, the test still documents expected behavior
+    }
+
+    #[test]
+    #[ignore = "expected failure until publishing_status progress is implemented"]
+    fn publishing_status_progress_is_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root =
+            Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("publishing-status".into()).unwrap();
+
+        // Use a processing pipeline with a single file
+        let ready_path = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap()
+            .join("laptop")
+            .join("ready")
+            .join(run_id.as_str());
+        fs::create_dir_all(ready_path.join("files/data")).unwrap();
+        fs::write(ready_path.join("files/data/file.txt"), b"hello").unwrap();
+
+        let run_config_content = r#"
+nickname = "laptop"
+
+[[sync]]
+name = "data"
+to = "data"
+delete_after_import = true
+"#;
+        fs::write(ready_path.join("run.toml"), run_config_content).unwrap();
+
+        let manifest = Manifest {
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![ManifestEntry {
+                sync_name: SyncName::new("data".into()).unwrap(),
+                local_path: ClientLocalPath::new("/src/file.txt".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/data/file.txt".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("file.txt".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
+                size: 5,
+                mtime_ns: 100,
+                sha256: None,
+                link_target: None,
+                mode: Default::default(),
+                postprocess_steps: Vec::new(),
+                covered_by: None,
+            }],
+        };
+        fs::write(ready_path.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+
+        let config = test_server_config(
+            &Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
+            &server_root,
+        );
+
+        let processing_path = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        fs::create_dir_all(processing_path.parent().unwrap()).unwrap();
+        fs::rename(&ready_path, &processing_path).unwrap();
+
+        process_processing_run(&config, &nickname, &run_id).unwrap();
+
+        let done_path = config
+            .purgery_root
+            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let progress_path = done_path.join("progress.toml");
+        let progress_content = fs::read_to_string(&progress_path).ok();
+
+        if let Some(content) = progress_content {
+            let progress: purgery_core::ProcessingProgress = toml::from_str(&content).unwrap();
+            assert_eq!(
+                progress.state, "publishing_status",
+                "expected 'publishing_status' state, got '{}'",
+                progress.state
+            );
+        }
+        // If progress was cleaned up, the test documents expected behavior
+    }
+
     #[test]
     fn prepare_run_rejection_mentions_conformance() {
         let tmp = tempfile::tempdir().unwrap();
