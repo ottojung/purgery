@@ -434,11 +434,7 @@ fn resume_one(state_dir: &str, state: &ClientRunState) -> Result<bool> {
         }
         ClientRunPhase::WaitingForTerminalState => {
             debug!("waiting for terminal state");
-            let terminal = wait_for_terminal(host, server_cmd, &nickname, &run_id)?;
-            if terminal.phase == "not_found" {
-                warn!("run not found on server, abandoning");
-                return Ok(true);
-            }
+            wait_for_terminal(host, server_cmd, &nickname, &run_id)?;
             let status = read_status(host, server_cmd, &nickname, &run_id)?;
             if status.nickname != nickname || status.run_id != run_id {
                 anyhow::bail!("server status envelope does not match persisted run");
@@ -783,13 +779,7 @@ pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
     )?;
 
     info!("waiting for server processing");
-    let terminal = wait_for_terminal(&remote.host, server_cmd, &nickname, &run_id)?;
-    if terminal.phase == "not_found" {
-        anyhow::bail!(
-            "run {} not found on server after finish-run",
-            run_id.as_str()
-        );
-    }
+    wait_for_terminal(&remote.host, server_cmd, &nickname, &run_id)?;
 
     info!("reading run status");
     let status = read_status(&remote.host, server_cmd, &nickname, &run_id)?;
