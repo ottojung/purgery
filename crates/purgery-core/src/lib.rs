@@ -205,9 +205,9 @@ pub fn build_rsync_args(source: &str, destination: &str) -> Vec<String> {
 
 /// Build rsync args for purgatory (staging) transfers.
 ///
-/// Delegates to `build_rsync_args`, which always includes `--partial`.
-/// This function exists to support call sites that explicitly name the
-/// purgatory transfer path for readability.
+/// Delegates to `build_rsync_args`, which always includes `--partial`,
+/// `--inplace`, and `--mkpath`. This function exists to support call sites
+/// that explicitly name the purgatory transfer path for readability.
 pub fn build_purgatory_rsync_args(source: &str, destination: &str) -> Vec<String> {
     build_rsync_args(source, destination)
 }
