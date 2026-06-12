@@ -14,6 +14,7 @@ pub(crate) fn build_manifest(
     run_id: &RunId,
     nickname: &Nickname,
     postprocess_steps: &[String],
+    capture_cleanup_identity: bool,
 ) -> Result<Manifest> {
     let source_path = Path::new(source);
     if !source_path.exists() {
@@ -76,14 +77,14 @@ pub(crate) fn build_manifest(
             });
         } else if file_type.is_file() {
             let size = metadata.len();
-            let (mtime_ns, sha256) = if has_postprocess || size > 0 {
+            let (mtime_ns, sha256) = if has_postprocess || capture_cleanup_identity || size > 0 {
                 let mtime = metadata
                     .modified()
                     .ok()
                     .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
                     .map(|d| d.as_nanos() as i64)
                     .unwrap_or(0);
-                let sha = if has_postprocess {
+                let sha = if has_postprocess || capture_cleanup_identity {
                     let utf8_path = Utf8Path::from_path(path)
                         .ok_or_else(|| anyhow::anyhow!("non-UTF-8 path: {}", path.display()))?;
                     Some(
@@ -111,7 +112,11 @@ pub(crate) fn build_manifest(
                 kind: ManifestEntryKind::RegularFile,
                 size,
                 mtime_ns,
-                sha256: if has_postprocess { sha256 } else { None },
+                sha256: if has_postprocess || capture_cleanup_identity {
+                    sha256
+                } else {
+                    None
+                },
                 link_target: None,
                 mode,
                 postprocess_steps: if has_postprocess {

@@ -6,12 +6,10 @@
 
 ```
 client: validate args
-client: begin-run over SSH -> server creates incoming directory, returns paths
-client: direct unfiltered rsync to destination
-client: if --delete-after-import:
-          write durable cleanup state atomically
-          remove confirmed local originals
-client: finish-run over SSH -> server moves incoming -> ready
+client: if --delete-after-import, capture durable local cleanup identity
+client: direct rsync to USER@HOST:DESTINATION/
+client: if --delete-after-import, mark the transfer successful and remove only unchanged originals
+(no server run, manifest, status polling, or finish-run)
 ```
 
 ### Path B: Postprocess (with --postprocess)
@@ -22,8 +20,8 @@ client: walk source tree, build manifest with entry classification
 client: generate run ID
 client: begin-run over SSH -> server creates incoming directory, returns paths
 client: write run.toml + manifest.toml to server incoming dir
+client: prepare-run over SSH -> server validates the destination, envelope, and requested steps
 client: rsync to server staging area (files/)
-client: prepare-run over SSH -> server validates plan
 client: persist local run state as upload_complete_finish_pending
 client: finish-run over SSH -> server moves incoming -> ready
 client: persist local state as waiting_for_terminal_state
@@ -38,7 +36,7 @@ client: persist local state as cleanup_complete
 | Command | Side effects | Returns |
 |---------|-------------|---------|
 | `begin-run --nickname N --run-id R` | Creates `incoming/R/` with lease, files/ dir | `BeginRunResponse` TOML |
-| `prepare-run --nickname N --run-id R` | Validates manifest, generates transfer plan | `PrepareRunResponse` TOML |
+| `prepare-run --nickname N --run-id R` | Validates destination, manifest envelope, and requested steps | `PrepareRunResponse` TOML |
 | `finish-run --nickname N --run-id R` | Moves run from incoming to ready | (none) |
 | `heartbeat-run --nickname N --run-id R` | Extends incoming lease | (none) |
 | `run-state --nickname N --run-id R` | None | `RunStateResponse` TOML |
@@ -75,11 +73,11 @@ heartbeat_interval_secs = 60
 
 ```toml
 nickname = "laptop"
-to = "/universe/synced/videos"
+destination = "/universe/synced/videos"
 delete_after_import = true
 ```
 
-The `to` field is the destination path. Relative destinations are accepted. Final archive paths are computed as `{to}/{relative_entry_path}`.
+The `destination` field is the exact client-supplied destination path. It may be absolute or relative. Final paths are computed as `{destination}/{relative_entry_path}`; `work_dir` is never prepended.
 
 ## Manifest (manifest.toml)
 
@@ -112,7 +110,7 @@ state = "done"
 local_path = "/home/user/Videos/test.mp4"
 relative_path = "test.mp4"
 status = "imported"
-final_paths = ["univ/videos/test.mp4"]
+final_paths = ["/universe/synced/videos/test.mp4"]
 postprocess = ["compress-video"]
 ```
 

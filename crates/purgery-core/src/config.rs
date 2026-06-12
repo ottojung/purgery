@@ -185,7 +185,7 @@ impl ServerConfig {
 #[serde(deny_unknown_fields)]
 pub struct RunConfig {
     pub nickname: Nickname,
-    pub to: String,
+    pub destination: DestinationPath,
     #[serde(default)]
     pub delete_after_import: bool,
 }

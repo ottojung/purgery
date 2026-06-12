@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use purgery_core::{
-    BeginRunResponse, ClientRunPhase, ClientRunState, DurableCleanupState, Manifest, Nickname,
-    PrepareRunResponse, RunConfig, RunId, RunStateResponse, RunStatus,
+    BeginRunResponse, ClientRunPhase, ClientRunState, DestinationPath, DurableCleanupState,
+    Manifest, Nickname, PrepareRunResponse, RunConfig, RunId, RunStateResponse, RunStatus,
 };
 use std::fs;
 use std::time::Duration;
@@ -13,7 +13,13 @@ use crate::ssh;
 use crate::transfer;
 use crate::SyncArgs;
 
-fn parse_destination(destination: &str) -> Result<(&str, &str)> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteDestination {
+    host: String,
+    path: DestinationPath,
+}
+
+fn parse_destination(destination: &str) -> Result<RemoteDestination> {
     let colon_pos = destination.rfind(':').ok_or_else(|| {
         anyhow::anyhow!("destination must be in format USER@HOST:PATH or HOST:PATH")
     })?;
@@ -22,12 +28,18 @@ fn parse_destination(destination: &str) -> Result<(&str, &str)> {
     if host.is_empty() || path.is_empty() {
         anyhow::bail!("destination host and path must not be empty");
     }
-    Ok((host, path))
+    let path = DestinationPath::new(camino::Utf8PathBuf::from(path))
+        .with_context(|| format!("invalid destination path: {path}"))?;
+    Ok(RemoteDestination {
+        host: host.to_owned(),
+        path,
+    })
 }
 
 fn derive_nickname(destination: &str) -> Result<Nickname> {
-    let (host_part, _) = parse_destination(destination)?;
-    let sanitized: String = host_part
+    let remote = parse_destination(destination)?;
+    let sanitized: String = remote
+        .host
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
@@ -259,12 +271,11 @@ fn remove_client_run_state(state_dir: &str, nickname: &Nickname, run_id: &RunId)
 
 pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
     let has_postprocess = !args.postprocess.is_empty();
-
     if has_postprocess && !args.delete_after_import {
         anyhow::bail!("--delete-after-import is required when --postprocess is used");
     }
 
-    let (host, dest_path) = parse_destination(&args.destination)?;
+    let remote = parse_destination(&args.destination)?;
     let nickname = derive_nickname(&args.destination)?;
     let run_id = RunId::generate();
     let state_dir = args.state_dir.clone().unwrap_or_else(|| {
@@ -276,55 +287,83 @@ pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
             "/tmp/purgery-client".to_string()
         }
     });
-    let server_cmd = &args.server_command;
+    cleanup::resume_pending_cleanups(&state_dir)?;
 
     info!(
         nickname = %nickname.as_str(),
-        run_id = %run_id.as_str(),
+        operation_id = %run_id.as_str(),
         source = %args.source,
-        destination = %args.destination,
+        host = %remote.host,
+        destination = %remote.path.as_str(),
         "starting sync"
     );
 
-    let run_config = RunConfig {
-        nickname: nickname.clone(),
-        to: dest_path.to_owned(),
-        delete_after_import: args.delete_after_import,
-    };
+    if !has_postprocess && !args.delete_after_import {
+        info!("starting direct rsync");
+        transfer::run_rsync(&args.source, &remote.host, remote.path.as_str())?;
+        info!("sync complete");
+        return Ok(());
+    }
 
-    let manifest = classify::build_manifest(&args.source, &run_id, &nickname, &args.postprocess)?;
-
+    let manifest = classify::build_manifest(
+        &args.source,
+        &run_id,
+        &nickname,
+        &args.postprocess,
+        args.delete_after_import,
+    )?;
     let cleanup_state_path = if args.delete_after_import {
         let entries = cleanup::build_cleanup_entries(&args.source, &manifest)?;
-        if !entries.is_empty() {
+        if entries.is_empty() {
+            None
+        } else {
             let state = DurableCleanupState {
                 nickname: nickname.as_str().to_owned(),
                 operation_id: run_id.as_str().to_owned(),
                 entries,
             };
             Some(cleanup::write_cleanup_state(&state, &state_dir)?)
-        } else {
-            None
         }
     } else {
         None
     };
 
-    info!("starting server run");
-    let begin_resp = begin_run(host, server_cmd, &nickname, &run_id)?;
-
-    info!("transferring files");
-    transfer::run_rsync(&args.source, host, &begin_resp.files_dir)?;
-
-    if let Some(ref state_path) = cleanup_state_path {
-        cleanup::mark_rsync_succeeded(state_path)?;
+    if !has_postprocess {
+        info!("starting direct rsync with durable cleanup");
+        transfer::run_rsync(&args.source, &remote.host, remote.path.as_str())?;
+        if let Some(ref state_path) = cleanup_state_path {
+            cleanup::confirm_all_imports(state_path)?;
+            cleanup::process_cleanup_state_file(state_path)?;
+        }
+        info!("sync complete");
+        return Ok(());
     }
 
-    ssh::write_remote_file(host, &begin_resp.run_config_path, &run_config.to_toml()?)?;
-    ssh::write_remote_file(host, &begin_resp.manifest_path, &manifest.to_toml()?)?;
+    let server_cmd = &args.server_command;
+    let run_config = RunConfig {
+        nickname: nickname.clone(),
+        destination: remote.path.clone(),
+        delete_after_import: true,
+    };
 
-    info!("preparing run");
-    prepare_run(host, server_cmd, &nickname, &run_id)?;
+    info!("starting server run");
+    let begin_resp = begin_run(&remote.host, server_cmd, &nickname, &run_id)?;
+    ssh::write_remote_file(
+        &remote.host,
+        &begin_resp.run_config_path,
+        &run_config.to_toml()?,
+    )?;
+    ssh::write_remote_file(
+        &remote.host,
+        &begin_resp.manifest_path,
+        &manifest.to_toml()?,
+    )?;
+
+    info!("validating server run plan");
+    prepare_run(&remote.host, server_cmd, &nickname, &run_id)?;
+
+    info!("transferring files to server staging");
+    transfer::run_rsync(&args.source, &remote.host, &begin_resp.files_dir)?;
 
     persist_client_run_state(
         &state_dir,
@@ -334,9 +373,7 @@ pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
         &run_config,
         ClientRunPhase::UploadCompleteFinishPending,
     )?;
-
-    finish_run(host, server_cmd, &nickname, &run_id)?;
-
+    finish_run(&remote.host, server_cmd, &nickname, &run_id)?;
     persist_client_run_state(
         &state_dir,
         &nickname,
@@ -346,15 +383,25 @@ pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
         ClientRunPhase::WaitingForTerminalState,
     )?;
 
-    if has_postprocess {
-        info!("waiting for server processing");
-        wait_for_terminal(host, server_cmd, &nickname, &run_id)?;
+    info!("waiting for server processing");
+    wait_for_terminal(&remote.host, server_cmd, &nickname, &run_id)?;
+    info!("reading run status");
+    let status = read_status(&remote.host, server_cmd, &nickname, &run_id)?;
+    if status.nickname != nickname || status.run_id != run_id {
+        anyhow::bail!("server status envelope does not match requested run");
     }
 
-    info!("reading run status");
-    let status = read_status(host, server_cmd, &nickname, &run_id)?;
+    persist_client_run_state(
+        &state_dir,
+        &nickname,
+        &run_id,
+        &manifest,
+        &run_config,
+        ClientRunPhase::TerminalStatusSeen,
+    )?;
 
     if let Some(ref state_path) = cleanup_state_path {
+        cleanup::confirm_imports_from_status(state_path, &status)?;
         cleanup::process_cleanup_state_file(state_path)?;
     }
 
@@ -370,4 +417,25 @@ pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
 
     info!(state = %status.state.as_str(), "sync complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_absolute_remote_destination() {
+        let parsed = parse_destination("user@host:/absolute/dest").unwrap();
+        assert_eq!(parsed.host, "user@host");
+        assert_eq!(parsed.path.as_str(), "/absolute/dest");
+        assert!(parsed.path.is_absolute());
+    }
+
+    #[test]
+    fn parses_relative_remote_destination() {
+        let parsed = parse_destination("user@host:relative/dest").unwrap();
+        assert_eq!(parsed.host, "user@host");
+        assert_eq!(parsed.path.as_str(), "relative/dest");
+        assert!(!parsed.path.is_absolute());
+    }
 }

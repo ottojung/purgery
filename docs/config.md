@@ -109,11 +109,11 @@ The client uploads a run config to the server:
 
 ```toml
 nickname = "laptop"
-to = "user@example.com:/universe/synced/videos"
+destination = "/universe/synced/videos"
 delete_after_import = true
 ```
 
-The `to` field is the destination path as specified by the client. It may be absolute or relative. The server uses it to compute final archive paths: `{to}/{relative_entry_path}`.
+The `destination` field is the path portion of the rsync-style client destination. It may be absolute or relative. The server computes final paths as `{destination}/{relative_entry_path}` and never places final files under `work_dir`.
 
 ## Config strictness
 

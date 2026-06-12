@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use purgery_core::{
-    path_is_within_root, validate_envelope, work_dir, EntryStatusEntry, FileStatus, Manifest,
-    ManifestEntry, ManifestEntryKind, Nickname, NormalizedRelativePath, RunConfig, RunId, RunPhase,
-    RunState, RunStatus, ServerConfig, ServerRoot,
+    path_is_within_root, validate_envelope, work_dir, DestinationPath, EntryStatusEntry,
+    FileStatus, Manifest, ManifestEntry, ManifestEntryKind, Nickname, NormalizedRelativePath,
+    RunConfig, RunId, RunPhase, RunState, RunStatus, ServerConfig,
 };
 use std::fs;
 use tracing::{debug, info, span, warn, Level};
@@ -187,7 +187,6 @@ fn failed_entry(entry: &ManifestEntry, error: impl Into<String>) -> EntryOutcome
 
 #[allow(clippy::too_many_arguments)]
 fn process_manifest_entry(
-    server_config: &ServerConfig,
     run_plan: &RunPlan,
     entry: &ManifestEntry,
     nickname: &Nickname,
@@ -196,7 +195,7 @@ fn process_manifest_entry(
     work_area: &Utf8Path,
     entry_index: usize,
     entry_total: usize,
-    to_path: &str,
+    destination: &DestinationPath,
 ) -> EntryOutcome {
     let expected_staged = Utf8Path::new("files").join(entry.relative_path.as_str());
     let Ok(expected_staged) = NormalizedRelativePath::new(expected_staged) else {
@@ -252,44 +251,37 @@ fn process_manifest_entry(
         ManifestEntryKind::Directory => {}
     }
 
-    let server_root = match ServerRoot::new(server_config.work_dir.as_path().to_owned()) {
-        Ok(r) => r,
-        Err(_) => return failed_entry(entry, "failed to create server root"),
-    };
-
-    let root_dest = NormalizedRelativePath::new(to_path.to_owned().into()).ok();
-    let final_path = server_root.final_path_under(root_dest.as_ref(), &entry.relative_path);
-    if !path_is_within_root(&final_path, server_root.as_path()) {
+    let destination_root = destination.as_path();
+    let final_path = destination.join(&entry.relative_path);
+    if !path_is_within_root(&final_path, destination_root) {
         return failed_entry(
             entry,
-            format!("final path escapes root: {}", final_path.as_str()),
+            format!("final path escapes destination: {}", final_path.as_str()),
         );
     }
-    let final_relative = format!("{}/{}", to_path, entry.relative_path.as_str());
+    let final_destination = final_path.as_str().to_owned();
 
     let has_postprocess = !entry.postprocess_steps.is_empty();
 
     let result = if !has_postprocess {
         match entry.kind {
-            ManifestEntryKind::Directory => {
-                commit_directory_entry(&final_path, server_root.as_path())
-                    .map(|_| (vec![final_relative], None))
-            }
+            ManifestEntryKind::Directory => commit_directory_entry(&final_path, destination_root)
+                .map(|_| (vec![final_destination], None)),
             ManifestEntryKind::Symlink => {
                 let work_path = match prepare_work_entry(entry, &source_path, work_area) {
                     Ok(p) => p,
                     Err(error) => return failed_entry(entry, error.to_string()),
                 };
-                commit_symlink_entry(&work_path, &final_path, server_root.as_path(), run_id)
-                    .map(|_| (vec![final_relative], None))
+                commit_symlink_entry(&work_path, &final_path, destination_root, run_id)
+                    .map(|_| (vec![final_destination], None))
             }
             ManifestEntryKind::RegularFile => {
                 let work_path = match prepare_work_entry(entry, &source_path, work_area) {
                     Ok(p) => p,
                     Err(error) => return failed_entry(entry, error.to_string()),
                 };
-                commit_regular_file_entry(&work_path, &final_path, server_root.as_path(), run_id)
-                    .map(|_| (vec![final_relative], None))
+                commit_regular_file_entry(&work_path, &final_path, destination_root, run_id)
+                    .map(|_| (vec![final_destination], None))
             }
         }
     } else {
@@ -333,11 +325,11 @@ fn process_manifest_entry(
                             |parent| parent.join(filename),
                         )
                     };
-                    if !path_is_within_root(&output_final, server_root.as_path()) {
+                    if !path_is_within_root(&output_final, destination_root) {
                         return failed_entry(entry, "output escapes root");
                     }
                     if let Err(error) =
-                        commit_output_entry(&output, &output_final, server_root.as_path(), run_id)
+                        commit_output_entry(&output, &output_final, destination_root, run_id)
                     {
                         return failed_entry(entry, format!("commit failed: {error}"));
                     }
@@ -356,7 +348,7 @@ fn process_manifest_entry(
                             }
                         }
                     };
-                    final_paths.push(format!("{}/{}", to_path, output_relative.as_str()));
+                    final_paths.push(destination.join(&output_relative).as_str().to_owned());
                 }
                 let steps: Vec<String> = entry.postprocess_steps.clone();
                 Ok((final_paths, (!steps.is_empty()).then_some(steps)))
@@ -532,7 +524,6 @@ pub fn process_processing_run(
         }
 
         outcomes.push(process_manifest_entry(
-            config,
             &run_plan,
             entry,
             nickname,
@@ -541,7 +532,7 @@ pub fn process_processing_run(
             &work_area,
             entry_idx,
             manifest.entries.len(),
-            &run_config.to,
+            &run_config.destination,
         ));
     }
 

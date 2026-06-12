@@ -218,52 +218,6 @@ impl FromStr for RunId {
 // ── Absolute path newtypes ───────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServerRoot(Utf8PathBuf);
-
-impl ServerRoot {
-    pub fn new(path: Utf8PathBuf) -> Result<Self, PathValidationError> {
-        if !path.is_absolute() {
-            return Err(PathValidationError::NotAbsolute);
-        }
-        Ok(ServerRoot(path))
-    }
-
-    pub fn as_path(&self) -> &Utf8Path {
-        &self.0
-    }
-
-    pub fn as_str(&self) -> &str {
-        self.0.as_str()
-    }
-
-    /// Build the final archive path by joining a destination root with a relative entry path.
-    pub fn final_path_under(
-        &self,
-        root_dest: Option<&NormalizedRelativePath>,
-        rel_path: &NormalizedRelativePath,
-    ) -> Utf8PathBuf {
-        let mut p = self.0.clone();
-        if let Some(sub) = root_dest {
-            p = p.join(sub.as_path());
-        }
-        p.join(rel_path.as_path())
-    }
-}
-
-impl Serialize for ServerRoot {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.0.serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for ServerRoot {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let p = Utf8PathBuf::deserialize(deserializer)?;
-        ServerRoot::new(p).map_err(serde::de::Error::custom)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PurgeryRoot(Utf8PathBuf);
 
 impl PurgeryRoot {
@@ -306,6 +260,76 @@ impl<'de> Deserialize<'de> for PurgeryRoot {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DestinationPath(Utf8PathBuf);
+
+impl DestinationPath {
+    /// Validates a client-supplied final destination at the CLI/config boundary.
+    ///
+    /// The path may be absolute or relative. Dot-dot components are rejected so
+    /// joining a validated manifest relative path cannot escape this destination.
+    pub fn new(path: Utf8PathBuf) -> Result<Self, PathValidationError> {
+        if path.as_str().is_empty() {
+            return Err(PathValidationError::EmptyComponent);
+        }
+
+        let absolute = path.is_absolute();
+        let mut components = Vec::new();
+        for component in path.components() {
+            let value = component.as_str();
+            match value {
+                "/" if absolute => {}
+                ".." => return Err(PathValidationError::ContainsDotDot),
+                "." | "" => {}
+                _ => components.push(value),
+            }
+        }
+
+        let normalized = if absolute {
+            if components.is_empty() {
+                Utf8PathBuf::from("/")
+            } else {
+                Utf8PathBuf::from(format!("/{}", components.join("/")))
+            }
+        } else {
+            if components.is_empty() {
+                return Err(PathValidationError::EmptyComponent);
+            }
+            Utf8PathBuf::from(components.join("/"))
+        };
+        Ok(Self(normalized))
+    }
+
+    pub fn as_path(&self) -> &Utf8Path {
+        &self.0
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    pub fn join(&self, relative: &NormalizedRelativePath) -> Utf8PathBuf {
+        self.0.join(relative.as_path())
+    }
+
+    pub fn is_absolute(&self) -> bool {
+        self.0.is_absolute()
+    }
+}
+
+impl Serialize for DestinationPath {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for DestinationPath {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let path = Utf8PathBuf::deserialize(deserializer)?;
+        Self::new(path).map_err(serde::de::Error::custom)
+    }
+}
+
 // ── Path Normalization ──────────────────────────────────────────────
 
 pub fn normalize_relative(path: &Utf8Path) -> Result<String, PathValidationError> {
@@ -326,37 +350,6 @@ pub fn normalize_relative(path: &Utf8Path) -> Result<String, PathValidationError
         return Err(PathValidationError::EmptyComponent);
     }
     Ok(result.join("/"))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RelativeDestinationPath(Utf8PathBuf);
-
-impl RelativeDestinationPath {
-    pub fn new(path: Utf8PathBuf) -> Result<Self, PathValidationError> {
-        let normalized = normalize_relative(path.as_path())?;
-        Ok(RelativeDestinationPath(Utf8PathBuf::from(normalized)))
-    }
-
-    pub fn as_path(&self) -> &Utf8Path {
-        &self.0
-    }
-
-    pub fn as_str(&self) -> &str {
-        self.0.as_str()
-    }
-}
-
-impl Serialize for RelativeDestinationPath {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.0.serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for RelativeDestinationPath {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let p = Utf8PathBuf::deserialize(deserializer)?;
-        RelativeDestinationPath::new(p).map_err(serde::de::Error::custom)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -418,16 +411,19 @@ pub fn path_is_within_root(resolved: &Utf8Path, root: &Utf8Path) -> bool {
 
 // ── Symlink Escape Hardening ────────────────────────────────────────
 
-pub fn check_symlink_in_path(final_path: &Utf8Path, server_root: &Utf8Path) -> Result<(), String> {
-    let relative = final_path.strip_prefix(server_root).map_err(|_| {
+pub fn check_symlink_in_path(
+    final_path: &Utf8Path,
+    destination_root: &Utf8Path,
+) -> Result<(), String> {
+    let relative = final_path.strip_prefix(destination_root).map_err(|_| {
         format!(
-            "final path '{}' is not under server root '{}'",
+            "final path '{}' is not under destination '{}'",
             final_path.as_str(),
-            server_root.as_str()
+            destination_root.as_str()
         )
     })?;
 
-    let mut current = server_root.to_owned();
+    let mut current = destination_root.to_owned();
     for component in relative.components() {
         current = current.join(component.as_str());
         match std::fs::symlink_metadata(current.as_std_path()) {
@@ -453,23 +449,24 @@ pub fn check_symlink_in_path(final_path: &Utf8Path, server_root: &Utf8Path) -> R
 mod tests {
     use super::*;
 
-    // ── ServerRoot::final_path_under tests ────────────────────────────
-
     #[test]
-    fn final_path_under_with_subpath() {
-        let root = ServerRoot::new(Utf8PathBuf::from("/universe/synced")).unwrap();
-        let sub = NormalizedRelativePath::new("videos".into()).unwrap();
-        let rel = NormalizedRelativePath::new("trips/a.mp4".into()).unwrap();
-        let result = root.final_path_under(Some(&sub), &rel);
-        assert_eq!(result.as_str(), "/universe/synced/videos/trips/a.mp4");
+    fn destination_joins_absolute_path_without_work_dir() {
+        let destination = DestinationPath::new("/universe/synced/videos".into()).unwrap();
+        let relative = NormalizedRelativePath::new("trip/a.mp4".into()).unwrap();
+        assert_eq!(
+            destination.join(&relative).as_str(),
+            "/universe/synced/videos/trip/a.mp4"
+        );
     }
 
     #[test]
-    fn final_path_under_without_subpath() {
-        let root = ServerRoot::new(Utf8PathBuf::from("/etc/system")).unwrap();
-        let rel = NormalizedRelativePath::new("nginx/site.conf".into()).unwrap();
-        let result = root.final_path_under(None, &rel);
-        assert_eq!(result.as_str(), "/etc/system/nginx/site.conf");
+    fn destination_joins_relative_path_without_rewriting_it() {
+        let destination = DestinationPath::new("incoming/videos".into()).unwrap();
+        let relative = NormalizedRelativePath::new("trip/a.mp4".into()).unwrap();
+        assert_eq!(
+            destination.join(&relative).as_str(),
+            "incoming/videos/trip/a.mp4"
+        );
     }
 
     // ── Server config parsing ──────────────────

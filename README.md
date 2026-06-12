@@ -33,9 +33,9 @@ The destination is rsync-style: `USER@HOST:/absolute/path` or `USER@HOST:relativ
 ## How it works
 
 1. You invoke `purgery-client sync` with a local source tree and a remote destination.
-2. The client walks the source tree (never following symlinks) and builds a manifest.
-3. If no `--postprocess` is given, the client transfers files directly to the destination via rsync (passthrough).
-4. If `--postprocess` is given, the client creates a server run: it transfers files to a staging area, the server processes entries and commits outputs to the destination, and the client optionally cleans up local originals after confirmed import.
+2. Without `--postprocess`, the client transfers directly to the destination with rsync; no server run or manifest exists.
+3. With passthrough cleanup, the client records local identity before rsync and removes only unchanged originals after rsync succeeds.
+4. With `--postprocess`, the client validates a server run plan before staging files, waits for processing, and retires only unchanged originals that server status marks imported.
 
 ## Configuration
 
