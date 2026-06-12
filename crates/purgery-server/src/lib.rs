@@ -7262,6 +7262,166 @@ steps = ["make-symlink"]
         assert_root_contains_exactly(server_root.as_path(), &expected);
     }
 
+    // ── Move-based final materialization tests ──────────────────────
+
+    #[test]
+    fn regular_file_commit_moves_source_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
+        let staging = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
+        let run_id = RunId::new("test-move".into()).unwrap();
+
+        let final_path = root.join("sub/file.txt");
+        let source = staging.join("source.txt");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, b"move-me").unwrap();
+
+        let result = commit_regular_file_entry(&source, &final_path, root.as_path(), &run_id);
+        assert!(result.is_ok(), "commit failed: {result:?}");
+
+        assert!(
+            !source.exists(),
+            "source must be consumed after successful materialization"
+        );
+        assert_eq!(fs::read_to_string(&final_path).unwrap(), "move-me");
+        let expected = vec![root.join("sub"), root.join("sub/file.txt")];
+        assert_root_contains_exactly(root.as_path(), &expected);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlink_commit_moves_source_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
+        let staging = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
+        let run_id = RunId::new("test-move".into()).unwrap();
+
+        fs::create_dir_all(&root).unwrap();
+        let final_path = root.join("sub/link");
+        let source = staging.join("mylink");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("/real/target", &source).unwrap();
+
+        let result = commit_symlink_entry(&source, &final_path, root.as_path(), &run_id);
+        assert!(result.is_ok(), "commit failed: {result:?}");
+
+        assert!(
+            !source.exists(),
+            "source symlink must be consumed after successful materialization"
+        );
+        let actual_target = std::fs::read_link(final_path.as_std_path()).unwrap();
+        assert_eq!(actual_target, std::path::Path::new("/real/target"));
+        let expected = vec![root.join("sub"), root.join("sub/link")];
+        assert_root_contains_exactly(root.as_path(), &expected);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn directory_tree_commit_consumes_source_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
+        let staging = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
+        let run_id = RunId::new("test-move".into()).unwrap();
+
+        fs::create_dir_all(&root).unwrap();
+        let source_dir = staging.join("srcdir");
+        let final_dir = root.join("dst");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::write(source_dir.join("a.txt"), b"aaa").unwrap();
+        fs::write(source_dir.join("b.txt"), b"bbb").unwrap();
+        std::os::unix::fs::symlink("/some/target", source_dir.join("link")).unwrap();
+        fs::create_dir(source_dir.join("sub")).unwrap();
+        fs::write(source_dir.join("sub/c.txt"), b"ccc").unwrap();
+
+        let result = commit_directory_tree(&source_dir, &final_dir, root.as_path(), &run_id);
+        assert!(result.is_ok(), "commit failed: {result:?}");
+
+        // Source files/symlinks must be consumed
+        assert!(!source_dir.join("a.txt").exists());
+        assert!(!source_dir.join("b.txt").exists());
+        assert!(!source_dir.join("link").exists());
+        assert!(!source_dir.join("sub/c.txt").exists());
+        assert!(!source_dir.join("sub").exists(), "empty subdirectory should be removed");
+        assert!(
+            !source_dir.exists(),
+            "empty source directory should be removed"
+        );
+
+        // Final tree must contain migrated entries
+        assert_eq!(fs::read_to_string(final_dir.join("a.txt")).unwrap(), "aaa");
+        assert_eq!(fs::read_to_string(final_dir.join("b.txt")).unwrap(), "bbb");
+        assert_eq!(
+            std::fs::read_link(final_dir.join("link")).unwrap(),
+            std::path::Path::new("/some/target")
+        );
+        assert_eq!(
+            fs::read_to_string(final_dir.join("sub/c.txt")).unwrap(),
+            "ccc"
+        );
+
+        let mut expected = vec![
+            root.join("dst"),
+            root.join("dst/a.txt"),
+            root.join("dst/b.txt"),
+            root.join("dst/link"),
+            root.join("dst/sub"),
+            root.join("dst/sub/c.txt"),
+        ];
+        expected.sort();
+        assert_root_contains_exactly(root.as_path(), &expected);
+    }
+
+    #[test]
+    fn regular_file_replaces_existing_file_with_move_semantics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
+        let staging = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
+        let run_id = RunId::new("test-move".into()).unwrap();
+
+        let final_path = root.join("sub/data.bin");
+        let source = staging.join("source.bin");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::create_dir_all(final_path.parent().unwrap()).unwrap();
+        fs::write(&final_path, b"old").unwrap();
+        fs::write(&source, b"new").unwrap();
+
+        let result = commit_regular_file_entry(&source, &final_path, root.as_path(), &run_id);
+        assert!(result.is_ok(), "commit failed: {result:?}");
+        assert_eq!(result.unwrap(), CommitDisposition::Replaced);
+
+        assert!(!source.exists(), "source must be consumed on replacement");
+        assert_eq!(fs::read_to_string(&final_path).unwrap(), "new");
+        let expected = vec![root.join("sub"), root.join("sub/data.bin")];
+        assert_root_contains_exactly(root.as_path(), &expected);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlink_replaces_existing_symlink_with_move_semantics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
+        let staging = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
+        let run_id = RunId::new("test-move".into()).unwrap();
+
+        fs::create_dir_all(&root).unwrap();
+        let final_path = root.join("sub/link");
+        let source = staging.join("mylink");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::create_dir_all(final_path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("/old/target", &final_path).unwrap();
+        std::os::unix::fs::symlink("/new/target", &source).unwrap();
+
+        let result = commit_symlink_entry(&source, &final_path, root.as_path(), &run_id);
+        assert!(result.is_ok(), "commit failed: {result:?}");
+        assert_eq!(result.unwrap(), CommitDisposition::Replaced);
+
+        assert!(!source.exists(), "source symlink must be consumed on replacement");
+        let actual_target = std::fs::read_link(final_path.as_std_path()).unwrap();
+        assert_eq!(actual_target, std::path::Path::new("/new/target"));
+        let expected = vec![root.join("sub"), root.join("sub/link")];
+        assert_root_contains_exactly(root.as_path(), &expected);
+    }
+
     #[test]
     fn postprocess_directory_output_with_recursive_descendants() {
         // A postprocess subprocess produces a directory tree as output.
