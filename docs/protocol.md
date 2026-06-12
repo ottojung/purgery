@@ -129,7 +129,10 @@ updated_at_unix_secs = 1234567890
 observed_at_unix_secs = 1234567891
 ```
 
-Phases: `incoming`, `ready`, `processing`, `done`, `failed`, `not_found`. Terminal phases: `done`, `failed`, `not_found`.
+Phases: `incoming`, `ready`, `processing`, `done`, `failed`, `corrupt`, `not_found`.
+- Terminal (`terminal = true`): `done`, `failed`.
+- Non-terminal (`terminal = false`): `incoming`, `ready`, `processing`, `corrupt`, `not_found`.
+`not_found` means the server does not know about the run; it is not a terminal success and the client treats it as an error.
 
 ## Client run state persistence
 
@@ -139,9 +142,16 @@ The client persists per-run state under `{state_dir}/runs/{nickname}-{run_id}/st
 protocol_version = 1
 nickname = "laptop"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+host = "user@server"
+server_command = "purgery-server"
 manifest = "..."
 run_config = "..."
 phase = "waiting_for_terminal_state"
 ```
+
+Fields:
+- `host` — the SSH host from the original destination.
+- `server_command` — the remote server command.
+- `terminal_status` — optional serialized `RunStatus` TOML, set when the phase becomes `terminal_status_seen`. Enables recovery without re-reading from the server.
 
 Phases: `upload_complete_finish_pending`, `waiting_for_terminal_state`, `terminal_status_seen`, `cleanup_complete`, `abandoned`, `corrupt`.
