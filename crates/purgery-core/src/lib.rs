@@ -1738,10 +1738,10 @@ files = []
 
     #[test]
     fn work_dir_returns_correct_path() {
-        let work_dir = PurgeryRoot::new(Utf8PathBuf::from("/tmp/purgery")).unwrap();
+        let purgery_root = PurgeryRoot::new(Utf8PathBuf::from("/tmp/purgery")).unwrap();
         let nick = Nickname::new("laptop".into()).unwrap();
         let run = RunId::new("run1".into()).unwrap();
-        let wd = work_dir(&work_dir, &nick, &run);
+        let wd = work_dir(&purgery_root, &nick, &run);
         assert_eq!(wd.as_str(), "/tmp/purgery/laptop/processing/run1/work");
     }
 

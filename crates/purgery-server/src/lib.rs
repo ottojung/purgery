@@ -2645,7 +2645,7 @@ steps = ["compress-video"]
             .run_dir(&nickname, &run_id, RunPhase::Processing);
         fs::create_dir_all(processing.parent().unwrap()).unwrap();
         fs::rename(&ready, &processing).unwrap();
-        let stale_work = work_dir(&config.work_dir, &nickname, &run_id);
+        let stale_work = purgery_core::work_dir(&config.work_dir, &nickname, &run_id);
         fs::create_dir_all(&stale_work).unwrap();
         fs::write(stale_work.join("stale"), b"stale").unwrap();
 
