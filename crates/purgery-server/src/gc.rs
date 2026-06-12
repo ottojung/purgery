@@ -20,7 +20,7 @@ pub fn run_gc(config: &ServerConfig) -> Result<()> {
         .as_secs();
 
     for entry in fs::read_dir(purgery_path.as_std_path())
-        .with_context(|| format!("failed to read purgery root: {}", purgery_path.as_str()))?
+        .with_context(|| format!("failed to read work directory: {}", purgery_path.as_str()))?
     {
         let entry = entry?;
         let nickname_path = entry.path();
