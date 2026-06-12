@@ -443,11 +443,13 @@ fn process_manifest_entry(
                 commit_directory_entry(&final_path, server_config.root.as_path())
                     .map(|_| (vec![final_relative], None))
             }
-            ManifestEntryKind::Symlink => {
-                let target = entry.link_target.as_deref().expect("validated target");
-                commit_symlink_entry(target, &final_path, server_config.root.as_path(), run_id)
-                    .map(|_| (vec![final_relative], None))
-            }
+            ManifestEntryKind::Symlink => commit_symlink_entry(
+                &source_path,
+                &final_path,
+                server_config.root.as_path(),
+                run_id,
+            )
+            .map(|_| (vec![final_relative], None)),
             ManifestEntryKind::RegularFile => commit_regular_file_entry(
                 &source_path,
                 &final_path,

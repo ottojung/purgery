@@ -3184,10 +3184,10 @@ steps = ["compress-video"]
         let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
         fs::create_dir_all(&root).unwrap();
         let source = Utf8PathBuf::from_path_buf(tmp.path().join("source")).unwrap();
-        fs::write(&source, "new content").unwrap();
         let run_id = RunId::new("oracle-file".into()).unwrap();
 
         for name in ["missing", "file", "symlink", "empty-dir"] {
+            fs::write(&source, "new content").unwrap();
             let destination = root.join(name);
             match name {
                 "file" => fs::write(&destination, "old").unwrap(),
@@ -3203,6 +3203,7 @@ steps = ["compress-video"]
                 .is_symlink());
         }
 
+        fs::write(&source, "new content").unwrap();
         let nonempty = root.join("nonempty-dir");
         fs::create_dir(&nonempty).unwrap();
         fs::write(nonempty.join("extra"), "keep").unwrap();
@@ -3214,26 +3215,35 @@ steps = ["compress-video"]
     fn test_rsync_oracle_symlink_conflicts_and_literal_target() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
+        let staging = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
         fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&staging).unwrap();
         let run_id = RunId::new("oracle-link".into()).unwrap();
-        let target = Utf8Path::new("../literal-target");
+        let link_target = Utf8Path::new("../literal-target");
 
         for name in ["missing", "file", "symlink", "empty-dir"] {
             let destination = root.join(name);
+            let source = staging.join(format!("source-{name}"));
+            std::os::unix::fs::symlink(link_target.as_std_path(), &source).unwrap();
             match name {
                 "file" => fs::write(&destination, "old").unwrap(),
                 "symlink" => std::os::unix::fs::symlink("old-target", &destination).unwrap(),
                 "empty-dir" => fs::create_dir(&destination).unwrap(),
                 _ => {}
             }
-            commit_symlink_entry(target, &destination, &root, &run_id).unwrap();
-            assert_eq!(fs::read_link(&destination).unwrap(), target.as_std_path());
+            commit_symlink_entry(&source, &destination, &root, &run_id).unwrap();
+            assert_eq!(
+                fs::read_link(&destination).unwrap(),
+                link_target.as_std_path()
+            );
         }
 
         let nonempty = root.join("nonempty-dir");
+        let source_nonempty = staging.join("source-nonempty");
+        std::os::unix::fs::symlink(link_target.as_std_path(), &source_nonempty).unwrap();
         fs::create_dir(&nonempty).unwrap();
         fs::write(nonempty.join("extra"), "keep").unwrap();
-        assert!(commit_symlink_entry(target, &nonempty, &root, &run_id).is_err());
+        assert!(commit_symlink_entry(&source_nonempty, &nonempty, &root, &run_id).is_err());
         assert_eq!(fs::read_to_string(nonempty.join("extra")).unwrap(), "keep");
     }
 
@@ -3243,10 +3253,10 @@ steps = ["compress-video"]
         let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
         fs::create_dir_all(&root).unwrap();
         let source = Utf8PathBuf::from_path_buf(tmp.path().join("source")).unwrap();
-        fs::write(&source, "child").unwrap();
         let run_id = RunId::new("oracle-parent".into()).unwrap();
 
         for name in ["file-parent", "symlink-parent"] {
+            fs::write(&source, "child").unwrap();
             let parent = root.join(name);
             if name == "file-parent" {
                 fs::write(&parent, "old").unwrap();
@@ -6588,13 +6598,16 @@ steps = ["pack"]
     fn symlink_commit_must_not_create_operational_paths_under_root() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
+        let staging = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
         let run_id = RunId::new("test-run".into()).unwrap();
 
+        fs::create_dir_all(&staging).unwrap();
         let final_path = root.join("subdir/link");
         fs::create_dir_all(final_path.parent().unwrap()).unwrap();
-        let target = Utf8PathBuf::from("/some/target");
+        let source = staging.join("srclink");
+        std::os::unix::fs::symlink("/some/target", &source).unwrap();
 
-        let result = commit_symlink_entry(&target, &final_path, root.as_path(), &run_id);
+        let result = commit_symlink_entry(&source, &final_path, root.as_path(), &run_id);
         assert!(result.is_ok(), "symlink commit failed: {result:?}");
         assert!(
             std::fs::symlink_metadata(final_path.as_std_path()).is_ok(),
@@ -6984,14 +6997,17 @@ steps = ["echo-args"]
     fn commit_symlink_replaces_existing_symlink_without_sibling_temp() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
+        let staging = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
         let run_id = RunId::new("test-run".into()).unwrap();
 
+        fs::create_dir_all(&staging).unwrap();
         let final_path = root.join("subdir/link");
         fs::create_dir_all(final_path.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink("/old/target", final_path.as_std_path()).unwrap();
 
-        let target = Utf8PathBuf::from("/new/target");
-        let result = commit_symlink_entry(&target, &final_path, root.as_path(), &run_id);
+        let source = staging.join("srclink");
+        std::os::unix::fs::symlink("/new/target", &source).unwrap();
+        let result = commit_symlink_entry(&source, &final_path, root.as_path(), &run_id);
         assert!(result.is_ok(), "replace failed: {result:?}");
 
         let actual_target = std::fs::read_link(final_path.as_std_path()).unwrap();
@@ -7341,7 +7357,10 @@ steps = ["make-symlink"]
         assert!(!source_dir.join("b.txt").exists());
         assert!(!source_dir.join("link").exists());
         assert!(!source_dir.join("sub/c.txt").exists());
-        assert!(!source_dir.join("sub").exists(), "empty subdirectory should be removed");
+        assert!(
+            !source_dir.join("sub").exists(),
+            "empty subdirectory should be removed"
+        );
         assert!(
             !source_dir.exists(),
             "empty source directory should be removed"
@@ -7415,7 +7434,10 @@ steps = ["make-symlink"]
         assert!(result.is_ok(), "commit failed: {result:?}");
         assert_eq!(result.unwrap(), CommitDisposition::Replaced);
 
-        assert!(!source.exists(), "source symlink must be consumed on replacement");
+        assert!(
+            !source.exists(),
+            "source symlink must be consumed on replacement"
+        );
         let actual_target = std::fs::read_link(final_path.as_std_path()).unwrap();
         assert_eq!(actual_target, std::path::Path::new("/new/target"));
         let expected = vec![root.join("sub"), root.join("sub/link")];

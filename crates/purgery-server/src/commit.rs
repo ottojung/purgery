@@ -21,19 +21,7 @@ pub(crate) fn remove_destination_for_non_directory(
             })?;
             Ok(CommitDisposition::Replaced)
         }
-        Ok(_) => {
-            // Remove any non-directory entry (file or symlink) so that
-            // the direct commit (copy or symlink creation) can proceed.
-            // Direct writes require explicit removal of the conflicting
-            // destination because there is no intermediate temp file.
-            fs::remove_file(final_path.as_std_path()).map_err(|error| {
-                format!(
-                    "failed to remove conflicting destination '{}': {error}",
-                    final_path.as_str()
-                )
-            })?;
-            Ok(CommitDisposition::Replaced)
-        }
+        Ok(_) => Ok(CommitDisposition::Replaced),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             Ok(CommitDisposition::Created)
         }
@@ -112,34 +100,21 @@ pub(crate) fn commit_regular_file_entry(
 ) -> Result<CommitDisposition, String> {
     ensure_final_parent(final_path, root)?;
     let disposition = remove_destination_for_non_directory(final_path)?;
-    fs::copy(source.as_std_path(), final_path.as_std_path())
-        .map_err(|error| format!("failed to commit regular file: {error}"))?;
+    fs::rename(source.as_std_path(), final_path.as_std_path())
+        .map_err(|error| format!("failed to materialize regular file: {error}"))?;
     Ok(disposition)
 }
 
-#[cfg(unix)]
-fn create_symlink(target: &Utf8Path, link: &Utf8Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(target.as_std_path(), link.as_std_path())
-}
-
-#[cfg(not(unix))]
-fn create_symlink(_target: &Utf8Path, _link: &Utf8Path) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "symlink creation is only supported on Unix",
-    ))
-}
-
 pub(crate) fn commit_symlink_entry(
-    target: &Utf8Path,
+    source: &Utf8Path,
     final_path: &Utf8Path,
     root: &Utf8Path,
     _run_id: &purgery_core::RunId,
 ) -> Result<CommitDisposition, String> {
     ensure_final_parent(final_path, root)?;
     let disposition = remove_destination_for_non_directory(final_path)?;
-    create_symlink(target, final_path)
-        .map_err(|error| format!("failed to commit symlink: {error}"))?;
+    fs::rename(source.as_std_path(), final_path.as_std_path())
+        .map_err(|error| format!("failed to materialize symlink: {error}"))?;
     Ok(disposition)
 }
 
@@ -181,11 +156,7 @@ pub(crate) fn commit_directory_tree(
         } else if meta.file_type().is_file() {
             commit_regular_file_entry(source_entry, final_entry, server_root, run_id)?;
         } else if meta.file_type().is_symlink() {
-            let target = fs::read_link(source_entry.as_std_path())
-                .map_err(|e| format!("failed to read output symlink target: {e}"))?;
-            let target_utf8 = Utf8PathBuf::from_path_buf(target)
-                .unwrap_or_else(|p| Utf8PathBuf::from(p.to_string_lossy().as_ref()));
-            commit_symlink_entry(&target_utf8, final_entry, server_root, run_id)?;
+            commit_symlink_entry(source_entry, final_entry, server_root, run_id)?;
         } else {
             return Err(format!(
                 "unsupported output entry type: {}",
@@ -193,6 +164,18 @@ pub(crate) fn commit_directory_tree(
             ));
         }
     }
+
+    // Remove empty source directories bottom-up.
+    for entry in WalkDir::new(source_root.as_std_path())
+        .min_depth(1)
+        .contents_first(true)
+    {
+        let entry = entry.map_err(|e| format!("failed to walk source directory: {e}"))?;
+        if entry.file_type().is_dir() {
+            let _ = fs::remove_dir(entry.path());
+        }
+    }
+    let _ = fs::remove_dir(source_root.as_std_path());
 
     Ok(root_disp)
 }
@@ -210,11 +193,7 @@ pub(crate) fn commit_output_entry(
     } else if meta.file_type().is_file() {
         commit_regular_file_entry(source, final_path, server_root, run_id)
     } else if meta.file_type().is_symlink() {
-        let target = fs::read_link(source.as_std_path())
-            .map_err(|e| format!("failed to read output symlink target: {e}"))?;
-        let target_utf8 = Utf8PathBuf::from_path_buf(target)
-            .unwrap_or_else(|p| Utf8PathBuf::from(p.to_string_lossy().as_ref()));
-        commit_symlink_entry(&target_utf8, final_path, server_root, run_id)
+        commit_symlink_entry(source, final_path, server_root, run_id)
     } else {
         Err(format!(
             "unsupported output entry type: {}",
