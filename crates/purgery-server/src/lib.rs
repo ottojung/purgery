@@ -7175,7 +7175,7 @@ steps = ["echo-args"]
     #[cfg(unix)]
     fn postprocess_symlink_output_committed_without_operational_paths() {
         // A postprocess subprocess produces a symlink as output.
-        // The symlink target is read and recreated at the final path.
+        // The symlink entry is moved from the work area to the final path.
         let tmp = tempfile::tempdir().unwrap();
         let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();

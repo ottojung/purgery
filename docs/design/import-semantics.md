@@ -14,25 +14,27 @@ The rule is: nothing non-final may appear under `root`. A partially written exac
 
 ### Regular files and symlinks
 
-Committed directly from their work-area location to the final path under `root`:
+Moved from their work-area location to the final path under `root`:
 
 ```
-work output → direct copy to final path
+work output → moved to final path
 ```
 
-The source (staged file or work-area output) is a complete file already verified against the manifest. A crash during the copy to final storage may leave a partial file at the exact final path. This is acceptable because the run has not published `status.toml` and will be replayed from staged data on recovery, overwriting the partial file.
+The source (staged file or work-area output) is a complete file already verified against the manifest. The source is consumed by the move — it no longer exists at its staging/work location after successful materialization.
 
-The copy writes directly to the final path. No intermediate helper files are created in the final parent directory.
+A crash during the move to final storage may leave a partial file at the exact final path. This is acceptable because the run has not published `status.toml` and will be replayed from staged data on recovery, overwriting the partial file.
+
+No intermediate helper files are created in the final parent directory.
 
 ### Directory roots
 
-Directory output roots are created, kept, or replaced directly via `commit_directory_entry`. Their descendants are then recursively overlaid using no-delete semantics. Subdirectories are created/kept directly; regular-file and symlink descendants are committed directly from their work-area sources to their final paths.
+Directory output roots are created, kept, or replaced directly. Their descendants are then recursively overlaid using no-delete semantics. Subdirectories are created/kept directly; regular-file and symlink descendants are moved from their work-area sources to their final paths. Empty source directories left behind by the recursive move are removed when possible.
 
 ## Directory overlay semantics
 
 Purgery uses recursive no-delete overlay semantics for commits. Existing directories are kept and merged. Regular files and symlinks replace existing conflicting entries (files, symlinks, or empty directories). Non-empty directories are not replaced — the operator must resolve them.
 
-Commits are not all-or-nothing. A crash during commit may leave some outputs already written to final storage, and a crash during a direct file copy may leave the exact final path with partial contents. This is acceptable because `status.toml` has not been published yet, `processing/` still exists, and `process-once` replays from staged files with idempotent commits, overwriting any partial remnants.
+Materialization is not all-or-nothing. A crash during materialization may leave some outputs already written to final storage, and a crash during a direct file move may leave the exact final path with partial contents. This is acceptable because `status.toml` has not been published yet, `processing/` still exists, and `process-once` replays from staged files with idempotent materialization, overwriting any partial remnants.
 
 ## Transfer and materialization consequences
 
@@ -54,9 +56,9 @@ Per-entry failures produce individual `EntryStatusEntry` records with `status = 
 
 ## Work area
 
-The server creates a work area at `<purgery_root>/<nickname>/processing/<run_id>/work/`. Entries are placed into the work area before processing. All staging, temporary files, helper paths, and intermediate artifacts live under this work area, never under `root`.
+The server creates a work area at `<purgery_root>/<nickname>/processing/<run_id>/work/`. Entries are placed into the work area before processing. All staging, temporary files, helper paths, and intermediate artifacts live under this work area, never under `root`. After successful materialization, work-area outputs are consumed (moved to final storage) and the work area is removed for `done` runs.
 
-Postprocess subprocesses run with their current directory set to the work-area parent of the input entry. This is work-area discipline: it makes relative-path outputs land inside the work area, not in an arbitrary inherited server cwd. Purgery validates that expected output paths resolve under the work area before committing them to final storage. This is not a security sandbox — a malicious subprocess can still write anywhere the process has permissions.
+Postprocess subprocesses run with their current directory set to the work-area parent of the input entry. This is work-area discipline: it makes relative-path outputs land inside the work area, not in an arbitrary inherited server cwd. Purgery validates that expected output paths resolve under the work area before materializing them to final storage. This is not a security sandbox — a malicious subprocess can still write anywhere the process has permissions.
 
 Cleanup policy:
 
@@ -168,9 +170,9 @@ If a directory entry matches a postprocess rule, that directory becomes a transf
 Expected outputs are file-name templates for output entry roots in the same work-area parent directory as the input entry. Allowed placeholders: `{file_name}`, `{file_stem}`, `{stem}`. `{input}` and `{parent}` are forbidden in expected outputs.
 
 After a subprocess runs, each expected output path is inspected with `symlink_metadata` to determine its kind:
-* **Directory**: committed recursively using no-delete overlay semantics.
-* **Regular file**: committed from its work-area location directly to the final path.
-* **Symlink**: the symlink target is read and the symlink is recreated at the final path.
+* **Directory**: materialized recursively using no-delete overlay semantics.
+* **Regular file**: moved from its work-area location to its final path.
+* **Symlink**: moved from its work-area location to its final path. The symlink entry is moved as-is; its target is not read or recreated.
 * **Unsupported or missing**: input entry fails.
 
 `keep_original = true` commits the original work-area input entry/root as one output. For directories this commits the subtree recursively.
