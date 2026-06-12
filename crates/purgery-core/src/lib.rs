@@ -235,8 +235,8 @@ pub fn insert_rsync_option_before_operands(
 
 // ── Work Area ────────────────────────────────────────────────────────
 
-pub fn work_dir(purgery_root: &PurgeryRoot, nickname: &Nickname, run_id: &RunId) -> Utf8PathBuf {
-    purgery_root
+pub fn work_dir(work_dir: &PurgeryRoot, nickname: &Nickname, run_id: &RunId) -> Utf8PathBuf {
+    work_dir
         .run_dir(nickname, run_id, RunPhase::Processing)
         .join("work")
 }
@@ -544,20 +544,20 @@ mod tests {
     // ── PurgeryRoot tests ──
 
     #[test]
-    fn purgery_root_absolute_valid() {
+    fn work_dir_absolute_valid() {
         let p = Utf8PathBuf::from("/universe/tmp/purgery");
         let r = PurgeryRoot::new(p.clone()).unwrap();
         assert_eq!(r.as_path(), &p);
     }
 
     #[test]
-    fn purgery_root_relative_is_error() {
+    fn work_dir_relative_is_error() {
         let p = Utf8PathBuf::from("tmp/purgy");
         assert_eq!(PurgeryRoot::new(p), Err(PathValidationError::NotAbsolute));
     }
 
     #[test]
-    fn purgery_root_path_helpers() {
+    fn work_dir_path_helpers() {
         let root = PurgeryRoot::new("/tmp/purgery".into()).unwrap();
         let nick = Nickname::new("laptop".into()).unwrap();
         let run = RunId::new("run1".into()).unwrap();
@@ -755,18 +755,18 @@ to = "../escape"
     fn parse_server_config_minimal() {
         let toml = r#"
 root = "/universe/synced"
-purgery_root = "/universe/tmp/purgery"
+work_dir = "/universe/tmp/purgery"
 "#;
         let config = ServerConfig::from_toml(toml).unwrap();
         assert_eq!(config.root.as_str(), "/universe/synced");
-        assert_eq!(config.purgery_root.as_str(), "/universe/tmp/purgery");
+        assert_eq!(config.work_dir.as_str(), "/universe/tmp/purgery");
     }
 
     #[test]
     fn parse_server_config_full() {
         let toml = r#"
 root = "/universe/synced"
-purgery_root = "/universe/tmp/purgery"
+work_dir = "/universe/tmp/purgery"
 [postprocess]
 
 [postprocess.steps.compress-video]
@@ -788,7 +788,7 @@ keep_original = true
     fn parse_server_config_subprocess_kind() {
         let toml = r#"
 root = "/universe/synced"
-purgery_root = "/universe/tmp/purgery"
+work_dir = "/universe/tmp/purgery"
 
 [postprocess.steps.compress-video]
 kind = "subprocess"
@@ -916,7 +916,7 @@ for = ["videos"]
     fn server_config_rejects_relative_root() {
         let toml = r#"
 root = "relative/path"
-purgery_root = "/universe/tmp/purgery"
+work_dir = "/universe/tmp/purgery"
 "#;
         let result = ServerConfig::from_toml(toml);
         assert!(result.is_err());
@@ -1740,10 +1740,10 @@ files = []
 
     #[test]
     fn work_dir_returns_correct_path() {
-        let purgery_root = PurgeryRoot::new(Utf8PathBuf::from("/tmp/purgery")).unwrap();
+        let work_dir = PurgeryRoot::new(Utf8PathBuf::from("/tmp/purgery")).unwrap();
         let nick = Nickname::new("laptop".into()).unwrap();
         let run = RunId::new("run1".into()).unwrap();
-        let wd = work_dir(&purgery_root, &nick, &run);
+        let wd = work_dir(&work_dir, &nick, &run);
         assert_eq!(wd.as_str(), "/tmp/purgery/laptop/processing/run1/work");
     }
 

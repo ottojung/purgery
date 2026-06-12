@@ -551,10 +551,10 @@ fn process_manifest_entry(
 
 pub fn process_ready_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> Result<()> {
     let ready_path = config
-        .purgery_root
+        .work_dir
         .run_dir(nickname, run_id, RunPhase::Ready);
     let processing_path = config
-        .purgery_root
+        .work_dir
         .run_dir(nickname, run_id, RunPhase::Processing);
 
     if let Some(parent) = processing_path.parent() {
@@ -581,10 +581,10 @@ pub fn process_processing_run(
     let _span = span!(Level::INFO, "run", nickname = %nickname.as_str(), run_id = %run_id.as_str())
         .entered();
     let processing_path = config
-        .purgery_root
+        .work_dir
         .run_dir(nickname, run_id, RunPhase::Processing);
 
-    let work_area = work_dir(&config.purgery_root, nickname, run_id);
+    let work_area = work_dir(&config.work_dir, nickname, run_id);
     if let Err(error) = fs::remove_dir_all(&work_area) {
         if error.kind() != std::io::ErrorKind::NotFound {
             warn!(
@@ -605,7 +605,7 @@ pub fn process_processing_run(
         Err(error) => {
             let msg = format!("failed to read run config: {error}");
             warn!("{}", msg);
-            write_run_failure(&config.purgery_root, nickname, run_id, &msg)?;
+            write_run_failure(&config.work_dir, nickname, run_id, &msg)?;
             anyhow::bail!("{msg}");
         }
     };
@@ -614,7 +614,7 @@ pub fn process_processing_run(
         Err(error) => {
             let msg = format!("failed to parse run config: {error}");
             warn!("{}", msg);
-            write_run_failure(&config.purgery_root, nickname, run_id, &msg)?;
+            write_run_failure(&config.work_dir, nickname, run_id, &msg)?;
             anyhow::bail!("{msg}");
         }
     };
@@ -622,7 +622,7 @@ pub fn process_processing_run(
     if let Err(error) = run_config.validate_uploaded_purgatory_run() {
         let msg = format!("uploaded run config validation failed: {error}");
         warn!("{}", msg);
-        write_run_failure(&config.purgery_root, nickname, run_id, &msg)?;
+        write_run_failure(&config.work_dir, nickname, run_id, &msg)?;
         anyhow::bail!("{msg}");
     }
 
@@ -631,7 +631,7 @@ pub fn process_processing_run(
         Err(error) => {
             let msg = format!("run plan validation failed: {error}");
             warn!("{}", msg);
-            write_run_failure(&config.purgery_root, nickname, run_id, &msg)?;
+            write_run_failure(&config.work_dir, nickname, run_id, &msg)?;
             anyhow::bail!("{msg}");
         }
     };
@@ -642,7 +642,7 @@ pub fn process_processing_run(
         Err(error) => {
             let msg = format!("failed to read manifest: {error}");
             warn!("{}", msg);
-            write_run_failure(&config.purgery_root, nickname, run_id, &msg)?;
+            write_run_failure(&config.work_dir, nickname, run_id, &msg)?;
             anyhow::bail!("{msg}");
         }
     };
@@ -651,7 +651,7 @@ pub fn process_processing_run(
         Err(error) => {
             let msg = format!("failed to parse manifest: {error}");
             warn!("{}", msg);
-            write_run_failure(&config.purgery_root, nickname, run_id, &msg)?;
+            write_run_failure(&config.work_dir, nickname, run_id, &msg)?;
             anyhow::bail!("{msg}");
         }
     };
@@ -659,7 +659,7 @@ pub fn process_processing_run(
     if let Err(error) = validate_envelope(nickname, run_id, &run_config, &manifest) {
         let msg = format!("envelope validation failed: {error}");
         warn!("{}", msg);
-        write_run_failure(&config.purgery_root, nickname, run_id, &msg)?;
+        write_run_failure(&config.work_dir, nickname, run_id, &msg)?;
         anyhow::bail!("{msg}");
     }
 
@@ -715,7 +715,7 @@ pub fn process_processing_run(
     ) {
         let msg = format!("manifest destination validation failed: {error}");
         warn!("{}", msg);
-        write_run_failure(&config.purgery_root, nickname, run_id, &msg)?;
+        write_run_failure(&config.work_dir, nickname, run_id, &msg)?;
         anyhow::bail!("{msg}");
     }
 
@@ -855,8 +855,8 @@ pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
         warn!(error = %error, "opportunistic GC failed");
     }
 
-    let processing_runs = crate::phases::find_processing_runs(&config.purgery_root)?;
-    let ready_runs = crate::phases::find_ready_runs(&config.purgery_root)?;
+    let processing_runs = crate::phases::find_processing_runs(&config.work_dir)?;
+    let ready_runs = crate::phases::find_ready_runs(&config.work_dir)?;
     if processing_runs.is_empty() && ready_runs.is_empty() {
         info!("no ready or processing runs found");
         return Ok(());
@@ -873,11 +873,11 @@ pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
             );
             let processing_path =
                 config
-                    .purgery_root
+                    .work_dir
                     .run_dir(nickname, run_id, RunPhase::Processing);
             if processing_path.exists() {
                 write_run_failure(
-                    &config.purgery_root,
+                    &config.work_dir,
                     nickname,
                     run_id,
                     &format!("processing recovery failed: {error}"),
@@ -901,7 +901,7 @@ pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
                 error = %error,
                 "run failed"
             );
-            move_to_failed(&config.purgery_root, nickname, run_id)?;
+            move_to_failed(&config.work_dir, nickname, run_id)?;
         }
     }
 

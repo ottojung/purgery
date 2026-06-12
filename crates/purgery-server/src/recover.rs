@@ -12,7 +12,7 @@ pub fn recover_or_process_processing_run(
     run_id: &RunId,
 ) -> Result<()> {
     let processing_path = config
-        .purgery_root
+        .work_dir
         .run_dir(nickname, run_id, RunPhase::Processing);
     let status_path = processing_path.join("status.toml");
 
@@ -31,7 +31,7 @@ pub fn recover_or_process_processing_run(
                     error,
                     "processing run recovery failed"
                 );
-                write_run_failure(&config.purgery_root, nickname, run_id, error)
+                write_run_failure(&config.work_dir, nickname, run_id, error)
             }
             Ok(status) => {
                 info!(
@@ -64,7 +64,7 @@ pub fn recover_or_process_processing_run(
                     error,
                     "processing run recovery failed"
                 );
-                write_run_failure(&config.purgery_root, nickname, run_id, error)
+                write_run_failure(&config.work_dir, nickname, run_id, error)
             }
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {

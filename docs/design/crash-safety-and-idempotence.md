@@ -150,7 +150,7 @@ symlink work output → rename to final path
 
 Cross-device rename failure is a hard failure. Purgery does not fall back to copying. If rename fails, the entry fails and the run reports a materialization error.
 
-The final destination tree (`root`) is output-only. All staging and intermediate artifacts live under `purgery_root`. Work-area copies are consumed after successful materialization. The original staged files under `processing/<run_id>/files/` are never consumed and remain as replay source.
+The final destination tree (`root`) is output-only. All staging and intermediate artifacts live under `work_dir`. Work-area copies are consumed after successful materialization. The original staged files under `processing/<run_id>/files/` are never consumed and remain as replay source.
 
 A source directory replaces a conflicting final file or symlink and then allows descendants to merge. A source regular file or symlink replaces a final file, symlink, or empty directory, but fails rather than deleting a non-empty final directory. Existing ancestors must be real directories; final-storage symlinks are never followed as directory components. Every derived path must remain inside the configured storage root.
 

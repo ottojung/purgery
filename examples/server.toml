@@ -1,5 +1,5 @@
 root = "/universe/synced"
-purgery_root = "/universe/tmp/purgery"
+work_dir = "/universe/tmp/purgery"
 
 [postprocess]
 

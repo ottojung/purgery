@@ -163,12 +163,12 @@ pub(crate) fn write_progress(
 }
 
 pub(crate) fn write_run_failure(
-    purgery_root: &PurgeryRoot,
+    work_dir: &PurgeryRoot,
     nickname: &Nickname,
     run_id: &RunId,
     error_msg: &str,
 ) -> Result<()> {
-    let processing_path = purgery_root.run_dir(nickname, run_id, RunPhase::Processing);
+    let processing_path = work_dir.run_dir(nickname, run_id, RunPhase::Processing);
     let status = RunStatus {
         run_id: run_id.clone(),
         nickname: nickname.clone(),
@@ -195,7 +195,7 @@ pub(crate) fn write_run_failure(
         )
     })?;
 
-    let failed_path = purgery_root.run_dir(nickname, run_id, RunPhase::Failed);
+    let failed_path = work_dir.run_dir(nickname, run_id, RunPhase::Failed);
     if let Some(parent) = failed_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create failed parent: {}", parent.as_str()))?;
@@ -212,11 +212,11 @@ pub(crate) fn write_run_failure(
 }
 
 pub(crate) fn find_runs_in_phase(
-    purgery_root: &PurgeryRoot,
+    work_dir: &PurgeryRoot,
     phase: RunPhase,
 ) -> Result<Vec<(Nickname, RunId)>> {
     let mut runs = Vec::new();
-    let purgery_path = purgery_root.as_path();
+    let purgery_path = work_dir.as_path();
 
     if !purgery_path.exists() {
         return Ok(runs);
@@ -266,12 +266,12 @@ pub(crate) fn find_runs_in_phase(
     Ok(runs)
 }
 
-pub fn find_ready_runs(purgery_root: &PurgeryRoot) -> Result<Vec<(Nickname, RunId)>> {
-    find_runs_in_phase(purgery_root, RunPhase::Ready)
+pub fn find_ready_runs(work_dir: &PurgeryRoot) -> Result<Vec<(Nickname, RunId)>> {
+    find_runs_in_phase(work_dir, RunPhase::Ready)
 }
 
-pub fn find_processing_runs(purgery_root: &PurgeryRoot) -> Result<Vec<(Nickname, RunId)>> {
-    find_runs_in_phase(purgery_root, RunPhase::Processing)
+pub fn find_processing_runs(work_dir: &PurgeryRoot) -> Result<Vec<(Nickname, RunId)>> {
+    find_runs_in_phase(work_dir, RunPhase::Processing)
 }
 
 pub(crate) fn finalize_processing_run(
@@ -281,13 +281,13 @@ pub(crate) fn finalize_processing_run(
     state: &RunState,
 ) -> Result<()> {
     let processing_path = config
-        .purgery_root
+        .work_dir
         .run_dir(nickname, run_id, RunPhase::Processing);
     let dest_phase = match state {
         RunState::Done | RunState::Partial => RunPhase::Done,
         RunState::Failed => RunPhase::Failed,
     };
-    let dest_path = config.purgery_root.run_dir(nickname, run_id, dest_phase);
+    let dest_path = config.work_dir.run_dir(nickname, run_id, dest_phase);
     if let Some(parent) = dest_path.parent() {
         fs::create_dir_all(parent).with_context(|| {
             format!(
@@ -309,12 +309,12 @@ pub(crate) fn finalize_processing_run(
 }
 
 pub fn move_to_failed(
-    purgery_root: &PurgeryRoot,
+    work_dir: &PurgeryRoot,
     nickname: &Nickname,
     run_id: &RunId,
 ) -> Result<()> {
-    let processing_path = purgery_root.run_dir(nickname, run_id, RunPhase::Processing);
-    let failed_path = purgery_root.run_dir(nickname, run_id, RunPhase::Failed);
+    let processing_path = work_dir.run_dir(nickname, run_id, RunPhase::Processing);
+    let failed_path = work_dir.run_dir(nickname, run_id, RunPhase::Failed);
 
     if processing_path.exists() {
         if let Some(parent) = failed_path.parent() {
@@ -347,7 +347,7 @@ pub fn begin_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> 
         RunPhase::Failed,
     ];
     for phase in &phases {
-        let phase_path = config.purgery_root.run_dir(nickname, run_id, *phase);
+        let phase_path = config.work_dir.run_dir(nickname, run_id, *phase);
         if phase_path.exists() {
             anyhow::bail!(
                 "run {}/{} already exists in '{}' phase at '{}'",
@@ -360,7 +360,7 @@ pub fn begin_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> 
     }
 
     let incoming_path = config
-        .purgery_root
+        .work_dir
         .run_dir(nickname, run_id, RunPhase::Incoming);
     let files_dir = incoming_path.join("files");
     let run_config_path = incoming_path.join("run.toml");
@@ -431,7 +431,7 @@ pub fn begin_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> 
 
 pub fn finish_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> Result<()> {
     let incoming_path = config
-        .purgery_root
+        .work_dir
         .run_dir(nickname, run_id, RunPhase::Incoming);
 
     // If run is already past incoming, treat finish as already accepted.
@@ -442,7 +442,7 @@ pub fn finish_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) ->
         RunPhase::Failed,
     ];
     for phase in &later_phases {
-        let dir = config.purgery_root.run_dir(nickname, run_id, *phase);
+        let dir = config.work_dir.run_dir(nickname, run_id, *phase);
         if dir.exists() {
             info!(
                 nickname = %nickname.as_str(),
@@ -504,7 +504,7 @@ pub fn finish_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) ->
     }
 
     let ready_path = config
-        .purgery_root
+        .work_dir
         .run_dir(nickname, run_id, RunPhase::Ready);
     if ready_path.exists() {
         anyhow::bail!(

@@ -35,7 +35,7 @@ If no config is found, Purgery emits a clear error listing every path it checked
 
 **All other operational files and directories** must be specified in the parsed config:
 
-- Server: `root` (final archive) and `purgery_root` (all working state)
+- Server: `root` (final archive) and `work_dir` (all working state)
 - Client: `state_dir` (all local state, temp files, cleanup ledgers, rsync filters)
 
 Purgery does not fall back to `$XDG_STATE_HOME`, `$HOME`, `/tmp`, `std::env::temp_dir()`, or any other implicit location for operational state. Every non-config filesystem path comes from a configured value.
@@ -44,7 +44,7 @@ Purgery does not fall back to `$XDG_STATE_HOME`, `$HOME`, `/tmp`, `std::env::tem
 
 ```toml
 root = "/universe/synced"
-purgery_root = "/universe/tmp/purgery"
+work_dir = "/universe/tmp/purgery"
 
 [gc]
 incoming_lease_secs = 1800
@@ -65,7 +65,7 @@ keep_original = true
 | Field | Required | Description |
 |-------|----------|-------------|
 | `root` | yes | Absolute path to final storage root (archive destination) |
-| `purgery_root` | yes | Absolute path to Purgery's working/state directory. Contains all non-final server state: incoming runs, ready/processing/done/failed runs, lease files, manifests, status files, postprocess work areas, and temporary files used for atomic writes. No internal work directories are created under `root` |
+| `work_dir` | yes | Absolute path to Purgery's working/state directory. Contains all non-final server state: incoming runs, ready/processing/done/failed runs, lease files, manifests, status files, postprocess work areas, and temporary files used for atomic writes. No internal work directories are created under `root` |
 | `gc` | no | GC configuration (see below) |
 | `postprocess` | no | Postprocessing configuration (see below) |
 
@@ -498,10 +498,10 @@ The `run_id` component ensures concurrent invocations with identical sync names 
 
 ## Server work area layout
 
-Server postprocess work areas live under `purgery_root`:
+Server postprocess work areas live under `work_dir`:
 
 ```text
-{purgery_root}/{nickname}/processing/{run_id}/work/
+{work_dir}/{nickname}/processing/{run_id}/work/
 ```
 
 This is inside the run's processing directory. On successful completion (`Done`), the work area is removed before the run moves to `done`. On failure (`Failed` or `Partial`), the work area stays with the run directory as it moves to `failed` or `done`. This ensures work areas are naturally cleaned or recovered with the processing run.

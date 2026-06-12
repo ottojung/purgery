@@ -66,7 +66,7 @@ Minimal server config (`server.toml`):
 
 ```toml
 root = "/universe/synced"
-purgery_root = "/universe/tmp/purgery"
+work_dir = "/universe/tmp/purgery"
 ```
 
 Minimal client config (`client.toml`):

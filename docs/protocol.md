@@ -78,7 +78,7 @@ Postprocess entries are transferred to a staging area (`incoming/files/<sync.to>
 | `run-state --nickname <n> --run-id <id>` | Report current filesystem phase without requiring terminal status. Returns `incoming`, `ready`, `processing`, `done`, `failed`, or `not_found`. When `processing`, may include progress details from `progress.toml` |
 | `heartbeat-run --nickname <n> --run-id <id>` | Update lease file for an incoming run |
 | `check` | Validate config and dependencies (side-effect-free) |
-| `bootstrap` | Create `root` and `purgery_root` directories |
+| `bootstrap` | Create `root` and `work_dir` directories |
 | `gc` | Run garbage collection on expired incoming runs |
 | `process-once` | Validate config, run GC, then process one batch of ready runs |
 
@@ -263,7 +263,7 @@ The client uses the per-sync destinations as rsync targets. For passthrough, it 
 Postprocess work areas are under:
 
 ```text
-{purgery_root}/{nickname}/processing/{run_id}/work/
+{work_dir}/{nickname}/processing/{run_id}/work/
 ```
 
 This is inside the run's processing directory, so it is naturally cleaned or recovered with the processing run. On successful completion (`Done`), the work area is removed before the run moves to `done`. On failure (`Failed` or `Partial`), the work area stays with the run directory as it moves to `failed` or `done`.
@@ -367,7 +367,7 @@ Semantics of the fields:
 While a run is in `processing/`, the server writes a progress file:
 
 ```text
-{purgery_root}/{nickname}/processing/{run_id}/progress.toml
+{work_dir}/{nickname}/processing/{run_id}/progress.toml
 ```
 
 The file is updated atomically when processing starts, before and after each manifest entry, before and after each postprocess step, and periodically while a long-running subprocess is executing. The client can query `run-state` to see progress details and that the server is still working.

@@ -154,7 +154,7 @@ impl FromStr for ColorMode {
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub root: ServerRoot,
-    pub purgery_root: PurgeryRoot,
+    pub work_dir: PurgeryRoot,
     #[serde(default)]
     pub postprocess: PostprocessConfig,
     #[serde(default)]

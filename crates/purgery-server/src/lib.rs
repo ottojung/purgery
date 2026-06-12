@@ -174,7 +174,7 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
 /// for an invalid run plan.
 pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> Result<String> {
     let incoming_path = config
-        .purgery_root
+        .work_dir
         .run_dir(nickname, run_id, RunPhase::Incoming);
     if !incoming_path.exists() {
         anyhow::bail!(
@@ -413,7 +413,7 @@ pub fn read_run_status(
 
     for phase in &phases {
         let status_path = config
-            .purgery_root
+            .work_dir
             .run_dir(nickname, run_id, *phase)
             .join("status.toml");
         if !status_path.exists() {
@@ -467,7 +467,7 @@ pub fn run_state(
         (RunPhase::Processing, "processing", false),
     ];
     for (phase, phase_str, _) in &non_terminal {
-        let dir = config.purgery_root.run_dir(nickname, run_id, *phase);
+        let dir = config.work_dir.run_dir(nickname, run_id, *phase);
         if !dir.exists() {
             continue;
         }
@@ -515,7 +515,7 @@ pub fn run_state(
     // Check terminal phases (done, failed) — require valid status.toml
     let terminal_phases = [(RunPhase::Done, "done"), (RunPhase::Failed, "failed")];
     for (phase, phase_str) in &terminal_phases {
-        let dir = config.purgery_root.run_dir(nickname, run_id, *phase);
+        let dir = config.work_dir.run_dir(nickname, run_id, *phase);
         if !dir.exists() {
             continue;
         }
@@ -725,20 +725,20 @@ pub fn server_check(config: &ServerConfig) -> Result<()> {
     }
     info!(path = %root_path.as_str(), "root: OK");
 
-    let purgery_path = config.purgery_root.as_path();
+    let purgery_path = config.work_dir.as_path();
     if !purgery_path.exists() {
         anyhow::bail!(
-            "purgery_root '{}' does not exist (run `purgery-server bootstrap` to create it)",
+            "work_dir '{}' does not exist (run `purgery-server bootstrap` to create it)",
             purgery_path.as_str()
         );
     }
     if !purgery_path.is_dir() {
         anyhow::bail!(
-            "purgery_root '{}' exists but is not a directory",
+            "work_dir '{}' exists but is not a directory",
             purgery_path.as_str()
         );
     }
-    info!(path = %purgery_path.as_str(), "purgery_root: OK");
+    info!(path = %purgery_path.as_str(), "work_dir: OK");
 
     for (name, step) in &config.postprocess.steps {
         let program = &step.program;
@@ -768,7 +768,7 @@ pub fn server_check(config: &ServerConfig) -> Result<()> {
     Ok(())
 }
 
-/// Bootstrap: create root and purgery_root directories.
+/// Bootstrap: create root and work_dir directories.
 pub fn bootstrap(config: &ServerConfig) -> Result<()> {
     info!("bootstrapping server directories");
 
@@ -777,10 +777,10 @@ pub fn bootstrap(config: &ServerConfig) -> Result<()> {
         .with_context(|| format!("failed to create root: {}", root_path.as_str()))?;
     info!(path = %root_path.as_str(), "created root");
 
-    let purgery_path = config.purgery_root.as_path();
+    let purgery_path = config.work_dir.as_path();
     fs::create_dir_all(purgery_path.as_std_path())
-        .with_context(|| format!("failed to create purgery_root: {}", purgery_path.as_str()))?;
-    info!(path = %purgery_path.as_str(), "created purgery_root");
+        .with_context(|| format!("failed to create work_dir: {}", purgery_path.as_str()))?;
+    info!(path = %purgery_path.as_str(), "created work_dir");
 
     info!("bootstrap complete");
     Ok(())
@@ -789,7 +789,7 @@ pub fn bootstrap(config: &ServerConfig) -> Result<()> {
 /// Heartbeat: update lease file for an incoming run.
 pub fn heartbeat_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> Result<()> {
     let incoming_path = config
-        .purgery_root
+        .work_dir
         .run_dir(nickname, run_id, RunPhase::Incoming);
     if !incoming_path.exists() {
         anyhow::bail!(
@@ -887,12 +887,12 @@ mod tests {
         )
     }
 
-    fn test_server_config(purgery_root: &Utf8Path, server_root: &Utf8Path) -> ServerConfig {
+    fn test_server_config(work_dir: &Utf8Path, server_root: &Utf8Path) -> ServerConfig {
         fs::create_dir_all(server_root).unwrap();
-        fs::create_dir_all(purgery_root).unwrap();
+        fs::create_dir_all(work_dir).unwrap();
         ServerConfig {
             root: ServerRoot::new(server_root.to_owned()).unwrap(),
-            purgery_root: PurgeryRoot::new(purgery_root.to_owned()).unwrap(),
+            work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig::default(),
             logging: Default::default(),
@@ -932,7 +932,7 @@ delete_after_import = true
     /// Helper to create a basic setup with a ready run containing one file.
     #[allow(clippy::too_many_arguments)]
     fn setup_single_file_ready(
-        purgery_root: &Utf8Path,
+        work_dir: &Utf8Path,
         server_root: &Utf8Path,
         nickname: &Nickname,
         run_id: &RunId,
@@ -941,9 +941,9 @@ delete_after_import = true
         staged_rel: &str,
         content: &[u8],
     ) -> (ServerConfig, Utf8PathBuf) {
-        let config = test_server_config(purgery_root, server_root);
+        let config = test_server_config(work_dir, server_root);
         let ready_path = config
-            .purgery_root
+            .work_dir
             .run_dir(nickname, run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
 
@@ -995,13 +995,13 @@ delete_after_import = true
     #[test]
     fn test_full_processing_pipeline() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-run-001".into()).unwrap();
 
         let (config, staged_file_path) = setup_single_file_ready(
-            &purgery_root,
+            &work_dir,
             &server_root,
             &nickname,
             &run_id,
@@ -1013,7 +1013,7 @@ delete_after_import = true
 
         process_run(&config, &nickname, &run_id).unwrap();
         let done_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(done_path.exists());
 
@@ -1037,14 +1037,14 @@ delete_after_import = true
     #[test]
     fn test_processing_skips_unknown_sync() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-run-002".into()).unwrap();
 
         let ready_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
 
@@ -1078,7 +1078,7 @@ delete_after_import = true
         process_run(&config, &nickname, &run_id).unwrap();
 
         let failed_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Failed);
         let status_content = fs::read_to_string(failed_path.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
@@ -1089,14 +1089,14 @@ delete_after_import = true
     #[test]
     fn test_processing_missing_staged_file() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-run-003".into()).unwrap();
 
         let ready_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
 
@@ -1130,7 +1130,7 @@ delete_after_import = true
         process_run(&config, &nickname, &run_id).unwrap();
 
         let failed_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Failed);
         let status_content = fs::read_to_string(failed_path.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
@@ -1198,14 +1198,14 @@ delete_after_import = true
     #[test]
     fn test_nickname_mismatch_rejected() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let dir_nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-env-001".into()).unwrap();
 
         let ready_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&dir_nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
 
@@ -1241,7 +1241,7 @@ delete_after_import = true
         assert!(result.is_err());
 
         let failed_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&dir_nickname, &run_id, RunPhase::Failed);
         let status_path = failed_path.join("status.toml");
         assert!(status_path.exists());
@@ -1254,14 +1254,14 @@ delete_after_import = true
     #[test]
     fn test_bad_manifest_produces_failed_status() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-bad-manifest".into()).unwrap();
 
         let ready_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
 
@@ -1272,7 +1272,7 @@ delete_after_import = true
         assert!(result.is_err());
 
         let failed_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Failed);
         let status_path = failed_path.join("status.toml");
         assert!(status_path.exists());
@@ -1285,14 +1285,14 @@ delete_after_import = true
     #[test]
     fn test_bad_run_config_produces_failed_status() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-bad-config".into()).unwrap();
 
         let ready_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
 
@@ -1326,7 +1326,7 @@ delete_after_import = true
         assert!(result.is_err());
 
         let failed_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Failed);
         let status_path = failed_path.join("status.toml");
         assert!(status_path.exists());
@@ -1357,7 +1357,7 @@ delete_after_import = true
     fn test_postprocessing_path_with_spaces() {
         let server_config = ServerConfig {
             root: ServerRoot::new("/data".into()).unwrap(),
-            purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
+            work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
                 steps: {
@@ -1406,13 +1406,13 @@ delete_after_import = true
     #[test]
     fn test_postprocessing_failure_does_not_create_final_output() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let server_str = server_root.as_str();
 
         let server_config = ServerConfig {
             root: ServerRoot::new(server_str.into()).unwrap(),
-            purgery_root: PurgeryRoot::new(purgery_root.as_str().into()).unwrap(),
+            work_dir: PurgeryRoot::new(work_dir.as_str().into()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
                 steps: {
@@ -1437,7 +1437,7 @@ delete_after_import = true
         let run_id = RunId::new("test-fail-pp".into()).unwrap();
 
         let ready_path = server_config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(ready_path.join("files/videos")).unwrap();
         fs::write(ready_path.join("files/videos/test.mp4"), b"video content").unwrap();
@@ -1484,7 +1484,7 @@ steps = ["compress-video"]
         process_run(&server_config, &nickname, &run_id).unwrap();
 
         let failed_path = server_config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Failed);
         let status_content = fs::read_to_string(failed_path.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
@@ -1508,7 +1508,7 @@ steps = ["compress-video"]
 
         let server_config = ServerConfig {
             root: ServerRoot::new("/data".into()).unwrap(),
-            purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
+            work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
                 steps: {
@@ -1560,7 +1560,7 @@ steps = ["compress-video"]
 
         let server_config = ServerConfig {
             root: ServerRoot::new("/data".into()).unwrap(),
-            purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
+            work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
                 steps: {
@@ -1619,7 +1619,7 @@ steps = ["compress-video"]
 
         let server_config = ServerConfig {
             root: ServerRoot::new("/data".into()).unwrap(),
-            purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
+            work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
                 steps: {
@@ -1669,13 +1669,13 @@ steps = ["compress-video"]
     #[test]
     fn regular_file_commit_produces_only_expected_final_paths() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-tmp-commit".into()).unwrap();
 
         let (config, _) = setup_single_file_ready(
-            &purgery_root,
+            &work_dir,
             &server_root,
             &nickname,
             &run_id,
@@ -1704,13 +1704,13 @@ steps = ["compress-video"]
     #[test]
     fn test_existing_regular_final_output_is_replaced() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-replace".into()).unwrap();
 
         let (config, _) = setup_single_file_ready(
-            &purgery_root,
+            &work_dir,
             &server_root,
             &nickname,
             &run_id,
@@ -1728,7 +1728,7 @@ steps = ["compress-video"]
 
         assert_eq!(fs::read_to_string(&final_path).unwrap(), "new content");
         let done_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Done);
         let status =
             RunStatus::from_toml(&fs::read_to_string(done_path.join("status.toml")).unwrap())
@@ -1740,12 +1740,12 @@ steps = ["compress-video"]
     #[test]
     fn test_regular_file_replaces_existing_empty_directory_like_rsync() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-directory-block".into()).unwrap();
         let (config, _) = setup_single_file_ready(
-            &purgery_root,
+            &work_dir,
             &server_root,
             &nickname,
             &run_id,
@@ -1761,7 +1761,7 @@ steps = ["compress-video"]
 
         assert_eq!(fs::read_to_string(&final_path).unwrap(), "content");
         let done_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Done);
         let status =
             RunStatus::from_toml(&fs::read_to_string(done_path.join("status.toml")).unwrap())
@@ -1773,12 +1773,12 @@ steps = ["compress-video"]
     #[cfg(unix)]
     fn test_regular_file_replaces_existing_symlink_like_rsync() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-final-symlink".into()).unwrap();
         let (config, _) = setup_single_file_ready(
-            &purgery_root,
+            &work_dir,
             &server_root,
             &nickname,
             &run_id,
@@ -1805,14 +1805,14 @@ steps = ["compress-video"]
     #[test]
     fn test_work_area_namespacing_no_collision() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-ns".into()).unwrap();
 
         let ready_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(ready_path.join("files/videos")).unwrap();
         fs::create_dir_all(ready_path.join("files/pictures")).unwrap();
@@ -1888,7 +1888,7 @@ delete_after_import = true
         );
 
         let done_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Done);
         let status_content = fs::read_to_string(done_path.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
@@ -1903,14 +1903,14 @@ delete_after_import = true
     #[test]
     fn test_manifest_staged_path_mismatch_rejected() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-sp-mismatch".into()).unwrap();
 
         let ready_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(ready_path.join("files/videos")).unwrap();
         fs::write(ready_path.join("files/videos/a.mp4"), b"content").unwrap();
@@ -1944,7 +1944,7 @@ delete_after_import = true
         process_run(&config, &nickname, &run_id).unwrap();
 
         let failed_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Failed);
         let status_content = fs::read_to_string(failed_path.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
@@ -1960,13 +1960,13 @@ delete_after_import = true
     #[test]
     fn test_manifest_staged_path_match_succeeds() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-sp-match".into()).unwrap();
 
         let (config, _) = setup_single_file_ready(
-            &purgery_root,
+            &work_dir,
             &server_root,
             &nickname,
             &run_id,
@@ -1979,7 +1979,7 @@ delete_after_import = true
         process_run(&config, &nickname, &run_id).unwrap();
 
         let done_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Done);
         let status_content = fs::read_to_string(done_path.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
@@ -1992,14 +1992,14 @@ delete_after_import = true
     #[test]
     fn test_staged_symlink_rejected() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-symlink".into()).unwrap();
 
         let ready_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(ready_path.join("files/videos")).unwrap();
 
@@ -2043,7 +2043,7 @@ delete_after_import = true
         );
 
         let failed_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Failed);
         let status_content = fs::read_to_string(failed_path.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
@@ -2061,14 +2061,14 @@ delete_after_import = true
     #[test]
     fn test_empty_postprocess_pattern_produces_failed_status() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-bad-pattern".into()).unwrap();
 
         let ready_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(ready_path.join("files/videos")).unwrap();
         fs::write(ready_path.join("files/videos/a.mp4"), b"content").unwrap();
@@ -2091,7 +2091,7 @@ steps = ["compress-video"]
         assert!(result.is_err(), "process_run must error on empty pattern");
 
         let failed_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Failed);
         assert!(failed_path.exists());
         let status_path = failed_path.join("status.toml");
@@ -2110,13 +2110,13 @@ steps = ["compress-video"]
     #[test]
     fn test_run_state_done_removes_work_area() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-done-wa".into()).unwrap();
 
         let (config, _) = setup_single_file_ready(
-            &purgery_root,
+            &work_dir,
             &server_root,
             &nickname,
             &run_id,
@@ -2128,19 +2128,19 @@ steps = ["compress-video"]
 
         process_run(&config, &nickname, &run_id).unwrap();
 
-        let work_area = purgery_core::work_dir(&config.purgery_root, &nickname, &run_id);
+        let work_area = purgery_core::work_dir(&config.work_dir, &nickname, &run_id);
         assert!(!work_area.exists(), "work area must be removed on Done");
     }
 
     #[test]
     fn test_run_state_partial_keeps_work_area() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
 
         let server_config = ServerConfig {
             root: ServerRoot::new(server_root.as_str().into()).unwrap(),
-            purgery_root: PurgeryRoot::new(purgery_root.as_str().into()).unwrap(),
+            work_dir: PurgeryRoot::new(work_dir.as_str().into()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
                 steps: {
@@ -2165,7 +2165,7 @@ steps = ["compress-video"]
         let run_id = RunId::new("test-partial-wa".into()).unwrap();
 
         let ready_path = server_config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(ready_path.join("files/videos")).unwrap();
         fs::write(ready_path.join("files/videos/test.mp4"), b"video content").unwrap();
@@ -2211,7 +2211,7 @@ steps = ["compress-video"]
         process_run(&server_config, &nickname, &run_id).unwrap();
 
         let failed_path = server_config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Failed);
         assert!(failed_path.exists());
         // The work area lives inside the run's processing directory, so it moves
@@ -2228,7 +2228,7 @@ steps = ["compress-video"]
     #[test]
     fn test_compress_video_keep_original_records_both_paths() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
 
         let script_path = tmp.path().join("compress.sh");
@@ -2244,7 +2244,7 @@ steps = ["compress-video"]
 
         let server_config = ServerConfig {
             root: ServerRoot::new(server_root.as_str().into()).unwrap(),
-            purgery_root: PurgeryRoot::new(purgery_root.as_str().into()).unwrap(),
+            work_dir: PurgeryRoot::new(work_dir.as_str().into()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
                 steps: {
@@ -2269,7 +2269,7 @@ steps = ["compress-video"]
         let run_id = RunId::new("test-pp-both".into()).unwrap();
 
         let ready_path = server_config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(ready_path.join("files/videos")).unwrap();
         fs::write(ready_path.join("files/videos/video.mp4"), b"video").unwrap();
@@ -2315,7 +2315,7 @@ steps = ["compress-video"]
         process_run(&server_config, &nickname, &run_id).unwrap();
 
         let done_path = server_config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Done);
         let status_content = fs::read_to_string(done_path.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
@@ -2332,7 +2332,7 @@ steps = ["compress-video"]
     #[test]
     fn test_compress_video_keep_original_false_records_one_path() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
 
         let script_path = tmp.path().join("compress.sh");
@@ -2348,7 +2348,7 @@ steps = ["compress-video"]
 
         let server_config = ServerConfig {
             root: ServerRoot::new(server_root.as_str().into()).unwrap(),
-            purgery_root: PurgeryRoot::new(purgery_root.as_str().into()).unwrap(),
+            work_dir: PurgeryRoot::new(work_dir.as_str().into()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
                 steps: {
@@ -2373,7 +2373,7 @@ steps = ["compress-video"]
         let run_id = RunId::new("test-pp-comp-only".into()).unwrap();
 
         let ready_path = server_config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(ready_path.join("files/videos")).unwrap();
         fs::write(ready_path.join("files/videos/video.mp4"), b"video").unwrap();
@@ -2419,7 +2419,7 @@ steps = ["compress-video"]
         process_run(&server_config, &nickname, &run_id).unwrap();
 
         let done_path = server_config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Done);
         let status_content = fs::read_to_string(done_path.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
@@ -2442,7 +2442,7 @@ steps = ["compress-video"]
     fn test_run_plan_validates_empty_pattern() {
         let server_config = ServerConfig {
             root: ServerRoot::new("/data".into()).unwrap(),
-            purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
+            work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig::default(),
             logging: Default::default(),
@@ -2467,7 +2467,7 @@ steps = ["compress-video"]
     fn test_run_plan_validates_step_references() {
         let server_config = ServerConfig {
             root: ServerRoot::new("/data".into()).unwrap(),
-            purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
+            work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig::default(),
             logging: Default::default(),
@@ -2496,7 +2496,7 @@ steps = ["compress-video"]
         let root_path = tmp.path().join("storage");
         let server_config = ServerConfig {
             root: ServerRoot::new(Utf8PathBuf::from_path_buf(root_path).unwrap()).unwrap(),
-            purgery_root: PurgeryRoot::new(
+            work_dir: PurgeryRoot::new(
                 Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
             )
             .unwrap(),
@@ -2527,7 +2527,7 @@ steps = ["compress-video"]
         let root_path = tmp.path().join("storage");
         let server_config = ServerConfig {
             root: ServerRoot::new(Utf8PathBuf::from_path_buf(root_path).unwrap()).unwrap(),
-            purgery_root: PurgeryRoot::new(
+            work_dir: PurgeryRoot::new(
                 Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
             )
             .unwrap(),
@@ -2543,7 +2543,7 @@ steps = ["compress-video"]
 
         let incoming_path =
             server_config
-                .purgery_root
+                .work_dir
                 .run_dir(&nickname, &run_id, RunPhase::Incoming);
         assert!(incoming_path.exists());
 
@@ -2555,7 +2555,7 @@ steps = ["compress-video"]
             "incoming must be gone after finish"
         );
         let ready_path = server_config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
         assert!(ready_path.exists(), "ready dir must exist after finish");
     }
@@ -2563,13 +2563,13 @@ steps = ["compress-video"]
     #[test]
     fn test_read_run_status_from_done() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-status".into()).unwrap();
 
         let (config, _) = setup_single_file_ready(
-            &purgery_root,
+            &work_dir,
             &server_root,
             &nickname,
             &run_id,
@@ -2593,7 +2593,7 @@ steps = ["compress-video"]
         let root_path = tmp.path().join("storage");
         let server_config = ServerConfig {
             root: ServerRoot::new(Utf8PathBuf::from_path_buf(root_path).unwrap()).unwrap(),
-            purgery_root: PurgeryRoot::new(
+            work_dir: PurgeryRoot::new(
                 Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
             )
             .unwrap(),
@@ -2614,7 +2614,7 @@ steps = ["compress-video"]
         let root_path = tmp.path().join("storage");
         let server_config = ServerConfig {
             root: ServerRoot::new(Utf8PathBuf::from_path_buf(root_path).unwrap()).unwrap(),
-            purgery_root: PurgeryRoot::new(
+            work_dir: PurgeryRoot::new(
                 Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
             )
             .unwrap(),
@@ -2629,7 +2629,7 @@ steps = ["compress-video"]
 
         let incoming_path =
             server_config
-                .purgery_root
+                .work_dir
                 .run_dir(&nickname, &run_id, RunPhase::Incoming);
         let lease_path = incoming_path.join("lease.toml");
         let mut lease: purgery_core::LeaseFile =
@@ -2652,7 +2652,7 @@ steps = ["compress-video"]
         let root_path = tmp.path().join("storage");
         let server_config = ServerConfig {
             root: ServerRoot::new(Utf8PathBuf::from_path_buf(root_path).unwrap()).unwrap(),
-            purgery_root: PurgeryRoot::new(
+            work_dir: PurgeryRoot::new(
                 Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
             )
             .unwrap(),
@@ -2667,7 +2667,7 @@ steps = ["compress-video"]
 
         let incoming_path =
             server_config
-                .purgery_root
+                .work_dir
                 .run_dir(&nickname, &run_id, RunPhase::Incoming);
         let lease_path = incoming_path.join("lease.toml");
         let mut lease: purgery_core::LeaseFile =
@@ -2687,12 +2687,12 @@ steps = ["compress-video"]
     #[test]
     fn test_process_once_processes_ready_run_after_restart() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("ready-after-restart".into()).unwrap();
         let (config, _) = setup_single_file_ready(
-            &purgery_root,
+            &work_dir,
             &server_root,
             &nickname,
             &run_id,
@@ -2705,7 +2705,7 @@ steps = ["compress-video"]
         process_once_raw(&config).unwrap();
 
         assert!(config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Done)
             .exists());
         assert_eq!(
@@ -2717,12 +2717,12 @@ steps = ["compress-video"]
     #[test]
     fn test_process_once_recovers_processing_run_without_status() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("recover-interrupted".into()).unwrap();
         let (config, _) = setup_single_file_ready(
-            &purgery_root,
+            &work_dir,
             &server_root,
             &nickname,
             &run_id,
@@ -2732,14 +2732,14 @@ steps = ["compress-video"]
             b"hello",
         );
         let ready = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
         let processing = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Processing);
         fs::create_dir_all(processing.parent().unwrap()).unwrap();
         fs::rename(&ready, &processing).unwrap();
-        let stale_work = work_dir(&config.purgery_root, &nickname, &run_id);
+        let stale_work = work_dir(&config.work_dir, &nickname, &run_id);
         fs::create_dir_all(&stale_work).unwrap();
         fs::write(stale_work.join("stale"), b"stale").unwrap();
 
@@ -2747,7 +2747,7 @@ steps = ["compress-video"]
 
         assert!(!processing.exists());
         let done = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(done.join("status.toml").exists());
         assert_eq!(
@@ -2760,13 +2760,13 @@ steps = ["compress-video"]
     #[test]
     fn test_process_once_finalizes_processing_run_with_valid_status() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("recover-status".into()).unwrap();
         let processing = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Processing);
         fs::create_dir_all(&processing).unwrap();
         let status = RunStatus {
@@ -2782,7 +2782,7 @@ steps = ["compress-video"]
 
         assert!(!processing.exists());
         assert!(config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Done)
             .exists());
     }
@@ -2793,13 +2793,13 @@ steps = ["compress-video"]
         directory_run_id: &str,
     ) {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new(directory_run_id.into()).unwrap();
         let processing = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Processing);
         fs::create_dir_all(&processing).unwrap();
         let status = RunStatus {
@@ -2815,11 +2815,11 @@ steps = ["compress-video"]
 
         assert!(!processing.exists());
         assert!(!config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Done)
             .exists());
         let failed = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Failed);
         let failed_status =
             RunStatus::from_toml(&fs::read_to_string(failed.join("status.toml")).unwrap()).unwrap();
@@ -2853,16 +2853,16 @@ steps = ["compress-video"]
     #[test]
     fn test_mismatched_status_recovery_propagates_terminal_move_failure() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("blocked-failed-move".into()).unwrap();
         let processing = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Processing);
         let failed = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Failed);
         fs::create_dir_all(&processing).unwrap();
         fs::create_dir_all(&failed).unwrap();
@@ -2899,13 +2899,13 @@ steps = ["compress-video"]
     #[test]
     fn test_malformed_status_recovery_propagates_failed_status_write_failure() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("blocked-status-write".into()).unwrap();
         let processing = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Processing);
         fs::create_dir_all(processing.join("status.toml.tmp")).unwrap();
         fs::write(processing.join("status.toml"), "not valid = [toml").unwrap();
@@ -2925,13 +2925,13 @@ steps = ["compress-video"]
     #[test]
     fn test_process_once_fails_processing_run_with_malformed_status() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("recover-malformed".into()).unwrap();
         let processing = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Processing);
         fs::create_dir_all(&processing).unwrap();
         fs::write(processing.join("status.toml"), "not valid = [toml").unwrap();
@@ -2940,7 +2940,7 @@ steps = ["compress-video"]
 
         assert!(!processing.exists());
         let failed = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Failed);
         let status =
             RunStatus::from_toml(&fs::read_to_string(failed.join("status.toml")).unwrap()).unwrap();
@@ -2954,12 +2954,12 @@ steps = ["compress-video"]
     #[test]
     fn test_replay_after_final_replacement_without_status_converges() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("recover-committed-output".into()).unwrap();
         let (config, _) = setup_single_file_ready(
-            &purgery_root,
+            &work_dir,
             &server_root,
             &nickname,
             &run_id,
@@ -2969,10 +2969,10 @@ steps = ["compress-video"]
             b"new",
         );
         let ready = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
         let processing = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Processing);
         fs::create_dir_all(processing.parent().unwrap()).unwrap();
         fs::rename(&ready, &processing).unwrap();
@@ -2985,7 +2985,7 @@ steps = ["compress-video"]
 
         assert_eq!(fs::read_to_string(&final_path).unwrap(), "new");
         let done = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Done);
         let status =
             RunStatus::from_toml(&fs::read_to_string(done.join("status.toml")).unwrap()).unwrap();
@@ -2995,14 +2995,14 @@ steps = ["compress-video"]
     #[test]
     fn test_repeated_imports_same_destination_are_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
 
         for (run, content) in [("repeat-1", b"hello".as_slice()), ("repeat-2", b"hello")] {
             let run_id = RunId::new(run.into()).unwrap();
             let (config, _) = setup_single_file_ready(
-                &purgery_root,
+                &work_dir,
                 &server_root,
                 &nickname,
                 &run_id,
@@ -3013,7 +3013,7 @@ steps = ["compress-video"]
             );
             process_run(&config, &nickname, &run_id).unwrap();
             assert!(config
-                .purgery_root
+                .work_dir
                 .run_dir(&nickname, &run_id, RunPhase::Done)
                 .exists());
         }
@@ -3027,14 +3027,14 @@ steps = ["compress-video"]
     #[test]
     fn test_repeated_import_replaces_changed_content() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
 
         for (run, content) in [("version-1", b"v1".as_slice()), ("version-2", b"v2")] {
             let run_id = RunId::new(run.into()).unwrap();
             let (config, _) = setup_single_file_ready(
-                &purgery_root,
+                &work_dir,
                 &server_root,
                 &nickname,
                 &run_id,
@@ -3055,14 +3055,14 @@ steps = ["compress-video"]
     #[test]
     fn test_gc_collects_abandoned_incoming_upload() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("abandoned-upload".into()).unwrap();
         begin_run(&config, &nickname, &run_id).unwrap();
         let incoming = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Incoming);
         fs::write(incoming.join("files/partial.txt"), b"partial").unwrap();
         let lease_path = incoming.join("lease.toml");
@@ -3074,7 +3074,7 @@ steps = ["compress-video"]
         run_gc(&config).unwrap();
 
         let failed = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Failed);
         assert!(!failed.join("files").exists());
         let status =
@@ -3092,7 +3092,7 @@ steps = ["compress-video"]
         let root_path = tmp.path().join("storage");
         let server_config = ServerConfig {
             root: ServerRoot::new(Utf8PathBuf::from_path_buf(root_path).unwrap()).unwrap(),
-            purgery_root: PurgeryRoot::new(
+            work_dir: PurgeryRoot::new(
                 Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
             )
             .unwrap(),
@@ -3117,13 +3117,13 @@ steps = ["compress-video"]
     #[test]
     fn test_status_stdout_is_parseable_toml() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-stdout-status".into()).unwrap();
 
         let (config, _) = setup_single_file_ready(
-            &purgery_root,
+            &work_dir,
             &server_root,
             &nickname,
             &run_id,
@@ -3276,13 +3276,13 @@ steps = ["compress-video"]
     #[test]
     fn test_process_run_overlays_directory_file_and_symlink_without_delete() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("tree-overlay".into()).unwrap();
         let ready = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
         let staged = ready.join("files/data/tree");
         fs::create_dir_all(&staged).unwrap();
@@ -3339,7 +3339,7 @@ steps = ["compress-video"]
             std::path::Path::new("../target")
         );
         let done = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Done);
         let status =
             RunStatus::from_toml(&fs::read_to_string(done.join("status.toml")).unwrap()).unwrap();
@@ -3353,13 +3353,13 @@ steps = ["compress-video"]
     #[test]
     fn test_read_run_status_rejects_mismatched_terminal_envelope() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("requested".into()).unwrap();
         let done = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Done);
         fs::create_dir_all(&done).unwrap();
         let status = RunStatus {
@@ -3651,13 +3651,13 @@ to = "{second_to}"
     #[test]
     fn processing_rejects_duplicate_final_paths_before_importing_entries() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("duplicate-run".into()).unwrap();
         let ready = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(ready.join("files/shared")).unwrap();
         fs::write(ready.join("files/shared/same.txt"), "staged").unwrap();
@@ -3719,7 +3719,7 @@ delete_after_import = true
         assert!(process_run(&config, &nickname, &run_id).is_err());
         assert!(!server_root.join("laptop/shared/same.txt").exists());
         let failed = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Failed);
         let status =
             RunStatus::from_toml(&fs::read_to_string(failed.join("status.toml")).unwrap()).unwrap();
@@ -3739,13 +3739,13 @@ delete_after_import = true
         // overlap validation failure.  The descendant should be skipped as
         // covered, not rejected as a planned-path conflict.
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("dir-transform".into()).unwrap();
         let ready = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
 
         // Create staged directory with child file
@@ -3769,7 +3769,7 @@ steps = ["pack"]
         // Server config with a matching step
         let config = ServerConfig {
             root: ServerRoot::new(server_root.clone()).unwrap(),
-            purgery_root: PurgeryRoot::new(purgery_root.clone()).unwrap(),
+            work_dir: PurgeryRoot::new(work_dir.clone()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
                 steps: {
@@ -4183,13 +4183,13 @@ steps = ["compress"]
     #[test]
     fn prepare_run_rejects_covered_entry_with_missing_covered_by() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         // Set up a postprocess step so the directory can be postprocessed
         let config = ServerConfig {
             root: config.root,
-            purgery_root: config.purgery_root,
+            work_dir: config.work_dir,
             postprocess: PostprocessConfig {
                 steps: {
                     let mut m = std::collections::BTreeMap::new();
@@ -4211,7 +4211,7 @@ steps = ["compress"]
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("covered-by-missing".into()).unwrap();
         let incoming = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Incoming);
         fs::create_dir_all(&incoming).unwrap();
         write_run_toml_with_sync(&incoming, &nickname, "data", "data");
@@ -4274,9 +4274,9 @@ steps = ["pack"]
     #[test]
     fn prepare_run_rejects_covered_entry_with_wrong_covered_by() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let config = ServerConfig {
             postprocess: PostprocessConfig {
                 steps: {
@@ -4299,7 +4299,7 @@ steps = ["pack"]
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("covered-by-wrong".into()).unwrap();
         let incoming = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Incoming);
         fs::create_dir_all(&incoming).unwrap();
         fs::write(
@@ -4364,9 +4364,9 @@ steps = ["pack"]
     #[test]
     fn prepare_run_rejects_covered_entry_with_non_empty_postprocess_steps() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let config = ServerConfig {
             postprocess: PostprocessConfig {
                 steps: {
@@ -4389,7 +4389,7 @@ steps = ["pack"]
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("covered-steps".into()).unwrap();
         let incoming = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Incoming);
         fs::create_dir_all(&incoming).unwrap();
         fs::write(
@@ -4454,9 +4454,9 @@ steps = ["pack"]
     #[test]
     fn prepare_run_rejects_descendant_marked_passthrough_under_postprocessed_directory() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let config = ServerConfig {
             postprocess: PostprocessConfig {
                 steps: {
@@ -4479,7 +4479,7 @@ steps = ["pack"]
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("descendant-passthrough".into()).unwrap();
         let incoming = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Incoming);
         fs::create_dir_all(&incoming).unwrap();
         fs::write(
@@ -4544,9 +4544,9 @@ steps = ["pack"]
     #[test]
     fn prepare_run_rejects_descendant_marked_postprocess_under_postprocessed_directory() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let config = ServerConfig {
             postprocess: PostprocessConfig {
                 steps: {
@@ -4569,7 +4569,7 @@ steps = ["pack"]
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("descendant-postprocess".into()).unwrap();
         let incoming = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Incoming);
         fs::create_dir_all(&incoming).unwrap();
         fs::write(
@@ -4634,9 +4634,9 @@ steps = ["pack"]
     #[test]
     fn processing_run_status_excludes_passthrough_entries() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let config = ServerConfig {
             postprocess: PostprocessConfig {
                 steps: {
@@ -4661,7 +4661,7 @@ steps = ["pack"]
 
         // Create a ready run with only postprocess/covered entries (no passthrough)
         let ready_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(ready_path.join("files/data/photos")).unwrap();
         fs::write(ready_path.join("files/data/photos/photo.txt"), b"photo").unwrap();
@@ -4727,7 +4727,7 @@ steps = ["pack"]
         process_run(&config, &nickname, &run_id).unwrap();
 
         let done_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Done);
         let status_content = fs::read_to_string(done_path.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
@@ -4744,9 +4744,9 @@ steps = ["pack"]
     #[test]
     fn prepare_run_without_passthrough_entries_succeeds() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let config = ServerConfig {
             postprocess: PostprocessConfig {
                 steps: {
@@ -4769,7 +4769,7 @@ steps = ["pack"]
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("no-passthrough-manifest".into()).unwrap();
         let incoming = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Incoming);
         fs::create_dir_all(&incoming).unwrap();
 
@@ -4841,9 +4841,9 @@ steps = ["pack"]
     #[test]
     fn prepare_run_rejects_sync_with_delete_after_import_false() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let config = ServerConfig {
             postprocess: PostprocessConfig {
                 steps: {
@@ -4866,7 +4866,7 @@ steps = ["pack"]
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("no-delete-purgatory".into()).unwrap();
         let incoming = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Incoming);
         fs::create_dir_all(&incoming).unwrap();
 
@@ -4926,9 +4926,9 @@ steps = ["pack"]
         // A postprocess rule scoped to "videos" must not cause a directory
         // in "docs" to be considered covered by a postprocessed ancestor.
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let config = ServerConfig {
             postprocess: PostprocessConfig {
                 steps: {
@@ -4951,7 +4951,7 @@ steps = ["pack"]
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("scoped-coverage".into()).unwrap();
         let ready = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
 
         // Set up two sync groups: "videos" (with album dir) and "docs" (with album dir)
@@ -5058,7 +5058,7 @@ for = ["videos"]
         process_run(&config, &nickname, &run_id).unwrap();
 
         let done = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Done);
         let status_content = fs::read_to_string(done.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
@@ -5082,13 +5082,13 @@ for = ["videos"]
     #[test]
     fn prepare_run_rejects_rule_with_empty_for() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("empty-for".into()).unwrap();
         let incoming = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Incoming);
         fs::create_dir_all(&incoming).unwrap();
 
@@ -5136,13 +5136,13 @@ postprocess_steps = ["pack"]
     #[test]
     fn prepare_run_rejects_rule_with_unknown_for() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("unknown-for".into()).unwrap();
         let incoming = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Incoming);
         fs::create_dir_all(&incoming).unwrap();
 
@@ -5190,9 +5190,9 @@ postprocess_steps = ["pack"]
     #[test]
     fn out_of_scope_rule_does_not_process_entry() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let config = ServerConfig {
             postprocess: PostprocessConfig {
                 steps: {
@@ -5215,7 +5215,7 @@ postprocess_steps = ["pack"]
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("scoped-processing".into()).unwrap();
         let ready = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
 
         // videos/ has a matching file pattern, but the rule is scoped to "pictures"
@@ -5265,7 +5265,7 @@ for = ["pictures"]
         // process_run must succeed — the rule is out of scope for videos
         process_run(&config, &nickname, &run_id).unwrap();
         let done = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Done);
         let status_content = fs::read_to_string(done.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
@@ -5281,9 +5281,9 @@ for = ["pictures"]
     #[test]
     fn out_of_scope_rule_does_not_affect_planned_outputs() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let config = ServerConfig {
             postprocess: PostprocessConfig {
                 steps: {
@@ -5306,7 +5306,7 @@ for = ["pictures"]
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("scoped-outputs".into()).unwrap();
         let incoming = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Incoming);
         fs::create_dir_all(&incoming).unwrap();
         fs::create_dir_all(incoming.join("files/videos")).unwrap();
@@ -5397,9 +5397,9 @@ for = ["videos"]
     #[test]
     fn process_processing_run_rejects_delete_after_import_false() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let config = ServerConfig {
             postprocess: PostprocessConfig {
                 steps: {
@@ -5422,7 +5422,7 @@ for = ["videos"]
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("processing-no-delete".into()).unwrap();
         let ready = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(ready.join("files/videos")).unwrap();
         fs::write(ready.join("files/videos/a.mp4"), b"content").unwrap();
@@ -5473,7 +5473,7 @@ steps = ["pack"]
         );
         // The run should be in failed state
         let failed = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Failed);
         assert!(failed.exists(), "failed run dir must exist");
     }
@@ -5530,7 +5530,7 @@ steps = ["pack"]
 
         let server_config = ServerConfig {
             root: ServerRoot::new("/data".into()).unwrap(),
-            purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
+            work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
                 steps: {
@@ -5603,7 +5603,7 @@ steps = ["pack"]
     #[test]
     fn progress_write_failure_does_not_fail_import() {
         let tmp = tempfile::tempdir().unwrap();
-        let _purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let _work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("progress-fail".into()).unwrap();
@@ -5660,7 +5660,7 @@ delete_after_import = true
 
         // Move from ready to processing
         let processing_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Processing);
         fs::create_dir_all(processing_path.parent().unwrap()).unwrap();
         fs::rename(&ready_path, &processing_path).unwrap();
@@ -5725,7 +5725,7 @@ delete_after_import = true
 
         let server_config = ServerConfig {
             root: ServerRoot::new("/data".into()).unwrap(),
-            purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
+            work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
                 steps: {
@@ -5835,7 +5835,7 @@ delete_after_import = true
 
         let server_config = ServerConfig {
             root: ServerRoot::new("/data".into()).unwrap(),
-            purgery_root: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
+            work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
                 steps: {
@@ -6419,9 +6419,9 @@ delete_after_import = true
     #[test]
     fn prepare_run_rejection_mentions_conformance() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let config = ServerConfig {
             postprocess: PostprocessConfig {
                 steps: {
@@ -6444,7 +6444,7 @@ delete_after_import = true
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("conformance-test".into()).unwrap();
         let incoming = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Incoming);
         fs::create_dir_all(&incoming).unwrap();
 
@@ -6657,13 +6657,13 @@ steps = ["pack"]
     #[test]
     fn full_processing_run_leaves_only_expected_paths_under_root() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-run-final-only".into()).unwrap();
 
         let (config, _staged) = setup_single_file_ready(
-            &purgery_root,
+            &work_dir,
             &server_root,
             &nickname,
             &run_id,
@@ -6676,7 +6676,7 @@ steps = ["pack"]
         process_run(&config, &nickname, &run_id).unwrap();
 
         let done_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(done_path.exists());
 
@@ -6691,14 +6691,14 @@ steps = ["pack"]
     #[test]
     fn failed_run_must_not_leave_operational_paths_under_root() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-fail".into()).unwrap();
 
         let ready_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
 
@@ -6731,7 +6731,7 @@ steps = ["pack"]
         process_run(&config, &nickname, &run_id).unwrap();
 
         let failed_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Failed);
         assert!(failed_path.exists(), "run should be in failed phase");
 
@@ -6740,16 +6740,16 @@ steps = ["pack"]
     }
 
     #[test]
-    fn partial_run_work_area_preserved_under_purgery_root_only() {
+    fn partial_run_work_area_preserved_under_work_dir_only() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-partial".into()).unwrap();
 
         let config = ServerConfig {
             root: ServerRoot::new(server_root.to_owned()).unwrap(),
-            purgery_root: PurgeryRoot::new(purgery_root.to_owned()).unwrap(),
+            work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
                 steps: {
@@ -6771,7 +6771,7 @@ steps = ["pack"]
         };
 
         let ready_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
         let staged_dir = ready_path.join("files/videos");
@@ -6842,7 +6842,7 @@ steps = ["always-fail"]
         process_run(&config, &nickname, &run_id).unwrap();
 
         let failed_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Failed);
         assert!(failed_path.exists());
 
@@ -6866,16 +6866,16 @@ steps = ["always-fail"]
         // relative-path outputs land inside the work area. Purgery validates
         // expected outputs are under the work area before committing.
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let server_str = server_root.as_str();
 
-        fs::create_dir_all(&purgery_root).unwrap();
+        fs::create_dir_all(&work_dir).unwrap();
         fs::create_dir_all(&server_root).unwrap();
 
         let server_config = ServerConfig {
             root: ServerRoot::new(server_str.into()).unwrap(),
-            purgery_root: PurgeryRoot::new(purgery_root.to_owned()).unwrap(),
+            work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
                 steps: {
@@ -6903,7 +6903,7 @@ steps = ["always-fail"]
         let run_id = RunId::new("test-pp-cwd".into()).unwrap();
 
         let ready_path = server_config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(ready_path.join("files/data")).unwrap();
         fs::write(ready_path.join("files/data/input.dat"), b"input").unwrap();
@@ -6955,7 +6955,7 @@ steps = ["echo-args"]
         assert!(result.is_ok(), "postprocess run should succeed: {result:?}");
 
         let done_path = server_config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(done_path.exists());
 
@@ -7111,13 +7111,13 @@ steps = ["echo-args"]
         // interrupted processing attempt. process-once must rebuild the
         // work area from staged files and converge to the correct result.
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-replay".into()).unwrap();
 
         let (config, _staged) = setup_single_file_ready(
-            &purgery_root,
+            &work_dir,
             &server_root,
             &nickname,
             &run_id,
@@ -7130,10 +7130,10 @@ steps = ["echo-args"]
         // Move from Ready to Processing and write a partial final file to
         // simulate interrupted materialization.
         let processing_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Processing);
         let ready_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(processing_path.parent().unwrap()).unwrap();
         fs::rename(&ready_path, &processing_path).unwrap();
@@ -7148,7 +7148,7 @@ steps = ["echo-args"]
         process_once_raw(&config).unwrap();
 
         let done_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(
             done_path.exists(),
@@ -7178,16 +7178,16 @@ steps = ["echo-args"]
         // A postprocess subprocess produces a symlink as output.
         // The symlink entry is moved from the work area to the final path.
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let server_str = server_root.as_str();
 
-        fs::create_dir_all(&purgery_root).unwrap();
+        fs::create_dir_all(&work_dir).unwrap();
         fs::create_dir_all(&server_root).unwrap();
 
         let server_config = ServerConfig {
             root: ServerRoot::new(server_str.into()).unwrap(),
-            purgery_root: PurgeryRoot::new(purgery_root.to_owned()).unwrap(),
+            work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
                 steps: {
@@ -7212,7 +7212,7 @@ steps = ["echo-args"]
         let run_id = RunId::new("test-pp-symlink".into()).unwrap();
 
         let ready_path = server_config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(ready_path.join("files/data")).unwrap();
         fs::write(ready_path.join("files/data/input.dat"), b"data").unwrap();
@@ -7267,7 +7267,7 @@ steps = ["make-symlink"]
         );
 
         let done_path = server_config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(done_path.exists());
 
@@ -7449,16 +7449,16 @@ steps = ["make-symlink"]
     fn postprocess_directory_output_with_recursive_descendants() {
         // A postprocess subprocess produces a directory tree as output.
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let server_str = server_root.as_str();
 
-        fs::create_dir_all(&purgery_root).unwrap();
+        fs::create_dir_all(&work_dir).unwrap();
         fs::create_dir_all(&server_root).unwrap();
 
         let server_config = ServerConfig {
             root: ServerRoot::new(server_str.into()).unwrap(),
-            purgery_root: PurgeryRoot::new(purgery_root.to_owned()).unwrap(),
+            work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
                 steps: {
@@ -7487,7 +7487,7 @@ steps = ["make-symlink"]
         let run_id = RunId::new("test-pp-dir".into()).unwrap();
 
         let ready_path = server_config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(ready_path.join("files/data")).unwrap();
         fs::write(ready_path.join("files/data/input.dat"), b"data").unwrap();
@@ -7542,7 +7542,7 @@ steps = ["make-tree"]
         );
 
         let done_path = server_config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(done_path.exists());
 
@@ -7565,13 +7565,13 @@ steps = ["make-tree"]
     #[test]
     fn non_postprocess_staged_file_preserved_after_successful_materialization() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-staged-preserved".into()).unwrap();
 
         let (config, _staged_a) = setup_single_file_ready(
-            &purgery_root,
+            &work_dir,
             &server_root,
             &nickname,
             &run_id,
@@ -7584,7 +7584,7 @@ steps = ["make-tree"]
         // Add a second entry that will fail (missing staged file) after the
         // first one succeeds.
         let ready_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
         let mut manifest: Manifest =
             toml::from_str(&fs::read_to_string(ready_path.join("manifest.toml")).unwrap()).unwrap();
@@ -7612,7 +7612,7 @@ steps = ["make-tree"]
         process_run(&config, &nickname, &run_id).unwrap();
 
         let done_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(
             done_path.exists(),
@@ -7656,14 +7656,14 @@ steps = ["make-tree"]
     #[cfg(unix)]
     fn non_postprocess_staged_symlink_preserved_after_materialization() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-symlink-staged".into()).unwrap();
 
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let ready_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
 
@@ -7720,7 +7720,7 @@ steps = ["make-tree"]
         process_run(&config, &nickname, &run_id).unwrap();
 
         let done_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(done_path.exists());
 
@@ -7760,13 +7760,13 @@ steps = ["make-tree"]
     #[test]
     fn replay_preserves_staged_upload_source() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-replay-staged".into()).unwrap();
 
         let (config, _staged_file) = setup_single_file_ready(
-            &purgery_root,
+            &work_dir,
             &server_root,
             &nickname,
             &run_id,
@@ -7778,10 +7778,10 @@ steps = ["make-tree"]
 
         // Move from Ready to Processing and write a partial final file.
         let processing_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Processing);
         let ready_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(processing_path.parent().unwrap()).unwrap();
         fs::rename(&ready_path, &processing_path).unwrap();
@@ -7799,7 +7799,7 @@ steps = ["make-tree"]
         process_once_raw(&config).unwrap();
 
         let done_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(done_path.exists());
 
@@ -7835,13 +7835,13 @@ steps = ["make-tree"]
     #[test]
     fn non_postprocess_regular_file_work_copy_consumed_staged_preserved() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-work-consumed".into()).unwrap();
 
         let (config, _staged_orig) = setup_single_file_ready(
-            &purgery_root,
+            &work_dir,
             &server_root,
             &nickname,
             &run_id,
@@ -7854,7 +7854,7 @@ steps = ["make-tree"]
         process_run(&config, &nickname, &run_id).unwrap();
 
         let done_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(done_path.exists());
 
@@ -7895,14 +7895,14 @@ steps = ["make-tree"]
     #[cfg(unix)]
     fn non_postprocess_symlink_work_copy_consumed_staged_preserved() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-symlink-consumed".into()).unwrap();
 
-        let config = test_server_config(&purgery_root, &server_root);
+        let config = test_server_config(&work_dir, &server_root);
         let ready_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
 
@@ -7940,7 +7940,7 @@ steps = ["make-tree"]
         process_run(&config, &nickname, &run_id).unwrap();
 
         let done_path = config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(done_path.exists());
 
@@ -7980,16 +7980,16 @@ steps = ["make-tree"]
     #[test]
     fn postprocess_work_area_outputs_consumed_after_materialization() {
         let tmp = tempfile::tempdir().unwrap();
-        let purgery_root = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let server_str = server_root.as_str();
 
-        fs::create_dir_all(&purgery_root).unwrap();
+        fs::create_dir_all(&work_dir).unwrap();
         fs::create_dir_all(&server_root).unwrap();
 
         let server_config = ServerConfig {
             root: ServerRoot::new(server_str.into()).unwrap(),
-            purgery_root: PurgeryRoot::new(purgery_root.to_owned()).unwrap(),
+            work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
                 steps: {
@@ -8014,7 +8014,7 @@ steps = ["make-tree"]
         let run_id = RunId::new("test-pp-consumed".into()).unwrap();
 
         let ready_path = server_config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(ready_path.join("files/data")).unwrap();
         fs::write(ready_path.join("files/data/input.bin"), b"binary data").unwrap();
@@ -8066,7 +8066,7 @@ steps = ["copy-cmd"]
         assert!(result.is_ok(), "postprocess run failed: {result:?}");
 
         let done_path = server_config
-            .purgery_root
+            .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(done_path.exists());
 

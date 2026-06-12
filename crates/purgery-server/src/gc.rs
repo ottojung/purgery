@@ -8,7 +8,7 @@ use crate::phases::publish_status_atomic;
 
 pub fn run_gc(config: &ServerConfig) -> Result<()> {
     let gc_config = &config.gc;
-    let purgery_path = config.purgery_root.as_path();
+    let purgery_path = config.work_dir.as_path();
 
     if !purgery_path.exists() {
         return Ok(());
@@ -107,11 +107,11 @@ pub fn run_gc(config: &ServerConfig) -> Result<()> {
             );
 
             let failed_path = config
-                .purgery_root
+                .work_dir
                 .run_dir(&nickname, &run_id, RunPhase::Failed);
             if failed_path.exists() {
                 let quarantine_name = format!("gc-quarantine-{}-{}", run_id.as_str(), now);
-                let quarantine_path = config.purgery_root.run_dir(
+                let quarantine_path = config.work_dir.run_dir(
                     &nickname,
                     &RunId::new(quarantine_name).unwrap(),
                     RunPhase::Failed,
