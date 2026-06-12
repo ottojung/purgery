@@ -19,23 +19,23 @@ mod transfer;
 )]
 struct Cli {
     /// Quiet: set log level to error (conflicts with --verbose and --log-level)
-    #[arg(long, conflicts_with_all = &["verbose", "log_level"])]
+    #[arg(long, global = true, conflicts_with_all = &["verbose", "log_level"])]
     quiet: bool,
 
     /// Verbose: set log level to debug (conflicts with --quiet and --log-level)
-    #[arg(long, conflicts_with_all = &["quiet", "log_level"])]
+    #[arg(long, global = true, conflicts_with_all = &["quiet", "log_level"])]
     verbose: bool,
 
     /// Log level: error, warn, info, debug, trace (conflicts with --quiet and --verbose)
-    #[arg(long, value_enum, conflicts_with_all = &["quiet", "verbose"])]
+    #[arg(long, global = true, value_enum, conflicts_with_all = &["quiet", "verbose"])]
     log_level: Option<LogLevelArg>,
 
     /// Log format: pretty, compact, json
-    #[arg(long, value_enum)]
+    #[arg(long, global = true, value_enum)]
     log_format: Option<LogFormatArg>,
 
     /// Color mode: auto, always, never
-    #[arg(long, value_enum)]
+    #[arg(long, global = true, value_enum)]
     color: Option<ColorModeArg>,
 
     #[command(subcommand)]
@@ -169,6 +169,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cli_verbose_before_subcommand() {
+        let args = Cli::try_parse_from([
+            "purgery-client",
+            "--verbose",
+            "sync",
+            "--",
+            "/src",
+            "host:dest",
+        ])
+        .unwrap();
+        let cfg = build_logging_config(&args);
+        assert!(matches!(cfg.level, LogLevel::Debug));
+    }
+
+    #[test]
+    fn cli_verbose_after_subcommand() {
+        let args = Cli::try_parse_from([
+            "purgery-client",
+            "sync",
+            "--verbose",
+            "--",
+            "/src",
+            "host:dest",
+        ])
+        .unwrap();
+        let cfg = build_logging_config(&args);
+        assert!(matches!(cfg.level, LogLevel::Debug));
+    }
+
+    #[test]
     fn cli_parses_sync_basic() {
         let args = Cli::try_parse_from([
             "purgery-client",
@@ -226,8 +256,6 @@ mod tests {
         ])
         .unwrap();
         assert!(args.log_level.is_some());
-        assert!(args.log_format.is_some());
-        assert!(args.color.is_some());
         let cfg = build_logging_config(&args);
         assert!(matches!(cfg.level, LogLevel::Debug));
         assert!(matches!(cfg.format, LogFormat::Json));

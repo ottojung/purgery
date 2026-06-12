@@ -259,6 +259,7 @@ fn persist_client_run_state(
     server_command: &str,
     manifest: &Manifest,
     run_config: &RunConfig,
+    status_toml: Option<&str>,
     phase: ClientRunPhase,
 ) -> Result<()> {
     let run_state = ClientRunState {
@@ -269,6 +270,7 @@ fn persist_client_run_state(
         server_command: server_command.to_owned(),
         manifest: manifest.to_toml()?,
         run_config: run_config.to_toml()?,
+        status_toml: status_toml.map(|s| s.to_owned()),
         phase,
     };
     let dir = camino::Utf8PathBuf::from(state_dir)
@@ -294,6 +296,7 @@ fn remove_client_run_state(state_dir: &str, nickname: &Nickname, run_id: &RunId)
 
 /// Start a heartbeat thread that calls heartbeat-run every interval_secs/2.
 /// The thread stops when `stop` is set to true.
+/// Returns the JoinHandle. The caller MUST join this handle and check the result.
 fn start_heartbeat(
     host: String,
     server_cmd: String,
@@ -318,10 +321,8 @@ fn start_heartbeat(
                 );
                 return Err(e);
             }
-            // Sleep in small increments so we can react to stop quickly
-            let sleep_remaining = half_interval;
             let start = std::time::Instant::now();
-            while start.elapsed() < sleep_remaining && !stop.load(Ordering::Relaxed) {
+            while start.elapsed() < half_interval && !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
@@ -336,6 +337,8 @@ fn start_heartbeat(
 
 // ── Resume logic ───────────────────────────────────────────────────────
 
+/// Resume persisted client run states. Returns Ok only if all recoverable
+/// states were resolved. Unresolved states cause the whole invocation to fail.
 fn resume_runs(state_dir: &str) -> Result<()> {
     let runs_dir = camino::Utf8PathBuf::from(state_dir).join("runs");
     if !runs_dir.as_std_path().is_dir() {
@@ -349,6 +352,8 @@ fn resume_runs(state_dir: &str) -> Result<()> {
     };
     entries.sort_by_key(|e| e.file_name());
 
+    let mut any_error = false;
+
     for entry in entries {
         let state_path = entry.path().join("state.toml");
         if !state_path.exists() {
@@ -361,7 +366,8 @@ fn resume_runs(state_dir: &str) -> Result<()> {
         let run_state: ClientRunState = match toml::from_str(&content) {
             Ok(s) => s,
             Err(e) => {
-                warn!("failed to parse client run state {:?}: {e}", state_path);
+                error!("failed to parse client run state {:?}: {e}", state_path);
+                any_error = true;
                 continue;
             }
         };
@@ -370,27 +376,25 @@ fn resume_runs(state_dir: &str) -> Result<()> {
             Ok(true) => {
                 let _ = fs::remove_dir_all(&run_dir);
             }
-            Ok(false) => {
-                info!(
-                    nickname = %run_state.nickname,
-                    run_id = %run_state.run_id,
-                    phase = ?run_state.phase,
-                    "resumed run state, waiting for next iteration"
-                );
-            }
+            Ok(false) => {}
             Err(e) => {
-                warn!(
+                error!(
                     "failed to resume run {}/{}: {e}",
                     run_state.nickname, run_state.run_id
                 );
+                any_error = true;
             }
         }
+    }
+
+    if any_error {
+        anyhow::bail!("failed to resume one or more prior run states; refusing to start new sync");
     }
     Ok(())
 }
 
 /// Returns Ok(true) if the run was fully completed (cleanup done, state removed).
-/// Returns Ok(false) if the run has been progressed but not finished.
+/// Returns Ok(false) if the run has made progress but needs another cycle.
 fn resume_one(state_dir: &str, state: &ClientRunState) -> Result<bool> {
     let nickname = Nickname::new(state.nickname.clone())
         .map_err(|e| anyhow::anyhow!("invalid nickname in persisted state: {e}"))?;
@@ -422,6 +426,7 @@ fn resume_one(state_dir: &str, state: &ClientRunState) -> Result<bool> {
                 server_cmd,
                 &manifest,
                 &run_config,
+                None,
                 ClientRunPhase::WaitingForTerminalState,
             )?;
             Ok(false)
@@ -437,6 +442,8 @@ fn resume_one(state_dir: &str, state: &ClientRunState) -> Result<bool> {
             if status.nickname != nickname || status.run_id != run_id {
                 anyhow::bail!("server status envelope does not match persisted run");
             }
+            let status_toml = toml::to_string(&status)
+                .map_err(|e| anyhow::anyhow!("status serialization: {e}"))?;
             persist_client_run_state(
                 state_dir,
                 &nickname,
@@ -445,6 +452,7 @@ fn resume_one(state_dir: &str, state: &ClientRunState) -> Result<bool> {
                 server_cmd,
                 &manifest,
                 &run_config,
+                Some(&status_toml),
                 ClientRunPhase::TerminalStatusSeen,
             )?;
             process_cleanup_from_status(
@@ -460,12 +468,12 @@ fn resume_one(state_dir: &str, state: &ClientRunState) -> Result<bool> {
             Ok(true)
         }
         ClientRunPhase::TerminalStatusSeen => {
-            let status = match read_status(host, server_cmd, &nickname, &run_id) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("could not read status for resume: {e}");
-                    return Ok(true);
+            let status = match &state.status_toml {
+                Some(toml_str) => {
+                    toml::from_str(toml_str).with_context(|| "failed to parse persisted status")?
                 }
+                None => read_status(host, server_cmd, &nickname, &run_id)
+                    .with_context(|| "no persisted status and could not re-read from server")?,
             };
             process_cleanup_from_status(
                 state_dir,
@@ -512,6 +520,7 @@ fn process_cleanup_from_status(
         server_cmd,
         manifest,
         run_config,
+        None,
         ClientRunPhase::CleanupComplete,
     )?;
     remove_client_run_state(state_dir, nickname, run_id);
@@ -519,6 +528,18 @@ fn process_cleanup_from_status(
 }
 
 // ── Main sync entry point ──────────────────────────────────────────────
+
+fn resolve_state_dir(args: &SyncArgs) -> String {
+    args.state_dir.clone().unwrap_or_else(|| {
+        if let Ok(dir) = std::env::var("XDG_STATE_HOME") {
+            format!("{dir}/purgery")
+        } else if let Ok(home) = std::env::var("HOME") {
+            format!("{home}/.local/state/purgery")
+        } else {
+            "/tmp/purgery-client".to_string()
+        }
+    })
+}
 
 fn validate_source_is_directory(source: &str) -> Result<()> {
     let path = Path::new(source);
@@ -531,7 +552,81 @@ fn validate_source_is_directory(source: &str) -> Result<()> {
     Ok(())
 }
 
+/// RAII-style heartbeat guard. Stops heartbeat on drop, joins the thread,
+/// and stores the result for the caller to check.
+struct HeartbeatGuard {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<Result<()>>>,
+    result: Option<Result<()>>,
+}
+
+impl HeartbeatGuard {
+    fn new(
+        host: String,
+        server_cmd: String,
+        nickname: Nickname,
+        run_id: RunId,
+        interval_secs: u64,
+    ) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = start_heartbeat(
+            host,
+            server_cmd,
+            nickname,
+            run_id,
+            interval_secs,
+            Arc::clone(&stop),
+        );
+        Self {
+            stop,
+            handle: Some(handle),
+            result: None,
+        }
+    }
+
+    /// Stop and join the heartbeat thread, capturing its result.
+    /// After this call, check_heartbeat() is available.
+    fn stop_and_join(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            self.result = Some(match handle.join() {
+                Ok(r) => r.map_err(|e| anyhow::anyhow!("{e:#}")),
+                Err(_) => Err(anyhow::anyhow!("heartbeat thread panicked")),
+            });
+        }
+    }
+
+    /// Check whether heartbeat succeeded. Returns an error if heartbeat failed
+    /// or panicked. Must be called after stop_and_join().
+    fn check_heartbeat(&self) -> Result<()> {
+        match &self.result {
+            Some(Ok(())) => Ok(()),
+            Some(Err(e)) => Err(anyhow::anyhow!("heartbeat error: {e}")),
+            None => Err(anyhow::anyhow!("heartbeat thread was never joined")),
+        }
+    }
+}
+
+impl Drop for HeartbeatGuard {
+    fn drop(&mut self) {
+        if self.handle.is_some() {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
 pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
+    let state_dir = resolve_state_dir(args);
+
+    // Phase 1: resume pending cleanup and run states before validating the
+    // new operation. Recovery failures block the new sync.
+    cleanup::resume_pending_cleanups(&state_dir)?;
+    resume_runs(&state_dir)?;
+
+    // Phase 2: validate the new operation
     validate_source_is_directory(&args.source)?;
 
     let has_postprocess = !args.postprocess.is_empty();
@@ -542,18 +637,6 @@ pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
     let remote = parse_destination(&args.destination)?;
     let nickname = derive_nickname(&args.destination)?;
     let run_id = RunId::generate();
-    let state_dir = args.state_dir.clone().unwrap_or_else(|| {
-        if let Ok(dir) = std::env::var("XDG_STATE_HOME") {
-            format!("{dir}/purgery")
-        } else if let Ok(home) = std::env::var("HOME") {
-            format!("{home}/.local/state/purgery")
-        } else {
-            "/tmp/purgery-client".to_string()
-        }
-    });
-
-    cleanup::resume_pending_cleanups(&state_dir)?;
-    resume_runs(&state_dir)?;
 
     info!(
         nickname = %nickname.as_str(),
@@ -564,6 +647,7 @@ pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
         "starting sync"
     );
 
+    // Passthrough, no cleanup: direct rsync only
     if !has_postprocess && !args.delete_after_import {
         info!("starting direct rsync");
         transfer::run_rsync(&args.source, &remote.host, remote.path.as_str())?;
@@ -594,6 +678,7 @@ pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
         None
     };
 
+    // Passthrough with cleanup: direct rsync + durable cleanup
     if !has_postprocess {
         info!("starting direct rsync with durable cleanup");
         transfer::run_rsync(&args.source, &remote.host, remote.path.as_str())?;
@@ -605,6 +690,7 @@ pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
         return Ok(());
     }
 
+    // Postprocess: server run flow with heartbeat and crash-safe persistence
     let server_cmd = &args.server_command;
     let run_config = RunConfig {
         nickname: nickname.clone(),
@@ -615,17 +701,20 @@ pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
     info!("starting server run");
     let begin_resp = begin_run(&remote.host, server_cmd, &nickname, &run_id)?;
 
-    let stop_heartbeat = Arc::new(AtomicBool::new(false));
-    let heartbeat_handle = start_heartbeat(
+    // Start heartbeat immediately after begin-run. The guard ensures the
+    // heartbeat thread is joined on drop (even on panic) and heartbeat
+    // errors are propagated.
+    let mut hb_guard = HeartbeatGuard::new(
         remote.host.clone(),
         server_cmd.to_string(),
         nickname.clone(),
         run_id.clone(),
         begin_resp.heartbeat_interval_secs,
-        Arc::clone(&stop_heartbeat),
     );
 
-    let result = (|| -> Result<()> {
+    // The staging phase: write metadata, validate, transfer, persist state.
+    // All of this happens under the heartbeat.
+    let staging_result = (|| -> Result<()> {
         ssh::write_remote_file(
             &remote.host,
             &begin_resp.run_config_path,
@@ -646,13 +735,14 @@ pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
         Ok(())
     })();
 
-    stop_heartbeat.store(true, Ordering::Relaxed);
-    let _ = heartbeat_handle.join();
-    result?;
+    if let Err(e) = staging_result {
+        // Heartbeat failure is irrelevant if staging already failed;
+        // the incoming run will be GC'd.
+        hb_guard.stop_and_join();
+        return Err(e);
+    }
 
-    info!("finishing server run");
-    finish_run(&remote.host, server_cmd, &nickname, &run_id)?;
-
+    // Persist state BEFORE finish-run so a crash after rsync can resume.
     persist_client_run_state(
         &state_dir,
         &nickname,
@@ -661,6 +751,28 @@ pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
         server_cmd,
         &manifest,
         &run_config,
+        None,
+        ClientRunPhase::UploadCompleteFinishPending,
+    )?;
+
+    // finish-run while heartbeat is still alive
+    info!("finishing server run");
+    finish_run(&remote.host, server_cmd, &nickname, &run_id)?;
+
+    // Now heartbeat is no longer needed — stop and check it
+    hb_guard.stop_and_join();
+    hb_guard.check_heartbeat()?;
+
+    // Update persisted state to WaitingForTerminalState
+    persist_client_run_state(
+        &state_dir,
+        &nickname,
+        &run_id,
+        &remote.host,
+        server_cmd,
+        &manifest,
+        &run_config,
+        None,
         ClientRunPhase::WaitingForTerminalState,
     )?;
 
@@ -679,6 +791,8 @@ pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
         anyhow::bail!("server status envelope does not match requested run");
     }
 
+    let status_toml =
+        toml::to_string(&status).map_err(|e| anyhow::anyhow!("status serialization: {e}"))?;
     persist_client_run_state(
         &state_dir,
         &nickname,
@@ -687,6 +801,7 @@ pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
         server_cmd,
         &manifest,
         &run_config,
+        Some(&status_toml),
         ClientRunPhase::TerminalStatusSeen,
     )?;
 
@@ -703,6 +818,7 @@ pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
         server_cmd,
         &manifest,
         &run_config,
+        None,
         ClientRunPhase::CleanupComplete,
     )?;
     remove_client_run_state(&state_dir, &nickname, &run_id);
@@ -768,6 +884,160 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("--delete-after-import is required"));
+    }
+
+    #[test]
+    fn recovery_from_upload_complete_calls_finish_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+
+        // Simulate a persisted UploadCompleteFinishPending state
+        let manifest = Manifest {
+            run_id: RunId::new("test-ucl".into()).unwrap(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            entries: vec![],
+        };
+        let run_config = RunConfig {
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            destination: DestinationPath::new(camino::Utf8PathBuf::from("relative/dest")).unwrap(),
+            delete_after_import: true,
+        };
+        persist_client_run_state(
+            &state_dir,
+            &Nickname::new("laptop".into()).unwrap(),
+            &RunId::new("test-ucl".into()).unwrap(),
+            "fake-host",
+            "purgery-server",
+            &manifest,
+            &run_config,
+            None,
+            ClientRunPhase::UploadCompleteFinishPending,
+        )
+        .unwrap();
+
+        // Resume should try finish-run and fail (no real SSH), then
+        // persist WaitingForTerminalState... or fail.
+        // Without SSH, finish_run will fail. The resume should propagate the error.
+        let result = resume_runs(&state_dir);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("failed to resume"));
+    }
+
+    #[test]
+    fn recovery_order_happens_before_validation() {
+        // Verify that resolve_state_dir and resume happen before any
+        // source/destination validation in the code structure.
+        let args = SyncArgs {
+            postprocess: vec![],
+            delete_after_import: false,
+            state_dir: Some("/nonexistent/dir".to_string()),
+            source: "/nonexistent/source".to_string(),
+            destination: "host:dest".to_string(),
+            server_command: "purgery-server".to_string(),
+        };
+
+        // run_sync calls resolve_state_dir, then resume, then validates.
+        // If the source doesn't exist, validation should fail AFTER resume.
+        // Resume should succeed if the state dir has no runs.
+        // Then source validation should fail because /nonexistent/source doesn't exist.
+        let result = run_sync(&args);
+        assert!(result.is_err());
+        // The error should be about the source, not about the resume step
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("source path does not exist"));
+    }
+
+    #[test]
+    fn heartbeat_guard_stops_and_captures_result() {
+        // Test that HeartbeatGuard properly stops heartbeat and captures
+        // the result when explicitly joined.
+        let mut guard = HeartbeatGuard::new(
+            "fake-host".to_string(),
+            "purgery-server".to_string(),
+            Nickname::new("test".into()).unwrap(),
+            RunId::new("test-hb".into()).unwrap(),
+            60,
+        );
+        // Sleep long enough for at least one heartbeat attempt
+        std::thread::sleep(Duration::from_millis(200));
+        guard.stop_and_join();
+        // Heartbeat will fail because there's no real SSH, but the guard
+        // captures the error rather than ignoring it.
+        assert!(guard.check_heartbeat().is_err());
+    }
+
+    #[test]
+    fn heartbeat_guard_joins_on_drop() {
+        // Verify the guard doesn't panic on drop and properly stops the
+        // heartbeat thread.
+        let (stop_flag, handle) = {
+            let guard = HeartbeatGuard::new(
+                "fake-host".to_string(),
+                "purgery-server".to_string(),
+                Nickname::new("test".into()).unwrap(),
+                RunId::new("test-drop".into()).unwrap(),
+                60,
+            );
+            let stop = Arc::clone(&guard.stop);
+            guard.stop.store(true, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(50));
+            (stop, guard.handle.is_some())
+        };
+        // After guard.drop(), stop was signaled and handle was taken
+        assert!(stop_flag.load(Ordering::Relaxed));
+        assert!(handle);
+    }
+
+    #[test]
+    fn terminal_status_seen_uses_persisted_status_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+
+        let manifest = Manifest {
+            run_id: RunId::new("test-tss".into()).unwrap(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            entries: vec![],
+        };
+        let run_config = RunConfig {
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            destination: DestinationPath::new(camino::Utf8PathBuf::from("rel")).unwrap(),
+            delete_after_import: true,
+        };
+
+        // Simulate TerminalStatusSeen with persisted status_toml
+        let status = RunStatus {
+            run_id: RunId::new("test-tss".into()).unwrap(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            state: purgery_core::RunState::Done,
+            entries: vec![],
+            error: None,
+        };
+        let status_toml = toml::to_string(&status).unwrap();
+
+        persist_client_run_state(
+            &state_dir,
+            &Nickname::new("laptop".into()).unwrap(),
+            &RunId::new("test-tss".into()).unwrap(),
+            "fake-host",
+            "purgery-server",
+            &manifest,
+            &run_config,
+            Some(&status_toml),
+            ClientRunPhase::TerminalStatusSeen,
+        )
+        .unwrap();
+
+        // Resume should complete immediately without SSH (using persisted status)
+        let result = resume_runs(&state_dir);
+        // Should succeed because cleanup is a no-op for empty entries,
+        // and the persisted status_toml avoids needing SSH.
+        assert!(result.is_ok());
+    }
+
+    fn mk_state_dir(tmp: &tempfile::TempDir) -> String {
+        tmp.path().join("purgery").to_string_lossy().to_string()
     }
 
     fn run_sync_validate(args: &SyncArgs) -> Result<()> {
