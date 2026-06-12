@@ -980,6 +980,11 @@ path = "/universe/synced"
 "#;
         let result = crate::ServerConfig::from_toml(toml);
         assert!(result.is_err(), "empty root name must be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("empty") || err_msg.contains("root name"),
+            "error must mention empty name or root name, got: {err_msg}"
+        );
     }
 
     #[test]
@@ -994,6 +999,11 @@ path = "/universe/synced"
 "#;
         let result = crate::ServerConfig::from_toml(toml);
         assert!(result.is_err(), "root name with slash must be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("invalid character") || err_msg.contains("root name"),
+            "error must mention invalid character or root name, got: {err_msg}"
+        );
     }
 
     #[test]
@@ -1008,6 +1018,11 @@ path = "relative/path"
 "#;
         let result = crate::ServerConfig::from_toml(toml);
         assert!(result.is_err(), "relative root path must be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("absolute") || err_msg.contains("not absolute"),
+            "error must mention non-absolute path, got: {err_msg}"
+        );
     }
 
     #[test]
@@ -1036,6 +1051,13 @@ work_dir = "/var/lib/purgery/work"
         assert!(
             result.is_err(),
             "top-level 'root = ' must be rejected; use [[root]]"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("[[root]]")
+                || err_msg.contains("named root")
+                || err_msg.contains("root"),
+            "error must reference named-root format, got: {err_msg}"
         );
     }
 

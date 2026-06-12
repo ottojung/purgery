@@ -7205,4 +7205,175 @@ steps = ["copy-cmd"]
         ];
         assert_root_contains_exactly(server_root.as_path(), &expected);
     }
+
+    // ── Issue #26 xfail: resolve_destinations with named roots ──────────
+
+    #[test]
+    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
+    fn xfail_issue_26_resolve_destinations_no_nickname_in_passthrough() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir, &server_root);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_config = purgery_core::RunConfig {
+            nickname: nickname.clone(),
+            sync: vec![purgery_core::RunConfigSync {
+                name: purgery_core::SyncName::new("videos".into()).unwrap(),
+                to_path: purgery_core::RelativeDestinationPath::new("univ/videos".into()).unwrap(),
+                delete_after_import: true,
+            }],
+            postprocess: purgery_core::ClientPostprocessConfig::default(),
+        };
+        let result = resolve_destinations(&config, &nickname, &run_config).unwrap();
+        let parsed: purgery_core::ResolveDestinationsResponse = toml::from_str(&result).unwrap();
+        assert_eq!(parsed.destinations.len(), 1);
+        assert_eq!(parsed.destinations[0].sync_name, "videos");
+        assert!(
+            !parsed.destinations[0].passthrough_dest.contains("laptop"),
+            "passthrough_dest must not contain nickname: {}",
+            parsed.destinations[0].passthrough_dest
+        );
+        assert_eq!(
+            parsed.destinations[0].passthrough_dest,
+            format!("{}/videos", server_root.as_str())
+        );
+    }
+
+    #[test]
+    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
+    fn xfail_issue_26_resolve_destinations_root_only_to() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir, &server_root);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_config = purgery_core::RunConfig {
+            nickname: nickname.clone(),
+            sync: vec![purgery_core::RunConfigSync {
+                name: purgery_core::SyncName::new("system".into()).unwrap(),
+                to_path: purgery_core::RelativeDestinationPath::new("system".into()).unwrap(),
+                delete_after_import: true,
+            }],
+            postprocess: purgery_core::ClientPostprocessConfig::default(),
+        };
+        let result = resolve_destinations(&config, &nickname, &run_config).unwrap();
+        let parsed: purgery_core::ResolveDestinationsResponse = toml::from_str(&result).unwrap();
+        assert_eq!(parsed.destinations.len(), 1);
+        assert_eq!(parsed.destinations[0].sync_name, "system");
+        assert!(
+            !parsed.destinations[0].passthrough_dest.contains("laptop"),
+            "passthrough_dest must not contain nickname: {}",
+            parsed.destinations[0].passthrough_dest
+        );
+        assert_eq!(
+            parsed.destinations[0].passthrough_dest,
+            server_root.as_str()
+        );
+    }
+
+    #[test]
+    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
+    fn xfail_issue_26_prepare_run_no_nickname_in_destinations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir, &server_root);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("test-run-xfail-p".into()).unwrap();
+
+        let incoming_path = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Incoming);
+        fs::create_dir_all(incoming_path.join("files")).unwrap();
+
+        write_run_toml_with_sync(&incoming_path, &nickname, "videos", "univ/videos");
+
+        let manifest = purgery_core::Manifest {
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![purgery_core::ManifestEntry {
+                sync_name: purgery_core::SyncName::new("videos".into()).unwrap(),
+                local_path: purgery_core::ClientLocalPath::new("/home/user/Videos/a.mp4".into())
+                    .unwrap(),
+                staged_path: purgery_core::NormalizedRelativePath::new("files/videos/a.mp4".into())
+                    .unwrap(),
+                relative_path: purgery_core::NormalizedRelativePath::new("a.mp4".into()).unwrap(),
+                kind: purgery_core::ManifestEntryKind::RegularFile,
+                size: 100,
+                mtime_ns: 1_000_000,
+                sha256: None,
+                link_target: None,
+                mode: purgery_core::ManifestEntryMode::Passthrough,
+                postprocess_steps: Vec::new(),
+                covered_by: None,
+            }],
+        };
+        fs::write(
+            incoming_path.join("manifest.toml"),
+            manifest.to_toml().unwrap(),
+        )
+        .unwrap();
+
+        let result = prepare_run(&config, &nickname, &run_id).unwrap();
+        let parsed: purgery_core::PrepareRunResponse = toml::from_str(&result).unwrap();
+
+        assert_eq!(parsed.destinations.len(), 1);
+        let dest = &parsed.destinations[0];
+        assert_eq!(dest.sync_name, "videos");
+        assert!(
+            !dest.passthrough_dest.contains("laptop"),
+            "passthrough_dest must not contain nickname: {}",
+            dest.passthrough_dest
+        );
+        assert_eq!(
+            dest.passthrough_dest,
+            format!("{}/videos", server_root.as_str())
+        );
+        assert!(
+            dest.purgatory_dest.contains("files/univ/videos"),
+            "purgatory_dest must use root-qualified path files/<root>/<sub>, got: {}",
+            dest.purgatory_dest
+        );
+    }
+
+    #[test]
+    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
+    fn xfail_issue_26_full_pipeline_status_final_paths_root_qualified() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("test-run-xfail-fp".into()).unwrap();
+
+        let (config, _staged_file_path) = setup_single_file_ready(
+            &work_dir,
+            &server_root,
+            &nickname,
+            &run_id,
+            "videos",
+            "univ/videos",
+            "files/videos/test.mp4",
+            b"hello world",
+        );
+
+        process_run(&config, &nickname, &run_id).unwrap();
+
+        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
+        let status_content = fs::read_to_string(done_path.join("status.toml")).unwrap();
+        let status = purgery_core::RunStatus::from_toml(&status_content).unwrap();
+        assert_eq!(status.entries.len(), 1);
+        assert!(!status.entries[0].final_paths.is_empty());
+        for fp in &status.entries[0].final_paths {
+            assert!(
+                !fp.contains("laptop"),
+                "final_paths must not contain nickname: {fp}"
+            );
+        }
+        assert_eq!(
+            status.entries[0].final_paths,
+            vec!["univ/videos/test.mp4"],
+            "final_paths must be root-qualified relative paths"
+        );
+    }
 }

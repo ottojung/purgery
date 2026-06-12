@@ -2784,4 +2784,84 @@ delete_after_import = true
         assert_eq!(d.root_name.as_str(), "system");
         assert!(d.path_under_root.is_none());
     }
+
+    // ── Issue #26 xfail: production ClientConfig semantic parse ─────
+
+    #[test]
+    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
+    fn xfail_issue_26_parse_example_client_config_semantic_parse() {
+        let toml = include_str!("../../../examples/client.toml");
+        let config = ClientConfig::from_toml(toml).unwrap();
+        assert_eq!(config.sync.len(), 2);
+        let dest0 = ClientDest::parse(config.sync[0].to_path.as_str()).unwrap();
+        assert_eq!(dest0.root_name.as_str(), "univ");
+        assert_eq!(dest0.path_under_root.unwrap().as_str(), "videos");
+        let dest1 = ClientDest::parse(config.sync[1].to_path.as_str()).unwrap();
+        assert_eq!(dest1.root_name.as_str(), "univ");
+        assert_eq!(dest1.path_under_root.unwrap().as_str(), "pictures");
+    }
+
+    // ── Issue #26 xfail: production to-path validation ──────────────
+
+    #[test]
+    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
+    fn xfail_issue_26_client_config_rejects_to_double_slash() {
+        let toml = r#"
+nickname = "laptop"
+state_dir = "/var/lib/purgery"
+
+[server]
+host = "example.com"
+
+[[sync]]
+name = "videos"
+from = "/home/user/Videos"
+to = "univ//videos"
+"#;
+        let result = ClientConfig::from_toml(toml);
+        assert!(result.is_err(), "to with // must be rejected");
+    }
+
+    #[test]
+    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
+    fn xfail_issue_26_client_config_rejects_to_dot() {
+        let toml = r#"
+nickname = "laptop"
+state_dir = "/var/lib/purgery"
+
+[server]
+host = "example.com"
+
+[[sync]]
+name = "videos"
+from = "/home/user/Videos"
+to = "."
+"#;
+        let result = ClientConfig::from_toml(toml);
+        assert!(result.is_err(), "to='.' must be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("dot") || err_msg.contains("invalid to"),
+            "error must indicate to='.' is not a valid destination, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
+    fn xfail_issue_26_client_config_rejects_to_dot_slash() {
+        let toml = r#"
+nickname = "laptop"
+state_dir = "/var/lib/purgery"
+
+[server]
+host = "example.com"
+
+[[sync]]
+name = "videos"
+from = "/home/user/Videos"
+to = "./univ/videos"
+"#;
+        let result = ClientConfig::from_toml(toml);
+        assert!(result.is_err(), "to='./univ/videos' must be rejected");
+    }
 }
