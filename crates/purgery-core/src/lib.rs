@@ -1,3 +1,6 @@
+#[cfg(not(unix))]
+compile_error!("Purgery is Unix-only — it requires rsync, SSH, and Unix filesystem semantics");
+
 use camino::{Utf8Path, Utf8PathBuf};
 use std::io;
 use thiserror::Error;
@@ -174,10 +177,26 @@ pub fn resolve_executable(program: &str) -> Result<ResolvedExecutable, Executabl
 
 // ── Build Rsync Args ────────────────────────────────────────────────
 
+/// Build rsync arguments for Purgery transfers.
+///
+/// Includes `--partial` so interrupted transfers can resume without
+/// re-transferring already-received data. Includes `--inplace` so rsync
+/// writes directly to the destination file path rather than creating a
+/// temporary sibling file and renaming into place — this keeps final `root`
+/// free of non-final helper paths. Includes `--mkpath` so rsync creates
+/// destination directories as needed — Purgery does not eagerly create final
+/// archive directory skeletons before a transfer begins.
+///
+/// A partially transferred file at an exact final path is the actual file
+/// being transferred — it is not an operational helper path. The output-only
+/// final destination invariant forbids non-final scaffold paths under `root`,
+/// not partial contents at exact final paths.
 pub fn build_rsync_args(source: &str, destination: &str) -> Vec<String> {
     vec![
         "--recursive".to_string(),
         "--partial".to_string(),
+        "--inplace".to_string(),
+        "--mkpath".to_string(),
         "--archive".to_string(),
         "--no-inc-recursive".to_string(),
         "--protect-args".to_string(),
@@ -185,6 +204,15 @@ pub fn build_rsync_args(source: &str, destination: &str) -> Vec<String> {
         format!("{}/", source),
         destination.to_string(),
     ]
+}
+
+/// Build rsync args for purgatory (staging) transfers.
+///
+/// Delegates to `build_rsync_args`, which always includes `--partial`,
+/// `--inplace`, and `--mkpath`. This function exists to support call sites
+/// that explicitly name the purgatory transfer path for readability.
+pub fn build_purgatory_rsync_args(source: &str, destination: &str) -> Vec<String> {
+    build_rsync_args(source, destination)
 }
 
 /// Insert an rsync option argument before the `--` operand separator.
@@ -211,14 +239,6 @@ pub fn work_dir(purgery_root: &PurgeryRoot, nickname: &Nickname, run_id: &RunId)
     purgery_root
         .run_dir(nickname, run_id, RunPhase::Processing)
         .join("work")
-}
-
-pub fn commit_temp_path(final_path: &Utf8Path, run_id: &RunId) -> Utf8PathBuf {
-    let filename = final_path.file_name().unwrap_or("unknown");
-    let tmp_name = format!(".purgery-commit.{}.{}.tmp", run_id.as_str(), filename);
-    final_path
-        .parent()
-        .map_or_else(|| Utf8PathBuf::from(&tmp_name), |p| p.join(&tmp_name))
 }
 
 // ── Envelope Validation ─────────────────────────────────────────────
@@ -1527,6 +1547,8 @@ files = []
             vec![
                 "--recursive",
                 "--partial",
+                "--inplace",
+                "--mkpath",
                 "--archive",
                 "--no-inc-recursive",
                 "--protect-args",
@@ -1538,6 +1560,24 @@ files = []
     }
 
     #[test]
+    fn build_rsync_args_includes_partial() {
+        let args = build_rsync_args("/src", "host:/dst");
+        assert!(args.contains(&"--partial".to_string()));
+    }
+
+    #[test]
+    fn build_rsync_args_includes_inplace() {
+        let args = build_rsync_args("/src", "host:/dst");
+        assert!(args.contains(&"--inplace".to_string()));
+    }
+
+    #[test]
+    fn build_rsync_args_includes_mkpath() {
+        let args = build_rsync_args("/src", "host:/dst");
+        assert!(args.contains(&"--mkpath".to_string()));
+    }
+
+    #[test]
     fn build_rsync_args_includes_protect_args() {
         let args = build_rsync_args("/src", "host:/dst");
         assert!(args.contains(&"--protect-args".to_string()));
@@ -1546,7 +1586,9 @@ files = []
     #[test]
     fn build_rsync_args_with_spaces_in_source() {
         let args = build_rsync_args("/home/user/My Videos", "host:/dst");
-        assert_eq!(args[6], "/home/user/My Videos/");
+        // Source is the last path operand, after the -- separator
+        let dashdash_pos = args.iter().position(|a| a == "--").unwrap();
+        assert_eq!(args[dashdash_pos + 1], "/home/user/My Videos/");
     }
 
     #[test]
@@ -1692,27 +1734,6 @@ files = []
         let result = check_symlink_in_path(&final_path, &root);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("symlink detected"));
-    }
-
-    // ── Commit temp path tests ──
-
-    #[test]
-    fn commit_temp_path_basic() {
-        let final_path = Utf8Path::new("/data/laptop/videos/a.mp4");
-        let run_id = RunId::new("01ARZ3NDEKTSV4RRFFQ69G5FAV".into()).unwrap();
-        let tmp = commit_temp_path(final_path, &run_id);
-        assert_eq!(
-            tmp.as_str(),
-            "/data/laptop/videos/.purgery-commit.01ARZ3NDEKTSV4RRFFQ69G5FAV.a.mp4.tmp"
-        );
-    }
-
-    #[test]
-    fn commit_temp_path_same_filesystem_as_parent() {
-        let final_path = Utf8Path::new("/root/sub/file.txt");
-        let run_id = RunId::new("run-1".into()).unwrap();
-        let tmp = commit_temp_path(final_path, &run_id);
-        assert_eq!(tmp.parent(), final_path.parent());
     }
 
     // ── Work Dir tests ──

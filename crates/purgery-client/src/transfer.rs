@@ -8,7 +8,8 @@ use crate::ssh::{server_cmd, server_cmd_with_stdin, write_remote_file};
 use anyhow::{Context, Result};
 use camino::Utf8Path;
 use purgery_core::{
-    build_rsync_args, BeginRunResponse, ClientConfig, ClientRunPhase, Manifest, RunId,
+    build_purgatory_rsync_args, build_rsync_args, BeginRunResponse, ClientConfig, ClientRunPhase,
+    Manifest, RunId,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -636,7 +637,7 @@ pub(crate) fn run_postprocess_path(
                     mode = "purgatory",
                     "purgatory rsync started"
                 );
-                let mut pg_args = build_rsync_args(from_path, &purgatory_rsync_dest);
+                let mut pg_args = build_purgatory_rsync_args(from_path, &purgatory_rsync_dest);
                 let pg_filter_arg = format!("--filter=merge {}", purgatory_file.as_str());
                 purgery_core::insert_rsync_option_before_operands(&mut pg_args, pg_filter_arg)
                     .map_err(|e| anyhow::anyhow!("failed to insert purgatory filter arg: {e}"))?;

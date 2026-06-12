@@ -69,9 +69,12 @@ pub fn apply_postprocessing_with_heartbeat(
                     &step.step_name,
                 ));
 
-                // Use spawn + try_wait loop for heartbeat, not blocking .status()
+                // Run with cwd set to the work-area parent so that relative-path
+                // outputs land inside the work area, not in an arbitrary
+                // inherited server cwd.
                 let mut child = std::process::Command::new(&step_def.program)
                     .args(&args)
+                    .current_dir(work_parent)
                     .spawn()
                     .map_err(|e| format!("failed to spawn {}: {e}", step.step_name))?;
 

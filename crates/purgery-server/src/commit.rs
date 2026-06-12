@@ -8,7 +8,7 @@ pub(crate) enum CommitDisposition {
     Replaced,
 }
 
-pub(crate) fn remove_destination_for_non_directory(
+pub(crate) fn prepare_destination_for_file_or_symlink(
     final_path: &Utf8Path,
 ) -> Result<CommitDisposition, String> {
     match fs::symlink_metadata(final_path.as_std_path()) {
@@ -26,17 +26,6 @@ pub(crate) fn remove_destination_for_non_directory(
             Ok(CommitDisposition::Created)
         }
         Err(error) => Err(format!("failed to inspect final destination: {error}")),
-    }
-}
-
-pub(crate) fn remove_stale_temp(temp_path: &Utf8Path) -> Result<(), String> {
-    match fs::symlink_metadata(temp_path.as_std_path()) {
-        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(temp_path.as_std_path())
-            .map_err(|error| format!("failed to remove stale temporary directory: {error}")),
-        Ok(_) => fs::remove_file(temp_path.as_std_path())
-            .map_err(|error| format!("failed to remove stale temporary entry: {error}")),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("failed to inspect temporary entry: {error}")),
     }
 }
 
@@ -107,42 +96,25 @@ pub(crate) fn commit_regular_file_entry(
     source: &Utf8Path,
     final_path: &Utf8Path,
     root: &Utf8Path,
-    run_id: &purgery_core::RunId,
+    _run_id: &purgery_core::RunId,
 ) -> Result<CommitDisposition, String> {
     ensure_final_parent(final_path, root)?;
-    let disposition = remove_destination_for_non_directory(final_path)?;
-    let temp_path = purgery_core::commit_temp_path(final_path, run_id);
-    remove_stale_temp(&temp_path)?;
-    fs::copy(source.as_std_path(), temp_path.as_std_path())
-        .map_err(|error| format!("failed to copy regular file to temporary path: {error}"))?;
-    if let Err(error) = fs::rename(temp_path.as_std_path(), final_path.as_std_path()) {
-        let _ = fs::remove_file(temp_path.as_std_path());
-        return Err(format!("failed to commit regular file: {error}"));
-    }
+    let disposition = prepare_destination_for_file_or_symlink(final_path)?;
+    fs::rename(source.as_std_path(), final_path.as_std_path())
+        .map_err(|error| format!("failed to materialize regular file: {error}"))?;
     Ok(disposition)
 }
 
-#[cfg(unix)]
-fn create_symlink(target: &Utf8Path, link: &Utf8Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(target.as_std_path(), link.as_std_path())
-}
-
 pub(crate) fn commit_symlink_entry(
-    target: &Utf8Path,
+    source: &Utf8Path,
     final_path: &Utf8Path,
     root: &Utf8Path,
-    run_id: &purgery_core::RunId,
+    _run_id: &purgery_core::RunId,
 ) -> Result<CommitDisposition, String> {
     ensure_final_parent(final_path, root)?;
-    let disposition = remove_destination_for_non_directory(final_path)?;
-    let temp_path = purgery_core::commit_temp_path(final_path, run_id);
-    remove_stale_temp(&temp_path)?;
-    create_symlink(target, &temp_path)
-        .map_err(|error| format!("failed to create temporary symlink: {error}"))?;
-    if let Err(error) = fs::rename(temp_path.as_std_path(), final_path.as_std_path()) {
-        let _ = fs::remove_file(temp_path.as_std_path());
-        return Err(format!("failed to commit symlink: {error}"));
-    }
+    let disposition = prepare_destination_for_file_or_symlink(final_path)?;
+    fs::rename(source.as_std_path(), final_path.as_std_path())
+        .map_err(|error| format!("failed to materialize symlink: {error}"))?;
     Ok(disposition)
 }
 
@@ -184,11 +156,7 @@ pub(crate) fn commit_directory_tree(
         } else if meta.file_type().is_file() {
             commit_regular_file_entry(source_entry, final_entry, server_root, run_id)?;
         } else if meta.file_type().is_symlink() {
-            let target = fs::read_link(source_entry.as_std_path())
-                .map_err(|e| format!("failed to read output symlink target: {e}"))?;
-            let target_utf8 = Utf8PathBuf::from_path_buf(target)
-                .unwrap_or_else(|p| Utf8PathBuf::from(p.to_string_lossy().as_ref()));
-            commit_symlink_entry(&target_utf8, final_entry, server_root, run_id)?;
+            commit_symlink_entry(source_entry, final_entry, server_root, run_id)?;
         } else {
             return Err(format!(
                 "unsupported output entry type: {}",
@@ -196,6 +164,18 @@ pub(crate) fn commit_directory_tree(
             ));
         }
     }
+
+    // Remove empty source directories bottom-up.
+    for entry in WalkDir::new(source_root.as_std_path())
+        .min_depth(1)
+        .contents_first(true)
+    {
+        let entry = entry.map_err(|e| format!("failed to walk source directory: {e}"))?;
+        if entry.file_type().is_dir() {
+            let _ = fs::remove_dir(entry.path());
+        }
+    }
+    let _ = fs::remove_dir(source_root.as_std_path());
 
     Ok(root_disp)
 }
@@ -213,11 +193,7 @@ pub(crate) fn commit_output_entry(
     } else if meta.file_type().is_file() {
         commit_regular_file_entry(source, final_path, server_root, run_id)
     } else if meta.file_type().is_symlink() {
-        let target = fs::read_link(source.as_std_path())
-            .map_err(|e| format!("failed to read output symlink target: {e}"))?;
-        let target_utf8 = Utf8PathBuf::from_path_buf(target)
-            .unwrap_or_else(|p| Utf8PathBuf::from(p.to_string_lossy().as_ref()));
-        commit_symlink_entry(&target_utf8, final_path, server_root, run_id)
+        commit_symlink_entry(source, final_path, server_root, run_id)
     } else {
         Err(format!(
             "unsupported output entry type: {}",
