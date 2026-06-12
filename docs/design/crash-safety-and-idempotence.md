@@ -129,13 +129,13 @@ The client verifies local identity against the cleanup state before removing. En
 
 Uploading the same logical tree again replays the same directory, regular-file, and symlink entries. The server keeps no deduplication database. Existing directories are retained and merged, regular files and symlinks are replaced, and unrelated final descendants remain.
 
-Final archive directories are created only as needed for actual materialized entries. Purgery does not eagerly create empty directory skeletons under `root` as run setup. For direct rsync transfers, rsync creates destination paths as needed. For server-side materialization, parent directories are created inline only when an entry is actually being moved to final storage.
+Final archive directories are created only as needed for actual materialized entries. Purgery does not eagerly create empty directory skeletons under any root as run setup. For direct rsync transfers, rsync creates destination paths as needed. For server-side materialization, parent directories are created inline only when an entry is actually being moved to final storage.
 
 With deterministic postprocessing, importing the same input tree repeatedly converges to the same final tree and is a semantic no-op. Non-deterministic postprocessing may produce different regular-file content on a later import; replacing the prior output is allowed.
 
 This property makes crash recovery replay-based to converge from staged or replay source data, rather than all-or-nothing atomic tree transactions.
 
-For direct passthrough transfers (Modes 1 and 2), the client writes to exact final paths in-place. An interrupted transfer may leave a partial file at the exact final path, which is repaired by re-running the transfer. No operational scaffolding appears under `root`.
+For direct passthrough transfers (Modes 1 and 2), the client writes to exact final paths in-place. An interrupted transfer may leave a partial file at the exact final path, which is repaired by re-running the transfer. No operational scaffolding appears under any root.
 
 For purgatory entries (Mode 3), a crash may occur after some entries have been materialized but before `status.toml` is written. The client retains local entries because no success status exists. On restart, the server replays the processing run from the immutable staged files under `processing/<run_id>/files/` and converges on the run's result. The work area is rebuilt from the staged files for each attempt.
 
@@ -150,7 +150,7 @@ symlink work output → rename to final path
 
 Cross-device rename failure is a hard failure. Purgery does not fall back to copying. If rename fails, the entry fails and the run reports a materialization error.
 
-The final destination tree (`root`) is output-only. All staging and intermediate artifacts live under `work_dir`. Work-area copies are consumed after successful materialization. The original staged files under `processing/<run_id>/files/` are never consumed and remain as replay source.
+The final destination trees (named roots) are output-only. All staging and intermediate artifacts live under `work_dir`. Work-area copies are consumed after successful materialization. The original staged files under `processing/<run_id>/files/` are never consumed and remain as replay source.
 
 A source directory replaces a conflicting final file or symlink and then allows descendants to merge. A source regular file or symlink replaces a final file, symlink, or empty directory, but fails rather than deleting a non-empty final directory. Existing ancestors must be real directories; final-storage symlinks are never followed as directory components. Every derived path must remain inside the configured storage root.
 
@@ -282,6 +282,6 @@ For postprocess entries, verified server status remains the authority for local 
 
 ## Tree-overlay recovery guarantee
 
-Purgery provides replayable convergence, not an all-or-nothing tree transaction. A crash may leave some directories, regular files, or symlinks materialized in final storage while later entries remain pending. A crash during a direct passthrough transfer may leave an exact final file path with partial contents — the transfer can resume and converge. A crash during a purgatory move to final storage may leave a partial file at the exact final path; this is acceptable because `status.toml` has not been published and `process-once` replays the run from staged files, overwriting any partial remnants. Non-final operational paths under `root` are still forbidden — only exact final user-data paths may appear there, even if their contents are partial. Until every manifest entry completes, `status.toml` is not published and the run remains recoverable in `processing/`. Directory merge, regular-file replacement, and symlink replacement are idempotent, so replay converges while preserving unrelated final descendants.
+Purgery provides replayable convergence, not an all-or-nothing tree transaction. A crash may leave some directories, regular files, or symlinks materialized in final storage while later entries remain pending. A crash during a direct passthrough transfer may leave an exact final file path with partial contents — the transfer can resume and converge. A crash during a purgatory move to final storage may leave a partial file at the exact final path; this is acceptable because `status.toml` has not been published and `process-once` replays the run from staged files, overwriting any partial remnants. Non-final operational paths under any root are still forbidden — only exact final user-data paths may appear there, even if their contents are partial. Until every manifest entry completes, `status.toml` is not published and the run remains recoverable in `processing/`. Directory merge, regular-file replacement, and symlink replacement are idempotent, so replay converges while preserving unrelated final descendants.
 
 Per-entry materialization is crash-safe and replay-safe. A terminal success status is published only after the complete manifest has been processed.

@@ -7,13 +7,13 @@ host = "example.com"
 [[sync]]
 name = "videos"
 from = "/home/vitalik/Videos"
-to = "videos"
+to = "univ/videos"
 delete_after_import = true
 
 [[sync]]
 name = "pictures"
 from = "/home/vitalik/Pictures"
-to = "pictures"
+to = "univ/pictures"
 delete_after_import = true
 
 [[postprocess.rules]]

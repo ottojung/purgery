@@ -44,7 +44,8 @@ If `--config` is omitted, the client looks for config at `$PURGERY_CLIENT_CONFIG
 | Term | Meaning |
 |------|---------|
 | **Source tree** | A local directory whose contents you want to import (e.g., `/home/user/Videos`) |
-| **Archive** | The central storage location where imported files accumulate (a path on a server) |
+| **Archive** | The central storage location where imported files accumulate (a server directory) |
+| **Named root** | A server-side archive root with a name visible to clients (e.g., `univ = /universe/synced`, `system = /etc/system`) |
 | **Import** | The act of copying or transforming an entry from a source tree into the archive |
 | **Transform** | An optional server-side postprocessing step (e.g., compress, convert, rename) applied during import |
 | **Passthrough import** | Copying an entry directly into the archive without transformation |
@@ -53,7 +54,7 @@ If `--config` is omitted, the client looks for config at `$PURGERY_CLIENT_CONFIG
 
 ---
 
-1. You configure one or more **source trees** on a device and point each to a destination inside the archive.
+1. You configure one or more **source trees** on a device and point each to a destination inside a named archive root.
 2. The client walks each source tree (never following symlinks) and classifies every entry as either **passthrough** (direct copy to archive) or **transformed** (server-side processing required).
 3. If any source tree has transformed entries, the client creates a server run: it uploads a manifest of only the entries needing transformation, validates the plan on the server, and transfers them to a staging area (not the final archive destination).
 4. The server processes transformed entries in the staging area: it prepares work areas from staged files, runs subprocesses there, and only after processing succeeds commits outputs to the final archive destination. If processing fails, no output reaches the archive.
@@ -65,8 +66,15 @@ If `--config` is omitted, the client looks for config at `$PURGERY_CLIENT_CONFIG
 Minimal server config (`server.toml`):
 
 ```toml
-root = "/universe/synced"
-work_dir = "/universe/tmp/purgery"
+work_dir = "/var/lib/purgery/work"
+
+[[root]]
+name = "univ"
+path = "/universe/synced"
+
+[[root]]
+name = "system"
+path = "/etc/system"
 ```
 
 Minimal client config (`client.toml`):
@@ -81,8 +89,17 @@ host = "example.com"
 [[sync]]
 name = "videos"
 from = "/home/user/Videos"
-to = "videos"
+to = "univ/videos"
+
+[[sync]]
+name = "server-configs"
+from = "/home/user/my/server-configs"
+to = "system/server-configs"
 ```
+
+The client sync `to` field references a named root: `to = "univ/videos"` means "place files under the root named `univ`, inside the `videos` subdirectory."
+
+The final archive path for `/home/user/Videos/trips/a.mp4` would be `/universe/synced/videos/trips/a.mp4`. The client nickname is operational metadata and does not appear in final archive paths.
 
 Full config reference: [docs/config.md](docs/config.md)
 
@@ -136,7 +153,6 @@ Purgery targets Unix/POSIX filesystem semantics and is conservative about data l
 - Symlink targets are literal data. The server never follows staged or archive symlinks as directories.
 - Tree imports provide replayable convergence through crash-safe per-entry commits, not an all-or-nothing transaction.
 - Transforms and cleanup apply to all entry kinds: regular files, directories, and symlinks. Client cleanup remains conservative and removes only confirmed unchanged local originals, respecting entry-kind identity checks (symlinks are unlinked without following the target; directories are removed bottom-up only when safe).
-- Overlapping source trees that would produce the same archive path are rejected rather than resolved by ordering.
 
 ## More documentation
 

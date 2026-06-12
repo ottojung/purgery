@@ -35,7 +35,7 @@ If no config is found, Purgery emits a clear error listing every path it checked
 
 **All other operational files and directories** must be specified in the parsed config:
 
-- Server: `root` (final archive) and `work_dir` (all working state)
+- Server: named archive roots (`[[root]]`) and `work_dir` (all working state)
 - Client: `state_dir` (all local state, temp files, cleanup ledgers, rsync filters)
 
 Purgery does not fall back to `$XDG_STATE_HOME`, `$HOME`, `/tmp`, `std::env::temp_dir()`, or any other implicit location for operational state. Every non-config filesystem path comes from a configured value.
@@ -43,8 +43,15 @@ Purgery does not fall back to `$XDG_STATE_HOME`, `$HOME`, `/tmp`, `std::env::tem
 ## Server config
 
 ```toml
-root = "/universe/synced"
-work_dir = "/universe/tmp/purgery"
+work_dir = "/var/lib/purgery/work"
+
+[[root]]
+name = "univ"
+path = "/universe/synced"
+
+[[root]]
+name = "system"
+path = "/etc/system"
 
 [gc]
 incoming_lease_secs = 1800
@@ -64,10 +71,21 @@ keep_original = true
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `root` | yes | Absolute path to final storage root (archive destination) |
-| `work_dir` | yes | Absolute path to Purgery's working/state directory. Contains all non-final server state: incoming runs, ready/processing/done/failed runs, lease files, manifests, status files, postprocess work areas, and temporary files used for atomic writes. No internal work directories are created under `root` |
+| `work_dir` | yes | Absolute path to Purgery's working/state directory. Contains all non-final server state: incoming runs, ready/processing/done/failed runs, lease files, manifests, status files, postprocess work areas, and temporary files used for atomic writes. No internal work directories are created under any root |
+| `[[root]]` | yes (at least one) | Named archive root definitions. Each defines a client-visible name and the absolute filesystem path of the archive root. At least one root is required. Root names must be unique |
 | `gc` | no | GC configuration (see below) |
 | `postprocess` | no | Postprocessing configuration (see below) |
+
+### Named roots
+
+Each `[[root]]` entry defines a named archive root:
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | yes | Client-visible root name. Non-empty, alphanumeric characters plus `-` and `_` only. Must be unique across all roots |
+| `path` | yes | Absolute filesystem path for this archive root |
+
+Root names are used by clients in the `to` field of sync mappings. The first path component of `to` is the root name; the remainder (if any) is the path under that root.
 
 ### Logging config
 
@@ -142,13 +160,13 @@ host = "example.com"
 [[sync]]
 name = "videos"
 from = "/home/user/Videos"
-to = "videos"
+to = "univ/videos"
 delete_after_import = true
 
 [[sync]]
 name = "pictures"
 from = "/home/user/Pictures"
-to = "pictures"
+to = "univ/pictures"
 delete_after_import = true
 
 [[postprocess.rules]]
@@ -160,7 +178,7 @@ steps = ["compress-video"]
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `nickname` | yes | Machine identifier (alphanumeric, hyphens, underscores) |
+| `nickname` | yes | Machine identifier (alphanumeric, hyphens, underscores). Used for leases, work directories, run IDs, logs, and status lookup. Does not appear in final archive paths |
 | `state_dir` | yes | Writable state directory for all client-owned operational state. Must be a non-empty absolute path. Contains cleanup ledgers, temporary filter files, and per-run temp subtrees |
 | `server` | yes | Server connection details |
 | `sync` | `[]` | List of sync mappings |
@@ -179,8 +197,22 @@ steps = ["compress-video"]
 |-------|---------|-------------|
 | `name` | — | Unique sync name |
 | `from` | — | Local source path |
-| `to` | — | Relative destination under `root / nickname` |
+| `to` | — | Destination specifier: `<root-name>` or `<root-name>/<path-under-root>`. The first path component names a server-side archive root; the remainder is the path under that root. For example, `"univ/videos"` means the root named "univ" inside the "videos" subdirectory |
 | `delete_after_import` | `false` | Remove unchanged local originals after confirmed import (regular files by size/mtime/SHA, symlinks by link target, directories bottom-up) |
+
+The `to` field uses this semantic model:
+
+```text
+to = "<root-name>/<path-under-that-root>"
+```
+
+Examples:
+
+- `to = "univ/videos"` — files land under `/universe/synced/videos/`
+- `to = "system"` — files land directly under `/etc/system/`
+- `to = "system/server-configs"` — files land under `/etc/system/server-configs/`
+
+The client nickname is operational metadata and is not part of the final archive path.
 
 ### Postprocess rule
 
@@ -230,7 +262,7 @@ Postprocessing is therefore modeled as import-and-retire: the source entry is up
 [[sync]]
 name = "videos"
 from = "/home/user/Videos"
-to = "videos"
+to = "univ/videos"
 delete_after_import = false
 
 [[postprocess.rules]]
@@ -305,7 +337,7 @@ Patterns are evaluated relative to each sync source root (`sync.from`), not the 
 [[sync]]
 name = "videos"
 from = "/home/user/Videos"
-to = "videos"
+to = "univ/videos"
 
 [[postprocess.rules]]
 match = "**/*.mp4"
@@ -410,7 +442,7 @@ nickname = "laptop"
 
 [[sync]]
 name = "videos"
-to = "videos"
+to = "univ/videos"
 delete_after_import = true
 
 [[postprocess.rules]]

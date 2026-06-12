@@ -530,6 +530,10 @@ mod tests {
 
     #[test]
     fn server_root_final_path() {
+        // Pre-#26: final_path included nickname.
+        // Issue #26: final archive paths must not include the nickname.
+        // Preserved as documentation of the old method signature during
+        // transition; the desired-behavior test is in path.rs.
         let root = ServerRoot::new("/universe/synced".into()).unwrap();
         let nick = Nickname::new("laptop".into()).unwrap();
         let dest = RelativeDestinationPath::new("videos".into()).unwrap();
@@ -1100,6 +1104,7 @@ status = "imported"
     }
 
     #[test]
+    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
     fn parse_status() {
         let toml = r#"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
@@ -1111,7 +1116,7 @@ sync_name = "videos"
 local_path = "/home/vitalik/Videos/a.mp4"
 relative_path = "a.mp4"
 status = "imported"
-final_paths = ["laptop/videos/a.mp4"]
+final_paths = ["univ/videos/a.mp4"]
 postprocess = ["compress-video"]
 
 [[entries]]
@@ -1125,7 +1130,7 @@ error = "compress-video failed"
         assert_eq!(status.state, RunState::Done);
         assert_eq!(status.entries.len(), 2);
         assert_eq!(status.entries[0].status, FileStatus::Imported);
-        assert_eq!(status.entries[0].final_paths, vec!["laptop/videos/a.mp4"]);
+        assert_eq!(status.entries[0].final_paths, vec!["univ/videos/a.mp4"]);
         assert_eq!(status.entries[0].sync_name.as_str(), "videos");
         assert_eq!(status.entries[1].status, FileStatus::Failed);
         assert_eq!(
@@ -1233,6 +1238,7 @@ files = []
     }
 
     #[test]
+    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
     fn status_toml_roundtrip() {
         let status = RunStatus {
             run_id: RunId::new("test-123".into()).unwrap(),
@@ -1244,7 +1250,7 @@ files = []
                 local_path: "/tmp/test.mp4".into(),
                 relative_path: "test.mp4".into(),
                 status: FileStatus::Imported,
-                final_paths: vec!["laptop/videos/test.mp4".into()],
+                final_paths: vec!["univ/videos/test.mp4".into()],
                 postprocess: Some(vec!["compress-video".into()]),
                 error: None,
             }],
@@ -1256,10 +1262,7 @@ files = []
         assert_eq!(parsed.entries.len(), 1);
         assert_eq!(parsed.entries[0].status, FileStatus::Imported);
         assert_eq!(parsed.entries[0].sync_name.as_str(), "videos");
-        assert_eq!(
-            parsed.entries[0].final_paths,
-            vec!["laptop/videos/test.mp4"]
-        );
+        assert_eq!(parsed.entries[0].final_paths, vec!["univ/videos/test.mp4"]);
     }
 
     // ── Envelope validation tests ──
@@ -1768,18 +1771,23 @@ files = []
     // ── Example config parsing tests ──
 
     #[test]
+    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
     fn parse_example_client_config() {
         let toml = include_str!("../../../examples/client.toml");
         let config = ClientConfig::from_toml(toml).unwrap();
         assert_eq!(config.nickname.as_str(), "laptop");
         assert_eq!(config.sync.len(), 2);
+        assert_eq!(config.sync[0].to_path.as_str(), "univ/videos");
+        assert_eq!(config.sync[1].to_path.as_str(), "univ/pictures");
     }
 
     #[test]
+    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
     fn parse_example_server_config() {
         let toml = include_str!("../../../examples/server.toml");
         let config = ServerConfig::from_toml(toml).unwrap();
-        assert_eq!(config.root.as_str(), "/universe/synced");
+        // ServerConfig still has the old `root` field during transition.
+        // After #26 lands, this will use `config.roots`.
         let step = config.postprocess.steps.get("compress-video").unwrap();
         assert_eq!(step.kind, PostprocessKind::Subprocess);
         assert_eq!(step.program, "my-compress-video");
@@ -2676,5 +2684,138 @@ steps = ["pack"]
             response.updated_at_unix_secs, response.observed_at_unix_secs,
             "updated_at and observed_at must be distinct when progress is unavailable"
         );
+    }
+
+    // ── Issue #26: named-root regression tests ────────────────────────
+
+    /// Verify that documentation does not describe nickname
+    /// as part of final archive paths.
+    #[test]
+    fn no_nickname_in_archive_path_example_in_readme() {
+        let readme = include_str!("../../../README.md");
+        let patterns = [
+            "/laptop/videos",
+            "/phone-dump/videos",
+            "/laptop/pictures",
+            "root / nickname",
+        ];
+        for pattern in &patterns {
+            if readme.contains(pattern) {
+                panic!(
+                    "README.md contains a nickname-in-archive-path pattern: {pattern:?}. \
+                     Nicknames must not appear in final archive paths per issue #26."
+                );
+            }
+        }
+    }
+
+    /// Verify that documentation does not describe nickname
+    /// as part of final archive paths in config docs.
+    #[test]
+    fn no_nickname_in_archive_path_example_in_config_docs() {
+        let config_md = include_str!("../../../docs/config.md");
+        let patterns = ["root / nickname", "<nickname>/", "/laptop/videos"];
+        for pattern in &patterns {
+            if config_md.contains(pattern) {
+                panic!("docs/config.md contains a nickname-in-archive-path pattern: {pattern:?}");
+            }
+        }
+    }
+
+    /// Verify that protocol docs do not use nickname in destination examples.
+    #[test]
+    fn no_nickname_in_destination_examples_in_protocol_docs() {
+        let protocol_md = include_str!("../../../docs/protocol.md");
+        // These substring patterns are the old way (nickname in archive paths).
+        let patterns = [
+            "/laptop/videos",
+            "/laptop/pictures",
+            "root/<nickname>",
+            "/universe/synced/laptop",
+        ];
+        for pattern in &patterns {
+            if protocol_md.contains(pattern) {
+                panic!("docs/protocol.md contains a nickname-in-path pattern: {pattern:?}");
+            }
+        }
+    }
+
+    /// Verify that examples do not use `root = "..."` (anonymous root).
+    #[test]
+    fn examples_do_not_use_anonymous_root() {
+        let server_toml = include_str!("../../../examples/server.toml");
+        // The only `root` occurrences should be within `[[root]]`, not `root = "..."`.
+        // A line that starts with "root =" (with optional whitespace) is the old format.
+        for line in server_toml.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("root = \"") {
+                panic!(
+                    "examples/server.toml uses old 'root = \"...\"' format: {line:?}. \
+                     Must use [[root]] per issue #26."
+                );
+            }
+        }
+    }
+
+    // ── Issue #26 xfail: remaining desired-behavior tests ─────────────
+
+    #[test]
+    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
+    fn xfail_issue_26_two_sync_groups_can_target_same_univ_videos() {
+        // Two different sync groups can both to="univ/videos"
+        let toml = r#"
+nickname = "multi-client"
+state_dir = "/var/lib/purgery"
+
+[server]
+host = "example.com"
+
+[[sync]]
+name = "videos-phone"
+from = "/home/phone/Videos"
+to = "univ/videos"
+delete_after_import = true
+
+[[sync]]
+name = "videos-laptop"
+from = "/home/laptop/Videos"
+to = "univ/videos"
+delete_after_import = true
+"#;
+        let config = ClientConfig::from_toml(toml).unwrap();
+        assert_eq!(config.sync.len(), 2);
+        assert_eq!(config.sync[0].to_path.as_str(), "univ/videos");
+        assert_eq!(config.sync[1].to_path.as_str(), "univ/videos");
+    }
+
+    #[test]
+    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
+    fn xfail_issue_26_resolve_destinations_does_not_contain_nickname() {
+        // resolve-destinations response paths must not contain the nickname.
+        let toml = r#"
+protocol_version = 1
+nickname = "laptop"
+
+[[destinations]]
+sync_name = "videos"
+passthrough_dest = "/universe/synced/videos"
+"#;
+        let resp: ResolveDestinationsResponse = toml::from_str(toml).unwrap();
+        for d in &resp.destinations {
+            assert!(
+                !d.passthrough_dest.contains("laptop"),
+                "passthrough_dest must not contain nickname: {}",
+                d.passthrough_dest
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
+    fn xfail_issue_26_sync_name_system_parses_as_root_system_no_subpath() {
+        // to = "system" should parse as root "system" with no subpath
+        let d = ClientDest::parse("system").unwrap();
+        assert_eq!(d.root_name.as_str(), "system");
+        assert!(d.path_under_root.is_none());
     }
 }
