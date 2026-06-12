@@ -4,8 +4,11 @@ use purgery_core::{
     Manifest, Nickname, PrepareRunResponse, RunConfig, RunId, RunStateResponse, RunStatus,
 };
 use std::fs;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
-use tracing::info;
+use tracing::{debug, error, info, warn};
 
 use crate::classify;
 use crate::cleanup;
@@ -106,6 +109,21 @@ fn prepare_run(
         );
     }
     Ok(resp)
+}
+
+fn heartbeat_run(host: &str, server_cmd: &str, nickname: &Nickname, run_id: &RunId) -> Result<()> {
+    ssh::server_cmd(
+        host,
+        server_cmd,
+        &[
+            "heartbeat-run",
+            "--nickname",
+            nickname.as_str(),
+            "--run-id",
+            run_id.as_str(),
+        ],
+    )?;
+    Ok(())
 }
 
 fn finish_run(host: &str, server_cmd: &str, nickname: &Nickname, run_id: &RunId) -> Result<()> {
@@ -232,10 +250,13 @@ fn wait_for_terminal(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn persist_client_run_state(
     state_dir: &str,
     nickname: &Nickname,
     run_id: &RunId,
+    host: &str,
+    server_command: &str,
     manifest: &Manifest,
     run_config: &RunConfig,
     phase: ClientRunPhase,
@@ -244,6 +265,8 @@ fn persist_client_run_state(
         protocol_version: 1,
         nickname: nickname.as_str().to_owned(),
         run_id: run_id.as_str().to_owned(),
+        host: host.to_owned(),
+        server_command: server_command.to_owned(),
         manifest: manifest.to_toml()?,
         run_config: run_config.to_toml()?,
         phase,
@@ -269,7 +292,248 @@ fn remove_client_run_state(state_dir: &str, nickname: &Nickname, run_id: &RunId)
     let _ = fs::remove_dir_all(dir.as_std_path());
 }
 
+/// Start a heartbeat thread that calls heartbeat-run every interval_secs/2.
+/// The thread stops when `stop` is set to true.
+fn start_heartbeat(
+    host: String,
+    server_cmd: String,
+    nickname: Nickname,
+    run_id: RunId,
+    interval_secs: u64,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<Result<()>> {
+    let half_interval = Duration::from_secs(interval_secs.max(1) / 2);
+    std::thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            debug!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                "sending heartbeat"
+            );
+            if let Err(e) = heartbeat_run(&host, &server_cmd, &nickname, &run_id) {
+                error!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    "heartbeat failed: {e}"
+                );
+                return Err(e);
+            }
+            // Sleep in small increments so we can react to stop quickly
+            let sleep_remaining = half_interval;
+            let start = std::time::Instant::now();
+            while start.elapsed() < sleep_remaining && !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        debug!(
+            nickname = %nickname.as_str(),
+            run_id = %run_id.as_str(),
+            "heartbeat stopped"
+        );
+        Ok(())
+    })
+}
+
+// ── Resume logic ───────────────────────────────────────────────────────
+
+fn resume_runs(state_dir: &str) -> Result<()> {
+    let runs_dir = camino::Utf8PathBuf::from(state_dir).join("runs");
+    if !runs_dir.as_std_path().is_dir() {
+        return Ok(());
+    }
+
+    let mut entries: Vec<_> = match fs::read_dir(runs_dir.as_std_path()) {
+        Ok(iter) => iter.filter_map(|e| e.ok()).collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| "failed to read runs directory")?,
+    };
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in entries {
+        let state_path = entry.path().join("state.toml");
+        if !state_path.exists() {
+            continue;
+        }
+        let content = match fs::read_to_string(&state_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let run_state: ClientRunState = match toml::from_str(&content) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("failed to parse client run state {:?}: {e}", state_path);
+                continue;
+            }
+        };
+        let run_dir = entry.path();
+        match resume_one(state_dir, &run_state) {
+            Ok(true) => {
+                let _ = fs::remove_dir_all(&run_dir);
+            }
+            Ok(false) => {
+                info!(
+                    nickname = %run_state.nickname,
+                    run_id = %run_state.run_id,
+                    phase = ?run_state.phase,
+                    "resumed run state, waiting for next iteration"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "failed to resume run {}/{}: {e}",
+                    run_state.nickname, run_state.run_id
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Returns Ok(true) if the run was fully completed (cleanup done, state removed).
+/// Returns Ok(false) if the run has been progressed but not finished.
+fn resume_one(state_dir: &str, state: &ClientRunState) -> Result<bool> {
+    let nickname = Nickname::new(state.nickname.clone())
+        .map_err(|e| anyhow::anyhow!("invalid nickname in persisted state: {e}"))?;
+    let run_id = RunId::new(state.run_id.clone())
+        .map_err(|e| anyhow::anyhow!("invalid run_id in persisted state: {e}"))?;
+    let host = &state.host;
+    let server_cmd = &state.server_command;
+    let manifest: Manifest =
+        toml::from_str(&state.manifest).with_context(|| "failed to parse persisted manifest")?;
+    let run_config: RunConfig = toml::from_str(&state.run_config)
+        .with_context(|| "failed to parse persisted run config")?;
+
+    info!(
+        nickname = %nickname.as_str(),
+        run_id = %run_id.as_str(),
+        phase = ?state.phase,
+        "resuming persisted client run state"
+    );
+
+    match state.phase {
+        ClientRunPhase::UploadCompleteFinishPending => {
+            debug!("calling finish-run idempotently");
+            finish_run(host, server_cmd, &nickname, &run_id)?;
+            persist_client_run_state(
+                state_dir,
+                &nickname,
+                &run_id,
+                host,
+                server_cmd,
+                &manifest,
+                &run_config,
+                ClientRunPhase::WaitingForTerminalState,
+            )?;
+            Ok(false)
+        }
+        ClientRunPhase::WaitingForTerminalState => {
+            debug!("waiting for terminal state");
+            let terminal = wait_for_terminal(host, server_cmd, &nickname, &run_id)?;
+            if terminal.phase == "not_found" {
+                warn!("run not found on server, abandoning");
+                return Ok(true);
+            }
+            let status = read_status(host, server_cmd, &nickname, &run_id)?;
+            if status.nickname != nickname || status.run_id != run_id {
+                anyhow::bail!("server status envelope does not match persisted run");
+            }
+            persist_client_run_state(
+                state_dir,
+                &nickname,
+                &run_id,
+                host,
+                server_cmd,
+                &manifest,
+                &run_config,
+                ClientRunPhase::TerminalStatusSeen,
+            )?;
+            process_cleanup_from_status(
+                state_dir,
+                host,
+                server_cmd,
+                &nickname,
+                &run_id,
+                &manifest,
+                &run_config,
+                &status,
+            )?;
+            Ok(true)
+        }
+        ClientRunPhase::TerminalStatusSeen => {
+            let status = match read_status(host, server_cmd, &nickname, &run_id) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("could not read status for resume: {e}");
+                    return Ok(true);
+                }
+            };
+            process_cleanup_from_status(
+                state_dir,
+                host,
+                server_cmd,
+                &nickname,
+                &run_id,
+                &manifest,
+                &run_config,
+                &status,
+            )?;
+            Ok(true)
+        }
+        ClientRunPhase::CleanupComplete => Ok(true),
+        ClientRunPhase::Abandoned | ClientRunPhase::Corrupt => {
+            warn!("abandoned or corrupt run state, removing");
+            Ok(true)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_cleanup_from_status(
+    state_dir: &str,
+    host: &str,
+    server_cmd: &str,
+    nickname: &Nickname,
+    run_id: &RunId,
+    manifest: &Manifest,
+    run_config: &RunConfig,
+    status: &RunStatus,
+) -> Result<()> {
+    let cleanup_filename = format!("cleanup-{}-{}.toml", nickname.as_str(), run_id.as_str());
+    let cleanup_path = camino::Utf8PathBuf::from(state_dir).join(&cleanup_filename);
+    if cleanup_path.as_std_path().exists() {
+        cleanup::confirm_imports_from_status(&cleanup_path, status)?;
+        cleanup::process_cleanup_state_file(&cleanup_path)?;
+    }
+    persist_client_run_state(
+        state_dir,
+        nickname,
+        run_id,
+        host,
+        server_cmd,
+        manifest,
+        run_config,
+        ClientRunPhase::CleanupComplete,
+    )?;
+    remove_client_run_state(state_dir, nickname, run_id);
+    Ok(())
+}
+
+// ── Main sync entry point ──────────────────────────────────────────────
+
+fn validate_source_is_directory(source: &str) -> Result<()> {
+    let path = Path::new(source);
+    if !path.exists() {
+        anyhow::bail!("source path does not exist: {source}");
+    }
+    if !path.is_dir() {
+        anyhow::bail!("source must be a directory, not a file: {source}");
+    }
+    Ok(())
+}
+
 pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
+    validate_source_is_directory(&args.source)?;
+
     let has_postprocess = !args.postprocess.is_empty();
     if has_postprocess && !args.delete_after_import {
         anyhow::bail!("--delete-after-import is required when --postprocess is used");
@@ -287,7 +551,9 @@ pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
             "/tmp/purgery-client".to_string()
         }
     });
+
     cleanup::resume_pending_cleanups(&state_dir)?;
+    resume_runs(&state_dir)?;
 
     info!(
         nickname = %nickname.as_str(),
@@ -348,43 +614,65 @@ pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
 
     info!("starting server run");
     let begin_resp = begin_run(&remote.host, server_cmd, &nickname, &run_id)?;
-    ssh::write_remote_file(
-        &remote.host,
-        &begin_resp.run_config_path,
-        &run_config.to_toml()?,
-    )?;
-    ssh::write_remote_file(
-        &remote.host,
-        &begin_resp.manifest_path,
-        &manifest.to_toml()?,
-    )?;
 
-    info!("validating server run plan");
-    prepare_run(&remote.host, server_cmd, &nickname, &run_id)?;
+    let stop_heartbeat = Arc::new(AtomicBool::new(false));
+    let heartbeat_handle = start_heartbeat(
+        remote.host.clone(),
+        server_cmd.to_string(),
+        nickname.clone(),
+        run_id.clone(),
+        begin_resp.heartbeat_interval_secs,
+        Arc::clone(&stop_heartbeat),
+    );
 
-    info!("transferring files to server staging");
-    transfer::run_rsync(&args.source, &remote.host, &begin_resp.files_dir)?;
+    let result = (|| -> Result<()> {
+        ssh::write_remote_file(
+            &remote.host,
+            &begin_resp.run_config_path,
+            &run_config.to_toml()?,
+        )?;
+        ssh::write_remote_file(
+            &remote.host,
+            &begin_resp.manifest_path,
+            &manifest.to_toml()?,
+        )?;
 
-    persist_client_run_state(
-        &state_dir,
-        &nickname,
-        &run_id,
-        &manifest,
-        &run_config,
-        ClientRunPhase::UploadCompleteFinishPending,
-    )?;
+        info!("validating server run plan");
+        prepare_run(&remote.host, server_cmd, &nickname, &run_id)?;
+
+        info!("transferring files to server staging");
+        transfer::run_rsync(&args.source, &remote.host, &begin_resp.files_dir)?;
+
+        Ok(())
+    })();
+
+    stop_heartbeat.store(true, Ordering::Relaxed);
+    let _ = heartbeat_handle.join();
+    result?;
+
+    info!("finishing server run");
     finish_run(&remote.host, server_cmd, &nickname, &run_id)?;
+
     persist_client_run_state(
         &state_dir,
         &nickname,
         &run_id,
+        &remote.host,
+        server_cmd,
         &manifest,
         &run_config,
         ClientRunPhase::WaitingForTerminalState,
     )?;
 
     info!("waiting for server processing");
-    wait_for_terminal(&remote.host, server_cmd, &nickname, &run_id)?;
+    let terminal = wait_for_terminal(&remote.host, server_cmd, &nickname, &run_id)?;
+    if terminal.phase == "not_found" {
+        anyhow::bail!(
+            "run {} not found on server after finish-run",
+            run_id.as_str()
+        );
+    }
+
     info!("reading run status");
     let status = read_status(&remote.host, server_cmd, &nickname, &run_id)?;
     if status.nickname != nickname || status.run_id != run_id {
@@ -395,6 +683,8 @@ pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
         &state_dir,
         &nickname,
         &run_id,
+        &remote.host,
+        server_cmd,
         &manifest,
         &run_config,
         ClientRunPhase::TerminalStatusSeen,
@@ -409,6 +699,8 @@ pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
         &state_dir,
         &nickname,
         &run_id,
+        &remote.host,
+        server_cmd,
         &manifest,
         &run_config,
         ClientRunPhase::CleanupComplete,
@@ -418,6 +710,8 @@ pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
     info!(state = %status.state.as_str(), "sync complete");
     Ok(())
 }
+
+// ── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -437,5 +731,50 @@ mod tests {
         assert_eq!(parsed.host, "user@host");
         assert_eq!(parsed.path.as_str(), "relative/dest");
         assert!(!parsed.path.is_absolute());
+    }
+
+    #[test]
+    fn rejects_file_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("single_file.txt");
+        fs::write(&file_path, "content").unwrap();
+        let result = validate_source_is_directory(file_path.to_str().unwrap());
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("must be a directory"));
+    }
+
+    #[test]
+    fn accepts_directory_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(validate_source_is_directory(tmp.path().to_str().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn postprocess_requires_delete_after_import() {
+        let args = SyncArgs {
+            postprocess: vec!["compress".to_string()],
+            delete_after_import: false,
+            state_dir: None,
+            source: "/src".to_string(),
+            destination: "host:dest".to_string(),
+            server_command: "purgery-server".to_string(),
+        };
+        let result = run_sync_validate(&args);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("--delete-after-import is required"));
+    }
+
+    fn run_sync_validate(args: &SyncArgs) -> Result<()> {
+        let has_postprocess = !args.postprocess.is_empty();
+        if has_postprocess && !args.delete_after_import {
+            anyhow::bail!("--delete-after-import is required when --postprocess is used");
+        }
+        Ok(())
     }
 }

@@ -311,6 +311,8 @@ pub struct ClientRunState {
     pub protocol_version: u32,
     pub nickname: String,
     pub run_id: String,
+    pub host: String,
+    pub server_command: String,
     pub manifest: String,
     pub run_config: String,
     pub phase: ClientRunPhase,

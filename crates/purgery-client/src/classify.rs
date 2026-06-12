@@ -22,24 +22,12 @@ pub(crate) fn build_manifest(
     }
 
     let has_postprocess = !postprocess_steps.is_empty();
-
-    let walk_root = if source_path.is_file() {
-        source_path.parent().unwrap_or(source_path).to_path_buf()
-    } else {
-        source_path.to_path_buf()
-    };
-
-    let is_file_source = source_path.is_file();
-    let source_abs = source_path;
+    let walk_root = source_path.to_path_buf();
     let mut entries: Vec<ManifestEntry> = Vec::new();
 
     for walk_entry in WalkDir::new(&walk_root).follow_links(false).min_depth(1) {
         let walk_entry = walk_entry.with_context(|| format!("error walking {source}"))?;
         let path = walk_entry.path();
-
-        if is_file_source && path != source_abs {
-            continue;
-        }
 
         let relative = path
             .strip_prefix(&walk_root)
