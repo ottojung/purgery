@@ -282,6 +282,9 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
         }
     }
 
+    RunPlan::build(config, &run_config)
+        .map_err(|e| anyhow::anyhow!("run plan validation failed: {e}"))?;
+
     let final_root = config.root.as_path().join(nickname.as_str());
     let purgatory_root = incoming_path.join("files");
     let destinations: Vec<purgery_core::SyncDestination> = run_config

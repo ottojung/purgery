@@ -239,6 +239,8 @@ After a subprocess runs, each expected output path is inspected with `symlink_me
 
 `keep_original = true` commits the original work-area input entry/root as one output. For directories this commits the subtree recursively.
 
+After collection, outputs are deduplicated while preserving order.
+
 The status `postprocess` field is derived by matching rules against the logical normalized path (e.g., `videos/video.mp4`), not the absolute work-area path.
 
 ## Malformed status handling
