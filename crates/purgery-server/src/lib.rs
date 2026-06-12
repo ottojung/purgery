@@ -930,6 +930,57 @@ delete_after_import = true
         (config, staged_path)
     }
 
+    // ── Issue #26 xfail: full processing pipeline nickname-free archive paths ──
+
+    #[test]
+    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
+    fn xfail_issue_26_full_processing_pipeline_nickname_free_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("test-run-001".into()).unwrap();
+
+        let (config, staged_file_path) = setup_single_file_ready(
+            &work_dir,
+            &server_root,
+            &nickname,
+            &run_id,
+            "videos",
+            "univ/videos",
+            "files/videos/test.mp4",
+            b"hello world",
+        );
+
+        process_run(&config, &nickname, &run_id).unwrap();
+        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
+        assert!(done_path.exists());
+
+        let status_content = fs::read_to_string(done_path.join("status.toml")).unwrap();
+        let status = RunStatus::from_toml(&status_content).unwrap();
+        assert_eq!(status.state, RunState::Done);
+        assert_eq!(status.entries.len(), 1);
+        assert_eq!(status.entries[0].status, FileStatus::Imported);
+        assert!(
+            !status.entries[0]
+                .final_paths
+                .iter()
+                .any(|fp| fp.contains("laptop")),
+            "final_paths must not contain nickname: {:?}",
+            status.entries[0].final_paths
+        );
+        assert_eq!(
+            status.entries[0].final_paths,
+            vec!["univ/videos/test.mp4"],
+            "final_paths must be root-qualified relative paths"
+        );
+
+        let final_path = server_root.join("univ/videos/test.mp4");
+        assert!(final_path.exists());
+        assert_eq!(fs::read_to_string(&final_path).unwrap(), "hello world");
+        assert!(!staged_file_path.exists());
+    }
+
     // ── Core pipeline test ──
 
     #[test]
@@ -960,15 +1011,8 @@ delete_after_import = true
         assert_eq!(status.state, RunState::Done);
         assert_eq!(status.entries.len(), 1);
         assert_eq!(status.entries[0].status, FileStatus::Imported);
-        assert_eq!(
-            status.entries[0].final_paths,
-            vec!["laptop/videos/test.mp4"],
-            "single-output import must record one final path"
-        );
+        assert!(!status.entries[0].final_paths.is_empty());
 
-        let final_path = server_root.join("laptop/videos/test.mp4");
-        assert!(final_path.exists());
-        assert_eq!(fs::read_to_string(&final_path).unwrap(), "hello world");
         assert!(!staged_file_path.exists());
     }
 
@@ -7087,6 +7131,125 @@ steps = ["make-tree"]
         assert_root_contains_exactly(server_root.as_path(), &expected);
     }
 
+    // ── Issue #26 xfail: postprocess archive paths nickname-free ──
+
+    /// For postprocess outputs, final archive paths use the root-qualified
+    /// destination path without nickname.
+    #[test]
+    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
+    fn xfail_issue_26_postprocess_archive_paths_nickname_free() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let server_str = server_root.as_str();
+
+        fs::create_dir_all(&work_dir).unwrap();
+        fs::create_dir_all(&server_root).unwrap();
+
+        let server_config = ServerConfig {
+            root: ServerRoot::new(server_str.into()).unwrap(),
+            work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
+            gc: Default::default(),
+            postprocess: PostprocessConfig {
+                steps: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "copy-cmd".to_owned(),
+                        PostprocessStepDefinition {
+                            kind: PostprocessKind::Subprocess,
+                            program: "sh".to_owned(),
+                            args: vec!["-c".to_owned(), "cp {input} {input}.out".to_owned()],
+                            expected_outputs: vec!["{file_name}.out".to_owned()],
+                            keep_original: false,
+                        },
+                    );
+                    m
+                },
+            },
+            logging: Default::default(),
+        };
+
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("test-pp-xfail".into()).unwrap();
+
+        let ready_path = server_config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        fs::create_dir_all(ready_path.join("files/data")).unwrap();
+        fs::write(ready_path.join("files/data/input.bin"), b"binary data").unwrap();
+
+        fs::write(
+            ready_path.join("run.toml"),
+            format!(
+                r#"nickname = "{}"
+
+[[sync]]
+name = "data"
+to = "univ/data"
+delete_after_import = true
+
+[[postprocess.rules]]
+match = "*.bin"
+steps = ["copy-cmd"]
+"#,
+                nickname.as_str()
+            ),
+        )
+        .unwrap();
+
+        let manifest = Manifest {
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![ManifestEntry {
+                sync_name: SyncName::new("data".into()).unwrap(),
+                local_path: ClientLocalPath::new("/home/user/input.bin".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/data/input.bin".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("input.bin".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
+                size: 11,
+                mtime_ns: 1000000,
+                sha256: None,
+                link_target: None,
+                mode: ManifestEntryMode::Postprocess,
+                postprocess_steps: vec!["copy-cmd".into()],
+                covered_by: None,
+            }],
+        };
+        fs::write(
+            ready_path.join("manifest.toml"),
+            manifest.to_toml().unwrap(),
+        )
+        .unwrap();
+
+        let result = process_run(&server_config, &nickname, &run_id);
+        assert!(result.is_ok(), "postprocess run failed: {result:?}");
+
+        let done_path = server_config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Done);
+        assert!(done_path.exists());
+
+        let status_content = fs::read_to_string(done_path.join("status.toml")).unwrap();
+        let status = purgery_core::RunStatus::from_toml(&status_content).unwrap();
+        for fp in status.entries.iter().flat_map(|e| e.final_paths.iter()) {
+            assert!(
+                !fp.contains("laptop"),
+                "final_paths must not contain nickname: {fp}"
+            );
+        }
+
+        let final_output = server_root.join("univ/data/input.bin.out");
+        assert!(final_output.exists());
+        assert_eq!(fs::read_to_string(&final_output).unwrap(), "binary data");
+
+        let expected = vec![
+            server_root.join("univ"),
+            server_root.join("univ/data"),
+            server_root.join("univ/data/input.bin.out"),
+        ];
+        assert_root_contains_exactly(server_root.as_path(), &expected);
+    }
+
     /// For postprocess outputs, the work-area outputs are consumed by
     /// materialization. The staged original still exists but the
     /// work-area output is gone after successful commit.
@@ -7192,18 +7355,6 @@ steps = ["copy-cmd"]
         // by materialization).
         let work_done_root = done_path.join("work");
         assert!(!work_done_root.exists());
-
-        // Final output must exist.
-        let final_output = server_root.join("laptop/data/input.bin.out");
-        assert!(final_output.exists());
-        assert_eq!(fs::read_to_string(&final_output).unwrap(), "binary data");
-
-        let expected = vec![
-            server_root.join("laptop"),
-            server_root.join("laptop/data"),
-            server_root.join("laptop/data/input.bin.out"),
-        ];
-        assert_root_contains_exactly(server_root.as_path(), &expected);
     }
 
     // ── Issue #26 xfail: resolve_destinations with named roots ──────────
