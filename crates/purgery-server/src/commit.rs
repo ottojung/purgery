@@ -8,7 +8,7 @@ pub(crate) enum CommitDisposition {
     Replaced,
 }
 
-pub(crate) fn remove_destination_for_non_directory(
+pub(crate) fn prepare_destination_for_file_or_symlink(
     final_path: &Utf8Path,
 ) -> Result<CommitDisposition, String> {
     match fs::symlink_metadata(final_path.as_std_path()) {
@@ -99,7 +99,7 @@ pub(crate) fn commit_regular_file_entry(
     _run_id: &purgery_core::RunId,
 ) -> Result<CommitDisposition, String> {
     ensure_final_parent(final_path, root)?;
-    let disposition = remove_destination_for_non_directory(final_path)?;
+    let disposition = prepare_destination_for_file_or_symlink(final_path)?;
     fs::rename(source.as_std_path(), final_path.as_std_path())
         .map_err(|error| format!("failed to materialize regular file: {error}"))?;
     Ok(disposition)
@@ -112,7 +112,7 @@ pub(crate) fn commit_symlink_entry(
     _run_id: &purgery_core::RunId,
 ) -> Result<CommitDisposition, String> {
     ensure_final_parent(final_path, root)?;
-    let disposition = remove_destination_for_non_directory(final_path)?;
+    let disposition = prepare_destination_for_file_or_symlink(final_path)?;
     fs::rename(source.as_std_path(), final_path.as_std_path())
         .map_err(|error| format!("failed to materialize symlink: {error}"))?;
     Ok(disposition)
