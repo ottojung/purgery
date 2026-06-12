@@ -101,6 +101,7 @@ impl EntryOutcome {
     }
 }
 
+#[cfg(unix)]
 fn prepare_work_entry(
     entry: &ManifestEntry,
     sync: &RunConfigSync,

@@ -41,7 +41,7 @@ For entries that need preprocessing or postprocessing:
 
 Purgery maintains two distinct storage locations:
 
-* **`root`** (final archive): Output-only storage. The only paths Purgery may create or modify under `root` are the actual final imported files, directories, and symlinks and their final postprocessed output versions. No operational, temporary, intermediate, progress, status, lock, staging, partial, or helper files are ever created under `root`.
+* **`root`** (final archive): Output-only storage. The only paths Purgery may create or modify under `root` are the actual final imported files, directories, and symlinks and their final postprocessed output versions. Non-final operational paths (status files, progress files, lock files, staging directories, helper files, sibling temp files, or other non-final scaffold paths) are never created under `root`.
 
 * **`purgery_root`** (Purgery-owned operational state): All operational state lives here, including incoming runs, ready/processing/done/failed run directories, manifests, status/progress files, work areas, and postprocess staging.
 
@@ -85,7 +85,7 @@ Materialization is not all-or-nothing. A crash during materialization may leave 
 
 ## Transfer and materialization consequences
 
-Direct transfers (Modes 1 and 2) write to exact final paths in-place, so the destination file is updated atomically at the block level without creating a sibling temporary file. Interrupted transfers can resume without re-transferring already-received data. A partially transferred file at an exact final path is still the actual final file being transferred — it is not an operational helper path.
+Direct transfers write to exact final paths in place. This avoids non-final sibling temp paths, but it is not an atomic replacement. During interruption, the exact final path may contain partial or mixed contents and is repaired by rerunning the transfer. Interrupted transfers can resume without re-transferring already-received data. A partially transferred file at an exact final path is still the actual final file being transferred — it is not an operational helper path.
 
 Server-side materialization (Mode 3) moves prepared outputs from the work area to final storage using filesystem rename. Cross-device rename failure is a hard failure.
 
@@ -188,7 +188,7 @@ The client generates transfer sets per sync group. Within a purgatory group, ent
 For purgatory groups:
 
 1. **Passthrough transfer set**: exact-path roots for entries with mode `passthrough` (regular files, symlinks, empty directories). Transferred directly to final storage.
-2. **Purgatory transfer set**: exact-path roots for ordinary postprocess entries plus subtree roots for postprocessed directories. Transferred to the server's staging area (`<purgery_root>/<nickname>/incoming/<run_id>/files/<sync.to>/`). Postprocess entries remain in staging until the server processes them successfully; only then are they committed to final storage. If processing fails, the run fails and no outputs reach the final archive.
+2. **Purgatory transfer set**: exact-path roots for ordinary postprocess entries plus subtree roots for postprocessed directories. Transferred to the server's staging area (`<purgery_root>/<nickname>/incoming/<run_id>/files/<sync.to>/`). Postprocess entries remain in staging until the server processes them successfully; only then are they committed to final storage. If a postprocess entry fails before materialization, that entry produces no final outputs. The run may still be partial, and earlier successfully materialized entries are not rolled back.
 
 For passthrough groups, the entire source tree is transferred via one direct unfiltered rsync to final storage. No transfer sets, no manifest, no server bookkeeping.
 

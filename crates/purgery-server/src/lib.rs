@@ -1,3 +1,6 @@
+#[cfg(not(unix))]
+compile_error!("Purgery is Unix-only — it requires rsync, SSH, and Unix filesystem semantics");
+
 use anyhow::{Context, Result};
 use purgery_core::{Nickname, RunId, RunPhase, RunStatus, ServerConfig};
 use std::fs;

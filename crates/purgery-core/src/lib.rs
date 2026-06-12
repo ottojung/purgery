@@ -1,3 +1,6 @@
+#[cfg(not(unix))]
+compile_error!("Purgery is Unix-only — it requires rsync, SSH, and Unix filesystem semantics");
+
 use camino::{Utf8Path, Utf8PathBuf};
 use std::io;
 use thiserror::Error;

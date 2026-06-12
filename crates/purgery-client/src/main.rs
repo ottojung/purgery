@@ -1,3 +1,6 @@
+#[cfg(not(unix))]
+compile_error!("Purgery is Unix-only — it requires rsync, SSH, and Unix filesystem semantics");
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use purgery_core::ClientConfig;
