@@ -46,11 +46,11 @@ client: persist local postprocess run state as upload_complete_finish_pending
 client: finish-run over SSH -> server moves incoming -> ready
 client: persist local state as waiting_for_terminal_state
 client: wait using run-state; retry only on ready/processing/incoming
-client: on corrupt → write local corrupt tombstone, stop, do not delete
-client: on not_found → write local abandoned tombstone, stop, do not delete
-client: on transport failure or malformed response → stop with state preserved
+client: on corrupt -> write local corrupt tombstone, stop, do not delete
+client: on not_found -> write local abandoned tombstone, stop, do not delete
+client: on transport failure or malformed response -> stop with state preserved
 client: after terminal run-state, read terminal status via status command
-client: if status fails (transport/parse/envelope) → write corrupt, stop, do not delete
+client: if status fails (transport/parse/envelope) -> write corrupt, stop, do not delete
 client: cleanup only imported postprocess entries whose local identity still matches
 client: mark cleanup complete and remove local run state
 server: claim run by renaming ready -> processing
@@ -64,7 +64,7 @@ The purgatory transfer loop operates only on purgatory groups — it never looks
 
 No final-archive rsync happens before `prepare-run` succeeds. The side-effect-free `resolve-destinations` call may happen earlier, but actual archive-affecting transfers are deferred until after the purgatory run passes server validation.
 
-Postprocess entries are transferred to a staging area (`incoming/files/<sync.to>/`), not to final storage. The server processes them in the staging area using isolated work areas, and only commits outputs to final storage after processing succeeds. If processing fails, no output reaches the final archive.
+Postprocess entries are transferred to a staging area (`incoming/files/<root-name>/<path-under-root>/`), not to final storage. The server processes them in the staging area using isolated work areas, and only commits outputs to final storage under the named archive root after processing succeeds. If processing fails, no output reaches the final archive.
 
 ## Server subcommands
 
@@ -78,7 +78,7 @@ Postprocess entries are transferred to a staging area (`incoming/files/<sync.to>
 | `run-state --nickname <n> --run-id <id>` | Report current filesystem phase without requiring terminal status. Returns `incoming`, `ready`, `processing`, `done`, `failed`, or `not_found`. When `processing`, may include progress details from `progress.toml` |
 | `heartbeat-run --nickname <n> --run-id <id>` | Update lease file for an incoming run |
 | `check` | Validate config and dependencies (side-effect-free) |
-| `bootstrap` | Create `root` and `work_dir` directories |
+| `bootstrap` | Create all named root directories and `work_dir` |
 | `gc` | Run garbage collection on expired incoming runs |
 | `process-once` | Validate config, run GC, then process one batch of ready runs |
 
@@ -86,7 +86,7 @@ Postprocess entries are transferred to a staging area (`incoming/files/<sync.to>
 
 Each manifest entry in a server run is classified as one of:
 
-- **postprocess**: transferred to purgatory/staging area, verified by server, processed via subprocesses, committed to final storage after processing succeeds.
+- **postprocess**: transferred to purgatory/staging area, verified by server, processed via subprocesses, committed to final storage under the named archive root after processing succeeds.
 - **covered**: descendant of a postprocessed directory. Not transferred independently. Skipped status.
 
 Ordinary passthrough entries are not part of the server manifest. They are handled by direct client rsync without server bookkeeping.
@@ -108,7 +108,7 @@ Passthrough entries do not appear in:
 
 ### Postprocess entries
 
-Postprocess entries are transferred by a separate bulk rsync call into the run's purgatory/staging area (`incoming/files/<sync.to>/`). The server prepares work-area input roots, runs subprocesses there, then commits selected output entry roots to final storage.
+Postprocess entries are transferred by a separate bulk rsync call into the run's purgatory/staging area (`incoming/files/<root-name>/<path-under-root>/`). The server prepares work-area input roots, runs subprocesses there, then commits selected output entry roots to final storage under the named archive root.
 
 ### Covered entries
 
@@ -217,6 +217,16 @@ The server applies these validations at every lifecycle point that reads the upl
 
 ## Destination resolution
 
+The server maintains a set of named archive roots. Client sync `to` fields reference a root by name. The `to` field format is:
+
+```text
+<root-name>[/<path-under-root>]
+```
+
+Examples:
+- `to = "univ/videos"` — root named "univ", inside the "videos" subdirectory
+- `to = "system"` — root named "system", directly under the root
+
 ### `resolve-destinations` response
 
 For pure passthrough groups (no postprocess roots), the client calls `resolve-destinations` instead of `begin-run`/`prepare-run`:
@@ -227,14 +237,14 @@ nickname = "laptop"
 
 [[destinations]]
 sync_name = "videos"
-passthrough_dest = "/universe/synced/laptop/videos"
+passthrough_dest = "/universe/synced/videos"
 
 [[destinations]]
 sync_name = "pictures"
-passthrough_dest = "/universe/synced/laptop/pictures"
+passthrough_dest = "/universe/synced/pictures"
 ```
 
-This command is side-effect-free. It does not create run directories, leases, manifests, or status files.
+This command is side-effect-free. It does not create run directories, leases, manifests, or status files. The resolved destinations are absolute paths under the named archive roots. The client nickname does not appear in resolved destinations.
 
 ### `prepare-run` response
 
@@ -247,13 +257,13 @@ run_id = "01ARZ..."
 
 [[destinations]]
 sync_name = "videos"
-passthrough_dest = "/universe/synced/laptop/videos"
-purgatory_dest = "/universe/tmp/purgery/laptop/incoming/01ARZ.../files/videos"
+passthrough_dest = "/universe/synced/videos"
+purgatory_dest = "/var/lib/purgery/work/laptop/incoming/01ARZ.../files/univ/videos"
 
 [[destinations]]
 sync_name = "pictures"
-passthrough_dest = "/universe/synced/laptop/pictures"
-purgatory_dest = "/universe/tmp/purgery/laptop/incoming/01ARZ.../files/pictures"
+passthrough_dest = "/universe/synced/pictures"
+purgatory_dest = "/var/lib/purgery/work/laptop/incoming/01ARZ.../files/univ/pictures"
 ```
 
 The client uses the per-sync destinations as rsync targets. For passthrough, it constructs `host:<passthrough_dest>/`. For purgatory, it constructs `host:<purgatory_dest>/`.
@@ -305,7 +315,7 @@ sync_name = "videos"
 local_path = "/home/user/Videos/a.mp4"
 relative_path = "a.mp4"
 status = "imported"
-final_paths = ["laptop/videos/a.mp4"]
+final_paths = ["univ/videos/a.mp4"]
 postprocess = ["compress-video"]
 
 [[entries]]
@@ -316,6 +326,10 @@ relative_path = "album/cover.jpg"
 status = "skipped"
 error = "covered by postprocessed ancestor directory"
 ```
+
+`final_paths` entries are root-qualified relative archive paths. The first component is the named root, followed by the path under that root and the relative entry path. The client nickname is not present in `final_paths`.
+
+Status entries with a `final_paths` value of `univ/videos/a.mp4` mean the file is at `/universe/synced/videos/a.mp4` (under the root named "univ"), not at any path containing the nickname.
 
 ## Run phases
 

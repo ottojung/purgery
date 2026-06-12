@@ -1,5 +1,12 @@
-root = "/universe/synced"
-work_dir = "/universe/tmp/purgery"
+work_dir = "/var/lib/purgery/work"
+
+[[root]]
+name = "univ"
+path = "/universe/synced"
+
+[[root]]
+name = "system"
+path = "/etc/system"
 
 [postprocess]
 

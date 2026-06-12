@@ -8,18 +8,18 @@ Purgery has three modes of operation. The mode is decided per entry, not per syn
 
 For entries that do not need preprocessing and do not need local cleanup after import:
 
-- The entry is transferred directly to final `root` storage.
+- The entry is transferred directly to final archive storage under the named root.
 - The transfer uses in-place writes so that an exact final file path is updated directly rather than through a temporary sibling file.
 - The entry is not uploaded to server staging.
 - The entry is not represented in a server processing run.
 - The server does not inspect or analyze the file contents.
-- No Purgery operational paths appear under final `root`.
+- No Purgery operational paths appear under any named archive root.
 
 ### Mode 2: Passthrough with delete-after-import
 
 For entries that do not need preprocessing but need local cleanup after import:
 
-- The entry is transferred directly to final `root` storage, with in-place writes.
+- The entry is transferred directly to final archive storage under the named root, with in-place writes.
 - The entry is not uploaded to server staging.
 - The client captures cleanup identity before transfer and persists durable cleanup state in the client `state_dir`.
 - Local deletion is the client's responsibility and is authorized only after rsync success and identity verification.
@@ -32,8 +32,8 @@ For entries that need preprocessing or postprocessing:
 
 - Entry bytes go first to `work_dir` staging.
 - All preprocessing and postprocessing work happens under `work_dir`.
-- Final `root` is touched only during materialization of actual final user-data paths.
-- Server-side materialization moves prepared outputs from the work area to final storage using filesystem rename.
+- Named archive roots are touched only during materialization of actual final user-data paths.
+- Server-side materialization moves prepared outputs from the work area to final storage under the named archive root using filesystem rename.
 - Cross-device rename failure is a hard failure — no copy fallback.
 - Staged uploads under `processing/<run_id>/files/` are replay source and are never consumed by materialization.
 
@@ -41,23 +41,23 @@ For entries that need preprocessing or postprocessing:
 
 Purgery maintains two distinct storage locations:
 
-* **`root`** (final archive): Output-only storage. The only paths Purgery may create or modify under `root` are the actual final imported files, directories, and symlinks and their final postprocessed output versions. Non-final operational paths (status files, progress files, lock files, staging directories, helper files, sibling temp files, or other non-final scaffold paths) are never created under `root`.
+* **Named archive roots** (final archive): Output-only storage. Each root is a named directory tree (configured as `[[root]]` in `server.toml`). The only paths Purgery may create or modify under an archive root are the actual final imported files, directories, and symlinks and their final postprocessed output versions. Non-final operational paths (status files, progress files, lock files, staging directories, helper files, sibling temp files, or other non-final scaffold paths) are never created under any archive root.
 
 * **`work_dir`** (Purgery-owned operational state): All operational state lives here, including incoming runs, ready/processing/done/failed run directories, manifests, status/progress files, work areas, and postprocess staging.
 
-The rule is: nothing non-final may appear under `root`. A partially written exact final file path is allowed during interrupted transfer or materialization — the path is still the actual final file being transferred. Sibling helper paths under `root` are forbidden because they are not final user-data paths.
+The rule is: nothing non-final may appear under any named archive root. A partially written exact final file path is allowed during interrupted transfer or materialization — the path is still the actual final file being transferred. Sibling helper paths under an archive root are forbidden because they are not final user-data paths.
 
 ## Commit path by output kind
 
 ### Passthrough entries (Modes 1 and 2)
 
-Passthrough entries are transferred directly to final `root` by the client. They do not involve server-side staging, work areas, or processing runs. The server never inspects, hashes, preprocesses, or postprocesses passthrough entries.
+Passthrough entries are transferred directly to final storage under the named archive root by the client. They do not involve server-side staging, work areas, or processing runs. The server never inspects, hashes, preprocesses, or postprocesses passthrough entries.
 
 For `delete_after_import = true`, the client handles local cleanup independently — the server has no role in cleanup authorization.
 
 ### Purgatory regular files and symlinks (Mode 3)
 
-Server-side regular-file and symlink entries are prepared in the work area before final materialization. The staged upload is copied or recreated in the work area, producing a consumable representation. The work-area representation is then moved to the final path under `root` using filesystem rename:
+Server-side regular-file and symlink entries are prepared in the work area before final materialization. The staged upload is copied or recreated in the work area, producing a consumable representation. The work-area representation is then moved to the final path under the named archive root using filesystem rename:
 
 ```
 staged upload → prepared in work area → moved (rename) to final path
@@ -75,7 +75,7 @@ No intermediate helper files are created in the final parent directory.
 
 Directory output roots are created, kept, or replaced directly. Their descendants are then recursively overlaid using no-delete semantics. Subdirectories are created/kept directly; regular-file and symlink descendants are moved from their work-area sources to their final paths. Empty source directories left behind by the recursive move are removed when possible.
 
-Actual final directory paths may be created directly under `root` — they are final user-data paths, not operational scaffolding.
+Actual final directory paths may be created directly under the named archive root — they are final user-data paths, not operational scaffolding.
 
 ## Directory overlay semantics
 
@@ -89,15 +89,19 @@ Direct transfers write to exact final paths in place. This avoids non-final sibl
 
 Server-side materialization (Mode 3) moves prepared outputs from the work area to final storage using filesystem rename. Cross-device rename failure is a hard failure.
 
-Purgery does not eagerly create final archive directory skeletons as run setup. Directories under `root` are created only when an actual final entry is materialized. A failed run with no successfully materialized entries should not leave empty `root/<nickname>/<sync.to>/` directories.
+Purgery does not eagerly create final archive directory skeletons as run setup. Directories under an archive root are created only when an actual final entry is materialized. A failed run with no successfully materialized entries should not leave empty destination directories.
 
-The invariant is that `root` contains only final user-data paths, not that every byte under `root` is always complete during transfer. Operational files (status, progress, lock, staging, filter, cleanup, or helper files) must never appear under `root` under any circumstance.
+The invariant is that named archive roots contain only final user-data paths, not that every byte under every root is always complete during transfer. Operational files (status, progress, lock, staging, filter, cleanup, or helper files) must never appear under any named archive root under any circumstance.
 
 ## `final_paths` (plural)
 
-Status entries use `final_paths` — a list of all committed paths relative to the server root. A single-output import produces one entry. Postprocessing (e.g., `compress-video`) may produce multiple outputs (original + compressed).
+Status entries use `final_paths` — a list of all committed paths as root-qualified relative archive paths. Each path starts with the named root, followed by the path under that root and the relative entry path. For example, `univ/videos/trips/a.mp4` means the file is at `/universe/synced/videos/trips/a.mp4` (under the root named "univ").
+
+A single-output import produces one entry. Postprocessing (e.g., `compress-video`) may produce multiple outputs (original + compressed).
 
 For a failed entry, `final_paths` is empty and the `error` field contains a description.
+
+The client nickname is not included in `final_paths`. Named roots provide unambiguous path qualification under multiple roots without embedding operational metadata in archive paths.
 
 ## Per-entry errors
 
@@ -109,7 +113,7 @@ The work area is used only for purgatory (Mode 3) entries. Passthrough entries (
 
 The server creates a work area at `<work_dir>/<nickname>/processing/<run_id>/work/`. The work area is used only for Mode 3 entries. A Mode 3 entry is, by definition, an entry selected for preprocessing or postprocessing. Regular files, symlinks, and directory transform roots in Mode 3 are prepared into the work area before postprocessing or materialization. Passthrough entries, including nonmatching entries in a purgatory sync group, do not use the work area.
 
-All staging, temporary files, helper paths, and intermediate artifacts live under this work area, never under `root`. After successful materialization, work-area outputs are consumed (moved to final storage) and the work area is removed for `done` runs.
+All staging, temporary files, helper paths, and intermediate artifacts live under this work area, never under any named root. After successful materialization, work-area outputs are consumed (moved to final storage) and the work area is removed for `done` runs.
 
 Postprocess subprocesses run with their current directory set to the work-area parent of the input entry. This is work-area discipline: it makes relative-path outputs land inside the work area, not in an arbitrary inherited server cwd. Purgery validates that expected output paths resolve under the work area before materializing them to final storage. This is not a security sandbox — a malicious subprocess can still write anywhere the process has permissions.
 
@@ -137,7 +141,7 @@ All server-side rule matching is sync-scoped. Every check that tests whether a r
 
 Passthrough entries (Modes 1 and 2) are transferred directly to final server storage by bulk rsync. They have no server bookkeeping — no staging upload, no work-area preparation, no processing run, no server-side inspection. The uploaded server manifest contains only postprocess roots and covered descendants — ordinary passthrough entries are excluded.
 
-Within a sync group that also contains purgatory (Mode 3) entries, passthrough entries are still transferred directly to final `root`. A single sync group may contain both passthrough and purgatory entries. Mixed invocations are valid.
+Within a sync group that also contains purgatory (Mode 3) entries, passthrough entries are still transferred directly to final archive storage under the named root. A single sync group may contain both passthrough and purgatory entries. Mixed invocations are valid.
 
 ### Identity bookkeeping boundaries
 
@@ -171,7 +175,7 @@ The configured `sync.from` path is the source tree root — a traversal boundary
 
 - **Passthrough group (no delete)**: no applicable postprocess rules, `delete_after_import = false`. One direct unfiltered rsync, no walk, no cleanup state. All entries use Mode 1.
 - **Passthrough group (with delete)**: no applicable postprocess rules, `delete_after_import = true`. One direct unfiltered rsync plus a durable cleanup ledger. All entries use Mode 2.
-- **Purgatory group**: one or more applicable postprocess rules and `delete_after_import = true`. Individual entries may use Mode 2 (passthrough within the group) or Mode 3 (postprocess). Passthrough entries in the group are transferred directly to final `root`; postprocess entries go through staging and server-side processing.
+- **Purgatory group**: one or more applicable postprocess rules and `delete_after_import = true`. Individual entries may use Mode 2 (passthrough within the group) or Mode 3 (postprocess). Passthrough entries in the group are transferred directly to final archive storage under the named root; postprocess entries go through staging and server-side processing.
 
 Passthrough groups are not included in the uploaded run config, server manifest, or status. In mixed invocations, passthrough destinations are resolved separately through the side-effect-free `resolve-destinations` command. The purgatory transfer loop iterates only purgatory groups.
 
@@ -184,7 +188,7 @@ The client generates transfer sets per sync group. Within a purgatory group, ent
 For purgatory groups:
 
 1. **Passthrough transfer set**: exact-path roots for entries with mode `passthrough` (regular files, symlinks, empty directories). Transferred directly to final storage.
-2. **Purgatory transfer set**: exact-path roots for ordinary postprocess entries plus subtree roots for postprocessed directories. Transferred to the server's staging area (`<work_dir>/<nickname>/incoming/<run_id>/files/<sync.to>/`). Postprocess entries remain in staging until the server processes them successfully; only then are they committed to final storage. If a postprocess entry fails before materialization, that entry produces no final outputs. The run may still be partial, and earlier successfully materialized entries are not rolled back.
+2. **Purgatory transfer set**: exact-path roots for ordinary postprocess entries plus subtree roots for postprocessed directories. Transferred to the server's staging area (`<work_dir>/<nickname>/incoming/<run_id>/files/<root-name>/<path-under-root>/`). Postprocess entries remain in staging until the server processes them successfully; only then are they committed to final storage under the named root. If a postprocess entry fails before materialization, that entry produces no final outputs. The run may still be partial, and earlier successfully materialized entries are not rolled back.
 
 For passthrough groups, the entire source tree is transferred via one direct unfiltered rsync to final storage. No transfer sets, no manifest, no server bookkeeping.
 
@@ -250,18 +254,17 @@ If a `status.toml` exists but is malformed (invalid TOML or missing required fie
 ## Directory layout
 
 ```
-<root>/                              # output-only final archive storage
-  <nickname>/
-    <sync.to>/                       # final imported entries, postprocessed outputs
-      ...                            # (only final files/dirs/symlinks — no temp/helper files)
+<roots>/                             # output-only final archive storage (one per named root)
+  <path-under-root>/                 # sync destination path under the root
+    ... final entries ...            # (only final files/dirs/symlinks — no temp/helper files)
 
-<work_dir>/                      # Purgery-owned operational state
+<work_dir>/                          # Purgery-owned operational state
   <nickname>/
     incoming/<run_id>/               # client uploads here
       lease.toml
       run.toml
       manifest.toml
-      files/                         # uploaded entries by sync mapping (staging)
+      files/                         # uploaded entries by root-name/path-under-root (staging)
     ready/<run_id>/                  # upload complete, pending processing
     processing/<run_id>/             # actively being processed
       work/                          # per-run work area (staging, postprocess

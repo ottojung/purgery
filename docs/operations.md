@@ -32,14 +32,14 @@ Precedence: CLI flags > config file > default. The `RUST_LOG` environment variab
 ## Setup
 
 ```sh
-# Create root and work_dir directories
+# Create archive root and work_dir directories
 purgery-server bootstrap --config server.toml
 
 # Verify configuration and dependencies
 purgery-server check --config server.toml
 ```
 
-`bootstrap` creates `root` and `work_dir` if missing. It does not process runs or run GC.
+`bootstrap` creates each named root directory and `work_dir` if missing. It does not process runs or run GC.
 
 ## Boot-time checks
 
@@ -52,7 +52,7 @@ purgery-server check --config server.toml
 
 Client checks: parse config, resolve `ssh` and `rsync` executables, validate config fields.
 
-Server checks: parse config, verify `root` and `work_dir` exist (but do not create them), resolve every postprocess `program`, validate step invariants.
+Server checks: parse config, verify each named root and `work_dir` exist (but do not create them), resolve every postprocess `program`, validate step invariants.
 
 If server directories do not exist, `check` reports an error and suggests running `bootstrap` first.
 
