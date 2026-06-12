@@ -107,11 +107,7 @@ Per-entry failures produce individual `EntryStatusEntry` records with `status = 
 
 The work area is used only for purgatory (Mode 3) entries. Passthrough entries (Modes 1 and 2) do not involve a work area — they are transferred directly to final storage by the client.
 
-The server creates a work area at `<purgery_root>/<nickname>/processing/<run_id>/work/`. Every purgatory entry is prepared into the work area before final materialization:
-
-* **Postprocess entries**: the staged file, symlink, or directory tree is copied into the work area. The subprocess runs with the work-area copy as input. Its outputs are collected from the work area and moved to final storage.
-
-* **Non-postprocess entries**: the staged file, symlink, or directory is prepared in the work area. The work-area copy is then moved to final storage, consuming it. The original staged file under `processing/<run_id>/files/` is preserved as replay source.
+The server creates a work area at `<purgery_root>/<nickname>/processing/<run_id>/work/`. The work area is used only for Mode 3 entries. A Mode 3 entry is, by definition, an entry selected for preprocessing or postprocessing. Regular files, symlinks, and directory transform roots in Mode 3 are prepared into the work area before postprocessing or materialization. Passthrough entries, including nonmatching entries in a purgatory sync group, do not use the work area.
 
 All staging, temporary files, helper paths, and intermediate artifacts live under this work area, never under `root`. After successful materialization, work-area outputs are consumed (moved to final storage) and the work area is removed for `done` runs.
 
