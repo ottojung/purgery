@@ -129,7 +129,7 @@ Uploaded staged files under `processing/<run_id>/files/` are immutable replay so
 
 ## Run plan validation
 
-Before processing any entries, the server validates the run plan via `prepare-run`. This validates the manifest classification, match patterns, step references, expected-output names, and planned final paths. If anything is invalid, the run is rejected before any passthrough rsync mutates final storage.
+Before processing any entries, the server validates the run plan via `prepare-run`. This validates the manifest classification, match patterns, step references, and expected-output names. If anything is invalid, the run is rejected before any passthrough rsync mutates final storage.
 
 All server-side rule matching is sync-scoped. Every check that tests whether a rule matches an entry also verifies that the rule applies to the entry's sync group via `rule.applies_to(entry_sync_name)`. A rule scoped to sync group A never affects entries from sync group B, even if the pattern matches.
 
@@ -239,8 +239,6 @@ After a subprocess runs, each expected output path is inspected with `symlink_me
 
 `keep_original = true` commits the original work-area input entry/root as one output. For directories this commits the subtree recursively.
 
-After collection, outputs are deduplicated while preserving order.
-
 The status `postprocess` field is derived by matching rules against the logical normalized path (e.g., `videos/video.mp4`), not the absolute work-area path.
 
 ## Malformed status handling
@@ -309,9 +307,13 @@ Therefore, postprocessing is modeled as an import-and-retire operation:
 
 The source original is removed from the source tree after successful import, so it will not be repeatedly reprocessed by later runs.
 
-## Planned final-path validation
+## Destination collision safety
 
-A run is rejected before entry processing if planned final paths conflict, including direct manifest-entry paths and postprocess-derived output roots.
+Purgery does not detect or resolve final destination collisions. Users must configure sync mappings and postprocess outputs so they do not write to the same final paths unless they intentionally accept the consequences.
+
+When two operations target the same destination path or overlapping destination subtrees, the result is unspecified and unsafe. Depending on transfer order, postprocessing, rsync behavior, and filesystem behavior, one operation may replace another operation's output, an operation may fail, or the final archive may contain a mixture of outputs.
+
+`delete_after_import` must be used carefully: Purgery may delete local files after a transfer or import that succeeded mechanically, even if the destination was logically wrong because of a collision.
 
 ## Cleanup authority by entry type
 
