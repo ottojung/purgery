@@ -13,7 +13,6 @@ pub struct DurableCleanupState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CleanupEntry {
-    pub sync_name: String,
     pub relative_path: String,
     pub local_path: String,
     #[serde(default)]

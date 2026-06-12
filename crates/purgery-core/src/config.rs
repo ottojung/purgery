@@ -1,7 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
-use thiserror::Error;
 
 use crate::path::*;
 use crate::postprocess::PostprocessConfig;
@@ -151,80 +149,10 @@ impl FromStr for ColorMode {
     }
 }
 
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum ServerRootsError {
-    #[error("at least one named root is required")]
-    Empty,
-    #[error("duplicate root name '{0}'")]
-    Duplicate(RootName),
-    #[error("invalid root name: {0}")]
-    InvalidName(#[from] RootNameError),
-    #[error("unknown server root '{0}'")]
-    Unknown(RootName),
-}
-
-#[derive(Debug, Clone)]
-pub struct ServerRoots(BTreeMap<RootName, ServerRoot>);
-
-impl ServerRoots {
-    pub fn single(name: &str, path: ServerRoot) -> Result<Self, ServerRootsError> {
-        let name = RootName::new(name.to_owned())?;
-        Self::new(vec![NamedRoot { name, path }])
-    }
-
-    pub fn new(roots: Vec<NamedRoot>) -> Result<Self, ServerRootsError> {
-        if roots.is_empty() {
-            return Err(ServerRootsError::Empty);
-        }
-        let mut names = BTreeSet::new();
-        let mut by_name = BTreeMap::new();
-        for root in roots {
-            if !names.insert(root.name.clone()) {
-                return Err(ServerRootsError::Duplicate(root.name));
-            }
-            by_name.insert(root.name, root.path);
-        }
-        Ok(Self(by_name))
-    }
-
-    pub fn get(&self, name: &RootName) -> Option<&ServerRoot> {
-        self.0.get(name)
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = (&RootName, &ServerRoot)> {
-        self.0.iter()
-    }
-
-    pub fn resolve_archive_dir(
-        &self,
-        dest: &ClientDest,
-    ) -> Result<camino::Utf8PathBuf, ServerRootsError> {
-        let root = self
-            .get(dest.root_name())
-            .ok_or_else(|| ServerRootsError::Unknown(dest.root_name().clone()))?;
-        Ok(match dest.path_under_root() {
-            Some(path) => root.as_path().join(path.as_path()),
-            None => root.as_path().to_owned(),
-        })
-    }
-
-    pub fn resolve_final_path(
-        &self,
-        dest: &ClientDest,
-        relative_path: &NormalizedRelativePath,
-    ) -> Result<camino::Utf8PathBuf, ServerRootsError> {
-        Ok(self
-            .resolve_archive_dir(dest)?
-            .join(relative_path.as_path()))
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ServerConfigFile {
     pub work_dir: PurgeryRoot,
-    #[serde(rename = "root")]
-    pub roots: Vec<NamedRoot>,
     #[serde(default)]
     pub postprocess: PostprocessConfig,
     #[serde(default)]
@@ -236,7 +164,6 @@ struct ServerConfigFile {
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub work_dir: PurgeryRoot,
-    pub roots: ServerRoots,
     pub postprocess: PostprocessConfig,
     pub gc: GCConfig,
     pub logging: LoggingConfig,
@@ -245,10 +172,8 @@ pub struct ServerConfig {
 impl ServerConfig {
     pub fn from_toml(input: &str) -> Result<Self, ConfigError> {
         let config: ServerConfigFile = toml::from_str(input)?;
-        let roots = ServerRoots::new(config.roots)?;
         Ok(Self {
             work_dir: config.work_dir,
-            roots,
             postprocess: config.postprocess,
             gc: config.gc,
             logging: config.logging,
@@ -258,237 +183,21 @@ impl ServerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ClientConfig {
-    pub nickname: Nickname,
-    pub server: ServerConnection,
-    #[serde(default)]
-    pub sync: Vec<SyncMapping>,
-    #[serde(default)]
-    pub postprocess: ClientPostprocessConfig,
-    #[serde(default)]
-    pub logging: LoggingConfig,
-    pub state_dir: String,
-}
-
-impl ClientConfig {
-    pub fn from_toml(input: &str) -> Result<Self, ConfigError> {
-        let config: ClientConfig = toml::from_str(input)?;
-        if config.state_dir.is_empty() {
-            return Err(ConfigError::StateDir("must be non-empty".into()));
-        }
-        if !config.state_dir.starts_with('/') {
-            return Err(ConfigError::StateDir("must be an absolute path".into()));
-        }
-        let sync_names: Vec<SyncName> = config.sync.iter().map(|s| s.name.clone()).collect();
-        config
-            .postprocess
-            .validate(&sync_names)
-            .map_err(ConfigError::PostprocessConfig)?;
-        config
-            .postprocess
-            .validate_delete_after_import(&config.sync)
-            .map_err(ConfigError::PostprocessConfig)?;
-        Ok(config)
-    }
-
-    pub fn find_sync(&self, name: &str) -> Option<&SyncMapping> {
-        self.sync.iter().find(|s| s.name.as_str() == name)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ServerConnection {
-    pub host: RemoteHost,
-    #[serde(default = "default_server_command")]
-    pub command: String,
-}
-
-fn default_server_command() -> String {
-    "purgery-server".to_string()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SyncMapping {
-    pub name: SyncName,
-    #[serde(rename = "from")]
-    pub from_path: LocalSourcePath,
-    #[serde(rename = "to")]
-    pub to_path: ClientDest,
-    #[serde(default = "default_delete_after_import")]
-    pub delete_after_import: bool,
-}
-
-fn default_delete_after_import() -> bool {
-    false
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClientPostprocessConfig {
-    #[serde(default)]
-    pub rules: Vec<PostprocessRule>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PostprocessRule {
-    #[serde(rename = "match")]
-    pub pattern: String,
-    pub steps: Vec<String>,
-    #[serde(rename = "for", default, skip_serializing_if = "Option::is_none")]
-    pub sync_names: Option<Vec<SyncName>>,
-}
-
-impl PostprocessRule {
-    pub fn applies_to(&self, sync_name: &str) -> bool {
-        match &self.sync_names {
-            None => true,
-            Some(names) => names.iter().any(|n| n.as_str() == sync_name),
-        }
-    }
-}
-
-pub fn applicable_rules<'a>(
-    rules: &'a [PostprocessRule],
-    sync_name: &str,
-) -> Vec<&'a PostprocessRule> {
-    rules.iter().filter(|r| r.applies_to(sync_name)).collect()
-}
-
-impl ClientPostprocessConfig {
-    pub fn validate(&self, sync_names: &[SyncName]) -> Result<(), String> {
-        for rule in &self.rules {
-            if let Some(ref names) = rule.sync_names {
-                if names.is_empty() {
-                    return Err("postprocess rule has empty for list".into());
-                }
-                for name in names {
-                    if !sync_names.iter().any(|s| s == name) {
-                        return Err(format!(
-                            "postprocess rule references unknown sync name '{}' in for",
-                            name.as_str()
-                        ));
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub fn validate_delete_after_import(&self, syncs: &[SyncMapping]) -> Result<(), String> {
-        for sync in syncs {
-            let applicable = applicable_rules(&self.rules, sync.name.as_str());
-            if !applicable.is_empty() && !sync.delete_after_import {
-                return Err(format!(
-                    "sync group '{}' has applicable postprocess rules but \
-                     delete_after_import is false; \
-                     postprocessing transforms the original and the server does not retain \
-                     indefinite source metadata, so confirmed originals must be retired \
-                     locally (import-and-retire)",
-                    sync.name.as_str()
-                ));
-            }
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SyncExecutionClass {
-    PassthroughNoDelete,
-    PassthroughDeleteAfterImport,
-    Purgatory,
-}
-
-pub fn classify_sync_groups<'a>(
-    syncs: &'a [SyncMapping],
-    rules: &'a [PostprocessRule],
-) -> Result<Vec<(SyncExecutionClass, &'a SyncMapping)>, String> {
-    let mut result = Vec::with_capacity(syncs.len());
-    for sync in syncs {
-        let applicable = applicable_rules(rules, sync.name.as_str());
-        if !applicable.is_empty() && !sync.delete_after_import {
-            return Err(format!(
-                "sync group '{}' has applicable postprocess rules but \
-                 delete_after_import is false; \
-                 postprocessing transforms the original and the server does not retain \
-                 indefinite source metadata, so confirmed originals must be retired \
-                 locally (import-and-retire)",
-                sync.name.as_str()
-            ));
-        }
-        let class = if !applicable.is_empty() {
-            SyncExecutionClass::Purgatory
-        } else if sync.delete_after_import {
-            SyncExecutionClass::PassthroughDeleteAfterImport
-        } else {
-            SyncExecutionClass::PassthroughNoDelete
-        };
-        result.push((class, sync));
-    }
-    Ok(result)
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RunConfig {
     pub nickname: Nickname,
+    pub to: String,
     #[serde(default)]
-    pub sync: Vec<RunConfigSync>,
-    #[serde(default)]
-    pub postprocess: ClientPostprocessConfig,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RunConfigSync {
-    pub name: SyncName,
-    #[serde(rename = "to")]
-    pub to_path: ClientDest,
-    #[serde(default = "default_delete_after_import")]
     pub delete_after_import: bool,
 }
 
 impl RunConfig {
     pub fn from_toml(input: &str) -> Result<Self, ConfigError> {
         let config: RunConfig = toml::from_str(input)?;
-        let sync_names: Vec<SyncName> = config.sync.iter().map(|s| s.name.clone()).collect();
-        config
-            .postprocess
-            .validate(&sync_names)
-            .map_err(ConfigError::PostprocessConfig)?;
         Ok(config)
     }
 
     pub fn to_toml(&self) -> Result<String, ConfigError> {
         toml::to_string(self).map_err(|e| ConfigError::TomlSerialize(e.to_string()))
-    }
-
-    pub fn sync_map(&self) -> BTreeMap<&str, &RunConfigSync> {
-        self.sync.iter().map(|s| (s.name.as_str(), s)).collect()
-    }
-
-    pub fn validate_sync_scoped_rules(&self) -> Result<(), String> {
-        let sync_names: Vec<SyncName> = self.sync.iter().map(|s| s.name.clone()).collect();
-        self.postprocess.validate(&sync_names)
-    }
-
-    pub fn validate_uploaded_purgatory_run(&self) -> Result<(), String> {
-        self.validate_sync_scoped_rules()?;
-        for sync in &self.sync {
-            if !sync.delete_after_import {
-                return Err(format!(
-                    "sync group '{}' in purgatory run config has delete_after_import = false; \
-                     postprocessing transforms the original and the server does not retain \
-                     indefinite source metadata, so confirmed originals must be retired \
-                     locally (import-and-retire)",
-                    sync.name.as_str()
-                ));
-            }
-        }
-        Ok(())
     }
 }
 
@@ -507,31 +216,10 @@ pub struct BeginRunResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SyncDestination {
-    pub sync_name: String,
-    pub passthrough_dest: String,
-    pub purgatory_dest: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrepareRunResponse {
     pub protocol_version: u32,
     pub nickname: String,
     pub run_id: String,
-    pub destinations: Vec<SyncDestination>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResolveDestinationsResponse {
-    pub protocol_version: u32,
-    pub nickname: String,
-    pub destinations: Vec<SyncPassthroughDestination>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SyncPassthroughDestination {
-    pub sync_name: String,
-    pub passthrough_dest: String,
 }
 
 // ── Run State / Progress ─────────────────────────────────────────────

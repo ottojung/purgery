@@ -105,7 +105,6 @@ pub struct RunStatus {
 pub struct EntryStatusEntry {
     #[serde(default)]
     pub kind: ManifestEntryKind,
-    pub sync_name: SyncName,
     pub local_path: String,
     pub relative_path: String,
     pub status: FileStatus,

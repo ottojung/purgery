@@ -9,7 +9,7 @@ use tracing::info;
 #[cfg_attr(not(test), allow(unused_imports))]
 use camino::Utf8Path;
 #[cfg_attr(not(test), allow(unused_imports))]
-use purgery_core::{FileStatus, Manifest, ManifestEntryKind, PurgeryRoot, RunConfig, RunState};
+use purgery_core::{FileStatus, Manifest, ManifestEntryKind, PurgeryRoot, RunState};
 
 mod commit;
 mod gc;
@@ -31,127 +31,64 @@ pub(crate) use commit::{
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use phases::{write_progress, write_progress_best_effort};
 
-/// A compiled postprocess rule with resolved step definitions.
-#[derive(Debug)]
-pub struct CompiledRule {
-    pub pattern: String,
-    pub steps: Vec<ResolvedStep>,
-    /// Optional sync group scoping (None means all groups).
-    pub sync_names: Option<Vec<purgery_core::SyncName>>,
-}
-
-impl CompiledRule {
-    /// Returns true if the normalized path matches this rule's rsync pattern.
-    pub fn is_match(&self, normalized_path: &str) -> bool {
-        purgery_core::rsync_pattern_match(&self.pattern, normalized_path)
-    }
-
-    /// Returns true if this rule applies to the given sync group.
-    pub fn applies_to(&self, sync_name: &str) -> bool {
-        match &self.sync_names {
-            None => true,
-            Some(names) => names.iter().any(|n| n.as_str() == sync_name),
-        }
-    }
-}
-
+/// A resolved postprocess step definition.
 #[derive(Debug, Clone)]
 pub struct ResolvedStep {
     pub step_name: String,
     pub step_def: purgery_core::PostprocessStepDefinition,
 }
 
-/// A validated run plan: precompiled rsync patterns and resolved step definitions.
+/// A validated run plan: validated step definitions from the server config.
 #[derive(Debug)]
 pub struct RunPlan {
-    pub rules: Vec<CompiledRule>,
+    pub steps: std::collections::BTreeMap<String, purgery_core::PostprocessStepDefinition>,
 }
 
 impl RunPlan {
-    /// Return the first compiled rule that both applies to the given sync
-    /// group AND matches the given normalized relative path, or None.
-    pub fn first_matching_rule<'a>(
-        &'a self,
-        sync_name: &str,
-        normalized_path: &str,
-    ) -> Option<&'a CompiledRule> {
-        self.rules
-            .iter()
-            .find(|r| r.applies_to(sync_name) && r.is_match(normalized_path))
-    }
-
-    /// Returns true if any rule applies to the given sync group and matches
-    /// the given normalized relative path.
-    pub fn entry_is_postprocess(&self, sync_name: &str, normalized_path: &str) -> bool {
-        self.rules
-            .iter()
-            .any(|r| r.applies_to(sync_name) && r.is_match(normalized_path))
-    }
-
-    /// Return step names from the first matching rule for the given sync group
-    /// and normalized relative path. Later matching rules are ignored (first-match-wins).
-    pub fn selected_steps_for(&self, sync_name: &str, normalized_path: &str) -> Vec<String> {
-        self.rules
-            .iter()
-            .find(|r| r.applies_to(sync_name) && r.is_match(normalized_path))
-            .map(|r| r.steps.iter().map(|s| s.step_name.clone()).collect())
-            .unwrap_or_default()
-    }
-
-    /// Build a run plan from server config and run config.
+    /// Build a run plan from server config.
     ///
-    /// Validates all patterns and step references. Returns an error
+    /// Validates all step definitions in the server config. Returns an error
     /// (suitable for run-level failure) if anything is invalid.
-    pub fn build(
-        server_config: &ServerConfig,
-        run_config: &purgery_core::RunConfig,
-    ) -> Result<Self, String> {
-        run_config
-            .validate_uploaded_purgatory_run()
-            .map_err(|e| format!("uploaded run config validation failed: {e}"))?;
-
-        let mut rules = Vec::new();
-
-        for rule in &run_config.postprocess.rules {
-            if rule.pattern.is_empty() {
-                return Err("postprocess rule has empty pattern".into());
+    pub fn build(server_config: &ServerConfig) -> Result<Self, String> {
+        for (name, step) in &server_config.postprocess.steps {
+            if step.program.is_empty() {
+                return Err(format!("postprocess step '{name}' has empty program"));
             }
 
-            let mut steps = Vec::new();
-            for step_name in &rule.steps {
-                let Some(def) = server_config.postprocess.steps.get(step_name.as_str()) else {
-                    return Err(format!(
-                        "postprocess step '{step_name}' referenced by rule is not defined on server"
-                    ));
-                };
-
-                for output in &def.expected_outputs {
-                    purgery_core::validate_expected_output_name(output).map_err(|e| {
-                        format!("postprocess step '{step_name}': expected_output {output:?}: {e}")
-                    })?;
-                }
-
-                if !def.keep_original && def.expected_outputs.is_empty() {
-                    return Err(format!(
-                        "postprocess step '{step_name}': keep_original=false with no \
-                         expected_outputs would produce zero committed outputs"
-                    ));
-                }
-
-                steps.push(ResolvedStep {
-                    step_name: step_name.clone(),
-                    step_def: def.clone(),
-                });
+            for output in &step.expected_outputs {
+                purgery_core::validate_expected_output_name(output).map_err(|e| {
+                    format!("postprocess step '{name}': expected_output {output:?}: {e}")
+                })?;
             }
 
-            rules.push(CompiledRule {
-                pattern: rule.pattern.clone(),
-                steps,
-                sync_names: rule.sync_names.clone(),
-            });
+            if !step.keep_original && step.expected_outputs.is_empty() {
+                return Err(format!(
+                    "postprocess step '{name}': keep_original=false with no \
+                     expected_outputs would produce zero committed outputs"
+                ));
+            }
         }
 
-        Ok(RunPlan { rules })
+        Ok(RunPlan {
+            steps: server_config.postprocess.steps.clone(),
+        })
+    }
+
+    /// Resolve step names to their ResolvedStep definitions.
+    pub fn resolve_steps(&self, step_names: &[String]) -> Result<Vec<ResolvedStep>, String> {
+        step_names
+            .iter()
+            .map(|name| {
+                let def = self
+                    .steps
+                    .get(name.as_str())
+                    .ok_or_else(|| format!("postprocess step '{name}' not defined on server"))?;
+                Ok(ResolvedStep {
+                    step_name: name.clone(),
+                    step_def: def.clone(),
+                })
+            })
+            .collect()
     }
 }
 
@@ -160,12 +97,11 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
     process_ready_run(config, nickname, run_id)
 }
 
-/// Server-side subcommand: validate the run plan and return transfer destinations.
+/// Server-side subcommand: validate the run plan.
 ///
 /// Must be called after the client has written `run.toml` and `manifest.toml`
 /// into the incoming directory but before any rsync transfer.
-/// This is the gate that prevents passthrough transfers into final storage
-/// for an invalid run plan.
+/// This is the gate that prevents an invalid run plan from being processed.
 pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> Result<String> {
     let incoming_path = config
         .work_dir
@@ -185,10 +121,6 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
     let run_config = purgery_core::RunConfig::from_toml(&run_config_content)
         .with_context(|| "failed to parse run config")?;
 
-    run_config
-        .validate_uploaded_purgatory_run()
-        .map_err(|e| anyhow::anyhow!("uploaded run config validation failed: {e}"))?;
-
     let manifest_path = incoming_path.join("manifest.toml");
     let manifest_content =
         fs::read_to_string(&manifest_path).with_context(|| "failed to read manifest")?;
@@ -199,33 +131,26 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
         anyhow::bail!("envelope validation failed: {e}");
     }
 
+    // Validate covered_by consistency
     {
-        let sync_map = run_config.sync_map();
-        for entry in &manifest.entries {
-            let _sync = sync_map.get(entry.sync_name.as_str());
-            let rp = entry.relative_path.as_str();
-            let scoped_rules = purgery_core::applicable_rules(
-                &run_config.postprocess.rules,
-                entry.sync_name.as_str(),
-            );
-            let matched = scoped_rules
-                .into_iter()
-                .find(|r| purgery_core::rsync_pattern_match(&r.pattern, rp));
-            let expected_mode = match matched {
-                Some(_) => purgery_core::ManifestEntryMode::Postprocess,
-                None => purgery_core::ManifestEntryMode::Passthrough,
-            };
+        let pp_dirs: Vec<&str> = manifest
+            .entries
+            .iter()
+            .filter(|e| {
+                e.kind == purgery_core::ManifestEntryKind::Directory
+                    && !e.postprocess_steps.is_empty()
+            })
+            .map(|e| e.relative_path.as_str())
+            .collect();
 
-            let covering_ancestor = manifest.entries.iter().find(|de| {
-                de.kind == purgery_core::ManifestEntryKind::Directory
-                    && de.mode == purgery_core::ManifestEntryMode::Postprocess
-                    && de.sync_name.as_str() == entry.sync_name.as_str()
-                    && rp.starts_with(de.relative_path.as_str())
-                    && rp.as_bytes().get(de.relative_path.as_str().len()) == Some(&b'/')
+        for entry in &manifest.entries {
+            let rp = entry.relative_path.as_str();
+
+            let covering_ancestor = pp_dirs.iter().find(|prefix| {
+                rp.starts_with(*prefix) && rp.as_bytes().get(prefix.len()) == Some(&b'/')
             });
 
-            if let Some(ancestor) = covering_ancestor {
-                let expected_covered_by = ancestor.relative_path.as_str();
+            if let Some(expected_covered_by) = covering_ancestor {
                 if entry.mode != purgery_core::ManifestEntryMode::Covered {
                     anyhow::bail!(
                         "classification mismatch: '{}' is a descendant of postprocessed \
@@ -249,98 +174,20 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
                         entry.postprocess_steps
                     );
                 }
-                continue;
-            }
-
-            if entry.mode != expected_mode {
-                anyhow::bail!(
-                    "classification mismatch for '{}': manifest says '{:?}' but \
-                     pattern classification says '{:?}'",
-                    rp,
-                    entry.mode,
-                    expected_mode
-                );
-            }
-
-            if entry.mode == purgery_core::ManifestEntryMode::Postprocess {
-                let Some(rule) = matched else {
-                    anyhow::bail!(
-                        "classification mismatch for '{}': postprocess mode but no matching rule",
-                        rp
-                    );
-                };
-                if entry.postprocess_steps != rule.steps {
-                    anyhow::bail!(
-                        "classification mismatch for '{}': postprocess_steps {:?} do not \
-                         match rule steps {:?}",
-                        rp,
-                        entry.postprocess_steps,
-                        rule.steps
-                    );
-                }
             }
         }
     }
 
-    RunPlan::build(config, &run_config)
-        .map_err(|e| anyhow::anyhow!("run plan validation failed: {e}"))?;
-
-    let purgatory_root = incoming_path.join("files");
-    let destinations: Vec<purgery_core::SyncDestination> = run_config
-        .sync
-        .iter()
-        .map(|sync| {
-            let passthrough_dest = config.roots.resolve_archive_dir(&sync.to_path)?;
-            let purgatory_dest = purgatory_root.join(sync.to_path.qualified_path());
-            Ok(purgery_core::SyncDestination {
-                sync_name: sync.name.as_str().to_owned(),
-                passthrough_dest: passthrough_dest.as_str().to_owned(),
-                purgatory_dest: purgatory_dest.as_str().to_owned(),
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+    RunPlan::build(config).map_err(|e| anyhow::anyhow!("run plan validation failed: {e}"))?;
 
     let response = purgery_core::PrepareRunResponse {
         protocol_version: 1,
         nickname: nickname.as_str().to_owned(),
         run_id: run_id.as_str().to_owned(),
-        destinations,
     };
 
     toml::to_string(&response)
         .map_err(|e| anyhow::anyhow!("failed to serialize prepare-run response: {e}"))
-}
-
-/// Server-side subcommand: resolve final storage destinations for pure passthrough groups.
-///
-/// Side-effect-free. Does not create run directories, leases, manifests, or status files.
-/// Returns the same passthrough destinations that `prepare-run` would return, without
-/// requiring a run ID or creating any run state.
-pub fn resolve_destinations(
-    config: &ServerConfig,
-    nickname: &Nickname,
-    run_config: &purgery_core::RunConfig,
-) -> Result<String> {
-    let destinations: Vec<purgery_core::SyncPassthroughDestination> = run_config
-        .sync
-        .iter()
-        .map(|sync| {
-            let passthrough_dest = config.roots.resolve_archive_dir(&sync.to_path)?;
-            Ok(purgery_core::SyncPassthroughDestination {
-                sync_name: sync.name.as_str().to_owned(),
-                passthrough_dest: passthrough_dest.as_str().to_owned(),
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let response = purgery_core::ResolveDestinationsResponse {
-        protocol_version: 1,
-        nickname: nickname.as_str().to_owned(),
-        destinations,
-    };
-
-    toml::to_string(&response)
-        .map_err(|e| anyhow::anyhow!("failed to serialize resolve-destinations response: {e}"))
 }
 
 /// Server-side subcommand: read the run status from done or failed.
@@ -650,25 +497,6 @@ pub fn server_check(config: &ServerConfig) -> Result<()> {
         );
     }
 
-    for (root_name, root) in config.roots.iter() {
-        let root_path = root.as_path();
-        if !root_path.exists() {
-            anyhow::bail!(
-                "root '{}' path '{}' does not exist (run `purgery-server bootstrap` to create it)",
-                root_name.as_str(),
-                root_path.as_str()
-            );
-        }
-        if !root_path.is_dir() {
-            anyhow::bail!(
-                "root '{}' path '{}' exists but is not a directory",
-                root_name.as_str(),
-                root_path.as_str()
-            );
-        }
-        info!(root = %root_name.as_str(), path = %root_path.as_str(), "root: OK");
-    }
-
     let purgery_path = config.work_dir.as_path();
     if !purgery_path.exists() {
         anyhow::bail!(
@@ -715,18 +543,6 @@ pub fn server_check(config: &ServerConfig) -> Result<()> {
 /// Bootstrap: create root and work_dir directories.
 pub fn bootstrap(config: &ServerConfig) -> Result<()> {
     info!("bootstrapping server directories");
-
-    for (root_name, root) in config.roots.iter() {
-        let root_path = root.as_path();
-        fs::create_dir_all(root_path.as_std_path()).with_context(|| {
-            format!(
-                "failed to create root '{}': {}",
-                root_name.as_str(),
-                root_path.as_str()
-            )
-        })?;
-        info!(root = %root_name.as_str(), path = %root_path.as_str(), "created root");
-    }
 
     let purgery_path = config.work_dir.as_path();
     fs::create_dir_all(purgery_path.as_std_path())
@@ -816,37 +632,35 @@ mod tests {
     use camino::Utf8PathBuf;
     use purgery_core::{
         ClientLocalPath, ManifestEntry, ManifestEntryMode, NormalizedRelativePath,
-        PostprocessConfig, PostprocessKind, PostprocessStepDefinition, ServerRoot, SyncName,
+        PostprocessConfig, PostprocessKind, PostprocessStepDefinition,
     };
 
     /// Call apply_postprocessing with a no-op progress callback for testing.
     fn test_apply_postprocessing(
         run_plan: &RunPlan,
-        sync_name: &str,
-        normalized_path: &str,
         work_path: &Utf8Path,
     ) -> Result<Vec<Utf8PathBuf>, String> {
+        let all_steps: Vec<ResolvedStep> = run_plan
+            .steps
+            .iter()
+            .map(|(name, def)| ResolvedStep {
+                step_name: name.clone(),
+                step_def: def.clone(),
+            })
+            .collect();
         apply_postprocessing(
-            run_plan,
-            sync_name,
-            normalized_path,
+            &all_steps,
             work_path,
             &mut |_: &purgery_core::ProgressUpdate| {},
             0,
             1,
-            normalized_path,
+            "test",
         )
     }
 
-    fn test_server_config(work_dir: &Utf8Path, server_root: &Utf8Path) -> ServerConfig {
-        fs::create_dir_all(server_root).unwrap();
+    fn test_server_config(work_dir: &Utf8Path) -> ServerConfig {
         fs::create_dir_all(work_dir).unwrap();
         ServerConfig {
-            roots: purgery_core::ServerRoots::single(
-                "univ",
-                ServerRoot::new(server_root.to_owned()).unwrap(),
-            )
-            .unwrap(),
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig::default(),
@@ -857,6 +671,8 @@ mod tests {
     fn write_run_toml(dir: &Utf8Path, nickname: &Nickname) {
         let content = format!(
             r#"nickname = "{}"
+to = "univ/default"
+delete_after_import = true
 "#,
             nickname.as_str()
         );
@@ -866,19 +682,15 @@ mod tests {
     fn write_run_toml_with_sync(
         dir: &Utf8Path,
         nickname: &Nickname,
-        sync_name: &str,
+        _sync_name: &str,
         to_path: &str,
     ) {
         let content = format!(
             r#"nickname = "{}"
-
-[[sync]]
-name = "{}"
 to = "{}"
 delete_after_import = true
 "#,
             nickname.as_str(),
-            sync_name,
             if to_path.contains('/') {
                 to_path.to_owned()
             } else {
@@ -892,7 +704,6 @@ delete_after_import = true
     #[allow(clippy::too_many_arguments)]
     fn setup_single_file_ready(
         work_dir: &Utf8Path,
-        server_root: &Utf8Path,
         nickname: &Nickname,
         run_id: &RunId,
         sync_name: &str,
@@ -900,7 +711,7 @@ delete_after_import = true
         staged_rel: &str,
         content: &[u8],
     ) -> (ServerConfig, Utf8PathBuf) {
-        let config = test_server_config(work_dir, server_root);
+        let config = test_server_config(work_dir);
         let ready_path = config.work_dir.run_dir(nickname, run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
 
@@ -916,7 +727,6 @@ delete_after_import = true
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
-                sync_name: SyncName::new(sync_name.into()).unwrap(),
                 local_path: ClientLocalPath::new(format!("/home/user/{sync_name}/{staged_rel}"))
                     .unwrap(),
                 staged_path: NormalizedRelativePath::new(staged_rel.into()).unwrap(),
@@ -953,13 +763,12 @@ delete_after_import = true
     fn full_processing_pipeline_nickname_free_archive() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-run-001".into()).unwrap();
 
         let (config, staged_file_path) = setup_single_file_ready(
             &work_dir,
-            &server_root,
             &nickname,
             &run_id,
             "videos",
@@ -991,7 +800,7 @@ delete_after_import = true
             "final_paths must be root-qualified relative paths"
         );
 
-        let final_path = server_root.join("videos/test.mp4");
+        let final_path = config.work_dir.as_path().join("univ/videos/test.mp4");
         assert!(final_path.exists());
         assert_eq!(fs::read_to_string(&final_path).unwrap(), "hello world");
         assert!(!staged_file_path.exists());
@@ -1003,13 +812,12 @@ delete_after_import = true
     fn test_full_processing_pipeline() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-run-001".into()).unwrap();
 
         let (config, staged_file_path) = setup_single_file_ready(
             &work_dir,
-            &server_root,
             &nickname,
             &run_id,
             "videos",
@@ -1033,61 +841,11 @@ delete_after_import = true
     }
 
     #[test]
-    fn test_processing_skips_unknown_sync() {
-        let tmp = tempfile::tempdir().unwrap();
-        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_id = RunId::new("test-run-002".into()).unwrap();
-
-        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
-        fs::create_dir_all(&ready_path).unwrap();
-
-        // Run config has no sync mappings
-        write_run_toml(&ready_path, &nickname);
-
-        let manifest = Manifest {
-            run_id: run_id.clone(),
-            nickname: nickname.clone(),
-            entries: vec![ManifestEntry {
-                sync_name: SyncName::new("unknown-sync".into()).unwrap(),
-                local_path: ClientLocalPath::new("/tmp/test.mp4".into()).unwrap(),
-                staged_path: NormalizedRelativePath::new("files/univ/test.mp4".into()).unwrap(),
-                relative_path: NormalizedRelativePath::new("test.mp4".into()).unwrap(),
-                kind: ManifestEntryKind::RegularFile,
-                size: 11,
-                mtime_ns: 1000000,
-                sha256: None,
-                link_target: None,
-                mode: Default::default(),
-                postprocess_steps: Vec::new(),
-                covered_by: None,
-            }],
-        };
-        fs::write(
-            ready_path.join("manifest.toml"),
-            manifest.to_toml().unwrap(),
-        )
-        .unwrap();
-
-        process_run(&config, &nickname, &run_id).unwrap();
-
-        let failed_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Failed);
-        let status_content = fs::read_to_string(failed_path.join("status.toml")).unwrap();
-        let status = RunStatus::from_toml(&status_content).unwrap();
-        assert_eq!(status.state, RunState::Failed);
-        assert_eq!(status.entries[0].status, FileStatus::Skipped);
-    }
-
-    #[test]
     fn test_processing_missing_staged_file() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-run-003".into()).unwrap();
 
@@ -1100,7 +858,6 @@ delete_after_import = true
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
-                sync_name: SyncName::new("videos".into()).unwrap(),
                 local_path: ClientLocalPath::new("/home/user/Videos/missing.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/univ/videos/missing.mp4".into())
                     .unwrap(),
@@ -1193,8 +950,8 @@ delete_after_import = true
     fn test_nickname_mismatch_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
         let dir_nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-env-001".into()).unwrap();
 
@@ -1204,14 +961,16 @@ delete_after_import = true
         fs::create_dir_all(&ready_path).unwrap();
 
         // Run config has different nickname than the directory
-        let run_config_content = r#"nickname = "other-machine""#;
+        let run_config_content = r#"nickname = "other-machine"
+to = "univ/default"
+delete_after_import = true
+"#;
         fs::write(ready_path.join("run.toml"), run_config_content).unwrap();
 
         let manifest = Manifest {
             run_id: run_id.clone(),
             nickname: Nickname::new("other-machine".into()).unwrap(),
             entries: vec![ManifestEntry {
-                sync_name: SyncName::new("videos".into()).unwrap(),
                 local_path: ClientLocalPath::new("/tmp/a.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/univ/a.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
@@ -1249,8 +1008,8 @@ delete_after_import = true
     fn test_bad_manifest_produces_failed_status() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-bad-manifest".into()).unwrap();
 
@@ -1278,8 +1037,8 @@ delete_after_import = true
     fn test_bad_run_config_produces_failed_status() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-bad-config".into()).unwrap();
 
@@ -1292,7 +1051,6 @@ delete_after_import = true
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
-                sync_name: SyncName::new("videos".into()).unwrap(),
                 local_path: ClientLocalPath::new("/tmp/a.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/univ/a.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
@@ -1346,11 +1104,6 @@ delete_after_import = true
     #[test]
     fn test_postprocessing_path_with_spaces() {
         let server_config = ServerConfig {
-            roots: purgery_core::ServerRoots::single(
-                "univ",
-                ServerRoot::new("/data".into()).unwrap(),
-            )
-            .unwrap(),
             work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
@@ -1371,26 +1124,13 @@ delete_after_import = true
             },
             logging: Default::default(),
         };
-        let run_config = RunConfig {
-            nickname: Nickname::new("laptop".into()).unwrap(),
-            sync: vec![],
-            postprocess: purgery_core::ClientPostprocessConfig {
-                rules: vec![purgery_core::PostprocessRule {
-                    pattern: "videos/*".to_owned(),
-                    steps: vec!["compress-video".to_owned()],
-                    sync_names: None,
-                }],
-            },
-        };
-
         let tmp = tempfile::tempdir().unwrap();
         let work_area = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
         let work_path = work_area.join("some file.mp4");
         fs::write(&work_path, b"test data").unwrap();
 
-        let run_plan = RunPlan::build(&server_config, &run_config).unwrap();
-        let results =
-            test_apply_postprocessing(&run_plan, "videos", "videos/some file.mp4", &work_path);
+        let run_plan = RunPlan::build(&server_config).unwrap();
+        let results = test_apply_postprocessing(&run_plan, &work_path);
         assert!(results.is_ok(), "postprocess with spaces should succeed");
         let outputs = results.unwrap();
         assert!(!outputs.is_empty());
@@ -1401,15 +1141,8 @@ delete_after_import = true
     fn test_postprocessing_failure_does_not_create_final_output() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let server_str = server_root.as_str();
 
         let server_config = ServerConfig {
-            roots: purgery_core::ServerRoots::single(
-                "univ",
-                ServerRoot::new(server_str.into()).unwrap(),
-            )
-            .unwrap(),
             work_dir: PurgeryRoot::new(work_dir.as_str().into()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
@@ -1446,15 +1179,8 @@ delete_after_import = true
 
         write_run_toml_with_sync(&ready_path, &nickname, "videos", "videos");
         let run_config_content = r#"nickname = "laptop"
-
-[[sync]]
-name = "videos"
 to = "univ/videos"
 delete_after_import = true
-
-[[postprocess.rules]]
-match = "*.mp4"
-steps = ["compress-video"]
 "#
         .to_string();
         fs::write(ready_path.join("run.toml"), &run_config_content).unwrap();
@@ -1463,7 +1189,6 @@ steps = ["compress-video"]
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
-                sync_name: SyncName::new("videos".into()).unwrap(),
                 local_path: ClientLocalPath::new("/home/user/Videos/test.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/univ/videos/test.mp4".into())
                     .unwrap(),
@@ -1473,8 +1198,8 @@ steps = ["compress-video"]
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
-                mode: Default::default(),
-                postprocess_steps: Vec::new(),
+                mode: purgery_core::ManifestEntryMode::Postprocess,
+                postprocess_steps: vec!["compress-video".into()],
                 covered_by: None,
             }],
         };
@@ -1495,7 +1220,7 @@ steps = ["compress-video"]
         assert_eq!(status.entries[0].status, FileStatus::Failed);
         assert!(status.entries[0].error.as_ref().unwrap().contains("failed"));
 
-        let final_path = server_root.join("videos/test.mp4");
+        let final_path = server_config.work_dir.as_path().join("videos/test.mp4");
         assert!(
             !final_path.exists(),
             "failed postprocess must not create final output"
@@ -1510,11 +1235,6 @@ steps = ["compress-video"]
         fs::write(&work_path, b"video").unwrap();
 
         let server_config = ServerConfig {
-            roots: purgery_core::ServerRoots::single(
-                "univ",
-                ServerRoot::new("/data".into()).unwrap(),
-            )
-            .unwrap(),
             work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
@@ -1535,21 +1255,8 @@ steps = ["compress-video"]
             },
             logging: Default::default(),
         };
-        let run_config = RunConfig {
-            nickname: Nickname::new("laptop".into()).unwrap(),
-            sync: vec![],
-            postprocess: purgery_core::ClientPostprocessConfig {
-                rules: vec![purgery_core::PostprocessRule {
-                    pattern: "videos/*.mp4".to_owned(),
-                    steps: vec!["compress-video".to_owned()],
-                    sync_names: None,
-                }],
-            },
-        };
-
-        let pp_run_plan = RunPlan::build(&server_config, &run_config).unwrap();
-        let result =
-            test_apply_postprocessing(&pp_run_plan, "videos", "videos/video.mp4", &work_path);
+        let pp_run_plan = RunPlan::build(&server_config).unwrap();
+        let result = test_apply_postprocessing(&pp_run_plan, &work_path);
         assert!(result.is_ok());
         let outputs = result.unwrap();
         assert!(outputs.contains(&work_path));
@@ -1566,11 +1273,6 @@ steps = ["compress-video"]
         fs::write(&compressed, b"compressed").unwrap();
 
         let server_config = ServerConfig {
-            roots: purgery_core::ServerRoots::single(
-                "univ",
-                ServerRoot::new("/data".into()).unwrap(),
-            )
-            .unwrap(),
             work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
@@ -1591,21 +1293,8 @@ steps = ["compress-video"]
             },
             logging: Default::default(),
         };
-        let run_config = RunConfig {
-            nickname: Nickname::new("laptop".into()).unwrap(),
-            sync: vec![],
-            postprocess: purgery_core::ClientPostprocessConfig {
-                rules: vec![purgery_core::PostprocessRule {
-                    pattern: "videos/*".to_owned(),
-                    steps: vec!["compress-video".to_owned()],
-                    sync_names: None,
-                }],
-            },
-        };
-
-        let pp_run_plan = RunPlan::build(&server_config, &run_config).unwrap();
-        let result =
-            test_apply_postprocessing(&pp_run_plan, "videos", "videos/video.mp4", &work_path);
+        let pp_run_plan = RunPlan::build(&server_config).unwrap();
+        let result = test_apply_postprocessing(&pp_run_plan, &work_path);
         assert!(result.is_ok());
         let outputs = result.unwrap();
         assert!(
@@ -1629,11 +1318,6 @@ steps = ["compress-video"]
         fs::write(&compressed, b"compressed").unwrap();
 
         let server_config = ServerConfig {
-            roots: purgery_core::ServerRoots::single(
-                "univ",
-                ServerRoot::new("/data".into()).unwrap(),
-            )
-            .unwrap(),
             work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
@@ -1654,21 +1338,8 @@ steps = ["compress-video"]
             },
             logging: Default::default(),
         };
-        let run_config = RunConfig {
-            nickname: Nickname::new("laptop".into()).unwrap(),
-            sync: vec![],
-            postprocess: purgery_core::ClientPostprocessConfig {
-                rules: vec![purgery_core::PostprocessRule {
-                    pattern: "videos/*".to_owned(),
-                    steps: vec!["compress-video".to_owned()],
-                    sync_names: None,
-                }],
-            },
-        };
-
-        let pp_run_plan = RunPlan::build(&server_config, &run_config).unwrap();
-        let result =
-            test_apply_postprocessing(&pp_run_plan, "videos", "videos/video.mp4", &work_path);
+        let pp_run_plan = RunPlan::build(&server_config).unwrap();
+        let result = test_apply_postprocessing(&pp_run_plan, &work_path);
         assert!(result.is_ok());
         let outputs = result.unwrap();
         assert!(
@@ -1685,13 +1356,11 @@ steps = ["compress-video"]
     fn regular_file_commit_produces_only_expected_final_paths() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-tmp-commit".into()).unwrap();
 
         let (config, _) = setup_single_file_ready(
             &work_dir,
-            &server_root,
             &nickname,
             &run_id,
             "videos",
@@ -1702,15 +1371,56 @@ steps = ["compress-video"]
 
         process_run(&config, &nickname, &run_id).unwrap();
 
-        let final_path = server_root.join("videos/test.mp4");
+        let final_path = config.work_dir.as_path().join("univ/videos/test.mp4");
         assert!(final_path.exists());
         assert_eq!(fs::read_to_string(&final_path).unwrap(), "hello");
 
         let expected = vec![
-            server_root.join("videos"),
-            server_root.join("videos/test.mp4"),
+            config.work_dir.as_path().join("univ"),
+            config.work_dir.as_path().join("univ/videos"),
+            config.work_dir.as_path().join("univ/videos/test.mp4"),
+            config.work_dir.as_path().join("laptop"),
+            config.work_dir.as_path().join("laptop/done"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-tmp-commit"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-tmp-commit/files"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-tmp-commit/files/univ"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-tmp-commit/files/univ/videos"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-tmp-commit/files/univ/videos/test.mp4"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-tmp-commit/manifest.toml"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-tmp-commit/progress.toml"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-tmp-commit/run.toml"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-tmp-commit/status.toml"),
+            config.work_dir.as_path().join("laptop/processing"),
+            config.work_dir.as_path().join("laptop/ready"),
         ];
-        assert_root_contains_exactly(server_root.as_path(), &expected);
+        assert_root_contains_exactly(config.work_dir.as_path(), &expected);
     }
 
     // ── Atomic replacement tests ──
@@ -1719,13 +1429,11 @@ steps = ["compress-video"]
     fn test_existing_regular_final_output_is_replaced() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-replace".into()).unwrap();
 
         let (config, _) = setup_single_file_ready(
             &work_dir,
-            &server_root,
             &nickname,
             &run_id,
             "videos",
@@ -1734,7 +1442,7 @@ steps = ["compress-video"]
             b"new content",
         );
 
-        let final_path = server_root.join("videos/test.mp4");
+        let final_path = config.work_dir.as_path().join("univ/videos/test.mp4");
         fs::create_dir_all(final_path.parent().unwrap()).unwrap();
         fs::write(&final_path, b"old content").unwrap();
 
@@ -1753,12 +1461,10 @@ steps = ["compress-video"]
     fn test_regular_file_replaces_existing_empty_directory_like_rsync() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-directory-block".into()).unwrap();
         let (config, _) = setup_single_file_ready(
             &work_dir,
-            &server_root,
             &nickname,
             &run_id,
             "videos",
@@ -1766,7 +1472,7 @@ steps = ["compress-video"]
             "files/univ/videos/test.mp4",
             b"content",
         );
-        let final_path = server_root.join("videos/test.mp4");
+        let final_path = config.work_dir.as_path().join("univ/videos/test.mp4");
         fs::create_dir_all(&final_path).unwrap();
 
         process_run(&config, &nickname, &run_id).unwrap();
@@ -1784,12 +1490,10 @@ steps = ["compress-video"]
     fn test_regular_file_replaces_existing_symlink_like_rsync() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-final-symlink".into()).unwrap();
         let (config, _) = setup_single_file_ready(
             &work_dir,
-            &server_root,
             &nickname,
             &run_id,
             "documents",
@@ -1797,7 +1501,7 @@ steps = ["compress-video"]
             "files/univ/documents/a.txt",
             b"content",
         );
-        let final_path = server_root.join("documents/a.txt");
+        let final_path = config.work_dir.as_path().join("univ/documents/a.txt");
         fs::create_dir_all(final_path.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink("missing-target", &final_path).unwrap();
 
@@ -1816,32 +1520,16 @@ steps = ["compress-video"]
     fn test_work_area_namespacing_no_collision() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
+        let config = test_server_config(&work_dir);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-ns".into()).unwrap();
 
         let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(ready_path.join("files/univ/videos")).unwrap();
-        fs::create_dir_all(ready_path.join("files/univ/pictures")).unwrap();
         fs::write(ready_path.join("files/univ/videos/a.mp4"), b"video content").unwrap();
-        fs::write(
-            ready_path.join("files/univ/pictures/a.mp4"),
-            b"picture content",
-        )
-        .unwrap();
 
-        let run_config_content = r#"
-nickname = "laptop"
-
-[[sync]]
-name = "videos"
+        let run_config_content = r#"nickname = "laptop"
 to = "univ/videos"
-delete_after_import = true
-
-[[sync]]
-name = "pictures"
-to = "univ/pictures"
 delete_after_import = true
 "#;
         fs::write(ready_path.join("run.toml"), run_config_content).unwrap();
@@ -1849,38 +1537,19 @@ delete_after_import = true
         let manifest = Manifest {
             run_id: run_id.clone(),
             nickname: nickname.clone(),
-            entries: vec![
-                ManifestEntry {
-                    sync_name: SyncName::new("videos".into()).unwrap(),
-                    local_path: ClientLocalPath::new("/home/user/Videos/a.mp4".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/univ/videos/a.mp4".into())
-                        .unwrap(),
-                    relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
-                    kind: ManifestEntryKind::RegularFile,
-                    size: 13,
-                    mtime_ns: 1000000,
-                    sha256: None,
-                    link_target: None,
-                    mode: Default::default(),
-                    postprocess_steps: Vec::new(),
-                    covered_by: None,
-                },
-                ManifestEntry {
-                    sync_name: SyncName::new("pictures".into()).unwrap(),
-                    local_path: ClientLocalPath::new("/home/user/Pictures/a.mp4".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/univ/pictures/a.mp4".into())
-                        .unwrap(),
-                    relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
-                    kind: ManifestEntryKind::RegularFile,
-                    size: 15,
-                    mtime_ns: 1000001,
-                    sha256: None,
-                    link_target: None,
-                    mode: Default::default(),
-                    postprocess_steps: Vec::new(),
-                    covered_by: None,
-                },
-            ],
+            entries: vec![ManifestEntry {
+                local_path: ClientLocalPath::new("/home/user/Videos/a.mp4".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/univ/videos/a.mp4".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
+                size: 13,
+                mtime_ns: 1000000,
+                sha256: None,
+                link_target: None,
+                mode: Default::default(),
+                postprocess_steps: Vec::new(),
+                covered_by: None,
+            }],
         };
         fs::write(
             ready_path.join("manifest.toml"),
@@ -1890,23 +1559,16 @@ delete_after_import = true
 
         process_run(&config, &nickname, &run_id).unwrap();
 
-        let video_final = server_root.join("videos/a.mp4");
-        let picture_final = server_root.join("pictures/a.mp4");
+        let video_final = config.work_dir.as_path().join("univ/videos/a.mp4");
         assert!(video_final.exists());
-        assert!(picture_final.exists());
         assert_eq!(fs::read_to_string(&video_final).unwrap(), "video content");
-        assert_eq!(
-            fs::read_to_string(&picture_final).unwrap(),
-            "picture content"
-        );
 
         let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         let status_content = fs::read_to_string(done_path.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
         assert_eq!(status.state, RunState::Done);
-        assert_eq!(status.entries.len(), 2);
+        assert_eq!(status.entries.len(), 1);
         assert_eq!(status.entries[0].status, FileStatus::Imported);
-        assert_eq!(status.entries[1].status, FileStatus::Imported);
     }
 
     // ── Staged path mismatch test ──
@@ -1915,8 +1577,8 @@ delete_after_import = true
     fn test_manifest_staged_path_mismatch_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-sp-mismatch".into()).unwrap();
 
@@ -1930,17 +1592,16 @@ delete_after_import = true
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
-                sync_name: SyncName::new("videos".into()).unwrap(),
                 local_path: ClientLocalPath::new("/home/user/Videos/a.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/univ/other/a.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
                 kind: ManifestEntryKind::RegularFile,
-                size: 7,
+                size: 13,
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
-                mode: Default::default(),
-                postprocess_steps: Vec::new(),
+                mode: purgery_core::ManifestEntryMode::Postprocess,
+                postprocess_steps: vec!["compress-video".into()],
                 covered_by: None,
             }],
         };
@@ -1970,13 +1631,12 @@ delete_after_import = true
     fn test_manifest_staged_path_match_succeeds() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-sp-match".into()).unwrap();
 
         let (config, _) = setup_single_file_ready(
             &work_dir,
-            &server_root,
             &nickname,
             &run_id,
             "videos",
@@ -2000,8 +1660,8 @@ delete_after_import = true
     fn test_staged_symlink_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-symlink".into()).unwrap();
 
@@ -2019,7 +1679,6 @@ delete_after_import = true
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
-                sync_name: SyncName::new("videos".into()).unwrap(),
                 local_path: ClientLocalPath::new("/home/user/Videos/a.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/univ/videos/a.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
@@ -2041,7 +1700,7 @@ delete_after_import = true
 
         process_run(&config, &nickname, &run_id).unwrap();
 
-        let final_path = server_root.join("videos/a.mp4");
+        let final_path = _server_root.join("videos/a.mp4");
         assert!(
             !final_path.exists(),
             "symlink must not be imported to final path"
@@ -2063,64 +1722,18 @@ delete_after_import = true
 
     // ── Invalid regex test ──
 
-    #[test]
-    fn test_empty_postprocess_pattern_produces_failed_status() {
-        let tmp = tempfile::tempdir().unwrap();
-        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_id = RunId::new("test-bad-pattern".into()).unwrap();
-
-        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
-        fs::create_dir_all(ready_path.join("files/univ/videos")).unwrap();
-        fs::write(ready_path.join("files/univ/videos/a.mp4"), b"content").unwrap();
-
-        let run_config_content = r#"
-nickname = "laptop"
-
-[[sync]]
-name = "videos"
-to = "univ/videos"
-delete_after_import = true
-
-[[postprocess.rules]]
-match = ""
-steps = ["compress-video"]
-"#;
-        fs::write(ready_path.join("run.toml"), run_config_content).unwrap();
-
-        let result = process_run(&config, &nickname, &run_id);
-        assert!(result.is_err(), "process_run must error on empty pattern");
-
-        let failed_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Failed);
-        assert!(failed_path.exists());
-        let status_path = failed_path.join("status.toml");
-        assert!(status_path.exists());
-        let status_content = fs::read_to_string(&status_path).unwrap();
-        let status = RunStatus::from_toml(&status_content).unwrap();
-        assert_eq!(status.state, RunState::Failed);
-        assert!(
-            status.error.as_deref().unwrap().contains("pattern")
-                || status.error.as_deref().unwrap().contains("invalid")
-        );
-    }
-
     // ── Work area cleanup tests ──
 
     #[test]
     fn test_run_state_done_removes_work_area() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-done-wa".into()).unwrap();
 
         let (config, _) = setup_single_file_ready(
             &work_dir,
-            &server_root,
             &nickname,
             &run_id,
             "videos",
@@ -2139,14 +1752,8 @@ steps = ["compress-video"]
     fn test_run_state_partial_keeps_work_area() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
 
         let server_config = ServerConfig {
-            roots: purgery_core::ServerRoots::single(
-                "univ",
-                ServerRoot::new(server_root.as_str().into()).unwrap(),
-            )
-            .unwrap(),
             work_dir: PurgeryRoot::new(work_dir.as_str().into()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
@@ -2181,17 +1788,9 @@ steps = ["compress-video"]
         )
         .unwrap();
 
-        let run_config_content = r#"
-nickname = "laptop"
-
-[[sync]]
-name = "videos"
+        let run_config_content = r#"nickname = "laptop"
 to = "univ/videos"
 delete_after_import = true
-
-[[postprocess.rules]]
-match = "*.mp4"
-steps = ["compress-video"]
 "#;
         fs::write(ready_path.join("run.toml"), run_config_content).unwrap();
 
@@ -2199,7 +1798,6 @@ steps = ["compress-video"]
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
-                sync_name: SyncName::new("videos".into()).unwrap(),
                 local_path: ClientLocalPath::new("/home/user/Videos/test.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/univ/videos/test.mp4".into())
                     .unwrap(),
@@ -2210,7 +1808,7 @@ steps = ["compress-video"]
                 sha256: None,
                 link_target: None,
                 mode: Default::default(),
-                postprocess_steps: Vec::new(),
+                postprocess_steps: vec!["compress-video".into()],
                 covered_by: None,
             }],
         };
@@ -2241,7 +1839,6 @@ steps = ["compress-video"]
     fn test_compress_video_keep_original_records_both_paths() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
 
         let script_path = tmp.path().join("compress.sh");
         std::fs::write(
@@ -2255,11 +1852,6 @@ steps = ["compress-video"]
         .unwrap();
 
         let server_config = ServerConfig {
-            roots: purgery_core::ServerRoots::single(
-                "univ",
-                ServerRoot::new(server_root.as_str().into()).unwrap(),
-            )
-            .unwrap(),
             work_dir: PurgeryRoot::new(work_dir.as_str().into()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
@@ -2290,17 +1882,9 @@ steps = ["compress-video"]
         fs::create_dir_all(ready_path.join("files/univ/videos")).unwrap();
         fs::write(ready_path.join("files/univ/videos/video.mp4"), b"video").unwrap();
 
-        let run_config_content = r#"
-nickname = "laptop"
-
-[[sync]]
-name = "videos"
+        let run_config_content = r#"nickname = "laptop"
 to = "univ/videos"
 delete_after_import = true
-
-[[postprocess.rules]]
-match = "*.mp4"
-steps = ["compress-video"]
 "#;
         fs::write(ready_path.join("run.toml"), run_config_content).unwrap();
 
@@ -2308,7 +1892,6 @@ steps = ["compress-video"]
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
-                sync_name: SyncName::new("videos".into()).unwrap(),
                 local_path: ClientLocalPath::new("/home/user/Videos/video.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/univ/videos/video.mp4".into())
                     .unwrap(),
@@ -2319,7 +1902,7 @@ steps = ["compress-video"]
                 sha256: None,
                 link_target: None,
                 mode: Default::default(),
-                postprocess_steps: Vec::new(),
+                postprocess_steps: vec!["compress-video".into()],
                 covered_by: None,
             }],
         };
@@ -2340,8 +1923,14 @@ steps = ["compress-video"]
         assert_eq!(status.entries[0].status, FileStatus::Imported);
         assert_eq!(status.entries[0].final_paths.len(), 2);
 
-        let original_final = server_root.join("videos/video.mp4");
-        let compressed_final = server_root.join("videos/video.Z.webm");
+        let original_final = server_config
+            .work_dir
+            .as_path()
+            .join("univ/videos/video.mp4");
+        let compressed_final = server_config
+            .work_dir
+            .as_path()
+            .join("univ/videos/video.Z.webm");
         assert!(original_final.exists());
         assert!(compressed_final.exists());
     }
@@ -2350,7 +1939,6 @@ steps = ["compress-video"]
     fn test_compress_video_keep_original_false_records_one_path() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
 
         let script_path = tmp.path().join("compress.sh");
         std::fs::write(
@@ -2364,11 +1952,6 @@ steps = ["compress-video"]
         .unwrap();
 
         let server_config = ServerConfig {
-            roots: purgery_core::ServerRoots::single(
-                "univ",
-                ServerRoot::new(server_root.as_str().into()).unwrap(),
-            )
-            .unwrap(),
             work_dir: PurgeryRoot::new(work_dir.as_str().into()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
@@ -2399,17 +1982,9 @@ steps = ["compress-video"]
         fs::create_dir_all(ready_path.join("files/univ/videos")).unwrap();
         fs::write(ready_path.join("files/univ/videos/video.mp4"), b"video").unwrap();
 
-        let run_config_content = r#"
-nickname = "laptop"
-
-[[sync]]
-name = "videos"
+        let run_config_content = r#"nickname = "laptop"
 to = "univ/videos"
 delete_after_import = true
-
-[[postprocess.rules]]
-match = "*.mp4"
-steps = ["compress-video"]
 "#;
         fs::write(ready_path.join("run.toml"), run_config_content).unwrap();
 
@@ -2417,7 +1992,6 @@ steps = ["compress-video"]
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
-                sync_name: SyncName::new("videos".into()).unwrap(),
                 local_path: ClientLocalPath::new("/home/user/Videos/video.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/univ/videos/video.mp4".into())
                     .unwrap(),
@@ -2428,7 +2002,7 @@ steps = ["compress-video"]
                 sha256: None,
                 link_target: None,
                 mode: Default::default(),
-                postprocess_steps: Vec::new(),
+                postprocess_steps: vec!["compress-video".into()],
                 covered_by: None,
             }],
         };
@@ -2449,8 +2023,14 @@ steps = ["compress-video"]
         assert_eq!(status.entries[0].status, FileStatus::Imported);
         assert_eq!(status.entries[0].final_paths.len(), 1);
 
-        let original_final = server_root.join("videos/video.mp4");
-        let compressed_final = server_root.join("videos/video.Z.webm");
+        let original_final = server_config
+            .work_dir
+            .as_path()
+            .join("univ/videos/video.mp4");
+        let compressed_final = server_config
+            .work_dir
+            .as_path()
+            .join("univ/videos/video.Z.webm");
         assert!(
             !original_final.exists(),
             "original must NOT exist with keep_original=false"
@@ -2458,78 +2038,13 @@ steps = ["compress-video"]
         assert!(compressed_final.exists());
     }
 
-    // ── Run Plan tests ──
-
-    #[test]
-    fn test_run_plan_validates_empty_pattern() {
-        let server_config = ServerConfig {
-            roots: purgery_core::ServerRoots::single(
-                "univ",
-                ServerRoot::new("/data".into()).unwrap(),
-            )
-            .unwrap(),
-            work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
-            gc: Default::default(),
-            postprocess: PostprocessConfig::default(),
-            logging: Default::default(),
-        };
-        let run_config = RunConfig {
-            nickname: Nickname::new("laptop".into()).unwrap(),
-            sync: vec![],
-            postprocess: purgery_core::ClientPostprocessConfig {
-                rules: vec![purgery_core::PostprocessRule {
-                    pattern: "".into(),
-                    steps: vec!["compress-video".into()],
-                    sync_names: None,
-                }],
-            },
-        };
-        let result = RunPlan::build(&server_config, &run_config);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("empty pattern"));
-    }
-
-    #[test]
-    fn test_run_plan_validates_step_references() {
-        let server_config = ServerConfig {
-            roots: purgery_core::ServerRoots::single(
-                "univ",
-                ServerRoot::new("/data".into()).unwrap(),
-            )
-            .unwrap(),
-            work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
-            gc: Default::default(),
-            postprocess: PostprocessConfig::default(),
-            logging: Default::default(),
-        };
-        let run_config = RunConfig {
-            nickname: Nickname::new("laptop".into()).unwrap(),
-            sync: vec![],
-            postprocess: purgery_core::ClientPostprocessConfig {
-                rules: vec![purgery_core::PostprocessRule {
-                    pattern: "videos/*".into(),
-                    steps: vec!["nonexistent-step".into()],
-                    sync_names: None,
-                }],
-            },
-        };
-        let result = RunPlan::build(&server_config, &run_config);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not defined on server"));
-    }
-
     // ── begin_run / finish_run tests ──
 
     #[test]
     fn test_begin_run_creates_directory() {
         let tmp = tempfile::tempdir().unwrap();
-        let root_path = tmp.path().join("storage");
+        let _root_path = tmp.path().join("storage");
         let server_config = ServerConfig {
-            roots: purgery_core::ServerRoots::single(
-                "univ",
-                ServerRoot::new(Utf8PathBuf::from_path_buf(root_path).unwrap()).unwrap(),
-            )
-            .unwrap(),
             work_dir: PurgeryRoot::new(
                 Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
             )
@@ -2558,13 +2073,8 @@ steps = ["compress-video"]
     #[test]
     fn test_finish_run_moves_from_incoming_to_ready() {
         let tmp = tempfile::tempdir().unwrap();
-        let root_path = tmp.path().join("storage");
+        let _root_path = tmp.path().join("storage");
         let server_config = ServerConfig {
-            roots: purgery_core::ServerRoots::single(
-                "univ",
-                ServerRoot::new(Utf8PathBuf::from_path_buf(root_path).unwrap()).unwrap(),
-            )
-            .unwrap(),
             work_dir: PurgeryRoot::new(
                 Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
             )
@@ -2601,13 +2111,12 @@ steps = ["compress-video"]
     fn test_read_run_status_from_done() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-status".into()).unwrap();
 
         let (config, _) = setup_single_file_ready(
             &work_dir,
-            &server_root,
             &nickname,
             &run_id,
             "videos",
@@ -2627,13 +2136,8 @@ steps = ["compress-video"]
     #[test]
     fn test_read_run_status_not_found() {
         let tmp = tempfile::tempdir().unwrap();
-        let root_path = tmp.path().join("storage");
+        let _root_path = tmp.path().join("storage");
         let server_config = ServerConfig {
-            roots: purgery_core::ServerRoots::single(
-                "univ",
-                ServerRoot::new(Utf8PathBuf::from_path_buf(root_path).unwrap()).unwrap(),
-            )
-            .unwrap(),
             work_dir: PurgeryRoot::new(
                 Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
             )
@@ -2652,13 +2156,8 @@ steps = ["compress-video"]
     #[test]
     fn test_finish_run_rejects_expired_lease() {
         let tmp = tempfile::tempdir().unwrap();
-        let root_path = tmp.path().join("storage");
+        let _root_path = tmp.path().join("storage");
         let server_config = ServerConfig {
-            roots: purgery_core::ServerRoots::single(
-                "univ",
-                ServerRoot::new(Utf8PathBuf::from_path_buf(root_path).unwrap()).unwrap(),
-            )
-            .unwrap(),
             work_dir: PurgeryRoot::new(
                 Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
             )
@@ -2693,13 +2192,8 @@ steps = ["compress-video"]
     #[test]
     fn test_finish_run_rejects_mismatched_lease_nickname() {
         let tmp = tempfile::tempdir().unwrap();
-        let root_path = tmp.path().join("storage");
+        let _root_path = tmp.path().join("storage");
         let server_config = ServerConfig {
-            roots: purgery_core::ServerRoots::single(
-                "univ",
-                ServerRoot::new(Utf8PathBuf::from_path_buf(root_path).unwrap()).unwrap(),
-            )
-            .unwrap(),
             work_dir: PurgeryRoot::new(
                 Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
             )
@@ -2735,12 +2229,11 @@ steps = ["compress-video"]
     fn test_process_once_processes_ready_run_after_restart() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("ready-after-restart".into()).unwrap();
         let (config, _) = setup_single_file_ready(
             &work_dir,
-            &server_root,
             &nickname,
             &run_id,
             "documents",
@@ -2756,7 +2249,7 @@ steps = ["compress-video"]
             .run_dir(&nickname, &run_id, RunPhase::Done)
             .exists());
         assert_eq!(
-            fs::read_to_string(server_root.join("documents/a.txt")).unwrap(),
+            fs::read_to_string(config.work_dir.as_path().join("univ/documents/a.txt")).unwrap(),
             "ready"
         );
     }
@@ -2765,12 +2258,10 @@ steps = ["compress-video"]
     fn test_process_once_recovers_processing_run_without_status() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("recover-interrupted".into()).unwrap();
         let (config, _) = setup_single_file_ready(
             &work_dir,
-            &server_root,
             &nickname,
             &run_id,
             "documents",
@@ -2794,7 +2285,7 @@ steps = ["compress-video"]
         let done = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(done.join("status.toml").exists());
         assert_eq!(
-            fs::read_to_string(server_root.join("documents/a.txt")).unwrap(),
+            fs::read_to_string(config.work_dir.as_path().join("univ/documents/a.txt")).unwrap(),
             "hello"
         );
         assert!(!stale_work.exists());
@@ -2804,8 +2295,8 @@ steps = ["compress-video"]
     fn test_process_once_finalizes_processing_run_with_valid_status() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("recover-status".into()).unwrap();
         let processing = config
@@ -2837,8 +2328,8 @@ steps = ["compress-video"]
     ) {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new(directory_run_id.into()).unwrap();
         let processing = config
@@ -2897,8 +2388,8 @@ steps = ["compress-video"]
     fn test_mismatched_status_recovery_propagates_terminal_move_failure() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("blocked-failed-move".into()).unwrap();
         let processing = config
@@ -2943,8 +2434,8 @@ steps = ["compress-video"]
     fn test_malformed_status_recovery_propagates_failed_status_write_failure() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("blocked-status-write".into()).unwrap();
         let processing = config
@@ -2969,8 +2460,8 @@ steps = ["compress-video"]
     fn test_process_once_fails_processing_run_with_malformed_status() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("recover-malformed".into()).unwrap();
         let processing = config
@@ -2998,12 +2489,11 @@ steps = ["compress-video"]
     fn test_replay_after_final_replacement_without_status_converges() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("recover-committed-output".into()).unwrap();
         let (config, _) = setup_single_file_ready(
             &work_dir,
-            &server_root,
             &nickname,
             &run_id,
             "documents",
@@ -3017,7 +2507,7 @@ steps = ["compress-video"]
             .run_dir(&nickname, &run_id, RunPhase::Processing);
         fs::create_dir_all(processing.parent().unwrap()).unwrap();
         fs::rename(&ready, &processing).unwrap();
-        let final_path = server_root.join("documents/a.txt");
+        let final_path = _server_root.join("documents/a.txt");
         fs::create_dir_all(final_path.parent().unwrap()).unwrap();
         fs::write(&final_path, b"new").unwrap();
         assert!(!processing.join("status.toml").exists());
@@ -3035,14 +2525,13 @@ steps = ["compress-video"]
     fn test_repeated_imports_same_destination_are_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
 
         for (run, content) in [("repeat-1", b"hello".as_slice()), ("repeat-2", b"hello")] {
             let run_id = RunId::new(run.into()).unwrap();
             let (config, _) = setup_single_file_ready(
                 &work_dir,
-                &server_root,
                 &nickname,
                 &run_id,
                 "documents",
@@ -3058,7 +2547,7 @@ steps = ["compress-video"]
         }
 
         assert_eq!(
-            fs::read_to_string(server_root.join("documents/a.txt")).unwrap(),
+            fs::read_to_string(work_dir.join("univ/documents/a.txt")).unwrap(),
             "hello"
         );
     }
@@ -3067,14 +2556,12 @@ steps = ["compress-video"]
     fn test_repeated_import_replaces_changed_content() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
 
         for (run, content) in [("version-1", b"v1".as_slice()), ("version-2", b"v2")] {
             let run_id = RunId::new(run.into()).unwrap();
             let (config, _) = setup_single_file_ready(
                 &work_dir,
-                &server_root,
                 &nickname,
                 &run_id,
                 "documents",
@@ -3086,7 +2573,7 @@ steps = ["compress-video"]
         }
 
         assert_eq!(
-            fs::read_to_string(server_root.join("documents/a.txt")).unwrap(),
+            fs::read_to_string(work_dir.join("univ/documents/a.txt")).unwrap(),
             "v2"
         );
     }
@@ -3095,8 +2582,8 @@ steps = ["compress-video"]
     fn test_gc_collects_abandoned_incoming_upload() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("abandoned-upload".into()).unwrap();
         begin_run(&config, &nickname, &run_id).unwrap();
@@ -3129,13 +2616,8 @@ steps = ["compress-video"]
     #[test]
     fn test_begin_run_stdout_is_parseable_toml() {
         let tmp = tempfile::tempdir().unwrap();
-        let root_path = tmp.path().join("storage");
+        let _root_path = tmp.path().join("storage");
         let server_config = ServerConfig {
-            roots: purgery_core::ServerRoots::single(
-                "univ",
-                ServerRoot::new(Utf8PathBuf::from_path_buf(root_path).unwrap()).unwrap(),
-            )
-            .unwrap(),
             work_dir: PurgeryRoot::new(
                 Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
             )
@@ -3162,13 +2644,12 @@ steps = ["compress-video"]
     fn test_status_stdout_is_parseable_toml() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-stdout-status".into()).unwrap();
 
         let (config, _) = setup_single_file_ready(
             &work_dir,
-            &server_root,
             &nickname,
             &run_id,
             "videos",
@@ -3321,8 +2802,8 @@ steps = ["compress-video"]
     fn test_process_run_overlays_directory_file_and_symlink_without_delete() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("tree-overlay".into()).unwrap();
         let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
@@ -3333,7 +2814,6 @@ steps = ["compress-video"]
         write_run_toml_with_sync(&ready, &nickname, "data", "data");
 
         let entry = |relative: &str, kind, size, target: Option<&str>| ManifestEntry {
-            sync_name: SyncName::new("data".into()).unwrap(),
             local_path: ClientLocalPath::new(format!("/source/{relative}")).unwrap(),
             staged_path: NormalizedRelativePath::new(format!("files/univ/data/{relative}").into())
                 .unwrap(),
@@ -3363,7 +2843,7 @@ steps = ["compress-video"]
         };
         fs::write(ready.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
 
-        let final_tree = server_root.join("data/tree");
+        let final_tree = config.work_dir.as_path().join("univ/data/tree");
         fs::create_dir_all(&final_tree).unwrap();
         fs::write(final_tree.join("extra.txt"), "keep").unwrap();
         process_run(&config, &nickname, &run_id).unwrap();
@@ -3394,8 +2874,8 @@ steps = ["compress-video"]
     fn test_read_run_status_rejects_mismatched_terminal_envelope() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("requested".into()).unwrap();
         let done = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
@@ -3414,22 +2894,18 @@ steps = ["compress-video"]
     }
 
     fn expected_output_test_plan() -> RunPlan {
-        RunPlan {
-            rules: vec![CompiledRule {
-                pattern: "data/*.txt".into(),
-                sync_names: None,
-                steps: vec![ResolvedStep {
-                    step_name: "generate".into(),
-                    step_def: PostprocessStepDefinition {
-                        kind: PostprocessKind::Subprocess,
-                        program: "true".into(),
-                        args: vec![],
-                        expected_outputs: vec!["{stem}.out".into()],
-                        keep_original: false,
-                    },
-                }],
-            }],
-        }
+        let mut steps = std::collections::BTreeMap::new();
+        steps.insert(
+            "generate".to_owned(),
+            PostprocessStepDefinition {
+                kind: PostprocessKind::Subprocess,
+                program: "true".into(),
+                args: vec![],
+                expected_outputs: vec!["{stem}.out".into()],
+                keep_original: false,
+            },
+        );
+        RunPlan { steps }
     }
 
     #[test]
@@ -3439,13 +2915,7 @@ steps = ["compress-video"]
         fs::write(&work_path, "input").unwrap();
         fs::write(work_path.with_file_name("input.out"), "output").unwrap();
 
-        let outputs = test_apply_postprocessing(
-            &expected_output_test_plan(),
-            "data",
-            "data/input.txt",
-            &work_path,
-        )
-        .unwrap();
+        let outputs = test_apply_postprocessing(&expected_output_test_plan(), &work_path).unwrap();
         assert_eq!(outputs, vec![work_path.with_file_name("input.out")]);
     }
 
@@ -3455,13 +2925,8 @@ steps = ["compress-video"]
         let work_path = Utf8PathBuf::from_path_buf(tmp.path().join("input.txt")).unwrap();
         fs::write(&work_path, "input").unwrap();
 
-        let error = test_apply_postprocessing(
-            &expected_output_test_plan(),
-            "data",
-            "data/input.txt",
-            &work_path,
-        )
-        .unwrap_err();
+        let error =
+            test_apply_postprocessing(&expected_output_test_plan(), &work_path).unwrap_err();
         assert!(error.contains("expected output not found"));
     }
 
@@ -3476,13 +2941,7 @@ steps = ["compress-video"]
         // itself must be accepted — Purgery must not follow or reject it.
         std::os::unix::fs::symlink(&target, work_path.with_file_name("input.out")).unwrap();
 
-        let outputs = test_apply_postprocessing(
-            &expected_output_test_plan(),
-            "data",
-            "data/input.txt",
-            &work_path,
-        )
-        .unwrap();
+        let outputs = test_apply_postprocessing(&expected_output_test_plan(), &work_path).unwrap();
         assert!(
             outputs.contains(&work_path.with_file_name("input.out")),
             "symlink expected output must be accepted"
@@ -3504,13 +2963,7 @@ steps = ["compress-video"]
         fs::write(&work_path, "input").unwrap();
         fs::create_dir(work_path.with_file_name("input.out")).unwrap();
 
-        let outputs = test_apply_postprocessing(
-            &expected_output_test_plan(),
-            "data",
-            "data/input.txt",
-            &work_path,
-        )
-        .unwrap();
+        let outputs = test_apply_postprocessing(&expected_output_test_plan(), &work_path).unwrap();
         assert!(outputs.contains(&work_path.with_file_name("input.out")));
     }
 
@@ -3521,13 +2974,7 @@ steps = ["compress-video"]
         fs::write(&work_path, "input").unwrap();
         std::os::unix::fs::symlink("some-target", work_path.with_file_name("input.out")).unwrap();
 
-        let outputs = test_apply_postprocessing(
-            &expected_output_test_plan(),
-            "data",
-            "data/input.txt",
-            &work_path,
-        )
-        .unwrap();
+        let outputs = test_apply_postprocessing(&expected_output_test_plan(), &work_path).unwrap();
         assert!(outputs.contains(&work_path.with_file_name("input.out")));
     }
 
@@ -3542,13 +2989,8 @@ steps = ["compress-video"]
             .status()
             .unwrap();
 
-        let error = test_apply_postprocessing(
-            &expected_output_test_plan(),
-            "data",
-            "data/input.txt",
-            &work_path,
-        )
-        .unwrap_err();
+        let error =
+            test_apply_postprocessing(&expected_output_test_plan(), &work_path).unwrap_err();
         assert!(error.contains("expected output is not a supported entry type"));
     }
 
@@ -3570,7 +3012,6 @@ steps = ["compress-video"]
     #[test]
     fn covered_entries_have_covered_mode_and_covered_by() {
         let entry_descendant = ManifestEntry {
-            sync_name: SyncName::new("data".into()).unwrap(),
             local_path: ClientLocalPath::new("/source/photos/photo.txt".into()).unwrap(),
             staged_path: NormalizedRelativePath::new("files/univ/data/photos/photo.txt".into())
                 .unwrap(),
@@ -3597,11 +3038,10 @@ steps = ["compress-video"]
     fn prepare_run_rejects_covered_entry_with_missing_covered_by() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
         // Set up a postprocess step so the directory can be postprocessed
         let config = ServerConfig {
-            roots: config.roots,
             work_dir: config.work_dir,
             postprocess: PostprocessConfig {
                 steps: {
@@ -3628,17 +3068,9 @@ steps = ["compress-video"]
             .run_dir(&nickname, &run_id, RunPhase::Incoming);
         fs::create_dir_all(&incoming).unwrap();
         write_run_toml_with_sync(&incoming, &nickname, "data", "data");
-        let run_config_content = r#"
-nickname = "laptop"
-
-[[sync]]
-name = "data"
+        let run_config_content = r#"nickname = "laptop"
 to = "univ/data"
 delete_after_import = true
-
-[[postprocess.rules]]
-match = "album"
-steps = ["pack"]
 "#;
         fs::write(incoming.join("run.toml"), run_config_content).unwrap();
         let manifest = Manifest {
@@ -3646,7 +3078,6 @@ steps = ["pack"]
             nickname: nickname.clone(),
             entries: vec![
                 ManifestEntry {
-                    sync_name: SyncName::new("data".into()).unwrap(),
                     local_path: ClientLocalPath::new("/source/album".into()).unwrap(),
                     staged_path: NormalizedRelativePath::new("files/univ/data/album".into())
                         .unwrap(),
@@ -3661,7 +3092,6 @@ steps = ["pack"]
                     covered_by: None,
                 },
                 ManifestEntry {
-                    sync_name: SyncName::new("data".into()).unwrap(),
                     local_path: ClientLocalPath::new("/source/album/song.mp3".into()).unwrap(),
                     staged_path: NormalizedRelativePath::new(
                         "files/univ/data/album/song.mp3".into(),
@@ -3691,8 +3121,8 @@ steps = ["pack"]
     fn prepare_run_rejects_covered_entry_with_wrong_covered_by() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
         let config = ServerConfig {
             postprocess: PostprocessConfig {
                 steps: {
@@ -3720,17 +3150,9 @@ steps = ["pack"]
         fs::create_dir_all(&incoming).unwrap();
         fs::write(
             incoming.join("run.toml"),
-            r#"
-nickname = "laptop"
-
-[[sync]]
-name = "data"
+            r#"nickname = "laptop"
 to = "univ/data"
 delete_after_import = true
-
-[[postprocess.rules]]
-match = "album"
-steps = ["pack"]
 "#,
         )
         .unwrap();
@@ -3739,7 +3161,6 @@ steps = ["pack"]
             nickname: nickname.clone(),
             entries: vec![
                 ManifestEntry {
-                    sync_name: SyncName::new("data".into()).unwrap(),
                     local_path: ClientLocalPath::new("/source/album".into()).unwrap(),
                     staged_path: NormalizedRelativePath::new("files/univ/data/album".into())
                         .unwrap(),
@@ -3754,7 +3175,6 @@ steps = ["pack"]
                     covered_by: None,
                 },
                 ManifestEntry {
-                    sync_name: SyncName::new("data".into()).unwrap(),
                     local_path: ClientLocalPath::new("/source/album/song.mp3".into()).unwrap(),
                     staged_path: NormalizedRelativePath::new(
                         "files/univ/data/album/song.mp3".into(),
@@ -3784,8 +3204,8 @@ steps = ["pack"]
     fn prepare_run_rejects_covered_entry_with_non_empty_postprocess_steps() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
         let config = ServerConfig {
             postprocess: PostprocessConfig {
                 steps: {
@@ -3813,17 +3233,9 @@ steps = ["pack"]
         fs::create_dir_all(&incoming).unwrap();
         fs::write(
             incoming.join("run.toml"),
-            r#"
-nickname = "laptop"
-
-[[sync]]
-name = "data"
+            r#"nickname = "laptop"
 to = "univ/data"
 delete_after_import = true
-
-[[postprocess.rules]]
-match = "album"
-steps = ["pack"]
 "#,
         )
         .unwrap();
@@ -3832,7 +3244,6 @@ steps = ["pack"]
             nickname: nickname.clone(),
             entries: vec![
                 ManifestEntry {
-                    sync_name: SyncName::new("data".into()).unwrap(),
                     local_path: ClientLocalPath::new("/source/album".into()).unwrap(),
                     staged_path: NormalizedRelativePath::new("files/univ/data/album".into())
                         .unwrap(),
@@ -3847,7 +3258,6 @@ steps = ["pack"]
                     covered_by: None,
                 },
                 ManifestEntry {
-                    sync_name: SyncName::new("data".into()).unwrap(),
                     local_path: ClientLocalPath::new("/source/album/song.mp3".into()).unwrap(),
                     staged_path: NormalizedRelativePath::new(
                         "files/univ/data/album/song.mp3".into(),
@@ -3877,8 +3287,8 @@ steps = ["pack"]
     fn prepare_run_rejects_descendant_marked_passthrough_under_postprocessed_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
         let config = ServerConfig {
             postprocess: PostprocessConfig {
                 steps: {
@@ -3906,17 +3316,9 @@ steps = ["pack"]
         fs::create_dir_all(&incoming).unwrap();
         fs::write(
             incoming.join("run.toml"),
-            r#"
-nickname = "laptop"
-
-[[sync]]
-name = "data"
+            r#"nickname = "laptop"
 to = "univ/data"
 delete_after_import = true
-
-[[postprocess.rules]]
-match = "album"
-steps = ["pack"]
 "#,
         )
         .unwrap();
@@ -3925,7 +3327,6 @@ steps = ["pack"]
             nickname: nickname.clone(),
             entries: vec![
                 ManifestEntry {
-                    sync_name: SyncName::new("data".into()).unwrap(),
                     local_path: ClientLocalPath::new("/source/album".into()).unwrap(),
                     staged_path: NormalizedRelativePath::new("files/univ/data/album".into())
                         .unwrap(),
@@ -3940,7 +3341,6 @@ steps = ["pack"]
                     covered_by: None,
                 },
                 ManifestEntry {
-                    sync_name: SyncName::new("data".into()).unwrap(),
                     local_path: ClientLocalPath::new("/source/album/song.mp3".into()).unwrap(),
                     staged_path: NormalizedRelativePath::new(
                         "files/univ/data/album/song.mp3".into(),
@@ -3970,8 +3370,8 @@ steps = ["pack"]
     fn prepare_run_rejects_descendant_marked_postprocess_under_postprocessed_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
         let config = ServerConfig {
             postprocess: PostprocessConfig {
                 steps: {
@@ -3999,17 +3399,9 @@ steps = ["pack"]
         fs::create_dir_all(&incoming).unwrap();
         fs::write(
             incoming.join("run.toml"),
-            r#"
-nickname = "laptop"
-
-[[sync]]
-name = "data"
+            r#"nickname = "laptop"
 to = "univ/data"
 delete_after_import = true
-
-[[postprocess.rules]]
-match = "album"
-steps = ["pack"]
 "#,
         )
         .unwrap();
@@ -4018,7 +3410,6 @@ steps = ["pack"]
             nickname: nickname.clone(),
             entries: vec![
                 ManifestEntry {
-                    sync_name: SyncName::new("data".into()).unwrap(),
                     local_path: ClientLocalPath::new("/source/album".into()).unwrap(),
                     staged_path: NormalizedRelativePath::new("files/univ/data/album".into())
                         .unwrap(),
@@ -4033,7 +3424,6 @@ steps = ["pack"]
                     covered_by: None,
                 },
                 ManifestEntry {
-                    sync_name: SyncName::new("data".into()).unwrap(),
                     local_path: ClientLocalPath::new("/source/album/song.mp3".into()).unwrap(),
                     staged_path: NormalizedRelativePath::new(
                         "files/univ/data/album/song.mp3".into(),
@@ -4063,8 +3453,8 @@ steps = ["pack"]
     fn processing_run_status_excludes_passthrough_entries() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
         let config = ServerConfig {
             postprocess: PostprocessConfig {
                 steps: {
@@ -4098,17 +3488,9 @@ steps = ["pack"]
 
         fs::write(
             ready_path.join("run.toml"),
-            r#"
-nickname = "laptop"
-
-[[sync]]
-name = "data"
+            r#"nickname = "laptop"
 to = "univ/data"
 delete_after_import = true
-
-[[postprocess.rules]]
-match = "photos"
-steps = ["pack"]
 "#,
         )
         .unwrap();
@@ -4118,7 +3500,6 @@ steps = ["pack"]
             nickname: nickname.clone(),
             entries: vec![
                 ManifestEntry {
-                    sync_name: SyncName::new("data".into()).unwrap(),
                     local_path: ClientLocalPath::new("/source/photos".into()).unwrap(),
                     staged_path: NormalizedRelativePath::new("files/univ/data/photos".into())
                         .unwrap(),
@@ -4133,7 +3514,6 @@ steps = ["pack"]
                     covered_by: None,
                 },
                 ManifestEntry {
-                    sync_name: SyncName::new("data".into()).unwrap(),
                     local_path: ClientLocalPath::new("/source/photos/photo.txt".into()).unwrap(),
                     staged_path: NormalizedRelativePath::new(
                         "files/univ/data/photos/photo.txt".into(),
@@ -4176,8 +3556,8 @@ steps = ["pack"]
     fn prepare_run_without_passthrough_entries_succeeds() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
         let config = ServerConfig {
             postprocess: PostprocessConfig {
                 steps: {
@@ -4207,17 +3587,9 @@ steps = ["pack"]
         // Run config with postprocess rule
         fs::write(
             incoming.join("run.toml"),
-            r#"
-nickname = "laptop"
-
-[[sync]]
-name = "data"
+            r#"nickname = "laptop"
 to = "univ/data"
 delete_after_import = true
-
-[[postprocess.rules]]
-match = "photos"
-steps = ["pack"]
 "#,
         )
         .unwrap();
@@ -4228,7 +3600,6 @@ steps = ["pack"]
             nickname: nickname.clone(),
             entries: vec![
                 ManifestEntry {
-                    sync_name: SyncName::new("data".into()).unwrap(),
                     local_path: ClientLocalPath::new("/source/photos".into()).unwrap(),
                     staged_path: NormalizedRelativePath::new("files/univ/data/photos".into())
                         .unwrap(),
@@ -4243,7 +3614,6 @@ steps = ["pack"]
                     covered_by: None,
                 },
                 ManifestEntry {
-                    sync_name: SyncName::new("data".into()).unwrap(),
                     local_path: ClientLocalPath::new("/source/photos/photo.txt".into()).unwrap(),
                     staged_path: NormalizedRelativePath::new(
                         "files/univ/data/photos/photo.txt".into(),
@@ -4273,362 +3643,11 @@ steps = ["pack"]
     }
 
     #[test]
-    fn prepare_run_rejects_sync_with_delete_after_import_false() {
-        let tmp = tempfile::tempdir().unwrap();
-        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
-        let config = ServerConfig {
-            postprocess: PostprocessConfig {
-                steps: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        "pack".to_owned(),
-                        PostprocessStepDefinition {
-                            kind: PostprocessKind::Subprocess,
-                            program: "true".into(),
-                            args: vec![],
-                            expected_outputs: vec![],
-                            keep_original: true,
-                        },
-                    );
-                    m
-                },
-            },
-            ..config
-        };
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_id = RunId::new("no-delete-purgatory".into()).unwrap();
-        let incoming = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Incoming);
-        fs::create_dir_all(&incoming).unwrap();
-
-        // Run config with delete_after_import = false but a postprocess rule
-        fs::write(
-            incoming.join("run.toml"),
-            r#"
-nickname = "laptop"
-
-[[sync]]
-name = "videos"
-to = "univ/videos"
-delete_after_import = false
-
-[[postprocess.rules]]
-match = "*.mp4"
-steps = ["pack"]
-"#,
-        )
-        .unwrap();
-
-        // Minimal manifest with one postprocess entry
-        let manifest = Manifest {
-            run_id: run_id.clone(),
-            nickname: nickname.clone(),
-            entries: vec![ManifestEntry {
-                sync_name: SyncName::new("videos".into()).unwrap(),
-                local_path: ClientLocalPath::new("/source/a.mp4".into()).unwrap(),
-                staged_path: NormalizedRelativePath::new("files/univ/videos/a.mp4".into()).unwrap(),
-                relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
-                kind: ManifestEntryKind::RegularFile,
-                size: 10,
-                mtime_ns: 100,
-                sha256: None,
-                link_target: None,
-                mode: purgery_core::ManifestEntryMode::Postprocess,
-                postprocess_steps: vec!["pack".into()],
-                covered_by: None,
-            }],
-        };
-        fs::write(incoming.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
-
-        let result = prepare_run(&config, &nickname, &run_id);
-        assert!(
-            result.is_err(),
-            "prepare_run must reject purgatory sync with delete_after_import=false"
-        );
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("delete_after_import = false"),
-            "error should mention delete_after_import=false: {err}"
-        );
-    }
-
-    #[test]
-    fn scoped_rule_does_not_cover_directory_in_other_sync_group() {
-        // A postprocess rule scoped to "videos" must not cause a directory
-        // in "docs" to be considered covered by a postprocessed ancestor.
-        let tmp = tempfile::tempdir().unwrap();
-        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
-        let config = ServerConfig {
-            postprocess: PostprocessConfig {
-                steps: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        "pack".to_owned(),
-                        PostprocessStepDefinition {
-                            kind: PostprocessKind::Subprocess,
-                            program: "true".into(),
-                            args: vec![],
-                            expected_outputs: vec![],
-                            keep_original: true,
-                        },
-                    );
-                    m
-                },
-            },
-            ..config
-        };
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_id = RunId::new("scoped-coverage".into()).unwrap();
-        let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
-
-        // Set up two sync groups: "videos" (with album dir) and "docs" (with album dir)
-        fs::create_dir_all(ready.join("files/univ/videos/album")).unwrap();
-        fs::write(ready.join("files/univ/videos/album/song.mp3"), b"audio").unwrap();
-        fs::create_dir_all(ready.join("files/univ/docs/album")).unwrap();
-        fs::write(ready.join("files/univ/docs/album/report.txt"), b"text").unwrap();
-
-        // Run config: rule scoped to "videos" only
-        fs::write(
-            ready.join("run.toml"),
-            r#"
-nickname = "laptop"
-
-[[sync]]
-name = "videos"
-to = "univ/videos"
-delete_after_import = true
-
-[[sync]]
-name = "docs"
-to = "univ/docs"
-delete_after_import = true
-
-[[postprocess.rules]]
-match = "album"
-steps = ["pack"]
-for = ["videos"]
-"#,
-        )
-        .unwrap();
-
-        let manifest = Manifest {
-            run_id: run_id.clone(),
-            nickname: nickname.clone(),
-            entries: vec![
-                // videos/album is postprocess (rule applies to videos)
-                ManifestEntry {
-                    sync_name: SyncName::new("videos".into()).unwrap(),
-                    local_path: ClientLocalPath::new("/src/videos/album".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/univ/videos/album".into())
-                        .unwrap(),
-                    relative_path: NormalizedRelativePath::new("album".into()).unwrap(),
-                    kind: ManifestEntryKind::Directory,
-                    size: 0,
-                    mtime_ns: 0,
-                    sha256: None,
-                    link_target: None,
-                    mode: purgery_core::ManifestEntryMode::Postprocess,
-                    postprocess_steps: vec!["pack".into()],
-                    covered_by: None,
-                },
-                // videos/album/song.mp3 is covered
-                ManifestEntry {
-                    sync_name: SyncName::new("videos".into()).unwrap(),
-                    local_path: ClientLocalPath::new("/src/videos/album/song.mp3".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new(
-                        "files/univ/videos/album/song.mp3".into(),
-                    )
-                    .unwrap(),
-                    relative_path: NormalizedRelativePath::new("album/song.mp3".into()).unwrap(),
-                    kind: ManifestEntryKind::RegularFile,
-                    size: 5,
-                    mtime_ns: 0,
-                    sha256: None,
-                    link_target: None,
-                    mode: purgery_core::ManifestEntryMode::Covered,
-                    postprocess_steps: Vec::new(),
-                    covered_by: Some("album".into()),
-                },
-                // docs/album is NOT postprocess (rule is scoped to videos only)
-                ManifestEntry {
-                    sync_name: SyncName::new("docs".into()).unwrap(),
-                    local_path: ClientLocalPath::new("/src/docs/album".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/univ/docs/album".into())
-                        .unwrap(),
-                    relative_path: NormalizedRelativePath::new("album".into()).unwrap(),
-                    kind: ManifestEntryKind::Directory,
-                    size: 0,
-                    mtime_ns: 0,
-                    sha256: None,
-                    link_target: None,
-                    mode: purgery_core::ManifestEntryMode::Passthrough,
-                    postprocess_steps: Vec::new(),
-                    covered_by: None,
-                },
-                // docs/album/report.txt is NOT covered (rule is scoped to videos only)
-                ManifestEntry {
-                    sync_name: SyncName::new("docs".into()).unwrap(),
-                    local_path: ClientLocalPath::new("/src/docs/album/report.txt".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new(
-                        "files/univ/docs/album/report.txt".into(),
-                    )
-                    .unwrap(),
-                    relative_path: NormalizedRelativePath::new("album/report.txt".into()).unwrap(),
-                    kind: ManifestEntryKind::RegularFile,
-                    size: 4,
-                    mtime_ns: 0,
-                    sha256: None,
-                    link_target: None,
-                    mode: purgery_core::ManifestEntryMode::Passthrough,
-                    postprocess_steps: Vec::new(),
-                    covered_by: None,
-                },
-            ],
-        };
-        fs::write(ready.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
-
-        // Processing must succeed — the docs entries are valid passthrough
-        process_run(&config, &nickname, &run_id).unwrap();
-
-        let done = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
-        let status_content = fs::read_to_string(done.join("status.toml")).unwrap();
-        let status = RunStatus::from_toml(&status_content).unwrap();
-
-        // The docs/album/report.txt must not be skipped as "covered"
-        let docs_entry = status
-            .entries
-            .iter()
-            .find(|e| e.relative_path == "album/report.txt" && e.sync_name.as_str() == "docs");
-        assert!(
-            docs_entry.is_some(),
-            "docs/album/report.txt must have a status entry"
-        );
-        assert_eq!(
-            docs_entry.unwrap().status,
-            FileStatus::Imported,
-            "docs/album/report.txt must be imported, not skipped as covered"
-        );
-    }
-
-    #[test]
-    fn prepare_run_rejects_rule_with_empty_for() {
-        let tmp = tempfile::tempdir().unwrap();
-        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_id = RunId::new("empty-for".into()).unwrap();
-        let incoming = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Incoming);
-        fs::create_dir_all(&incoming).unwrap();
-
-        fs::write(
-            incoming.join("run.toml"),
-            r#"
-nickname = "laptop"
-
-[[sync]]
-name = "videos"
-to = "univ/videos"
-delete_after_import = true
-
-[[postprocess.rules]]
-match = "*.mp4"
-steps = ["pack"]
-for = []
-"#,
-        )
-        .unwrap();
-        fs::write(
-            incoming.join("manifest.toml"),
-            r#"
-run_id = "empty-for"
-nickname = "laptop"
-
-[[entries]]
-sync_name = "videos"
-local_path = "/source/a.mp4"
-staged_path = "files/univ/videos/a.mp4"
-relative_path = "a.mp4"
-kind = "regular_file"
-size = 5
-mtime_ns = 100
-mode = "postprocess"
-postprocess_steps = ["pack"]
-"#,
-        )
-        .unwrap();
-
-        let result = prepare_run(&config, &nickname, &run_id);
-        assert!(result.is_err(), "empty for must be rejected");
-    }
-
-    #[test]
-    fn prepare_run_rejects_rule_with_unknown_for() {
-        let tmp = tempfile::tempdir().unwrap();
-        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_id = RunId::new("unknown-for".into()).unwrap();
-        let incoming = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Incoming);
-        fs::create_dir_all(&incoming).unwrap();
-
-        fs::write(
-            incoming.join("run.toml"),
-            r#"
-nickname = "laptop"
-
-[[sync]]
-name = "videos"
-to = "univ/videos"
-delete_after_import = true
-
-[[postprocess.rules]]
-match = "*.mp4"
-steps = ["pack"]
-for = ["missing"]
-"#,
-        )
-        .unwrap();
-        fs::write(
-            incoming.join("manifest.toml"),
-            r#"
-run_id = "unknown-for"
-nickname = "laptop"
-
-[[entries]]
-sync_name = "videos"
-local_path = "/source/a.mp4"
-staged_path = "files/univ/videos/a.mp4"
-relative_path = "a.mp4"
-kind = "regular_file"
-size = 5
-mtime_ns = 100
-mode = "postprocess"
-postprocess_steps = ["pack"]
-"#,
-        )
-        .unwrap();
-
-        let result = prepare_run(&config, &nickname, &run_id);
-        assert!(result.is_err(), "unknown sync in for must be rejected");
-    }
-
-    #[test]
     fn out_of_scope_rule_does_not_process_entry() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
         let config = ServerConfig {
             postprocess: PostprocessConfig {
                 steps: {
@@ -4658,20 +3677,8 @@ postprocess_steps = ["pack"]
         fs::write(
             ready.join("run.toml"),
             br#"nickname = "laptop"
-[[sync]]
-name = "videos"
 to = "univ/videos"
 delete_after_import = true
-
-[[sync]]
-name = "pictures"
-to = "univ/pictures"
-delete_after_import = true
-
-[[postprocess.rules]]
-match = "*.mp4"
-steps = ["pack"]
-for = ["pictures"]
 "#,
         )
         .unwrap();
@@ -4680,7 +3687,6 @@ for = ["pictures"]
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
-                sync_name: SyncName::new("videos".into()).unwrap(),
                 local_path: ClientLocalPath::new("/src/a.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/univ/videos/a.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
@@ -4708,88 +3714,6 @@ for = ["pictures"]
             status.entries[0].postprocess.is_none()
                 || status.entries[0].postprocess.as_deref() == Some(&[])
         );
-    }
-
-    #[test]
-    fn process_processing_run_rejects_delete_after_import_false() {
-        let tmp = tempfile::tempdir().unwrap();
-        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
-        let config = ServerConfig {
-            postprocess: PostprocessConfig {
-                steps: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        "pack".to_owned(),
-                        PostprocessStepDefinition {
-                            kind: PostprocessKind::Subprocess,
-                            program: "true".into(),
-                            args: vec![],
-                            expected_outputs: vec![],
-                            keep_original: true,
-                        },
-                    );
-                    m
-                },
-            },
-            ..config
-        };
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_id = RunId::new("processing-no-delete".into()).unwrap();
-        let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
-        fs::create_dir_all(ready.join("files/univ/videos")).unwrap();
-        fs::write(ready.join("files/univ/videos/a.mp4"), b"content").unwrap();
-
-        // Run config with delete_after_import = false but a postprocess rule
-        fs::write(
-            ready.join("run.toml"),
-            r#"
-nickname = "laptop"
-
-[[sync]]
-name = "videos"
-to = "univ/videos"
-delete_after_import = false
-
-[[postprocess.rules]]
-match = "*.mp4"
-steps = ["pack"]
-"#,
-        )
-        .unwrap();
-
-        let manifest = Manifest {
-            run_id: run_id.clone(),
-            nickname: nickname.clone(),
-            entries: vec![ManifestEntry {
-                sync_name: SyncName::new("videos".into()).unwrap(),
-                local_path: ClientLocalPath::new("/source/a.mp4".into()).unwrap(),
-                staged_path: NormalizedRelativePath::new("files/univ/videos/a.mp4".into()).unwrap(),
-                relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
-                kind: ManifestEntryKind::RegularFile,
-                size: 7,
-                mtime_ns: 100,
-                sha256: None,
-                link_target: None,
-                mode: purgery_core::ManifestEntryMode::Postprocess,
-                postprocess_steps: vec!["pack".into()],
-                covered_by: None,
-            }],
-        };
-        fs::write(ready.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
-
-        // process_run goes through ready -> claim -> processing
-        let result = process_run(&config, &nickname, &run_id);
-        assert!(
-            result.is_err(),
-            "process_run must fail when run config has delete_after_import=false"
-        );
-        // The run should be in failed state
-        let failed = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Failed);
-        assert!(failed.exists(), "failed run dir must exist");
     }
 
     // ── Progress context tests ──
@@ -4843,11 +3767,6 @@ steps = ["pack"]
         fs::write(&compressed, b"output").unwrap();
 
         let server_config = ServerConfig {
-            roots: purgery_core::ServerRoots::single(
-                "univ",
-                ServerRoot::new("/data".into()).unwrap(),
-            )
-            .unwrap(),
             work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
@@ -4868,18 +3787,7 @@ steps = ["pack"]
             },
             logging: Default::default(),
         };
-        let run_config = RunConfig {
-            nickname: Nickname::new("laptop".into()).unwrap(),
-            sync: vec![],
-            postprocess: purgery_core::ClientPostprocessConfig {
-                rules: vec![purgery_core::PostprocessRule {
-                    pattern: "*.txt".into(),
-                    steps: vec!["compress".into()],
-                    sync_names: None,
-                }],
-            },
-        };
-        let run_plan = RunPlan::build(&server_config, &run_config).unwrap();
+        let run_plan = RunPlan::build(&server_config).unwrap();
 
         let captured = std::sync::Mutex::new(Vec::new());
         let mut callback = |update: &purgery_core::ProgressUpdate| {
@@ -4892,10 +3800,16 @@ steps = ["pack"]
             ));
         };
 
+        let all_steps: Vec<ResolvedStep> = run_plan
+            .steps
+            .iter()
+            .map(|(n, d)| ResolvedStep {
+                step_name: n.clone(),
+                step_def: d.clone(),
+            })
+            .collect();
         apply_postprocessing_with_heartbeat(
-            &run_plan,
-            "data",
-            "data/input.txt",
+            &all_steps,
             &work_path,
             std::time::Duration::from_millis(1),
             &mut callback,
@@ -4922,7 +3836,6 @@ steps = ["pack"]
     fn progress_write_failure_does_not_fail_import() {
         let tmp = tempfile::tempdir().unwrap();
         let _work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("progress-fail".into()).unwrap();
 
@@ -4938,9 +3851,6 @@ steps = ["pack"]
         fs::write(
             ready_path.join("run.toml"),
             r#"nickname = "laptop"
-
-[[sync]]
-name = "data"
 to = "univ/data"
 delete_after_import = true
 "#,
@@ -4951,7 +3861,6 @@ delete_after_import = true
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
-                sync_name: SyncName::new("data".into()).unwrap(),
                 local_path: ClientLocalPath::new("/src/file.txt".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/univ/data/file.txt".into())
                     .unwrap(),
@@ -4972,10 +3881,8 @@ delete_after_import = true
         )
         .unwrap();
 
-        let config = test_server_config(
-            &Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
-            &server_root,
-        );
+        let config =
+            test_server_config(&Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap());
 
         // Move from ready to processing
         let processing_path = config
@@ -4999,7 +3906,7 @@ delete_after_import = true
         );
 
         // The final file must exist
-        let final_path = server_root.join("data/file.txt");
+        let final_path = config.work_dir.as_path().join("univ/data/file.txt");
         assert_eq!(
             fs::read_to_string(&final_path).unwrap(),
             "content",
@@ -5043,11 +3950,6 @@ delete_after_import = true
         fs::write(&compressed, b"output").unwrap();
 
         let server_config = ServerConfig {
-            roots: purgery_core::ServerRoots::single(
-                "univ",
-                ServerRoot::new("/data".into()).unwrap(),
-            )
-            .unwrap(),
             work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
@@ -5068,18 +3970,7 @@ delete_after_import = true
             },
             logging: Default::default(),
         };
-        let run_config = RunConfig {
-            nickname: Nickname::new("laptop".into()).unwrap(),
-            sync: vec![],
-            postprocess: purgery_core::ClientPostprocessConfig {
-                rules: vec![purgery_core::PostprocessRule {
-                    pattern: "*.txt".into(),
-                    steps: vec!["compress".into()],
-                    sync_names: None,
-                }],
-            },
-        };
-        let run_plan = RunPlan::build(&server_config, &run_config).unwrap();
+        let run_plan = RunPlan::build(&server_config).unwrap();
 
         let captured = std::sync::Mutex::new(Vec::new());
         let mut callback = |update: &purgery_core::ProgressUpdate| {
@@ -5092,10 +3983,16 @@ delete_after_import = true
             ));
         };
 
+        let all_steps: Vec<ResolvedStep> = run_plan
+            .steps
+            .iter()
+            .map(|(n, d)| ResolvedStep {
+                step_name: n.clone(),
+                step_def: d.clone(),
+            })
+            .collect();
         apply_postprocessing_with_heartbeat(
-            &run_plan,
-            "data",
-            "data/input.txt",
+            &all_steps,
             &work_path,
             std::time::Duration::from_millis(1),
             &mut callback,
@@ -5157,11 +4054,6 @@ delete_after_import = true
         fs::write(work_path.with_file_name("input.out"), b"output").unwrap();
 
         let server_config = ServerConfig {
-            roots: purgery_core::ServerRoots::single(
-                "univ",
-                ServerRoot::new("/data".into()).unwrap(),
-            )
-            .unwrap(),
             work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
@@ -5182,18 +4074,7 @@ delete_after_import = true
             },
             logging: Default::default(),
         };
-        let run_config = RunConfig {
-            nickname: Nickname::new("laptop".into()).unwrap(),
-            sync: vec![],
-            postprocess: purgery_core::ClientPostprocessConfig {
-                rules: vec![purgery_core::PostprocessRule {
-                    pattern: "*.txt".into(),
-                    steps: vec!["compress".into()],
-                    sync_names: None,
-                }],
-            },
-        };
-        let run_plan = RunPlan::build(&server_config, &run_config).unwrap();
+        let run_plan = RunPlan::build(&server_config).unwrap();
 
         let captured = std::sync::Mutex::new(Vec::new());
         let mut callback = |update: &purgery_core::ProgressUpdate| {
@@ -5206,10 +4087,16 @@ delete_after_import = true
             ));
         };
 
+        let all_steps: Vec<ResolvedStep> = run_plan
+            .steps
+            .iter()
+            .map(|(n, d)| ResolvedStep {
+                step_name: n.clone(),
+                step_def: d.clone(),
+            })
+            .collect();
         apply_postprocessing_with_heartbeat(
-            &run_plan,
-            "data",
-            "data/input.txt",
+            &all_steps,
             &work_path,
             std::time::Duration::from_millis(1),
             &mut callback,
@@ -5743,72 +4630,6 @@ delete_after_import = true
         );
     }
 
-    #[test]
-    fn prepare_run_rejection_mentions_conformance() {
-        let tmp = tempfile::tempdir().unwrap();
-        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
-        let config = ServerConfig {
-            postprocess: PostprocessConfig {
-                steps: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        "pack".to_owned(),
-                        PostprocessStepDefinition {
-                            kind: PostprocessKind::Subprocess,
-                            program: "true".into(),
-                            args: vec![],
-                            expected_outputs: vec![],
-                            keep_original: true,
-                        },
-                    );
-                    m
-                },
-            },
-            ..config
-        };
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_id = RunId::new("conformance-test".into()).unwrap();
-        let incoming = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Incoming);
-        fs::create_dir_all(&incoming).unwrap();
-
-        fs::write(
-            incoming.join("run.toml"),
-            r#"
-nickname = "laptop"
-
-[[sync]]
-name = "videos"
-to = "univ/videos"
-delete_after_import = false
-
-[[postprocess.rules]]
-match = "*.mp4"
-steps = ["pack"]
-"#,
-        )
-        .unwrap();
-
-        let manifest = Manifest {
-            run_id: run_id.clone(),
-            nickname: nickname.clone(),
-            entries: vec![],
-        };
-        fs::write(incoming.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
-
-        let result = prepare_run(&config, &nickname, &run_id);
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("conformance")
-                || err.contains("import-and-retire")
-                || err.contains("indefinite"),
-            "rejection must explain conformance tradeoff, got: {err}"
-        );
-    }
-
     /// Spec and design docs must describe protocol, behavior, and invariants,
     /// not test process, development process, or agent workflow.
     #[test]
@@ -5985,13 +4806,11 @@ steps = ["pack"]
     fn full_processing_run_leaves_only_expected_paths_under_root() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-run-final-only".into()).unwrap();
 
         let (config, _staged) = setup_single_file_ready(
             &work_dir,
-            &server_root,
             &nickname,
             &run_id,
             "videos",
@@ -6006,18 +4825,59 @@ steps = ["pack"]
         assert!(done_path.exists());
 
         let expected = vec![
-            server_root.join("videos"),
-            server_root.join("videos/test.mp4"),
+            config.work_dir.as_path().join("univ"),
+            config.work_dir.as_path().join("univ/videos"),
+            config.work_dir.as_path().join("univ/videos/test.mp4"),
+            config.work_dir.as_path().join("laptop"),
+            config.work_dir.as_path().join("laptop/done"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-run-final-only"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-run-final-only/files"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-run-final-only/files/univ"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-run-final-only/files/univ/videos"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-run-final-only/files/univ/videos/test.mp4"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-run-final-only/manifest.toml"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-run-final-only/progress.toml"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-run-final-only/run.toml"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-run-final-only/status.toml"),
+            config.work_dir.as_path().join("laptop/processing"),
+            config.work_dir.as_path().join("laptop/ready"),
         ];
-        assert_root_contains_exactly(server_root.as_path(), &expected);
+        assert_root_contains_exactly(config.work_dir.as_path(), &expected);
     }
 
     #[test]
     fn failed_run_must_not_leave_operational_paths_under_root() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-fail".into()).unwrap();
 
@@ -6029,7 +4889,6 @@ steps = ["pack"]
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
-                sync_name: SyncName::new("videos".into()).unwrap(),
                 local_path: ClientLocalPath::new("/home/user/missing.mp4".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/univ/videos/missing.mp4".into())
                     .unwrap(),
@@ -6058,23 +4917,18 @@ steps = ["pack"]
         assert!(failed_path.exists(), "run should be in failed phase");
 
         let expected: Vec<Utf8PathBuf> = vec![];
-        assert_root_contains_exactly(server_root.as_path(), &expected);
+        assert_root_contains_exactly(_server_root.as_path(), &expected);
     }
 
     #[test]
     fn partial_run_work_area_preserved_under_work_dir_only() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-partial".into()).unwrap();
 
         let config = ServerConfig {
-            roots: purgery_core::ServerRoots::single(
-                "univ",
-                ServerRoot::new(server_root.to_owned()).unwrap(),
-            )
-            .unwrap(),
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
@@ -6105,19 +4959,8 @@ steps = ["pack"]
 
         let run_config_content = format!(
             r#"nickname = "{}"
-
-[[sync]]
-name = "videos"
 to = "univ/videos"
 delete_after_import = true
-
-[[postprocess.rules]]
-match = "a.mp4"
-steps = ["always-fail"]
-
-[[postprocess.rules]]
-match = "b.mp4"
-steps = ["always-fail"]
 "#,
             nickname.as_str()
         );
@@ -6128,7 +4971,6 @@ steps = ["always-fail"]
             nickname: nickname.clone(),
             entries: vec![
                 ManifestEntry {
-                    sync_name: SyncName::new("videos".into()).unwrap(),
                     local_path: ClientLocalPath::new("/home/user/a.mp4".into()).unwrap(),
                     staged_path: NormalizedRelativePath::new("files/univ/videos/a.mp4".into())
                         .unwrap(),
@@ -6143,7 +4985,6 @@ steps = ["always-fail"]
                     covered_by: None,
                 },
                 ManifestEntry {
-                    sync_name: SyncName::new("videos".into()).unwrap(),
                     local_path: ClientLocalPath::new("/home/user/b.mp4".into()).unwrap(),
                     staged_path: NormalizedRelativePath::new("files/univ/videos/b.mp4".into())
                         .unwrap(),
@@ -6174,7 +5015,7 @@ steps = ["always-fail"]
 
         // Root must be empty: no entry was successfully committed.
         let expected: Vec<Utf8PathBuf> = vec![];
-        assert_root_contains_exactly(server_root.as_path(), &expected);
+        assert_root_contains_exactly(_server_root.as_path(), &expected);
 
         // Work area is preserved under the failed run directory for diagnostics.
         let work_under_failed = failed_path.join("work");
@@ -6193,18 +5034,10 @@ steps = ["always-fail"]
         // expected outputs are under the work area before committing.
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let server_str = server_root.as_str();
 
         fs::create_dir_all(&work_dir).unwrap();
-        fs::create_dir_all(&server_root).unwrap();
 
         let server_config = ServerConfig {
-            roots: purgery_core::ServerRoots::single(
-                "univ",
-                ServerRoot::new(server_str.into()).unwrap(),
-            )
-            .unwrap(),
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
@@ -6242,15 +5075,8 @@ steps = ["always-fail"]
             ready_path.join("run.toml"),
             format!(
                 r#"nickname = "{}"
-
-[[sync]]
-name = "data"
 to = "univ/data"
 delete_after_import = true
-
-[[postprocess.rules]]
-match = "*.dat"
-steps = ["echo-args"]
 "#,
                 nickname.as_str()
             ),
@@ -6261,7 +5087,6 @@ steps = ["echo-args"]
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
-                sync_name: SyncName::new("data".into()).unwrap(),
                 local_path: ClientLocalPath::new("/home/user/input.dat".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/univ/data/input.dat".into())
                     .unwrap(),
@@ -6292,11 +5117,55 @@ steps = ["echo-args"]
 
         // Root must contain only the expected final output paths
         let expected = vec![
-            server_root.join("data"),
-            server_root.join("data/_outputs"),
-            server_root.join("data/_outputs/result.txt"),
+            server_config.work_dir.as_path().join("univ"),
+            server_config.work_dir.as_path().join("univ/data"),
+            server_config.work_dir.as_path().join("univ/data/_outputs"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("univ/data/_outputs/result.txt"),
+            server_config.work_dir.as_path().join("laptop"),
+            server_config.work_dir.as_path().join("laptop/done"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-cwd"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-cwd/files"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-cwd/files/univ"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-cwd/files/univ/data"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-cwd/files/univ/data/input.dat"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-cwd/manifest.toml"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-cwd/progress.toml"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-cwd/run.toml"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-cwd/status.toml"),
+            server_config.work_dir.as_path().join("laptop/processing"),
+            server_config.work_dir.as_path().join("laptop/ready"),
         ];
-        assert_root_contains_exactly(server_root.as_path(), &expected);
+        assert_root_contains_exactly(server_config.work_dir.as_path(), &expected);
     }
 
     // ── Replacement and replay tests ─────────────────────────────────
@@ -6442,13 +5311,11 @@ steps = ["echo-args"]
         // work area from staged files and converge to the correct result.
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-replay".into()).unwrap();
 
         let (config, _staged) = setup_single_file_ready(
             &work_dir,
-            &server_root,
             &nickname,
             &run_id,
             "videos",
@@ -6468,7 +5335,7 @@ steps = ["echo-args"]
 
         // Write a partial file at the final path to simulate an interrupted
         // direct copy from the previous attempt.
-        let final_path = server_root.join("videos/test.mp4");
+        let final_path = config.work_dir.as_path().join("univ/videos/test.mp4");
         fs::create_dir_all(final_path.parent().unwrap()).unwrap();
         fs::write(&final_path, b"partial remnant").unwrap();
 
@@ -6480,6 +5347,7 @@ steps = ["echo-args"]
             done_path.exists(),
             "run should be in done phase after replay"
         );
+        let final_path = config.work_dir.as_path().join("univ/videos/test.mp4");
         assert_eq!(
             fs::read_to_string(&final_path).unwrap(),
             "replay content",
@@ -6487,14 +5355,48 @@ steps = ["echo-args"]
         );
 
         let expected = vec![
-            server_root.join("videos"),
-            server_root.join("videos/test.mp4"),
+            config.work_dir.as_path().join("univ"),
+            config.work_dir.as_path().join("univ/videos"),
+            config.work_dir.as_path().join("univ/videos/test.mp4"),
+            config.work_dir.as_path().join("laptop"),
+            config.work_dir.as_path().join("laptop/done"),
+            config.work_dir.as_path().join("laptop/done/test-replay"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-replay/files"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-replay/files/univ"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-replay/files/univ/videos"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-replay/files/univ/videos/test.mp4"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-replay/manifest.toml"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-replay/progress.toml"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-replay/run.toml"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-replay/status.toml"),
+            config.work_dir.as_path().join("laptop/processing"),
+            config.work_dir.as_path().join("laptop/ready"),
         ];
-        assert_root_contains_exactly(server_root.as_path(), &expected);
-
-        let status_content = fs::read_to_string(done_path.join("status.toml")).unwrap();
-        let status = RunStatus::from_toml(&status_content).unwrap();
-        assert_eq!(status.state, RunState::Done);
+        assert_root_contains_exactly(config.work_dir.as_path(), &expected);
     }
 
     #[test]
@@ -6504,18 +5406,10 @@ steps = ["echo-args"]
         // The symlink entry is moved from the work area to the final path.
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let server_str = server_root.as_str();
 
         fs::create_dir_all(&work_dir).unwrap();
-        fs::create_dir_all(&server_root).unwrap();
 
         let server_config = ServerConfig {
-            roots: purgery_core::ServerRoots::single(
-                "univ",
-                ServerRoot::new(server_str.into()).unwrap(),
-            )
-            .unwrap(),
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
@@ -6550,15 +5444,8 @@ steps = ["echo-args"]
             ready_path.join("run.toml"),
             format!(
                 r#"nickname = "{}"
-
-[[sync]]
-name = "data"
 to = "univ/data"
 delete_after_import = true
-
-[[postprocess.rules]]
-match = "*.dat"
-steps = ["make-symlink"]
 "#,
                 nickname.as_str()
             ),
@@ -6569,7 +5456,6 @@ steps = ["make-symlink"]
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
-                sync_name: SyncName::new("data".into()).unwrap(),
                 local_path: ClientLocalPath::new("/home/user/input.dat".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/univ/data/input.dat".into())
                     .unwrap(),
@@ -6601,8 +5487,52 @@ steps = ["make-symlink"]
             .run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(done_path.exists());
 
-        let expected = vec![server_root.join("data"), server_root.join("data/the-link")];
-        assert_root_contains_exactly(server_root.as_path(), &expected);
+        let expected = vec![
+            server_config.work_dir.as_path().join("univ"),
+            server_config.work_dir.as_path().join("univ/data"),
+            server_config.work_dir.as_path().join("univ/data/the-link"),
+            server_config.work_dir.as_path().join("laptop"),
+            server_config.work_dir.as_path().join("laptop/done"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-symlink"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-symlink/files"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-symlink/files/univ"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-symlink/files/univ/data"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-symlink/files/univ/data/input.dat"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-symlink/manifest.toml"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-symlink/progress.toml"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-symlink/run.toml"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-symlink/status.toml"),
+            server_config.work_dir.as_path().join("laptop/processing"),
+            server_config.work_dir.as_path().join("laptop/ready"),
+        ];
+        assert_root_contains_exactly(server_config.work_dir.as_path(), &expected);
     }
 
     // ── Move-based final materialization tests ──────────────────────
@@ -6776,18 +5706,10 @@ steps = ["make-symlink"]
         // A postprocess subprocess produces a directory tree as output.
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let server_str = server_root.as_str();
 
         fs::create_dir_all(&work_dir).unwrap();
-        fs::create_dir_all(&server_root).unwrap();
 
         let server_config = ServerConfig {
-            roots: purgery_core::ServerRoots::single(
-                "univ",
-                ServerRoot::new(server_str.into()).unwrap(),
-            )
-            .unwrap(),
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
@@ -6826,15 +5748,8 @@ steps = ["make-symlink"]
             ready_path.join("run.toml"),
             format!(
                 r#"nickname = "{}"
-
-[[sync]]
-name = "data"
 to = "univ/data"
 delete_after_import = true
-
-[[postprocess.rules]]
-match = "*.dat"
-steps = ["make-tree"]
 "#,
                 nickname.as_str()
             ),
@@ -6845,7 +5760,6 @@ steps = ["make-tree"]
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
-                sync_name: SyncName::new("data".into()).unwrap(),
                 local_path: ClientLocalPath::new("/home/user/input.dat".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/univ/data/input.dat".into())
                     .unwrap(),
@@ -6878,13 +5792,57 @@ steps = ["make-tree"]
         assert!(done_path.exists());
 
         let expected = vec![
-            server_root.join("data"),
-            server_root.join("data/out"),
-            server_root.join("data/out/b.txt"),
-            server_root.join("data/out/sub"),
-            server_root.join("data/out/sub/a.txt"),
+            server_config.work_dir.as_path().join("univ"),
+            server_config.work_dir.as_path().join("univ/data"),
+            server_config.work_dir.as_path().join("univ/data/out"),
+            server_config.work_dir.as_path().join("univ/data/out/b.txt"),
+            server_config.work_dir.as_path().join("univ/data/out/sub"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("univ/data/out/sub/a.txt"),
+            server_config.work_dir.as_path().join("laptop"),
+            server_config.work_dir.as_path().join("laptop/done"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-dir"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-dir/files"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-dir/files/univ"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-dir/files/univ/data"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-dir/files/univ/data/input.dat"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-dir/manifest.toml"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-dir/progress.toml"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-dir/run.toml"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-dir/status.toml"),
+            server_config.work_dir.as_path().join("laptop/processing"),
+            server_config.work_dir.as_path().join("laptop/ready"),
         ];
-        assert_root_contains_exactly(server_root.as_path(), &expected);
+        assert_root_contains_exactly(server_config.work_dir.as_path(), &expected);
     }
 
     // ── Staged file preservation tests ────────────────────────────────
@@ -6896,13 +5854,12 @@ steps = ["make-tree"]
     fn non_postprocess_staged_file_preserved_after_successful_materialization() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-staged-preserved".into()).unwrap();
 
         let (config, _staged_a) = setup_single_file_ready(
             &work_dir,
-            &server_root,
             &nickname,
             &run_id,
             "videos",
@@ -6917,7 +5874,6 @@ steps = ["make-tree"]
         let mut manifest: Manifest =
             toml::from_str(&fs::read_to_string(ready_path.join("manifest.toml")).unwrap()).unwrap();
         manifest.entries.push(ManifestEntry {
-            sync_name: SyncName::new("videos".into()).unwrap(),
             local_path: ClientLocalPath::new("/home/user/nonexistent.mp4".into()).unwrap(),
             staged_path: NormalizedRelativePath::new("files/univ/videos/nonexistent.mp4".into())
                 .unwrap(),
@@ -6963,13 +5919,69 @@ steps = ["make-tree"]
             "video a content"
         );
 
-        // Final output must exist under root.
-        let final_path = server_root.join("videos/a.mp4");
+        // Final output must exist under work_dir.
+        let final_path = config.work_dir.as_path().join("univ/videos/a.mp4");
         assert!(final_path.exists());
         assert_eq!(fs::read_to_string(&final_path).unwrap(), "video a content");
 
-        let expected = vec![server_root.join("videos"), server_root.join("videos/a.mp4")];
-        assert_root_contains_exactly(server_root.as_path(), &expected);
+        let expected = vec![
+            config.work_dir.as_path().join("univ"),
+            config.work_dir.as_path().join("univ/videos"),
+            config.work_dir.as_path().join("univ/videos/a.mp4"),
+            config.work_dir.as_path().join("laptop"),
+            config.work_dir.as_path().join("laptop/done"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-staged-preserved"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-staged-preserved/files"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-staged-preserved/files/univ"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-staged-preserved/files/univ/videos"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-staged-preserved/files/univ/videos/a.mp4"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-staged-preserved/manifest.toml"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-staged-preserved/progress.toml"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-staged-preserved/run.toml"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-staged-preserved/status.toml"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-staged-preserved/work"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-staged-preserved/work/univ"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-staged-preserved/work/univ/videos"),
+            config.work_dir.as_path().join("laptop/processing"),
+            config.work_dir.as_path().join("laptop/ready"),
+        ];
+        assert_root_contains_exactly(config.work_dir.as_path(), &expected);
     }
 
     /// Non-postprocess symlink entries must preserve the staged symlink
@@ -6979,11 +5991,10 @@ steps = ["make-tree"]
     fn non_postprocess_staged_symlink_preserved_after_materialization() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-symlink-staged".into()).unwrap();
 
-        let config = test_server_config(&work_dir, &server_root);
+        let config = test_server_config(&work_dir);
         let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
 
@@ -7000,7 +6011,6 @@ steps = ["make-tree"]
             nickname: nickname.clone(),
             entries: vec![
                 ManifestEntry {
-                    sync_name: SyncName::new("data".into()).unwrap(),
                     local_path: ClientLocalPath::new("/home/user/mylink".into()).unwrap(),
                     staged_path: NormalizedRelativePath::new("files/univ/data/mylink".into())
                         .unwrap(),
@@ -7016,7 +6026,6 @@ steps = ["make-tree"]
                 },
                 // Second entry fails (missing staged file).
                 ManifestEntry {
-                    sync_name: SyncName::new("data".into()).unwrap(),
                     local_path: ClientLocalPath::new("/home/user/missing.dat".into()).unwrap(),
                     staged_path: NormalizedRelativePath::new("files/univ/data/missing.dat".into())
                         .unwrap(),
@@ -7056,8 +6065,8 @@ steps = ["make-tree"]
         let staged_target = std::fs::read_link(staged_after.as_std_path()).unwrap();
         assert_eq!(staged_target, std::path::Path::new("/usr/share/data"));
 
-        // Final symlink must exist under root.
-        let final_path = server_root.join("data/mylink");
+        // Final symlink must exist under work_dir.
+        let final_path = config.work_dir.as_path().join("univ/data/mylink");
         assert!(
             fs::symlink_metadata(final_path.as_std_path()).is_ok(),
             "final symlink must exist under root"
@@ -7065,8 +6074,64 @@ steps = ["make-tree"]
         let final_target = std::fs::read_link(final_path.as_std_path()).unwrap();
         assert_eq!(final_target, std::path::Path::new("/usr/share/data"));
 
-        let expected = vec![server_root.join("data"), server_root.join("data/mylink")];
-        assert_root_contains_exactly(server_root.as_path(), &expected);
+        let expected = vec![
+            config.work_dir.as_path().join("univ"),
+            config.work_dir.as_path().join("univ/data"),
+            config.work_dir.as_path().join("univ/data/mylink"),
+            config.work_dir.as_path().join("laptop"),
+            config.work_dir.as_path().join("laptop/done"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-symlink-staged"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-symlink-staged/files"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-symlink-staged/files/univ"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-symlink-staged/files/univ/data"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-symlink-staged/files/univ/data/mylink"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-symlink-staged/manifest.toml"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-symlink-staged/progress.toml"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-symlink-staged/run.toml"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-symlink-staged/status.toml"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-symlink-staged/work"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-symlink-staged/work/univ"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-symlink-staged/work/univ/data"),
+            config.work_dir.as_path().join("laptop/processing"),
+            config.work_dir.as_path().join("laptop/ready"),
+        ];
+        assert_root_contains_exactly(config.work_dir.as_path(), &expected);
     }
 
     /// When a processing run is replayed (e.g. after interrupted
@@ -7076,13 +6141,11 @@ steps = ["make-tree"]
     fn replay_preserves_staged_upload_source() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-replay-staged".into()).unwrap();
 
         let (config, _staged_file) = setup_single_file_ready(
             &work_dir,
-            &server_root,
             &nickname,
             &run_id,
             "videos",
@@ -7099,7 +6162,7 @@ steps = ["make-tree"]
         fs::create_dir_all(processing_path.parent().unwrap()).unwrap();
         fs::rename(&ready_path, &processing_path).unwrap();
 
-        let final_path = server_root.join("videos/test.mp4");
+        let final_path = config.work_dir.as_path().join("univ/videos/test.mp4");
         fs::create_dir_all(final_path.parent().unwrap()).unwrap();
         fs::write(&final_path, b"partial remnant").unwrap();
 
@@ -7132,10 +6195,51 @@ steps = ["make-tree"]
         assert_eq!(fs::read_to_string(&final_path).unwrap(), "replay content");
 
         let expected = vec![
-            server_root.join("videos"),
-            server_root.join("videos/test.mp4"),
+            config.work_dir.as_path().join("univ"),
+            config.work_dir.as_path().join("univ/videos"),
+            config.work_dir.as_path().join("univ/videos/test.mp4"),
+            config.work_dir.as_path().join("laptop"),
+            config.work_dir.as_path().join("laptop/done"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-replay-staged"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-replay-staged/files"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-replay-staged/files/univ"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-replay-staged/files/univ/videos"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-replay-staged/files/univ/videos/test.mp4"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-replay-staged/manifest.toml"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-replay-staged/progress.toml"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-replay-staged/run.toml"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-replay-staged/status.toml"),
+            config.work_dir.as_path().join("laptop/processing"),
+            config.work_dir.as_path().join("laptop/ready"),
         ];
-        assert_root_contains_exactly(server_root.as_path(), &expected);
+        assert_root_contains_exactly(config.work_dir.as_path(), &expected);
     }
 
     // ── Work-area consumption tests ───────────────────────────────────
@@ -7146,13 +6250,11 @@ steps = ["make-tree"]
     fn non_postprocess_regular_file_work_copy_consumed_staged_preserved() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-work-consumed".into()).unwrap();
 
         let (config, _staged_orig) = setup_single_file_ready(
             &work_dir,
-            &server_root,
             &nickname,
             &run_id,
             "data",
@@ -7185,12 +6287,56 @@ steps = ["make-tree"]
         );
 
         // Final path must contain the content.
-        let final_path = server_root.join("data/doc.txt");
+        let final_path = config.work_dir.as_path().join("univ/data/doc.txt");
         assert!(final_path.exists());
         assert_eq!(fs::read_to_string(&final_path).unwrap(), "original content");
 
-        let expected = vec![server_root.join("data"), server_root.join("data/doc.txt")];
-        assert_root_contains_exactly(server_root.as_path(), &expected);
+        let expected = vec![
+            config.work_dir.as_path().join("univ"),
+            config.work_dir.as_path().join("univ/data"),
+            config.work_dir.as_path().join("univ/data/doc.txt"),
+            config.work_dir.as_path().join("laptop"),
+            config.work_dir.as_path().join("laptop/done"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-work-consumed"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-work-consumed/files"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-work-consumed/files/univ"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-work-consumed/files/univ/data"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-work-consumed/files/univ/data/doc.txt"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-work-consumed/manifest.toml"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-work-consumed/progress.toml"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-work-consumed/run.toml"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-work-consumed/status.toml"),
+            config.work_dir.as_path().join("laptop/processing"),
+            config.work_dir.as_path().join("laptop/ready"),
+        ];
+        assert_root_contains_exactly(config.work_dir.as_path(), &expected);
     }
 
     /// For a non-postprocess symlink, the work-area symlink copy is
@@ -7200,11 +6346,10 @@ steps = ["make-tree"]
     fn non_postprocess_symlink_work_copy_consumed_staged_preserved() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-symlink-consumed".into()).unwrap();
 
-        let config = test_server_config(&work_dir, &server_root);
+        let config = test_server_config(&work_dir);
         let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
 
@@ -7219,7 +6364,6 @@ steps = ["make-tree"]
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
-                sync_name: SyncName::new("data".into()).unwrap(),
                 local_path: ClientLocalPath::new("/home/user/the-link".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/univ/data/the-link".into())
                     .unwrap(),
@@ -7259,7 +6403,7 @@ steps = ["make-tree"]
         assert!(!work_done_root.exists());
 
         // Final symlink must exist.
-        let final_path = server_root.join("data/the-link");
+        let final_path = config.work_dir.as_path().join("univ/data/the-link");
         assert!(
             fs::symlink_metadata(final_path.as_std_path()).is_ok(),
             "final symlink must exist"
@@ -7267,8 +6411,52 @@ steps = ["make-tree"]
         let final_target = std::fs::read_link(final_path.as_std_path()).unwrap();
         assert_eq!(final_target, std::path::Path::new("/etc/config"));
 
-        let expected = vec![server_root.join("data"), server_root.join("data/the-link")];
-        assert_root_contains_exactly(server_root.as_path(), &expected);
+        let expected = vec![
+            config.work_dir.as_path().join("univ"),
+            config.work_dir.as_path().join("univ/data"),
+            config.work_dir.as_path().join("univ/data/the-link"),
+            config.work_dir.as_path().join("laptop"),
+            config.work_dir.as_path().join("laptop/done"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-symlink-consumed"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-symlink-consumed/files"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-symlink-consumed/files/univ"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-symlink-consumed/files/univ/data"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-symlink-consumed/files/univ/data/the-link"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-symlink-consumed/manifest.toml"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-symlink-consumed/progress.toml"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-symlink-consumed/run.toml"),
+            config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-symlink-consumed/status.toml"),
+            config.work_dir.as_path().join("laptop/processing"),
+            config.work_dir.as_path().join("laptop/ready"),
+        ];
+        assert_root_contains_exactly(config.work_dir.as_path(), &expected);
     }
 
     // ── postprocess archive paths nickname-free ──
@@ -7279,18 +6467,10 @@ steps = ["make-tree"]
     fn postprocess_archive_paths_nickname_free() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let server_str = server_root.as_str();
 
         fs::create_dir_all(&work_dir).unwrap();
-        fs::create_dir_all(&server_root).unwrap();
 
         let server_config = ServerConfig {
-            roots: purgery_core::ServerRoots::single(
-                "univ",
-                ServerRoot::new(server_str.into()).unwrap(),
-            )
-            .unwrap(),
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
@@ -7325,15 +6505,8 @@ steps = ["make-tree"]
             ready_path.join("run.toml"),
             format!(
                 r#"nickname = "{}"
-
-[[sync]]
-name = "data"
 to = "univ/data"
 delete_after_import = true
-
-[[postprocess.rules]]
-match = "*.bin"
-steps = ["copy-cmd"]
 "#,
                 nickname.as_str()
             ),
@@ -7344,7 +6517,6 @@ steps = ["copy-cmd"]
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
-                sync_name: SyncName::new("data".into()).unwrap(),
                 local_path: ClientLocalPath::new("/home/user/input.bin".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/univ/data/input.bin".into())
                     .unwrap(),
@@ -7382,15 +6554,62 @@ steps = ["copy-cmd"]
             );
         }
 
-        let final_output = server_root.join("data/input.bin.out");
+        let final_output = server_config
+            .work_dir
+            .as_path()
+            .join("univ/data/input.bin.out");
         assert!(final_output.exists());
         assert_eq!(fs::read_to_string(&final_output).unwrap(), "binary data");
 
         let expected = vec![
-            server_root.join("data"),
-            server_root.join("data/input.bin.out"),
+            server_config.work_dir.as_path().join("univ"),
+            server_config.work_dir.as_path().join("univ/data"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("univ/data/input.bin.out"),
+            server_config.work_dir.as_path().join("laptop"),
+            server_config.work_dir.as_path().join("laptop/done"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-named-root"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-named-root/files"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-named-root/files/univ"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-named-root/files/univ/data"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-named-root/files/univ/data/input.bin"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-named-root/manifest.toml"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-named-root/progress.toml"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-named-root/run.toml"),
+            server_config
+                .work_dir
+                .as_path()
+                .join("laptop/done/test-pp-named-root/status.toml"),
+            server_config.work_dir.as_path().join("laptop/processing"),
+            server_config.work_dir.as_path().join("laptop/ready"),
         ];
-        assert_root_contains_exactly(server_root.as_path(), &expected);
+        assert_root_contains_exactly(server_config.work_dir.as_path(), &expected);
     }
 
     /// For postprocess outputs, the work-area outputs are consumed by
@@ -7400,18 +6619,10 @@ steps = ["copy-cmd"]
     fn postprocess_work_area_outputs_consumed_after_materialization() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let server_str = server_root.as_str();
 
         fs::create_dir_all(&work_dir).unwrap();
-        fs::create_dir_all(&server_root).unwrap();
 
         let server_config = ServerConfig {
-            roots: purgery_core::ServerRoots::single(
-                "univ",
-                ServerRoot::new(server_str.into()).unwrap(),
-            )
-            .unwrap(),
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             postprocess: PostprocessConfig {
@@ -7446,15 +6657,8 @@ steps = ["copy-cmd"]
             ready_path.join("run.toml"),
             format!(
                 r#"nickname = "{}"
-
-[[sync]]
-name = "data"
 to = "univ/data"
 delete_after_import = true
-
-[[postprocess.rules]]
-match = "*.bin"
-steps = ["copy-cmd"]
 "#,
                 nickname.as_str()
             ),
@@ -7465,7 +6669,6 @@ steps = ["copy-cmd"]
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
-                sync_name: SyncName::new("data".into()).unwrap(),
                 local_path: ClientLocalPath::new("/home/user/input.bin".into()).unwrap(),
                 staged_path: NormalizedRelativePath::new("files/univ/data/input.bin".into())
                     .unwrap(),
@@ -7508,170 +6711,14 @@ steps = ["copy-cmd"]
     // ── resolve_destinations with named roots ──────────
 
     #[test]
-    fn resolve_destinations_no_nickname_in_passthrough() {
-        let tmp = tempfile::tempdir().unwrap();
-        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_config = purgery_core::RunConfig {
-            nickname: nickname.clone(),
-            sync: vec![purgery_core::RunConfigSync {
-                name: purgery_core::SyncName::new("videos".into()).unwrap(),
-                to_path: purgery_core::ClientDest::parse("univ/videos").unwrap(),
-                delete_after_import: true,
-            }],
-            postprocess: purgery_core::ClientPostprocessConfig::default(),
-        };
-        let result = resolve_destinations(&config, &nickname, &run_config).unwrap();
-        let parsed: purgery_core::ResolveDestinationsResponse = toml::from_str(&result).unwrap();
-        assert_eq!(parsed.destinations.len(), 1);
-        assert_eq!(parsed.destinations[0].sync_name, "videos");
-        assert!(
-            !parsed.destinations[0].passthrough_dest.contains("laptop"),
-            "passthrough_dest must not contain nickname: {}",
-            parsed.destinations[0].passthrough_dest
-        );
-        assert_eq!(
-            parsed.destinations[0].passthrough_dest,
-            format!("{}/videos", server_root.as_str())
-        );
-    }
-
-    #[test]
-    fn resolve_destinations_root_only_to() {
-        let tmp = tempfile::tempdir().unwrap();
-        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let mut config = test_server_config(&work_dir, &server_root);
-        config.roots = purgery_core::ServerRoots::single(
-            "system",
-            ServerRoot::new(server_root.clone()).unwrap(),
-        )
-        .unwrap();
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_config = purgery_core::RunConfig {
-            nickname: nickname.clone(),
-            sync: vec![purgery_core::RunConfigSync {
-                name: purgery_core::SyncName::new("system".into()).unwrap(),
-                to_path: purgery_core::ClientDest::parse("system").unwrap(),
-                delete_after_import: true,
-            }],
-            postprocess: purgery_core::ClientPostprocessConfig::default(),
-        };
-        let result = resolve_destinations(&config, &nickname, &run_config).unwrap();
-        let parsed: purgery_core::ResolveDestinationsResponse = toml::from_str(&result).unwrap();
-        assert_eq!(parsed.destinations.len(), 1);
-        assert_eq!(parsed.destinations[0].sync_name, "system");
-        assert!(
-            !parsed.destinations[0].passthrough_dest.contains("laptop"),
-            "passthrough_dest must not contain nickname: {}",
-            parsed.destinations[0].passthrough_dest
-        );
-        assert_eq!(
-            parsed.destinations[0].passthrough_dest,
-            server_root.as_str()
-        );
-    }
-
-    #[test]
-    fn resolve_destinations_rejects_unknown_root() {
-        let tmp = tempfile::tempdir().unwrap();
-        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_config = purgery_core::RunConfig {
-            nickname: nickname.clone(),
-            sync: vec![purgery_core::RunConfigSync {
-                name: purgery_core::SyncName::new("configs".into()).unwrap(),
-                to_path: purgery_core::ClientDest::parse("system/configs").unwrap(),
-                delete_after_import: true,
-            }],
-            postprocess: purgery_core::ClientPostprocessConfig::default(),
-        };
-
-        let error = resolve_destinations(&config, &nickname, &run_config).unwrap_err();
-        assert!(error.to_string().contains("unknown server root 'system'"));
-    }
-
-    #[test]
-    fn prepare_run_no_nickname_in_destinations() {
-        let tmp = tempfile::tempdir().unwrap();
-        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_id = RunId::new("test-run-prepare".into()).unwrap();
-
-        let incoming_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Incoming);
-        fs::create_dir_all(incoming_path.join("files")).unwrap();
-
-        write_run_toml_with_sync(&incoming_path, &nickname, "videos", "univ/videos");
-
-        let manifest = purgery_core::Manifest {
-            run_id: run_id.clone(),
-            nickname: nickname.clone(),
-            entries: vec![purgery_core::ManifestEntry {
-                sync_name: purgery_core::SyncName::new("videos".into()).unwrap(),
-                local_path: purgery_core::ClientLocalPath::new("/home/user/Videos/a.mp4".into())
-                    .unwrap(),
-                staged_path: purgery_core::NormalizedRelativePath::new(
-                    "files/univ/videos/a.mp4".into(),
-                )
-                .unwrap(),
-                relative_path: purgery_core::NormalizedRelativePath::new("a.mp4".into()).unwrap(),
-                kind: purgery_core::ManifestEntryKind::RegularFile,
-                size: 100,
-                mtime_ns: 1_000_000,
-                sha256: None,
-                link_target: None,
-                mode: purgery_core::ManifestEntryMode::Passthrough,
-                postprocess_steps: Vec::new(),
-                covered_by: None,
-            }],
-        };
-        fs::write(
-            incoming_path.join("manifest.toml"),
-            manifest.to_toml().unwrap(),
-        )
-        .unwrap();
-
-        let result = prepare_run(&config, &nickname, &run_id).unwrap();
-        let parsed: purgery_core::PrepareRunResponse = toml::from_str(&result).unwrap();
-
-        assert_eq!(parsed.destinations.len(), 1);
-        let dest = &parsed.destinations[0];
-        assert_eq!(dest.sync_name, "videos");
-        assert!(
-            !dest.passthrough_dest.contains("laptop"),
-            "passthrough_dest must not contain nickname: {}",
-            dest.passthrough_dest
-        );
-        assert_eq!(
-            dest.passthrough_dest,
-            format!("{}/videos", server_root.as_str())
-        );
-        assert!(
-            dest.purgatory_dest.contains("files/univ/videos"),
-            "purgatory_dest must use root-qualified path files/<root>/<sub>, got: {}",
-            dest.purgatory_dest
-        );
-    }
-
-    #[test]
     fn full_pipeline_status_final_paths_root_qualified() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-run-final-paths".into()).unwrap();
 
         let (config, _staged_file_path) = setup_single_file_ready(
             &work_dir,
-            &server_root,
             &nickname,
             &run_id,
             "videos",

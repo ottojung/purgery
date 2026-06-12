@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use purgery_core::{ColorMode, LogFormat, LogLevel, Nickname, RunId, ServerConfig};
 use purgery_server::{
     begin_run, bootstrap, finish_run, heartbeat_run, prepare_run, process_once_raw,
-    read_run_status, resolve_destinations, run_gc, run_state, server_check,
+    read_run_status, run_gc, run_state, server_check,
 };
 use std::fs;
 
@@ -122,12 +122,6 @@ enum Command {
         #[arg(long)]
         run_id: String,
     },
-    /// Resolve final storage destinations for pure passthrough groups (side-effect-free)
-    /// Reads run config from stdin.
-    ResolveDestinations {
-        #[arg(long)]
-        nickname: String,
-    },
     /// Report run phase without requiring terminal status
     RunState {
         #[arg(long)]
@@ -222,18 +216,6 @@ fn main() -> Result<()> {
             let nickname = Nickname::new(nickname).with_context(|| "invalid nickname")?;
             let run_id = RunId::new(run_id).with_context(|| "invalid run ID")?;
             heartbeat_run(&server_config, &nickname, &run_id)?;
-        }
-        Command::ResolveDestinations { nickname } => {
-            let nickname = Nickname::new(nickname).with_context(|| "invalid nickname")?;
-            use std::io::Read;
-            let mut stdin_content = String::new();
-            std::io::stdin()
-                .read_to_string(&mut stdin_content)
-                .with_context(|| "failed to read stdin")?;
-            let run_config = purgery_core::RunConfig::from_toml(&stdin_content)
-                .with_context(|| "failed to parse run config")?;
-            let response = resolve_destinations(&server_config, &nickname, &run_config)?;
-            print!("{response}");
         }
         Command::RunState { nickname, run_id } => {
             let nickname = Nickname::new(nickname).with_context(|| "invalid nickname")?;

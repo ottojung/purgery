@@ -35,7 +35,6 @@ pub struct Manifest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestEntry {
-    pub sync_name: SyncName,
     pub local_path: ClientLocalPath,
     pub staged_path: NormalizedRelativePath,
     pub relative_path: NormalizedRelativePath,
@@ -150,7 +149,6 @@ impl Manifest {
         self.entries
             .iter()
             .map(|e| TransferPlanEntry {
-                sync_name: e.sync_name.clone(),
                 relative_path: e.relative_path.clone(),
                 kind: e.kind,
                 mode: e.mode,
@@ -187,7 +185,6 @@ pub enum TransferRoot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferPlanEntry {
-    pub sync_name: SyncName,
     pub relative_path: NormalizedRelativePath,
     pub kind: ManifestEntryKind,
     pub mode: ManifestEntryMode,

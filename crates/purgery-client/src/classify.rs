@@ -1,144 +1,148 @@
 use anyhow::{Context, Result};
+use camino::{Utf8Path, Utf8PathBuf};
 use purgery_core::{
-    ClientConfig, ClientLocalPath, ManifestEntry, ManifestEntryKind, ManifestEntryMode,
-    NormalizedRelativePath, PostprocessRule, RunId,
+    compute_sha256, ClientLocalPath, Manifest, ManifestEntry, ManifestEntryKind, ManifestEntryMode,
+    Nickname, NormalizedRelativePath, RunId,
 };
 use std::fs;
 use std::path::Path;
 use std::time::SystemTime;
-use tracing::warn;
 use walkdir::WalkDir;
 
-use crate::cleanup::compute_sha256;
-
-/// Walk one sync group and return manifest entries plus whether any are postprocess.
-/// Uses only the provided applicable rules for classification.
-pub(crate) fn walk_and_classify_sync(
-    _config: &ClientConfig,
-    sync: &purgery_core::SyncMapping,
-    _run_id: &RunId,
-    applicable_rules: &[&PostprocessRule],
-) -> Result<(Vec<ManifestEntry>, bool)> {
-    let from_path = sync.from_path.as_str();
-    let to_path = sync.to_path.qualified_path();
-    let from = Path::new(from_path);
-
-    if !from.exists() {
-        warn!(path = from_path, "sync path does not exist, skipping");
-        return Ok((Vec::new(), false));
+pub(crate) fn build_manifest(
+    source: &str,
+    run_id: &RunId,
+    nickname: &Nickname,
+    postprocess_steps: &[String],
+) -> Result<Manifest> {
+    let source_path = Path::new(source);
+    if !source_path.exists() {
+        anyhow::bail!("source path does not exist: {source}");
     }
 
-    let mut entries = Vec::new();
-    let mut has_postprocess = false;
+    let has_postprocess = !postprocess_steps.is_empty();
 
-    for walk_entry in WalkDir::new(from).follow_links(false).min_depth(1) {
-        let walk_entry = walk_entry.with_context(|| format!("error walking {from_path}"))?;
+    let walk_root = if source_path.is_file() {
+        source_path.parent().unwrap_or(source_path).to_path_buf()
+    } else {
+        source_path.to_path_buf()
+    };
+
+    let is_file_source = source_path.is_file();
+    let source_abs = source_path;
+    let mut entries: Vec<ManifestEntry> = Vec::new();
+
+    for walk_entry in WalkDir::new(&walk_root).follow_links(false).min_depth(1) {
+        let walk_entry = walk_entry.with_context(|| format!("error walking {source}"))?;
         let path = walk_entry.path();
+
+        if is_file_source && path != source_abs {
+            continue;
+        }
+
         let relative = path
-            .strip_prefix(from)
-            .with_context(|| format!("failed to compute relative path for: {}", path.display()))?;
-        let relative_path =
-            camino::Utf8PathBuf::from_path_buf(relative.to_path_buf()).map_err(|path| {
-                anyhow::anyhow!("non-UTF-8 relative path is unsupported: {}", path.display())
-            })?;
-        let staged_path = camino::Utf8Path::new("files")
-            .join(&to_path)
-            .join(&relative_path);
+            .strip_prefix(&walk_root)
+            .with_context(|| format!("failed to compute relative path: {}", path.display()))?;
+        let relative_path = Utf8PathBuf::from_path_buf(relative.to_path_buf())
+            .map_err(|p| anyhow::anyhow!("non-UTF-8 relative path: {}", p.display()))?;
+        let relative_path_norm = NormalizedRelativePath::new(relative_path.clone())
+            .with_context(|| format!("invalid relative path: {}", relative_path.as_str()))?;
+
+        let staged_path = Utf8PathBuf::from("files").join(&relative_path);
+        let staged_path_norm = NormalizedRelativePath::new(staged_path)
+            .with_context(|| format!("invalid staged path: {}", relative.display()))?;
+
         let metadata = fs::symlink_metadata(path)
             .with_context(|| format!("failed to read metadata: {}", path.display()))?;
         let file_type = metadata.file_type();
-        let normalized_path = relative_path.as_str().to_owned();
 
-        // Classify using only applicable rules for this sync
-        let matched_rule = applicable_rules
-            .iter()
-            .find(|r| purgery_core::rsync_pattern_match(&r.pattern, &normalized_path));
-        let mode = if matched_rule.is_some() {
-            has_postprocess = true;
-            ManifestEntryMode::Postprocess
-        } else {
-            ManifestEntryMode::Passthrough
-        };
-        let postprocess_steps: Vec<String> =
-            matched_rule.map(|r| r.steps.clone()).unwrap_or_default();
+        let local_path_str = path.to_string_lossy().to_string();
+        let local_path = ClientLocalPath::new(local_path_str)
+            .with_context(|| format!("invalid local path: {}", path.display()))?;
 
-        let (kind, size, mtime_ns, sha256, link_target) = if file_type.is_dir() {
-            (ManifestEntryKind::Directory, 0, 0, None, None)
+        if file_type.is_dir() {
+            entries.push(ManifestEntry {
+                local_path,
+                staged_path: staged_path_norm,
+                relative_path: relative_path_norm,
+                kind: ManifestEntryKind::Directory,
+                size: 0,
+                mtime_ns: 0,
+                sha256: None,
+                link_target: None,
+                mode: ManifestEntryMode::Passthrough,
+                postprocess_steps: Vec::new(),
+                covered_by: None,
+            });
         } else if file_type.is_file() {
-            let (mtime_ns, sha256) = if matched_rule.is_some() {
-                // Postprocess entries require SHA-256 for server-side identity verification
-                let mtime_ns = metadata
+            let size = metadata.len();
+            let (mtime_ns, sha256) = if has_postprocess || size > 0 {
+                let mtime = metadata
                     .modified()
                     .ok()
-                    .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
-                    .map(|duration| duration.as_nanos() as i64)
+                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos() as i64)
                     .unwrap_or(0);
-                let sha256 = compute_sha256(path).with_context(|| {
-                    format!(
-                        "failed to compute SHA-256 for postprocess entry: {}",
-                        path.display()
+                let sha = if has_postprocess {
+                    let utf8_path = Utf8Path::from_path(path)
+                        .ok_or_else(|| anyhow::anyhow!("non-UTF-8 path: {}", path.display()))?;
+                    Some(
+                        compute_sha256(utf8_path)
+                            .with_context(|| format!("SHA-256 failed: {}", path.display()))?,
                     )
-                })?;
-                (mtime_ns, Some(sha256))
-            } else if sync.delete_after_import {
-                // Passthrough entries with delete-after-import: SHA needed for cleanup identity
-                let mtime_ns = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
-                    .map(|duration| duration.as_nanos() as i64)
-                    .unwrap_or(0);
-                let sha256 = compute_sha256(path).with_context(|| {
-                    format!(
-                        "failed to compute SHA-256 for delete-after-import entry: {}",
-                        path.display()
-                    )
-                })?;
-                (mtime_ns, Some(sha256))
+                } else {
+                    None
+                };
+                (mtime, sha)
             } else {
                 (0, None)
             };
-            (
-                ManifestEntryKind::RegularFile,
-                metadata.len(),
+
+            let mode = if has_postprocess {
+                ManifestEntryMode::Postprocess
+            } else {
+                ManifestEntryMode::Passthrough
+            };
+
+            entries.push(ManifestEntry {
+                local_path,
+                staged_path: staged_path_norm,
+                relative_path: relative_path_norm,
+                kind: ManifestEntryKind::RegularFile,
+                size,
                 mtime_ns,
-                sha256,
-                None,
-            )
+                sha256: if has_postprocess { sha256 } else { None },
+                link_target: None,
+                mode,
+                postprocess_steps: if has_postprocess {
+                    postprocess_steps.to_vec()
+                } else {
+                    Vec::new()
+                },
+                covered_by: None,
+            });
         } else if file_type.is_symlink() {
             let target = fs::read_link(path)
                 .with_context(|| format!("failed to read symlink: {}", path.display()))?;
-            let target = camino::Utf8PathBuf::from_path_buf(target).map_err(|path| {
-                anyhow::anyhow!(
-                    "non-UTF-8 symlink target is unsupported: {}",
-                    path.display()
-                )
-            })?;
-            (ManifestEntryKind::Symlink, 0, 0, None, Some(target))
-        } else {
-            anyhow::bail!("unsupported filesystem object: {}", path.display());
-        };
+            let target = Utf8PathBuf::from_path_buf(target)
+                .map_err(|p| anyhow::anyhow!("non-UTF-8 symlink target: {}", p.display()))?;
 
-        entries.push(ManifestEntry {
-            sync_name: sync.name.clone(),
-            local_path: ClientLocalPath::new(path.to_string_lossy().to_string())
-                .with_context(|| format!("invalid local path for: {}", path.display()))?,
-            staged_path: NormalizedRelativePath::new(staged_path)
-                .with_context(|| format!("invalid staged path for: {}", path.display()))?,
-            relative_path: NormalizedRelativePath::new(relative_path)
-                .with_context(|| format!("invalid relative path for: {}", path.display()))?,
-            kind,
-            size,
-            mtime_ns,
-            sha256,
-            link_target,
-            mode,
-            postprocess_steps,
-            covered_by: None,
-        });
+            entries.push(ManifestEntry {
+                local_path,
+                staged_path: staged_path_norm,
+                relative_path: relative_path_norm,
+                kind: ManifestEntryKind::Symlink,
+                size: 0,
+                mtime_ns: 0,
+                sha256: None,
+                link_target: Some(target),
+                mode: ManifestEntryMode::Passthrough,
+                postprocess_steps: Vec::new(),
+                covered_by: None,
+            });
+        }
     }
 
-    // Identify covered entries under postprocessed directories.
     let covering_dirs: Vec<String> = entries
         .iter()
         .filter(|e| {
@@ -147,6 +151,9 @@ pub(crate) fn walk_and_classify_sync(
         .map(|e| e.relative_path.as_str().to_owned())
         .collect();
     for entry in entries.iter_mut() {
+        if entry.mode == ManifestEntryMode::Postprocess {
+            continue;
+        }
         let rp = entry.relative_path.as_str();
         for dir_path in &covering_dirs {
             if rp == dir_path.as_str() {
@@ -162,70 +169,26 @@ pub(crate) fn walk_and_classify_sync(
         }
     }
 
-    // Sort: directories first, then by depth, then by name
-    entries.sort_by(|left, right| {
-        let left_depth = left.relative_path.as_path().components().count();
-        let right_depth = right.relative_path.as_path().components().count();
+    entries.sort_by(|a, b| {
+        let a_depth = a.relative_path.as_path().components().count();
+        let b_depth = b.relative_path.as_path().components().count();
         let kind_order = |kind| match kind {
             ManifestEntryKind::Directory => 0,
             ManifestEntryKind::RegularFile | ManifestEntryKind::Symlink => 1,
         };
-        left_depth
-            .cmp(&right_depth)
-            .then_with(|| kind_order(left.kind).cmp(&kind_order(right.kind)))
-            .then_with(|| left.sync_name.as_str().cmp(right.sync_name.as_str()))
-            .then_with(|| {
-                left.relative_path
-                    .as_str()
-                    .cmp(right.relative_path.as_str())
-            })
-    });
-
-    Ok((entries, has_postprocess))
-}
-
-/// Walk all sync directories and build the manifest using the current
-/// per-sync walk-and-classify model. Test-only; production code uses
-/// classify_sync_groups + walk_and_classify_sync per purgatory group.
-#[cfg(test)]
-pub(crate) fn build_manifest(
-    config: &ClientConfig,
-    run_id: &RunId,
-) -> Result<purgery_core::Manifest> {
-    let mut entries = Vec::new();
-    for sync in &config.sync {
-        let sync_name = sync.name.as_str();
-        let applicable = purgery_core::applicable_rules(&config.postprocess.rules, sync_name);
-        let (sync_entries, _) = walk_and_classify_sync(config, sync, run_id, &applicable)?;
-        entries.extend(sync_entries);
-    }
-
-    // Sort: directories first, then by depth, then by name
-    entries.sort_by(|left, right| {
-        let left_depth = left.relative_path.as_path().components().count();
-        let right_depth = right.relative_path.as_path().components().count();
-        let kind_order = |kind| match kind {
-            ManifestEntryKind::Directory => 0,
-            ManifestEntryKind::RegularFile | ManifestEntryKind::Symlink => 1,
-        };
-        left_depth
-            .cmp(&right_depth)
-            .then_with(|| kind_order(left.kind).cmp(&kind_order(right.kind)))
-            .then_with(|| left.sync_name.as_str().cmp(right.sync_name.as_str()))
-            .then_with(|| {
-                left.relative_path
-                    .as_str()
-                    .cmp(right.relative_path.as_str())
-            })
+        a_depth
+            .cmp(&b_depth)
+            .then_with(|| kind_order(a.kind).cmp(&kind_order(b.kind)))
+            .then_with(|| a.relative_path.as_str().cmp(b.relative_path.as_str()))
     });
 
     if entries.is_empty() {
         anyhow::bail!("no filesystem entries found to sync");
     }
 
-    Ok(purgery_core::Manifest {
+    Ok(Manifest {
         run_id: run_id.clone(),
-        nickname: config.nickname.clone(),
+        nickname: nickname.clone(),
         entries,
     })
 }

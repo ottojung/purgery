@@ -3,16 +3,14 @@ use std::collections::HashSet;
 use std::fs;
 use tracing::info;
 
-use crate::RunPlan;
+use crate::ResolvedStep;
 
 /// Default heartbeat interval for subprocess progress updates (5 seconds).
 const DEFAULT_HEARTBEAT_SECS: u64 = 5;
 
 #[allow(clippy::too_many_arguments)]
 pub fn apply_postprocessing(
-    run_plan: &RunPlan,
-    sync_name: &str,
-    normalized_path: &str,
+    steps: &[ResolvedStep],
     work_path: &Utf8Path,
     progress_step: &mut dyn FnMut(&purgery_core::ProgressUpdate),
     entry_index: usize,
@@ -20,9 +18,7 @@ pub fn apply_postprocessing(
     current_entry: &str,
 ) -> Result<Vec<Utf8PathBuf>, String> {
     apply_postprocessing_with_heartbeat(
-        run_plan,
-        sync_name,
-        normalized_path,
+        steps,
         work_path,
         std::time::Duration::from_secs(DEFAULT_HEARTBEAT_SECS),
         progress_step,
@@ -34,9 +30,7 @@ pub fn apply_postprocessing(
 
 #[allow(clippy::too_many_arguments)]
 pub fn apply_postprocessing_with_heartbeat(
-    run_plan: &RunPlan,
-    sync_name: &str,
-    normalized_path: &str,
+    steps: &[ResolvedStep],
     work_path: &Utf8Path,
     heartbeat_interval: std::time::Duration,
     progress_step: &mut dyn FnMut(&purgery_core::ProgressUpdate),
@@ -50,11 +44,7 @@ pub fn apply_postprocessing_with_heartbeat(
         .parent()
         .ok_or_else(|| "work path has no parent directory".to_string())?;
 
-    let Some(compiled) = run_plan.first_matching_rule(sync_name, normalized_path) else {
-        return Err("no selected postprocess rule for entry".into());
-    };
-
-    for step in &compiled.steps {
+    for step in steps {
         let step_def = &step.step_def;
 
         match step_def.kind {

@@ -2,10 +2,9 @@ use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use purgery_core::{
     path_is_within_root, validate_envelope, work_dir, EntryStatusEntry, FileStatus, Manifest,
-    ManifestEntry, ManifestEntryKind, Nickname, NormalizedRelativePath, RunConfig, RunConfigSync,
-    RunId, RunPhase, RunState, RunStatus, ServerConfig,
+    ManifestEntry, ManifestEntryKind, Nickname, NormalizedRelativePath, RunConfig, RunId, RunPhase,
+    RunState, RunStatus, ServerConfig, ServerRoot,
 };
-use std::collections::HashMap;
 use std::fs;
 use tracing::{debug, info, span, warn, Level};
 
@@ -23,7 +22,6 @@ use crate::RunPlan;
 pub(crate) enum EntryOutcome {
     Success {
         kind: ManifestEntryKind,
-        sync_name: purgery_core::SyncName,
         local_path: String,
         relative_path: String,
         final_paths: Vec<String>,
@@ -31,14 +29,12 @@ pub(crate) enum EntryOutcome {
     },
     Failure {
         kind: ManifestEntryKind,
-        sync_name: purgery_core::SyncName,
         local_path: String,
         relative_path: String,
         error: String,
     },
     Skipped {
         kind: ManifestEntryKind,
-        sync_name: purgery_core::SyncName,
         local_path: String,
         relative_path: String,
         error: String,
@@ -50,14 +46,12 @@ impl EntryOutcome {
         match self {
             EntryOutcome::Success {
                 kind,
-                sync_name,
                 local_path,
                 relative_path,
                 final_paths,
                 postprocess,
             } => EntryStatusEntry {
                 kind,
-                sync_name,
                 local_path,
                 relative_path,
                 status: FileStatus::Imported,
@@ -67,13 +61,11 @@ impl EntryOutcome {
             },
             EntryOutcome::Failure {
                 kind,
-                sync_name,
                 local_path,
                 relative_path,
                 error,
             } => EntryStatusEntry {
                 kind,
-                sync_name,
                 local_path,
                 relative_path,
                 status: FileStatus::Failed,
@@ -83,13 +75,11 @@ impl EntryOutcome {
             },
             EntryOutcome::Skipped {
                 kind,
-                sync_name,
                 local_path,
                 relative_path,
                 error,
             } => EntryStatusEntry {
                 kind,
-                sync_name,
                 local_path,
                 relative_path,
                 status: FileStatus::Skipped,
@@ -104,13 +94,11 @@ impl EntryOutcome {
 #[cfg(unix)]
 fn prepare_work_entry(
     entry: &ManifestEntry,
-    sync: &RunConfigSync,
+    to_path: &str,
     source_path: &Utf8Path,
     work_area: &Utf8Path,
 ) -> Result<Utf8PathBuf, String> {
-    let work_path = work_area
-        .join(sync.to_path.qualified_path())
-        .join(entry.relative_path.as_str());
+    let work_path = work_area.join(to_path).join(entry.relative_path.as_str());
 
     match entry.kind {
         ManifestEntryKind::Directory => {
@@ -192,7 +180,6 @@ fn prepare_work_entry(
 fn failed_entry(entry: &ManifestEntry, error: impl Into<String>) -> EntryOutcome {
     EntryOutcome::Failure {
         kind: entry.kind,
-        sync_name: entry.sync_name.clone(),
         local_path: entry.local_path.as_str().to_owned(),
         relative_path: entry.relative_path.as_str().to_owned(),
         error: error.into(),
@@ -203,7 +190,6 @@ fn failed_entry(entry: &ManifestEntry, error: impl Into<String>) -> EntryOutcome
 fn process_manifest_entry(
     server_config: &ServerConfig,
     run_plan: &RunPlan,
-    sync: &RunConfigSync,
     entry: &ManifestEntry,
     nickname: &Nickname,
     run_id: &RunId,
@@ -211,9 +197,10 @@ fn process_manifest_entry(
     work_area: &Utf8Path,
     entry_index: usize,
     entry_total: usize,
+    to_path: &str,
 ) -> EntryOutcome {
     let expected_staged = Utf8Path::new("files")
-        .join(sync.to_path.qualified_path())
+        .join(to_path)
         .join(entry.relative_path.as_str());
     let Ok(expected_staged) = NormalizedRelativePath::new(expected_staged) else {
         return failed_entry(entry, "failed to normalize expected staged path");
@@ -268,59 +255,48 @@ fn process_manifest_entry(
         ManifestEntryKind::Directory => {}
     }
 
-    let root = match server_config.roots.get(sync.to_path.root_name()) {
-        Some(root) => root,
-        None => {
-            return failed_entry(
-                entry,
-                format!(
-                    "unknown server root '{}'",
-                    sync.to_path.root_name().as_str()
-                ),
-            )
-        }
+    let server_root = match ServerRoot::new(server_config.work_dir.as_path().to_owned()) {
+        Ok(r) => r,
+        Err(_) => return failed_entry(entry, "failed to create server root"),
     };
-    let final_path = match server_config
-        .roots
-        .resolve_final_path(&sync.to_path, &entry.relative_path)
-    {
-        Ok(path) => path,
-        Err(error) => return failed_entry(entry, error.to_string()),
-    };
-    if !path_is_within_root(&final_path, root.as_path()) {
+
+    let root_dest = NormalizedRelativePath::new(to_path.to_owned().into()).ok();
+    let final_path = server_root.final_path_under(root_dest.as_ref(), &entry.relative_path);
+    if !path_is_within_root(&final_path, server_root.as_path()) {
         return failed_entry(
             entry,
             format!("final path escapes root: {}", final_path.as_str()),
         );
     }
-    let final_relative = sync.to_path.status_path_for(&entry.relative_path);
-    let normalized_path = entry.relative_path.as_str().to_owned();
+    let final_relative = format!("{}/{}", to_path, entry.relative_path.as_str());
 
-    let matched = run_plan.entry_is_postprocess(entry.sync_name.as_str(), &normalized_path);
+    let has_postprocess = !entry.postprocess_steps.is_empty();
 
-    let result = if !matched {
+    let result = if !has_postprocess {
         match entry.kind {
-            ManifestEntryKind::Directory => commit_directory_entry(&final_path, root.as_path())
-                .map(|_| (vec![final_relative], None)),
+            ManifestEntryKind::Directory => {
+                commit_directory_entry(&final_path, server_root.as_path())
+                    .map(|_| (vec![final_relative], None))
+            }
             ManifestEntryKind::Symlink => {
-                let work_path = match prepare_work_entry(entry, sync, &source_path, work_area) {
+                let work_path = match prepare_work_entry(entry, to_path, &source_path, work_area) {
                     Ok(p) => p,
                     Err(error) => return failed_entry(entry, error.to_string()),
                 };
-                commit_symlink_entry(&work_path, &final_path, root.as_path(), run_id)
+                commit_symlink_entry(&work_path, &final_path, server_root.as_path(), run_id)
                     .map(|_| (vec![final_relative], None))
             }
             ManifestEntryKind::RegularFile => {
-                let work_path = match prepare_work_entry(entry, sync, &source_path, work_area) {
+                let work_path = match prepare_work_entry(entry, to_path, &source_path, work_area) {
                     Ok(p) => p,
                     Err(error) => return failed_entry(entry, error.to_string()),
                 };
-                commit_regular_file_entry(&work_path, &final_path, root.as_path(), run_id)
+                commit_regular_file_entry(&work_path, &final_path, server_root.as_path(), run_id)
                     .map(|_| (vec![final_relative], None))
             }
         }
     } else {
-        let work_path = match prepare_work_entry(entry, sync, &source_path, work_area) {
+        let work_path = match prepare_work_entry(entry, to_path, &source_path, work_area) {
             Ok(p) => p,
             Err(error) => return failed_entry(entry, error.to_string()),
         };
@@ -336,10 +312,12 @@ fn process_manifest_entry(
                 update.current_step,
             );
         };
+        let resolved_steps = match run_plan.resolve_steps(&entry.postprocess_steps) {
+            Ok(s) => s,
+            Err(error) => return failed_entry(entry, error),
+        };
         match apply_postprocessing(
-            run_plan,
-            entry.sync_name.as_str(),
-            &normalized_path,
+            &resolved_steps,
             &work_path,
             &mut pp_helper,
             entry_index,
@@ -358,11 +336,11 @@ fn process_manifest_entry(
                             |parent| parent.join(filename),
                         )
                     };
-                    if !path_is_within_root(&output_final, root.as_path()) {
+                    if !path_is_within_root(&output_final, server_root.as_path()) {
                         return failed_entry(entry, "output escapes root");
                     }
                     if let Err(error) =
-                        commit_output_entry(&output, &output_final, root.as_path(), run_id)
+                        commit_output_entry(&output, &output_final, server_root.as_path(), run_id)
                     {
                         return failed_entry(entry, format!("commit failed: {error}"));
                     }
@@ -381,10 +359,9 @@ fn process_manifest_entry(
                             }
                         }
                     };
-                    final_paths.push(sync.to_path.status_path_for(&output_relative));
+                    final_paths.push(format!("{}/{}", to_path, output_relative.as_str()));
                 }
-                let steps: Vec<String> =
-                    run_plan.selected_steps_for(entry.sync_name.as_str(), &normalized_path);
+                let steps: Vec<String> = entry.postprocess_steps.clone();
                 Ok((final_paths, (!steps.is_empty()).then_some(steps)))
             }
             Err(error) => Err(error),
@@ -394,7 +371,6 @@ fn process_manifest_entry(
     match result {
         Ok((final_paths, postprocess)) => EntryOutcome::Success {
             kind: entry.kind,
-            sync_name: entry.sync_name.clone(),
             local_path: entry.local_path.as_str().to_owned(),
             relative_path: entry.relative_path.as_str().to_owned(),
             final_paths,
@@ -472,14 +448,7 @@ pub fn process_processing_run(
         }
     };
 
-    if let Err(error) = run_config.validate_uploaded_purgatory_run() {
-        let msg = format!("uploaded run config validation failed: {error}");
-        warn!("{}", msg);
-        write_run_failure(&config.work_dir, nickname, run_id, &msg)?;
-        anyhow::bail!("{msg}");
-    }
-
-    let run_plan = match RunPlan::build(config, &run_config) {
+    let run_plan = match RunPlan::build(config) {
         Ok(plan) => plan,
         Err(error) => {
             let msg = format!("run plan validation failed: {error}");
@@ -516,25 +485,11 @@ pub fn process_processing_run(
         anyhow::bail!("{msg}");
     }
 
-    let sync_map: HashMap<&str, &RunConfigSync> = run_config.sync_map().into_iter().collect();
-
-    let covered_by_dir: std::collections::HashSet<(String, String)> = manifest
+    let covered_by_dirs: Vec<String> = manifest
         .entries
         .iter()
-        .filter(|e| e.kind == ManifestEntryKind::Directory)
-        .filter_map(|dir_entry| {
-            let _sync = sync_map.get(dir_entry.sync_name.as_str())?;
-            let np = dir_entry.relative_path.as_str().to_owned();
-            let matched = run_plan
-                .rules
-                .iter()
-                .any(|rule| rule.applies_to(dir_entry.sync_name.as_str()) && rule.is_match(&np));
-            if matched {
-                Some((dir_entry.sync_name.as_str().to_owned(), np))
-            } else {
-                None
-            }
-        })
+        .filter(|e| e.kind == ManifestEntryKind::Directory && !e.postprocess_steps.is_empty())
+        .map(|e| e.relative_path.as_str().to_owned())
         .collect();
 
     // Write initial progress before processing entries
@@ -562,36 +517,16 @@ pub fn process_processing_run(
             entry.relative_path.as_str(),
             "",
         );
-        let sync_name = entry.sync_name.as_str();
-        let Some(sync) = sync_map.get(sync_name) else {
-            warn!(
-                sync_name = sync_name,
-                "sync mapping not found in run config, skipping"
-            );
-            outcomes.push(EntryOutcome::Skipped {
-                kind: entry.kind,
-                sync_name: entry.sync_name.clone(),
-                local_path: entry.local_path.as_str().to_owned(),
-                relative_path: entry.relative_path.as_str().to_owned(),
-                error: format!("sync mapping '{sync_name}' not found"),
-            });
-            continue;
-        };
 
         let np = entry.relative_path.as_str().to_owned();
-        let entry_sync = entry.sync_name.as_str();
-        let covered = covered_by_dir.iter().any(|(sync_name, prefix)| {
-            sync_name.as_str() == entry_sync
-                && match np.as_str().strip_prefix(prefix.as_str()) {
-                    Some(tail) => tail.starts_with('/'),
-                    None => false,
-                }
+        let covered = covered_by_dirs.iter().any(|prefix| {
+            np.strip_prefix(prefix.as_str())
+                .is_some_and(|tail| tail.starts_with('/'))
         });
         if covered {
-            debug!(sync_name = sync_name, path = %np, "entry covered by postprocessed ancestor directory, skipping");
+            debug!(path = %np, "entry covered by postprocessed ancestor directory, skipping");
             outcomes.push(EntryOutcome::Skipped {
                 kind: entry.kind,
-                sync_name: entry.sync_name.clone(),
                 local_path: entry.local_path.as_str().to_owned(),
                 relative_path: entry.relative_path.as_str().to_owned(),
                 error: "covered by postprocessed ancestor directory".into(),
@@ -602,7 +537,6 @@ pub fn process_processing_run(
         outcomes.push(process_manifest_entry(
             config,
             &run_plan,
-            sync,
             entry,
             nickname,
             run_id,
@@ -610,6 +544,7 @@ pub fn process_processing_run(
             &work_area,
             entry_idx,
             manifest.entries.len(),
+            &run_config.to,
         ));
     }
 
