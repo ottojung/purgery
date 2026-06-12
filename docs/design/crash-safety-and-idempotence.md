@@ -133,7 +133,7 @@ Final archive directories are created only as needed for actual materialized ent
 
 With deterministic postprocessing, importing the same input tree repeatedly converges to the same final tree and is a semantic no-op. Non-deterministic postprocessing may produce different regular-file content on a later import; replacing the prior output is allowed.
 
-This property makes crash recovery replay-based. A crash may occur after some entries have been materialized but before `status.toml` is written. The client retains local entries because no success status exists. On restart, the server replays the processing run from staged files and converges on the run's result.
+This property makes crash recovery replay-based. A crash may occur after some entries have been materialized but before `status.toml` is written. The client retains local entries because no success status exists. On restart, the server replays the processing run from the immutable staged files under `processing/<run_id>/files/` and converges on the run's result. The work area is rebuilt from the staged files for each attempt.
 
 ## Per-entry replacement invariant
 
@@ -144,7 +144,7 @@ regular work output → moved to final path
 symlink work output → moved to final path
 ```
 
-The final destination tree (`root`) is output-only. All staging and intermediate artifacts live under `purgery_root`. Source entries under the work area are consumed after successful materialization.
+The final destination tree (`root`) is output-only. All staging and intermediate artifacts live under `purgery_root`. Work-area copies are consumed after successful materialization. The original staged files under `processing/<run_id>/files/` are never consumed and remain as replay source.
 
 A source directory replaces a conflicting final file or symlink and then allows descendants to merge. A source regular file or symlink replaces a final file, symlink, or empty directory, but fails rather than deleting a non-empty final directory. Existing ancestors must be real directories; final-storage symlinks are never followed as directory components. Every derived path must remain inside the configured storage root.
 

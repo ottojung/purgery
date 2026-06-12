@@ -14,13 +14,13 @@ The rule is: nothing non-final may appear under `root`. A partially written exac
 
 ### Regular files and symlinks
 
-Moved from their work-area location to the final path under `root`:
+Every server-side entry is first prepared in the work area: the staged upload is copied or recreated, producing a work-area representation. The work-area representation is then moved to the final path under `root`:
 
 ```
-work output → moved to final path
+staged upload → prepared in work area → moved to final path
 ```
 
-The source (staged file or work-area output) is a complete file already verified against the manifest. The source is consumed by the move — it no longer exists at its staging/work location after successful materialization.
+The work-area copy is consumed by the move — it no longer exists at its work-area location after successful materialization. The staged upload under `processing/<run_id>/files/` is never consumed and remains as replay source.
 
 A crash during the move to final storage may leave a partial file at the exact final path. This is acceptable because the run has not published `status.toml` and will be replayed from staged data on recovery, overwriting the partial file.
 
@@ -56,7 +56,13 @@ Per-entry failures produce individual `EntryStatusEntry` records with `status = 
 
 ## Work area
 
-The server creates a work area at `<purgery_root>/<nickname>/processing/<run_id>/work/`. Entries are placed into the work area before processing. All staging, temporary files, helper paths, and intermediate artifacts live under this work area, never under `root`. After successful materialization, work-area outputs are consumed (moved to final storage) and the work area is removed for `done` runs.
+The server creates a work area at `<purgery_root>/<nickname>/processing/<run_id>/work/`. Every server-side entry is prepared into the work area before final materialization:
+
+* **Postprocess entries**: the staged file, symlink, or directory tree is copied into the work area. The subprocess runs with the work-area copy as input. Its outputs are collected from the work area and moved to final storage.
+
+* **Non-postprocess entries**: the staged file, symlink, or directory is prepared in the work area. The work-area copy is then moved to final storage, consuming it. The original staged file under `processing/<run_id>/files/` is preserved as replay source.
+
+All staging, temporary files, helper paths, and intermediate artifacts live under this work area, never under `root`. After successful materialization, work-area outputs are consumed (moved to final storage) and the work area is removed for `done` runs.
 
 Postprocess subprocesses run with their current directory set to the work-area parent of the input entry. This is work-area discipline: it makes relative-path outputs land inside the work area, not in an arbitrary inherited server cwd. Purgery validates that expected output paths resolve under the work area before materializing them to final storage. This is not a security sandbox — a malicious subprocess can still write anywhere the process has permissions.
 
@@ -69,6 +75,10 @@ Cleanup policy:
 | `failed`  | kept            |
 
 Stale work areas from interrupted runs are removed on processing start. The work area is rebuilt from staged files for each processing attempt.
+
+### Replay source
+
+Uploaded staged files under `processing/<run_id>/files/` are immutable replay source. They are never consumed by final materialization — only work-area copies are consumed. This preserves the ability to replay an interrupted run without re-upload: `process-once` rebuilds the work area from staged files and replays the run to convergence.
 
 ## Run plan validation
 
@@ -151,15 +161,17 @@ A directory selected for postprocessing is a subtree transformation root:
 
 ## Postprocessing applies to all entry kinds
 
-Every manifest entry kind (directory, regular file, symlink) is eligible for postprocessing. If an entry's normalized path matches a postprocess rule, the entry is transformed by the subprocess. If it does not match any rule, the entry is imported directly.
+Every manifest entry kind (directory, regular file, symlink) is eligible for postprocessing. If an entry's normalized path matches a postprocess rule, the entry is transformed by the subprocess. If it does not match any rule, the entry is prepared in the work area and then moved to final storage.
 
 ### Work-area preparation
 
-Before a subprocess runs, the server creates an isolated work-area representation of the matched entry:
+All server-side entries are prepared into the work area before final materialization:
 
-* **Regular file**: copied from the staged file.
-* **Symlink**: created in the work area with the same literal target. Symlinks are never followed.
-* **Directory**: the entire staged subtree is copied into the work area, preserving directories, regular files, and symlinks as symlinks. Unsupported filesystem objects inside the subtree fail the directory entry.
+* **Regular file**: copied from the staged file into the work area.
+* **Symlink**: created in the work area with the same literal target as the staged symlink. Symlinks are never followed.
+* **Directory**: the staged subtree is copied into the work area, preserving directories, regular files, and symlinks as symlinks. Unsupported filesystem objects inside the subtree fail the directory entry.
+
+For postprocess entries, the work-area copy serves as input to the subprocess. For non-postprocess entries, the work-area copy is moved to final storage, consuming it; the original staged file is preserved.
 
 ### Directory transform boundary
 
