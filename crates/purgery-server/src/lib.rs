@@ -26,16 +26,12 @@ pub use postprocess::{apply_postprocessing, apply_postprocessing_with_heartbeat}
 pub use process::{process_once_raw, process_processing_run, process_ready_run};
 pub use recover::recover_or_process_processing_run;
 
-pub(crate) use process::validate_unique_final_paths;
-
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use commit::{
     commit_directory_entry, commit_regular_file_entry, commit_symlink_entry, CommitDisposition,
 };
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use phases::{write_progress, write_progress_best_effort};
-#[cfg_attr(not(test), allow(unused_imports))]
-pub(crate) use process::planned_entry_outputs;
 
 /// A compiled postprocess rule with resolved step definitions.
 #[derive(Debug)]
@@ -287,61 +283,6 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
             }
         }
     }
-
-    let run_plan = RunPlan::build(config, &run_config)
-        .map_err(|e| anyhow::anyhow!("run plan validation failed: {e}"))?;
-
-    let sync_map = run_config.sync_map();
-    let covered_by_dir: std::collections::HashSet<(String, String)> = manifest
-        .entries
-        .iter()
-        .filter(|e| e.kind == purgery_core::ManifestEntryKind::Directory)
-        .filter_map(|dir_entry| {
-            let _sync = sync_map.get(dir_entry.sync_name.as_str())?;
-            let np = dir_entry.relative_path.as_str().to_owned();
-            let matched = run_plan
-                .rules
-                .iter()
-                .any(|rule| rule.applies_to(dir_entry.sync_name.as_str()) && rule.is_match(&np));
-            if matched {
-                Some((dir_entry.sync_name.as_str().to_owned(), np))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    let sync_map2 = run_config.sync_map();
-    let covered_indices: std::collections::HashSet<usize> = manifest
-        .entries
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| {
-            let Some(_sync) = sync_map2.get(entry.sync_name.as_str()) else {
-                return false;
-            };
-            let np2 = entry.relative_path.as_str().to_owned();
-            let entry_sync = entry.sync_name.as_str();
-            covered_by_dir.iter().any(|(sync_name, prefix)| {
-                sync_name.as_str() == entry_sync
-                    && match np2.as_str().strip_prefix(prefix.as_str()) {
-                        Some(tail) => tail.starts_with('/'),
-                        None => false,
-                    }
-            })
-        })
-        .map(|(i, _)| i)
-        .collect();
-
-    validate_unique_final_paths(
-        config,
-        nickname,
-        &run_config,
-        &manifest,
-        &run_plan,
-        &covered_indices,
-    )
-    .map_err(|e| anyhow::anyhow!("destination validation failed: {e}"))?;
 
     let final_root = config.root.as_path().join(nickname.as_str());
     let purgatory_root = incoming_path.join("files");
