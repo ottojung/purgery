@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use purgery_core::{
-    CleanupEntry, DurableCleanupState, Manifest, ManifestEntryKind, ManifestEntryMode,
+    CleanupEntry, DurableCleanupState, FileStatus, Manifest, ManifestEntryKind, ManifestEntryMode,
+    RunStatus,
 };
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -53,14 +54,14 @@ pub(crate) fn mark_cleaned(state_path: &Utf8Path, local_path: &str) -> Result<()
     Ok(())
 }
 
-pub(crate) fn mark_rsync_succeeded(state_path: &Utf8Path) -> Result<()> {
+pub(crate) fn confirm_all_imports(state_path: &Utf8Path) -> Result<()> {
     let content = fs::read_to_string(state_path.as_std_path())
         .with_context(|| format!("failed to read cleanup state: {state_path}"))?;
     let mut state: DurableCleanupState = toml::from_str(&content)
         .map_err(|e| anyhow::anyhow!("failed to parse cleanup state: {e}"))?;
     for entry in &mut state.entries {
-        if !entry.rsync_succeeded {
-            entry.rsync_succeeded = true;
+        if !entry.import_confirmed {
+            entry.import_confirmed = true;
         }
     }
     let tmp_path = state_path.with_extension("toml.tmp");
@@ -73,7 +74,31 @@ pub(crate) fn mark_rsync_succeeded(state_path: &Utf8Path) -> Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
+pub(crate) fn confirm_imports_from_status(state_path: &Utf8Path, status: &RunStatus) -> Result<()> {
+    let content = fs::read_to_string(state_path.as_std_path())
+        .with_context(|| format!("failed to read cleanup state: {state_path}"))?;
+    let mut state: DurableCleanupState = toml::from_str(&content)
+        .map_err(|e| anyhow::anyhow!("failed to parse cleanup state: {e}"))?;
+
+    for cleanup_entry in &mut state.entries {
+        cleanup_entry.import_confirmed = status.entries.iter().any(|status_entry| {
+            status_entry.status == FileStatus::Imported
+                && status_entry.local_path == cleanup_entry.local_path
+                && status_entry.relative_path == cleanup_entry.relative_path
+                && status_entry.kind == cleanup_entry.kind
+        });
+    }
+
+    let tmp_path = state_path.with_extension("toml.tmp");
+    let new_content = toml::to_string(&state)
+        .map_err(|e| anyhow::anyhow!("failed to serialize cleanup state: {e}"))?;
+    fs::write(&tmp_path, &new_content)
+        .with_context(|| format!("failed to write cleanup state: {tmp_path}"))?;
+    fs::rename(&tmp_path, state_path)
+        .with_context(|| format!("failed to atomically update cleanup state: {state_path}"))?;
+    Ok(())
+}
+
 pub(crate) fn resume_pending_cleanups(state_dir: &str) -> Result<()> {
     let dir = match state_dir_path(state_dir) {
         Ok(d) => d,
@@ -141,10 +166,6 @@ pub(crate) fn build_cleanup_entries(
         let local_path = entry.local_path.as_str();
         let path = Path::new(local_path);
 
-        if entry.mode == ManifestEntryMode::Postprocess {
-            continue;
-        }
-
         if entry.mode == ManifestEntryMode::Covered {
             continue;
         }
@@ -170,7 +191,7 @@ pub(crate) fn build_cleanup_entries(
                     mtime_ns: 0,
                     sha256: None,
                     link_target,
-                    rsync_succeeded: false,
+                    import_confirmed: false,
                     cleaned: false,
                 });
             }
@@ -184,7 +205,7 @@ pub(crate) fn build_cleanup_entries(
                     mtime_ns: ident.mtime_ns,
                     sha256: ident.sha256,
                     link_target: None,
-                    rsync_succeeded: false,
+                    import_confirmed: false,
                     cleaned: false,
                 });
             }
@@ -200,7 +221,7 @@ pub(crate) fn build_cleanup_entries(
             mtime_ns: 0,
             sha256: None,
             link_target: None,
-            rsync_succeeded: false,
+            import_confirmed: false,
             cleaned: false,
         });
     }
@@ -238,7 +259,7 @@ pub(crate) fn process_cleanup_state_file(state_path: &Utf8Path) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to parse cleanup state: {e}"))?;
 
     for entry in &state.entries {
-        if !entry.rsync_succeeded || entry.cleaned {
+        if !entry.import_confirmed || entry.cleaned {
             continue;
         }
         let local_path = Path::new(&entry.local_path);
@@ -273,7 +294,7 @@ pub(crate) fn process_cleanup_state_file(state_path: &Utf8Path) -> Result<()> {
                             }
                             if state.entries.iter().any(|e| {
                                 let e_path = Path::new(&e.local_path);
-                                e_path == child_path && (e.cleaned || !e.rsync_succeeded)
+                                e_path == child_path && (e.cleaned || !e.import_confirmed)
                             }) {
                                 continue;
                             }
@@ -348,4 +369,91 @@ pub(crate) fn process_cleanup_state_file(state_path: &Utf8Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use purgery_core::{EntryStatusEntry, Nickname, RunId, RunState};
+
+    fn cleanup_entry(path: &Path) -> CleanupEntry {
+        let metadata = fs::metadata(path).unwrap();
+        let mtime_ns = metadata
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        CleanupEntry {
+            relative_path: "a.txt".to_owned(),
+            local_path: path.to_str().unwrap().to_owned(),
+            kind: ManifestEntryKind::RegularFile,
+            size: metadata.len(),
+            mtime_ns,
+            sha256: Some(compute_sha256(path).unwrap()),
+            link_target: None,
+            import_confirmed: false,
+            cleaned: false,
+        }
+    }
+
+    fn status_for(path: &Path, file_status: FileStatus) -> RunStatus {
+        RunStatus {
+            run_id: RunId::new("run-1".to_owned()).unwrap(),
+            nickname: Nickname::new("host".to_owned()).unwrap(),
+            state: RunState::Done,
+            entries: vec![EntryStatusEntry {
+                kind: ManifestEntryKind::RegularFile,
+                local_path: path.to_str().unwrap().to_owned(),
+                relative_path: "a.txt".to_owned(),
+                status: file_status,
+                final_paths: vec!["/destination/a.txt".to_owned()],
+                postprocess: Some(vec!["transform".to_owned()]),
+                error: None,
+            }],
+            error: None,
+        }
+    }
+
+    #[test]
+    fn postprocess_cleanup_waits_for_imported_server_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("a.txt");
+        fs::write(&file, "original").unwrap();
+        let state = DurableCleanupState {
+            nickname: "host".to_owned(),
+            operation_id: "run-1".to_owned(),
+            entries: vec![cleanup_entry(&file)],
+        };
+        let state_path = write_cleanup_state(&state, tmp.path().to_str().unwrap()).unwrap();
+
+        process_cleanup_state_file(&state_path).unwrap();
+        assert!(
+            file.exists(),
+            "staging transfer alone must not authorize cleanup"
+        );
+
+        confirm_imports_from_status(&state_path, &status_for(&file, FileStatus::Imported)).unwrap();
+        process_cleanup_state_file(&state_path).unwrap();
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn postprocess_cleanup_preserves_failed_and_skipped_entries() {
+        for status in [FileStatus::Failed, FileStatus::Skipped] {
+            let tmp = tempfile::tempdir().unwrap();
+            let file = tmp.path().join("a.txt");
+            fs::write(&file, "original").unwrap();
+            let state = DurableCleanupState {
+                nickname: "host".to_owned(),
+                operation_id: format!("run-{}", status.as_str()),
+                entries: vec![cleanup_entry(&file)],
+            };
+            let state_path = write_cleanup_state(&state, tmp.path().to_str().unwrap()).unwrap();
+
+            confirm_imports_from_status(&state_path, &status_for(&file, status)).unwrap();
+            process_cleanup_state_file(&state_path).unwrap();
+            assert!(file.exists());
+        }
+    }
 }

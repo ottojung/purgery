@@ -1,15 +1,5 @@
 work_dir = "/var/lib/purgery/work"
 
-[[root]]
-name = "univ"
-path = "/universe/synced"
-
-[[root]]
-name = "system"
-path = "/etc/system"
-
-[postprocess]
-
 [postprocess.steps.compress-video]
 kind = "subprocess"
 program = "my-compress-video"

@@ -23,6 +23,7 @@ pub struct CleanupEntry {
     pub sha256: Option<String>,
     #[serde(default)]
     pub link_target: Option<String>,
-    pub rsync_succeeded: bool,
+    #[serde(default)]
+    pub import_confirmed: bool,
     pub cleaned: bool,
 }

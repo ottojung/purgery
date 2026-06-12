@@ -12,7 +12,6 @@ mod config;
 mod manifest;
 mod path;
 mod postprocess;
-mod rsync_filter;
 mod status;
 
 pub use cleanup_state::*;
@@ -20,7 +19,6 @@ pub use config::*;
 pub use manifest::*;
 pub use path::*;
 pub use postprocess::*;
-pub use rsync_filter::*;
 pub use status::*;
 
 // ── Error Types ──────────────────────────────────────────────────────
@@ -173,14 +171,14 @@ pub fn resolve_executable(program: &str) -> Result<ResolvedExecutable, Executabl
 /// re-transferring already-received data. Includes `--inplace` so rsync
 /// writes directly to the destination file path rather than creating a
 /// temporary sibling file and renaming into place — this keeps the
-/// named archive root free of non-final helper paths. Includes `--mkpath`
+/// final destination free of non-final helper paths. Includes `--mkpath`
 /// so rsync creates destination directories as needed — Purgery does not
-/// eagerly create final archive directory skeletons before a transfer begins.
+/// eagerly create destination directory skeletons before a transfer begins.
 ///
 /// A partially transferred file at an exact final path is the actual file
 /// being transferred — it is not an operational helper path. The output-only
 /// final destination invariant forbids non-final scaffold paths under any
-/// named archive root, not partial contents at exact final paths.
+/// final destination, not partial contents at exact final paths.
 pub fn build_rsync_args(source: &str, destination: &str) -> Vec<String> {
     vec![
         "--recursive".to_string(),
@@ -193,33 +191,6 @@ pub fn build_rsync_args(source: &str, destination: &str) -> Vec<String> {
         format!("{}/", source),
         destination.to_string(),
     ]
-}
-
-/// Build rsync args for purgatory (staging) transfers.
-///
-/// Delegates to `build_rsync_args`, which always includes `--partial`,
-/// `--inplace`, and `--mkpath`. This function exists to support call sites
-/// that explicitly name the purgatory transfer path for readability.
-pub fn build_purgatory_rsync_args(source: &str, destination: &str) -> Vec<String> {
-    build_rsync_args(source, destination)
-}
-
-/// Insert an rsync option argument before the `--` operand separator.
-///
-/// Returns an error if the args list does not contain a literal `--` element.
-/// The option is inserted as the last option before `--`, preserving the
-/// invariant that all options appear before the separator and all path
-/// operands appear after it.
-pub fn insert_rsync_option_before_operands(
-    args: &mut Vec<String>,
-    option: String,
-) -> Result<(), &'static str> {
-    let dashdash_pos = args
-        .iter()
-        .position(|a| a == "--")
-        .ok_or("rsync args list has no `--` separator")?;
-    args.insert(dashdash_pos, option);
-    Ok(())
 }
 
 // ── Work Area ────────────────────────────────────────────────────────
@@ -455,29 +426,6 @@ mod tests {
         assert!(RunId::new(id.as_str().to_owned()).is_ok());
     }
 
-    // ── ServerRoot tests ──
-
-    #[test]
-    fn server_root_absolute_valid() {
-        let p = Utf8PathBuf::from("/universe/synced");
-        let r = ServerRoot::new(p.clone()).unwrap();
-        assert_eq!(r.as_path(), &p);
-    }
-
-    #[test]
-    fn server_root_relative_is_error() {
-        let p = Utf8PathBuf::from("relative/path");
-        assert_eq!(ServerRoot::new(p), Err(PathValidationError::NotAbsolute));
-    }
-
-    #[test]
-    fn server_root_serde_roundtrip() {
-        let r = ServerRoot::new("/data".into()).unwrap();
-        let json = serde_json::to_string(&r).unwrap();
-        let back: ServerRoot = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, r);
-    }
-
     // ── PurgeryRoot tests ──
 
     #[test]
@@ -512,51 +460,24 @@ mod tests {
         );
     }
 
-    // ── RelativeDestinationPath tests ──
+    // ── DestinationPath tests ──
 
     #[test]
-    fn relative_dest_valid() {
-        let p = Utf8PathBuf::from("videos");
-        let r = RelativeDestinationPath::new(p.clone()).unwrap();
-        assert_eq!(r.as_path(), &p);
+    fn destination_accepts_absolute_and_relative_paths() {
+        let absolute = DestinationPath::new("/some/path".into()).unwrap();
+        let relative = DestinationPath::new("some/path".into()).unwrap();
+        assert_eq!(absolute.as_str(), "/some/path");
+        assert!(absolute.is_absolute());
+        assert_eq!(relative.as_str(), "some/path");
+        assert!(!relative.is_absolute());
     }
 
     #[test]
-    fn relative_dest_with_subdir() {
-        let p = Utf8PathBuf::from("media/videos");
-        RelativeDestinationPath::new(p).unwrap();
-    }
-
-    #[test]
-    fn relative_dest_absolute_is_error() {
-        let p = Utf8PathBuf::from("/absolute/path");
+    fn destination_rejects_parent_traversal() {
         assert_eq!(
-            RelativeDestinationPath::new(p),
-            Err(PathValidationError::NotRelative)
-        );
-    }
-
-    #[test]
-    fn relative_dest_dotdot_is_error() {
-        let p = Utf8PathBuf::from("../escape");
-        assert_eq!(
-            RelativeDestinationPath::new(p),
+            DestinationPath::new("some/../path".into()),
             Err(PathValidationError::ContainsDotDot)
         );
-    }
-
-    #[test]
-    fn relative_dest_collapses_consecutive_separators() {
-        let p = Utf8PathBuf::from("a//b");
-        let r = RelativeDestinationPath::new(p).unwrap();
-        assert_eq!(r.as_str(), "a/b");
-    }
-
-    #[test]
-    fn relative_dest_removes_dot_components() {
-        let p = Utf8PathBuf::from("a/./b");
-        let r = RelativeDestinationPath::new(p).unwrap();
-        assert_eq!(r.as_str(), "a/b");
     }
 
     // ── NormalizedRelativePath tests ──
@@ -910,19 +831,6 @@ files = []
     }
 
     #[test]
-    fn insert_rsync_option_before_operands_places_option_before_separator() {
-        let mut args = build_rsync_args("/src", "host:/dst");
-        let filter = "--filter=merge /tmp/filters".to_string();
-        insert_rsync_option_before_operands(&mut args, filter.clone()).unwrap();
-        let dashdash_pos = args.iter().position(|a| a == "--").unwrap();
-        let filter_pos = args.iter().position(|a| a == &filter).unwrap();
-        assert!(
-            filter_pos < dashdash_pos,
-            "filter option must be inserted before --"
-        );
-    }
-
-    #[test]
     fn postprocess_argv_not_rewritten() {
         let configured_args = vec!["--input".to_string(), "{input}".to_string()];
         let step = PostprocessStepDefinition {
@@ -1207,99 +1115,6 @@ color = "never"
         assert!(validate_expected_output_name("sub/out.webm").is_err());
     }
 
-    // ── Transfer filter generation tests ──
-
-    fn roots_exact(paths: &[&str]) -> Vec<TransferRoot> {
-        paths
-            .iter()
-            .map(|p| TransferRoot::Exact(p.to_string()))
-            .collect()
-    }
-
-    fn roots_subtree(path: &str) -> Vec<TransferRoot> {
-        vec![TransferRoot::Subtree(path.to_string())]
-    }
-
-    #[test]
-    fn transfer_filter_includes_subtree_for_postprocessed_directory() {
-        let filter = transfer_set_filter(&roots_subtree("album"));
-        assert!(
-            filter.contains("+ album/**"),
-            "subtree root must include descendants: {filter}"
-        );
-    }
-
-    #[test]
-    fn transfer_filter_includes_ancestors_and_exact_roots() {
-        let filter = transfer_set_filter(&roots_exact(&["sub/outside.txt"]));
-        assert!(
-            filter.contains("+ sub/"),
-            "ancestor dir must be included: {filter}"
-        );
-        assert!(
-            filter.contains("+ sub/outside.txt"),
-            "exact root must be included: {filter}"
-        );
-        assert!(
-            !filter.contains("+ sub/**"),
-            "exact root must not have subtree pattern: {filter}"
-        );
-    }
-
-    #[test]
-    fn transfer_filter_for_directory_root_includes_both_dir_and_descendants() {
-        let mut roots = roots_subtree("album");
-        roots.push(TransferRoot::Exact("outside.txt".to_string()));
-        let filter = transfer_set_filter(&roots);
-        assert!(
-            filter.contains("+ album/"),
-            "directory root must include dir/: {filter}"
-        );
-        assert!(
-            filter.contains("+ album/**"),
-            "subtree root must include descendants: {filter}"
-        );
-        assert!(
-            filter.contains("+ outside.txt"),
-            "exact root must be included: {filter}"
-        );
-    }
-
-    #[test]
-    fn transfer_filter_excludes_everything_else() {
-        let filter = transfer_set_filter(&roots_exact(&["a.txt"]));
-        assert!(
-            filter.ends_with("- *\n") || filter.ends_with("- *"),
-            "filter must end with exclude all: {filter}"
-        );
-    }
-
-    #[test]
-    fn transfer_filter_nested_subtree_includes_all_ancestors() {
-        let filter = transfer_set_filter(&roots_subtree("a/b/album"));
-        assert!(
-            filter.contains("+ a/"),
-            "must include ancestor a/: {filter}"
-        );
-        assert!(
-            filter.contains("+ a/b/"),
-            "must include ancestor a/b/: {filter}"
-        );
-        assert!(
-            filter.contains("+ a/b/album/**"),
-            "subtree root must include descendants: {filter}"
-        );
-    }
-
-    #[test]
-    fn transfer_filter_excludes_covered_descendants_from_independent_roots() {
-        let filter = transfer_set_filter(&roots_subtree("album"));
-        assert!(
-            !filter.contains("song.mp3"),
-            "covered descendants must not be independent roots: {filter}"
-        );
-    }
-
     #[test]
     fn client_run_phase_serde_roundtrip() {
         // All ClientRunPhase variants must serialize/deserialize correctly.
@@ -1395,7 +1210,7 @@ color = "never"
     /// Verify that documentation does not describe nickname
     /// as part of final archive paths.
     #[test]
-    fn no_nickname_in_archive_path_example_in_readme() {
+    fn no_nickname_in_final_path_example_in_readme() {
         let readme = include_str!("../../../README.md");
         let patterns = [
             "/laptop/videos",
@@ -1416,7 +1231,7 @@ color = "never"
     /// Verify that documentation does not describe nickname
     /// as part of final archive paths in config docs.
     #[test]
-    fn no_nickname_in_archive_path_example_in_config_docs() {
+    fn no_nickname_in_final_path_example_in_config_docs() {
         let config_md = include_str!("../../../docs/config.md");
         let patterns = ["root / nickname", "<nickname>/", "/laptop/videos"];
         for pattern in &patterns {
@@ -1443,18 +1258,15 @@ color = "never"
         }
     }
 
-    /// Verify that examples do not use `root = "..."` (anonymous root).
     #[test]
-    fn examples_do_not_use_anonymous_root() {
-        let server_toml = include_str!("../../../examples/server.toml");
-        for line in server_toml.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with("root = \"") {
-                panic!(
-                    "examples/server.toml uses anonymous 'root = \"...\"' format: {line:?}. \
-                     Must use [[root]] per issue #26."
-                );
-            }
-        }
+    fn server_config_rejects_old_root_tables() {
+        let config = r#"
+work_dir = "/var/lib/purgery/work"
+
+[[root]]
+name = "archive"
+path = "/archive"
+"#;
+        assert!(ServerConfig::from_toml(config).is_err());
     }
 }

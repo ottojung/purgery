@@ -104,11 +104,11 @@ enum Command {
     },
     /// Check server configuration and dependencies (side-effect-free)
     Check,
-    /// Bootstrap server directories (creates root and work_dir)
+    /// Bootstrap server internal directories under work_dir
     Bootstrap,
     /// Run garbage collection on expired incoming runs
     Gc,
-    /// Validate run plan and return transfer destinations (passthrough + purgatory roots)
+    /// Validate an incoming postprocess run plan
     PrepareRun {
         #[arg(long)]
         nickname: String,
