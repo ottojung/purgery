@@ -177,9 +177,12 @@ pub fn resolve_executable(program: &str) -> Result<ResolvedExecutable, Executabl
 /// Build rsync arguments for Purgery transfers.
 ///
 /// Includes `--partial` so interrupted transfers can resume without
-/// re-transferring already-received data. Includes `--mkpath` so rsync
-/// creates destination directories as needed — Purgery does not eagerly
-/// create final archive directory skeletons before a transfer begins.
+/// re-transferring already-received data. Includes `--inplace` so rsync
+/// writes directly to the destination file path rather than creating a
+/// temporary sibling file and renaming into place — this keeps final `root`
+/// free of non-final helper paths. Includes `--mkpath` so rsync creates
+/// destination directories as needed — Purgery does not eagerly create final
+/// archive directory skeletons before a transfer begins.
 ///
 /// A partially transferred file at an exact final path is the actual file
 /// being transferred — it is not an operational helper path. The output-only
@@ -189,6 +192,7 @@ pub fn build_rsync_args(source: &str, destination: &str) -> Vec<String> {
     vec![
         "--recursive".to_string(),
         "--partial".to_string(),
+        "--inplace".to_string(),
         "--mkpath".to_string(),
         "--archive".to_string(),
         "--no-inc-recursive".to_string(),
