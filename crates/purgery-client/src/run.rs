@@ -305,7 +305,8 @@ fn start_heartbeat(
     interval_secs: u64,
     stop: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<Result<()>> {
-    let half_interval = Duration::from_secs(interval_secs.max(1) / 2);
+    let half_interval =
+        Duration::from_millis((interval_secs.max(2) * 500).min(600_000));
     std::thread::spawn(move || {
         while !stop.load(Ordering::Relaxed) {
             debug!(
@@ -759,9 +760,14 @@ pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
     info!("finishing server run");
     finish_run(&remote.host, server_cmd, &nickname, &run_id)?;
 
-    // Now heartbeat is no longer needed — stop and check it
+    // Now heartbeat is no longer needed — stop and check it.
+    // If heartbeat failed but finish-run succeeded, the run has already been
+    // accepted out of incoming; warn and continue rather than fail the whole
+    // operation.
     hb_guard.stop_and_join();
-    hb_guard.check_heartbeat()?;
+    if let Err(e) = hb_guard.check_heartbeat() {
+        warn!("heartbeat error after successful finish-run: {e}");
+    }
 
     // Update persisted state to WaitingForTerminalState
     persist_client_run_state(
