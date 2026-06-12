@@ -3215,15 +3215,15 @@ steps = ["compress-video"]
     fn test_rsync_oracle_symlink_conflicts_and_literal_target() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
-        let staging = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
+        let work_source = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
         fs::create_dir_all(&root).unwrap();
-        fs::create_dir_all(&staging).unwrap();
+        fs::create_dir_all(&work_source).unwrap();
         let run_id = RunId::new("oracle-link".into()).unwrap();
         let link_target = Utf8Path::new("../literal-target");
 
         for name in ["missing", "file", "symlink", "empty-dir"] {
             let destination = root.join(name);
-            let source = staging.join(format!("source-{name}"));
+            let source = work_source.join(format!("source-{name}"));
             std::os::unix::fs::symlink(link_target.as_std_path(), &source).unwrap();
             match name {
                 "file" => fs::write(&destination, "old").unwrap(),
@@ -3239,7 +3239,7 @@ steps = ["compress-video"]
         }
 
         let nonempty = root.join("nonempty-dir");
-        let source_nonempty = staging.join("source-nonempty");
+        let source_nonempty = work_source.join("source-nonempty");
         std::os::unix::fs::symlink(link_target.as_std_path(), &source_nonempty).unwrap();
         fs::create_dir(&nonempty).unwrap();
         fs::write(nonempty.join("extra"), "keep").unwrap();
@@ -6555,11 +6555,11 @@ steps = ["pack"]
     fn regular_file_commit_must_not_create_operational_paths_under_root() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
-        let staging = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
+        let work_source = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
         let run_id = RunId::new("test-run".into()).unwrap();
 
         let final_path = root.join("subdir/file.txt");
-        let source = staging.join("source.txt");
+        let source = work_source.join("source.txt");
         fs::create_dir_all(source.parent().unwrap()).unwrap();
         fs::create_dir_all(final_path.parent().unwrap()).unwrap();
         fs::write(&source, b"hello").unwrap();
@@ -6576,11 +6576,11 @@ steps = ["pack"]
     fn regular_file_commit_allows_final_dotfile() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
-        let staging = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
+        let work_source = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
         let run_id = RunId::new("test-run".into()).unwrap();
 
         let final_path = root.join(".hidden-file");
-        let source = staging.join("source.txt");
+        let source = work_source.join("source.txt");
         fs::create_dir_all(source.parent().unwrap()).unwrap();
         fs::create_dir_all(root.as_std_path()).unwrap();
         fs::write(&source, b"secret").unwrap();
@@ -6598,13 +6598,13 @@ steps = ["pack"]
     fn symlink_commit_must_not_create_operational_paths_under_root() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
-        let staging = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
+        let work_source = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
         let run_id = RunId::new("test-run".into()).unwrap();
 
-        fs::create_dir_all(&staging).unwrap();
+        fs::create_dir_all(&work_source).unwrap();
         let final_path = root.join("subdir/link");
         fs::create_dir_all(final_path.parent().unwrap()).unwrap();
-        let source = staging.join("srclink");
+        let source = work_source.join("srclink");
         std::os::unix::fs::symlink("/some/target", &source).unwrap();
 
         let result = commit_symlink_entry(&source, &final_path, root.as_path(), &run_id);
@@ -6623,10 +6623,10 @@ steps = ["pack"]
     fn directory_tree_commit_must_not_create_operational_paths_under_root() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
-        let staging = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
+        let work_source = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
         let run_id = RunId::new("test-run".into()).unwrap();
 
-        let source_dir = staging.join("srcdir");
+        let source_dir = work_source.join("srcdir");
         let final_dir = root.join("dst");
 
         fs::create_dir_all(&source_dir).unwrap();
@@ -6847,16 +6847,14 @@ steps = ["always-fail"]
         let expected: Vec<Utf8PathBuf> = vec![];
         assert_root_contains_exactly(server_root.as_path(), &expected);
 
-        // Work area should be preserved under purgery_root for diagnostics
-        let work_area = purgery_core::work_dir(&config.purgery_root, &nickname, &run_id);
-        let work_exists = work_area.exists();
-        if work_exists {
-            assert!(
-                work_area.as_str().starts_with(purgery_root.as_str()),
-                "work area must be under purgery_root, found at {}",
-                work_area.as_str()
-            );
-        }
+        // Work area is preserved under the failed run directory for diagnostics.
+        let work_under_failed = failed_path.join("work");
+        assert!(
+            work_under_failed.exists(),
+            "work area must be preserved under failed run directory for diagnostics, \
+             expected: {}",
+            work_under_failed.as_str()
+        );
     }
 
     #[test]
@@ -6974,11 +6972,11 @@ steps = ["echo-args"]
     fn commit_regular_file_replaces_existing_file_without_sibling_temp() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
-        let staging = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
+        let work_source = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
         let run_id = RunId::new("test-run".into()).unwrap();
 
         let final_path = root.join("subdir/file.txt");
-        let source = staging.join("source.txt");
+        let source = work_source.join("source.txt");
         fs::create_dir_all(source.parent().unwrap()).unwrap();
         fs::create_dir_all(final_path.parent().unwrap()).unwrap();
         fs::write(&final_path, b"old content").unwrap();
@@ -6997,15 +6995,15 @@ steps = ["echo-args"]
     fn commit_symlink_replaces_existing_symlink_without_sibling_temp() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
-        let staging = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
+        let work_source = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
         let run_id = RunId::new("test-run".into()).unwrap();
 
-        fs::create_dir_all(&staging).unwrap();
+        fs::create_dir_all(&work_source).unwrap();
         let final_path = root.join("subdir/link");
         fs::create_dir_all(final_path.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink("/old/target", final_path.as_std_path()).unwrap();
 
-        let source = staging.join("srclink");
+        let source = work_source.join("srclink");
         std::os::unix::fs::symlink("/new/target", &source).unwrap();
         let result = commit_symlink_entry(&source, &final_path, root.as_path(), &run_id);
         assert!(result.is_ok(), "replace failed: {result:?}");
@@ -7024,11 +7022,11 @@ steps = ["echo-args"]
     fn commit_regular_file_replaces_empty_directory_without_sibling_temp() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
-        let staging = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
+        let work_source = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
         let run_id = RunId::new("test-run".into()).unwrap();
 
         let final_path = root.join("subdir/file.txt");
-        let source = staging.join("source.txt");
+        let source = work_source.join("source.txt");
         fs::create_dir_all(source.parent().unwrap()).unwrap();
         fs::create_dir_all(&final_path).unwrap(); // empty directory at final path
         fs::write(&source, b"content").unwrap();
@@ -7046,11 +7044,11 @@ steps = ["echo-args"]
     fn commit_regular_file_refuses_non_empty_directory_without_mutation() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
-        let staging = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
+        let work_source = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
         let run_id = RunId::new("test-run".into()).unwrap();
 
         let final_path = root.join("subdir/file.txt");
-        let source = staging.join("source.txt");
+        let source = work_source.join("source.txt");
         fs::create_dir_all(source.parent().unwrap()).unwrap();
         fs::create_dir_all(&final_path).unwrap();
         fs::write(final_path.join("child.txt"), b"child").unwrap(); // non-empty dir
@@ -7081,11 +7079,11 @@ steps = ["echo-args"]
         // overwrite it without creating sibling helpers.
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
-        let staging = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
+        let work_source = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
         let run_id = RunId::new("test-run".into()).unwrap();
 
         let final_path = root.join("subdir/file.txt");
-        let source = staging.join("source.txt");
+        let source = work_source.join("source.txt");
         fs::create_dir_all(source.parent().unwrap()).unwrap();
         fs::create_dir_all(final_path.parent().unwrap()).unwrap();
         fs::write(&source, b"complete content here").unwrap();
@@ -7284,11 +7282,11 @@ steps = ["make-symlink"]
     fn regular_file_commit_moves_source_file() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
-        let staging = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
+        let work_source = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
         let run_id = RunId::new("test-move".into()).unwrap();
 
         let final_path = root.join("sub/file.txt");
-        let source = staging.join("source.txt");
+        let source = work_source.join("source.txt");
         fs::create_dir_all(source.parent().unwrap()).unwrap();
         fs::write(&source, b"move-me").unwrap();
 
@@ -7309,12 +7307,12 @@ steps = ["make-symlink"]
     fn symlink_commit_moves_source_symlink() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
-        let staging = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
+        let work_source = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
         let run_id = RunId::new("test-move".into()).unwrap();
 
         fs::create_dir_all(&root).unwrap();
         let final_path = root.join("sub/link");
-        let source = staging.join("mylink");
+        let source = work_source.join("mylink");
         fs::create_dir_all(source.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink("/real/target", &source).unwrap();
 
@@ -7336,11 +7334,11 @@ steps = ["make-symlink"]
     fn directory_tree_commit_consumes_source_tree() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
-        let staging = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
+        let work_source = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
         let run_id = RunId::new("test-move".into()).unwrap();
 
         fs::create_dir_all(&root).unwrap();
-        let source_dir = staging.join("srcdir");
+        let source_dir = work_source.join("srcdir");
         let final_dir = root.join("dst");
         fs::create_dir_all(&source_dir).unwrap();
         fs::write(source_dir.join("a.txt"), b"aaa").unwrap();
@@ -7394,11 +7392,11 @@ steps = ["make-symlink"]
     fn regular_file_replaces_existing_file_with_move_semantics() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
-        let staging = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
+        let work_source = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
         let run_id = RunId::new("test-move".into()).unwrap();
 
         let final_path = root.join("sub/data.bin");
-        let source = staging.join("source.bin");
+        let source = work_source.join("source.bin");
         fs::create_dir_all(source.parent().unwrap()).unwrap();
         fs::create_dir_all(final_path.parent().unwrap()).unwrap();
         fs::write(&final_path, b"old").unwrap();
@@ -7419,12 +7417,12 @@ steps = ["make-symlink"]
     fn symlink_replaces_existing_symlink_with_move_semantics() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().join("root")).unwrap();
-        let staging = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
+        let work_source = Utf8PathBuf::from_path_buf(tmp.path().join("staging")).unwrap();
         let run_id = RunId::new("test-move".into()).unwrap();
 
         fs::create_dir_all(&root).unwrap();
         let final_path = root.join("sub/link");
-        let source = staging.join("mylink");
+        let source = work_source.join("mylink");
         fs::create_dir_all(source.parent().unwrap()).unwrap();
         fs::create_dir_all(final_path.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink("/old/target", &final_path).unwrap();
