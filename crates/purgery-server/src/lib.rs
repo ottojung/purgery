@@ -9,9 +9,7 @@ use tracing::info;
 #[cfg_attr(not(test), allow(unused_imports))]
 use camino::Utf8Path;
 #[cfg_attr(not(test), allow(unused_imports))]
-use purgery_core::{
-    work_dir, FileStatus, Manifest, ManifestEntryKind, PurgeryRoot, RunConfig, RunState,
-};
+use purgery_core::{FileStatus, Manifest, ManifestEntryKind, PurgeryRoot, RunConfig, RunState};
 
 mod commit;
 mod gc;
