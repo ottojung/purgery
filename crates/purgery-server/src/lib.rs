@@ -7588,7 +7588,8 @@ steps = ["make-tree"]
         manifest.entries.push(ManifestEntry {
             sync_name: SyncName::new("videos".into()).unwrap(),
             local_path: ClientLocalPath::new("/home/user/nonexistent.mp4".into()).unwrap(),
-            staged_path: NormalizedRelativePath::new("files/videos/nonexistent.mp4".into()).unwrap(),
+            staged_path: NormalizedRelativePath::new("files/videos/nonexistent.mp4".into())
+                .unwrap(),
             relative_path: NormalizedRelativePath::new("nonexistent.mp4".into()).unwrap(),
             kind: ManifestEntryKind::RegularFile,
             size: 42,
@@ -7617,8 +7618,7 @@ steps = ["make-tree"]
 
         // Status should be partial.
         let status: RunStatus =
-            toml::from_str(&fs::read_to_string(done_path.join("status.toml")).unwrap())
-                .unwrap();
+            toml::from_str(&fs::read_to_string(done_path.join("status.toml")).unwrap()).unwrap();
         assert_eq!(status.state, RunState::Partial);
 
         // Staged file for the successful entry must still exist.
@@ -7637,10 +7637,7 @@ steps = ["make-tree"]
         // Final output must exist under root.
         let final_path = server_root.join("laptop/videos/a.mp4");
         assert!(final_path.exists());
-        assert_eq!(
-            fs::read_to_string(&final_path).unwrap(),
-            "video a content"
-        );
+        assert_eq!(fs::read_to_string(&final_path).unwrap(), "video a content");
 
         let expected = vec![
             server_root.join("laptop"),
@@ -7725,8 +7722,7 @@ steps = ["make-tree"]
         assert!(done_path.exists());
 
         let status: RunStatus =
-            toml::from_str(&fs::read_to_string(done_path.join("status.toml")).unwrap())
-                .unwrap();
+            toml::from_str(&fs::read_to_string(done_path.join("status.toml")).unwrap()).unwrap();
         assert_eq!(status.state, RunState::Partial);
 
         // Staged symlink must still exist.
@@ -7819,10 +7815,7 @@ steps = ["make-tree"]
         );
 
         // Final output converges.
-        assert_eq!(
-            fs::read_to_string(&final_path).unwrap(),
-            "replay content"
-        );
+        assert_eq!(fs::read_to_string(&final_path).unwrap(), "replay content");
 
         let expected = vec![
             server_root.join("laptop"),
@@ -7864,10 +7857,7 @@ steps = ["make-tree"]
 
         // Staged original must still exist.
         let staged_path = done_path.join("files/data/doc.txt");
-        assert!(
-            staged_path.exists(),
-            "staged original must be preserved"
-        );
+        assert!(staged_path.exists(), "staged original must be preserved");
         assert_eq!(
             fs::read_to_string(&staged_path).unwrap(),
             "original content"
@@ -7886,10 +7876,7 @@ steps = ["make-tree"]
         // Final path must contain the content.
         let final_path = server_root.join("laptop/data/doc.txt");
         assert!(final_path.exists());
-        assert_eq!(
-            fs::read_to_string(&final_path).unwrap(),
-            "original content"
-        );
+        assert_eq!(fs::read_to_string(&final_path).unwrap(), "original content");
 
         let expected = vec![
             server_root.join("laptop"),
@@ -8009,10 +7996,7 @@ steps = ["make-tree"]
                         PostprocessStepDefinition {
                             kind: PostprocessKind::Subprocess,
                             program: "sh".to_owned(),
-                            args: vec![
-                                "-c".to_owned(),
-                                "cp {input} {input}.out".to_owned(),
-                            ],
+                            args: vec!["-c".to_owned(), "cp {input} {input}.out".to_owned()],
                             expected_outputs: vec!["{file_name}.out".to_owned()],
                             keep_original: false,
                         },
@@ -8086,10 +8070,7 @@ steps = ["copy-cmd"]
         // Staged original must still exist.
         let staged_after = done_path.join("files/data/input.bin");
         assert!(staged_after.exists());
-        assert_eq!(
-            fs::read_to_string(&staged_after).unwrap(),
-            "binary data"
-        );
+        assert_eq!(fs::read_to_string(&staged_after).unwrap(), "binary data");
 
         // Work area must be removed for done runs (outputs are consumed
         // by materialization).
@@ -8099,10 +8080,7 @@ steps = ["copy-cmd"]
         // Final output must exist.
         let final_output = server_root.join("laptop/data/input.bin.out");
         assert!(final_output.exists());
-        assert_eq!(
-            fs::read_to_string(&final_output).unwrap(),
-            "binary data"
-        );
+        assert_eq!(fs::read_to_string(&final_output).unwrap(), "binary data");
 
         let expected = vec![
             server_root.join("laptop"),
