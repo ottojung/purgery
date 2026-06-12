@@ -144,5 +144,4 @@ Purgery targets Unix/POSIX filesystem semantics and is conservative about data l
 - [Protocol](docs/protocol.md) — lifecycle, subcommands, run states, status format
 - [Operations](docs/operations.md) — bootstrap, check, GC, heartbeat, leases
 - [Import semantics](docs/design/import-semantics.md) — tree-overlay model, work areas, and per-entry safety rules
-- [Rsync overlay oracle](docs/design/rsync-overlay-oracle.md) — characterized conflict cases and intentional Purgery differences
 - [Crash safety and idempotence](docs/design/crash-safety-and-idempotence.md) — durable phases, replay recovery, atomic replacement, and deletion authority
