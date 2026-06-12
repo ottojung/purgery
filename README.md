@@ -57,7 +57,7 @@ If `--config` is omitted, the client looks for config at `$PURGERY_CLIENT_CONFIG
 1. You configure one or more **source trees** on a device and point each to a destination inside a named archive root.
 2. The client walks each source tree (never following symlinks) and classifies every entry as either **passthrough** (direct copy to archive) or **transformed** (server-side processing required).
 3. If any source tree has transformed entries, the client creates a server run: it uploads a manifest of only the entries needing transformation, validates the plan on the server, and transfers them to a staging area (not the final archive destination).
-4. The server processes transformed entries in the staging area: it prepares work areas from staged files, runs subprocesses there, and only after processing succeeds commits outputs to the final archive destination. If processing fails, no output reaches the archive.
+4. The server processes transformed entries in the staging area: it prepares work areas from staged files, runs subprocesses there, and only after processing succeeds commits outputs to the final archive destination. If a transformed entry fails before materialization, that entry produces no final outputs. A run can be partial; entries already committed by the same run are not rolled back.
 5. For source trees that are pure passthrough (no transformation), the client skips server bookkeeping entirely and copies entries directly to the archive.
 6. Local cleanup of originals depends on how cleanup was configured for each source tree. Passthrough entries use locally recorded transfer state as authority. Transformed entries are cleaned only after server status confirms the import.
 
