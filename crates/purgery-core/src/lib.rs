@@ -1540,6 +1540,7 @@ files = []
             vec![
                 "--recursive",
                 "--partial",
+                "--inplace",
                 "--mkpath",
                 "--archive",
                 "--no-inc-recursive",
@@ -1555,6 +1556,12 @@ files = []
     fn build_rsync_args_includes_partial() {
         let args = build_rsync_args("/src", "host:/dst");
         assert!(args.contains(&"--partial".to_string()));
+    }
+
+    #[test]
+    fn build_rsync_args_includes_inplace() {
+        let args = build_rsync_args("/src", "host:/dst");
+        assert!(args.contains(&"--inplace".to_string()));
     }
 
     #[test]
