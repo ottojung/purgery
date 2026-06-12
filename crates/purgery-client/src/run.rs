@@ -15,16 +15,14 @@ use std::time::{Duration, SystemTime};
 use tracing::{info, warn};
 
 /// Build a RunConfig from a ClientConfig, optionally filtering to include
-/// only purgatory sync groups and rules applicable to those groups.
+/// only sync groups whose selected entries require server processing.
 pub(crate) fn build_run_config(config: &ClientConfig, purgatory_only: bool) -> RunConfig {
     let sync: Vec<RunConfigSync> = config
         .sync
         .iter()
         .filter(|s| {
             if purgatory_only {
-                let applicable =
-                    purgery_core::applicable_rules(&config.postprocess.rules, s.name.as_str());
-                !applicable.is_empty()
+                !s.postprocess_steps.is_empty()
             } else {
                 true
             }
@@ -103,7 +101,7 @@ pub(crate) fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
     {
         anyhow::bail!("postprocess config validation failed: {e}");
     }
-    info!("postprocess rules validated");
+    info!("postprocess selections validated");
 
     // 2. Classify sync groups by their execution class.
     let run_id = RunId::generate();
@@ -119,14 +117,18 @@ pub(crate) fn sync_and_cleanup(config: &ClientConfig) -> Result<()> {
             SyncExecutionClass::PassthroughNoDelete => {
                 info!(
                     sync = sync.name.as_str(),
-                    "PassthroughNoDelete: direct rsync only"
+                    from = %sync.source.qualified_path(),
+                    to = %sync.to_path.qualified_path(),
+                    "passthrough sync selected"
                 );
                 passthrough_nodelete.push(sync);
             }
             SyncExecutionClass::PassthroughDeleteAfterImport => {
                 info!(
                     sync = sync.name.as_str(),
-                    "PassthroughDeleteAfterImport: direct rsync with cleanup"
+                    from = %sync.source.qualified_path(),
+                    to = %sync.to_path.qualified_path(),
+                    "passthrough sync selected with cleanup"
                 );
                 passthrough_cleanup.push(sync);
             }

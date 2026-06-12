@@ -169,9 +169,12 @@ state_dir = "/tmp/purgery-state"
 [server]
 host = "example.invalid"
 
-[[sync]]
+[[root]]
 name = "data"
-from = "{}"
+path = "{}"
+
+[[sync]]
+from = "data"
 to = "data"
 delete_after_import = true
 "#,
@@ -189,9 +192,12 @@ state_dir = "/tmp/purgery-state"
 [server]
 host = "example.invalid"
 
-[[sync]]
+[[root]]
 name = "data"
-from = "{}"
+path = "{}"
+
+[[sync]]
+from = "data"
 to = "data"
 delete_after_import = false
 "#,
@@ -263,15 +269,17 @@ state_dir = "/tmp/purgery-state"
 [server]
 host = "example.invalid"
 
-[[sync]]
+[[root]]
 name = "data"
-from = "{}"
+path = "{}"
+
+[[sync]]
+from = "data"
 to = "data"
+match = "file.txt"
+postprocess = ["compress-video"]
 delete_after_import = true
 
-[[postprocess.rules]]
-match = "file.txt"
-steps = ["compress-video"]
 "#,
             source.display()
         ))
@@ -328,15 +336,17 @@ state_dir = "/tmp/purgery-state"
 [server]
 host = "example.invalid"
 
-[[sync]]
+[[root]]
 name = "data"
-from = "{}"
+path = "{}"
+
+[[sync]]
+from = "data"
 to = "data"
+match = "file.txt"
+postprocess = ["compress-video"]
 delete_after_import = true
 
-[[postprocess.rules]]
-match = "file.txt"
-steps = ["compress-video"]
 "#,
             source.display()
         ))
@@ -454,15 +464,17 @@ state_dir = "/tmp/purgery-state"
 [server]
 host = "example.invalid"
 
-[[sync]]
+[[root]]
 name = "data"
-from = "{}"
+path = "{}"
+
+[[sync]]
+from = "data"
 to = "data"
+match = "link.lnk"
+postprocess = ["compress-video"]
 delete_after_import = true
 
-[[postprocess.rules]]
-match = "link.lnk"
-steps = ["compress-video"]
 "#,
             source.display()
         ))
@@ -518,15 +530,16 @@ state_dir = "/tmp/purgery-state"
 [server]
 host = "example.invalid"
 
-[[sync]]
+[[root]]
 name = "data"
-from = "{}"
+path = "{}"
+
+[[sync]]
+from = "data"
 to = "data"
+postprocess = ["compress-video"]
 delete_after_import = true
 
-[[postprocess.rules]]
-match = "photos"
-steps = ["compress-video"]
 "#,
             source.display()
         ))
@@ -598,15 +611,16 @@ state_dir = "/tmp/purgery-state"
 [server]
 host = "example.invalid"
 
-[[sync]]
+[[root]]
 name = "data"
-from = "{}"
+path = "{}"
+
+[[sync]]
+from = "data"
 to = "data"
+postprocess = ["compress-video"]
 delete_after_import = true
 
-[[postprocess.rules]]
-match = "photos"
-steps = ["compress-video"]
 "#,
             source.display()
         ))
@@ -711,15 +725,16 @@ state_dir = "/tmp/purgery-state"
 [server]
 host = "example.invalid"
 
-[[sync]]
+[[root]]
 name = "data"
-from = "{}"
+path = "{}"
+
+[[sync]]
+from = "data"
 to = "data"
+postprocess = ["compress-video"]
 delete_after_import = true
 
-[[postprocess.rules]]
-match = "photos"
-steps = ["compress-video"]
 "#,
             source.display()
         ))
@@ -845,15 +860,16 @@ state_dir = "/tmp/purgery-state"
 [server]
 host = "example.invalid"
 
-[[sync]]
+[[root]]
 name = "data"
-from = "{}"
+path = "{}"
+
+[[sync]]
+from = "data"
 to = "data"
+postprocess = ["compress-video"]
 delete_after_import = true
 
-[[postprocess.rules]]
-match = "photos"
-steps = ["compress-video"]
 "#,
             source.display()
         ))
@@ -925,15 +941,16 @@ state_dir = "/tmp/purgery-state"
 [server]
 host = "example.invalid"
 
-[[sync]]
+[[root]]
 name = "data"
-from = "{}"
+path = "{}"
+
+[[sync]]
+from = "data"
 to = "data"
+postprocess = ["compress-video"]
 delete_after_import = true
 
-[[postprocess.rules]]
-match = "photos"
-steps = ["compress-video"]
 "#,
             source.display()
         ))
@@ -1002,9 +1019,12 @@ state_dir = "/tmp/purgery-state"
 [server]
 host = "example.invalid"
 
-[[sync]]
+[[root]]
 name = "data"
-from = "{}"
+path = "{}"
+
+[[sync]]
+from = "data"
 to = "data"
 delete_after_import = true
 "#,
@@ -1048,15 +1068,16 @@ state_dir = "/tmp/purgery-state"
 [server]
 host = "example.invalid"
 
-[[sync]]
+[[root]]
 name = "data"
-from = "{}"
+path = "{}"
+
+[[sync]]
+from = "data"
 to = "data"
+postprocess = ["compress-video"]
 delete_after_import = true
 
-[[postprocess.rules]]
-match = "photos"
-steps = ["compress-video"]
 "#,
             source.display()
         ))
@@ -1117,15 +1138,16 @@ state_dir = "/tmp/purgery-state"
 [server]
 host = "example.invalid"
 
-[[sync]]
+[[root]]
 name = "data"
-from = "{}"
+path = "{}"
+
+[[sync]]
+from = "data"
 to = "data"
+postprocess = ["compress-video"]
 delete_after_import = true
 
-[[postprocess.rules]]
-match = "photos"
-steps = ["compress-video"]
 "#,
             source.display()
         ))
@@ -1189,15 +1211,16 @@ state_dir = "/tmp/purgery-state"
 [server]
 host = "example.invalid"
 
-[[sync]]
+[[root]]
 name = "data"
-from = "{}"
+path = "{}"
+
+[[sync]]
+from = "data"
 to = "data"
+postprocess = ["compress-video"]
 delete_after_import = true
 
-[[postprocess.rules]]
-match = "photos"
-steps = ["compress-video"]
 "#,
             source.display()
         ))
@@ -1273,23 +1296,18 @@ state_dir = "/tmp/purgery-state"
 [server]
 host = "example.invalid"
 
-[[sync]]
+[[root]]
 name = "data"
-from = "{}"
+path = "{}"
+
+[[sync]]
+from = "data"
 to = "data"
+postprocess = ["compress-video"]
 delete_after_import = true
 
-[[postprocess.rules]]
-match = "file.txt"
-steps = ["compress-video"]
 
-[[postprocess.rules]]
-match = "link.lnk"
-steps = ["compress-video"]
 
-[[postprocess.rules]]
-match = "a_dir"
-steps = ["compress-video"]
 "#,
             source.display()
         ))
@@ -1358,10 +1376,13 @@ steps = ["compress-video"]
 
         // Create a config with delete_after_import for a regular file
         let sync = purgery_core::SyncMapping {
-            name: purgery_core::SyncName::new("data".into()).unwrap(),
+            name: purgery_core::SyncName::new("sync-0001".into()).unwrap(),
+            source: purgery_core::ClientSource::parse("data").unwrap(),
             from_path: purgery_core::LocalSourcePath::new(source.to_string_lossy().into_owned())
                 .unwrap(),
             to_path: purgery_core::ClientDest::parse("univ/data").unwrap(),
+            match_pattern: None,
+            postprocess_steps: Vec::new(),
             delete_after_import: true,
         };
 
@@ -1420,9 +1441,12 @@ state_dir = "{}"
 [server]
 host = "example.invalid"
 
-[[sync]]
+[[root]]
 name = "data"
-from = "{}"
+path = "{}"
+
+[[sync]]
+from = "data"
 to = "data"
 delete_after_import = true
 "#,
@@ -1470,9 +1494,12 @@ state_dir = "{}"
 [server]
 host = "example.invalid"
 
-[[sync]]
+[[root]]
 name = "data"
-from = "{}"
+path = "{}"
+
+[[sync]]
+from = "data"
 to = "data"
 delete_after_import = true
 "#,
@@ -1550,15 +1577,17 @@ state_dir = "/tmp/purgery-state"
 [server]
 host = "example.invalid"
 
-[[sync]]
+[[root]]
 name = "data"
-from = "{}"
+path = "{}"
+
+[[sync]]
+from = "data"
 to = "data"
+match = "**"
+postprocess = ["compress-video"]
 delete_after_import = true
 
-[[postprocess.rules]]
-match = "*.mp4"
-steps = ["compress-video"]
 "#,
             source.display()
         ))
@@ -1569,7 +1598,7 @@ steps = ["compress-video"]
 
         // Build cleanup entries from manifest (passthrough entries only)
         let entries =
-            crate::cleanup::build_cleanup_entries_from_manifest(&config, "data", &manifest)
+            crate::cleanup::build_cleanup_entries_from_manifest(&config, "sync-0001", &manifest)
                 .unwrap();
 
         // Must include directories and symlinks even though they have no SHA
@@ -1580,19 +1609,18 @@ steps = ["compress-video"]
             "cleanup ledger must include directory entries"
         );
         assert!(
-            entries.iter().any(|e| e.kind == ManifestEntryKind::Symlink),
-            "cleanup ledger must include symlink entries"
+            manifest.entries.iter().any(|entry| {
+                entry.kind == ManifestEntryKind::Symlink
+                    && entry.mode == ManifestEntryMode::Postprocess
+            }),
+            "selected symlinks must be represented as postprocess entries"
         );
-        // Regular files must have SHA
-        let regular = entries
-            .iter()
-            .find(|e| e.kind == ManifestEntryKind::RegularFile);
-        if let Some(rf) = regular {
-            assert!(
-                rf.sha256.is_some(),
-                "regular file in cleanup ledger must have SHA"
-            );
-        }
+        assert!(
+            manifest.entries.iter().any(|entry| {
+                entry.kind == ManifestEntryKind::RegularFile && entry.sha256.is_some()
+            }),
+            "postprocessed regular files must carry SHA-256 identity"
+        );
     }
 
     #[test]
@@ -1612,15 +1640,16 @@ state_dir = "/tmp/purgery-state"
 [server]
 host = "example.invalid"
 
-[[sync]]
+[[root]]
 name = "data"
-from = "{}"
+path = "{}"
+
+[[sync]]
+from = "data"
 to = "data"
+postprocess = ["compress-video"]
 delete_after_import = true
 
-[[postprocess.rules]]
-match = "photos"
-steps = ["compress-video"]
 "#,
             source.display()
         ))
@@ -1799,10 +1828,13 @@ steps = ["compress-video"]
 
         // read_link should succeed here; the entry should have link_target set.
         let sync = purgery_core::SyncMapping {
-            name: purgery_core::SyncName::new("data".into()).unwrap(),
+            name: purgery_core::SyncName::new("sync-0001".into()).unwrap(),
+            source: purgery_core::ClientSource::parse("data").unwrap(),
             from_path: purgery_core::LocalSourcePath::new(source.to_string_lossy().into_owned())
                 .unwrap(),
             to_path: purgery_core::ClientDest::parse("univ/data").unwrap(),
+            match_pattern: None,
+            postprocess_steps: Vec::new(),
             delete_after_import: true,
         };
         let config = ClientConfig::from_toml(&format!(
@@ -1813,9 +1845,12 @@ state_dir = "/tmp/purgery-state"
 [server]
 host = "example.invalid"
 
-[[sync]]
+[[root]]
 name = "data"
-from = "{}"
+path = "{}"
+
+[[sync]]
+from = "data"
 to = "data"
 delete_after_import = true
 "#,
@@ -1925,6 +1960,10 @@ state_dir = "{}"
 
 [server]
 host = "example.invalid"
+
+[[root]]
+name = "data"
+path = "/tmp"
 "#,
             state_dir.display()
         ))
@@ -1974,6 +2013,10 @@ state_dir = "{}"
 
 [server]
 host = "example.invalid"
+
+[[root]]
+name = "data"
+path = "/tmp"
 "#,
             state_dir.display()
         ))
@@ -2344,5 +2387,108 @@ command = "true"
                 violations.join("\n")
             );
         }
+    }
+
+    #[test]
+    fn root_based_match_selects_only_matching_entries_and_structural_ancestors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("Videos");
+        fs::create_dir_all(source.join("dogs")).unwrap();
+        fs::create_dir_all(source.join("trips")).unwrap();
+        fs::write(source.join("dogs/dog-beach.png"), b"dog").unwrap();
+        fs::write(source.join("dogs/readme.txt"), b"notes").unwrap();
+        fs::write(source.join("trips/baku-arrival.mp4"), b"trip").unwrap();
+
+        let config = ClientConfig::from_toml(&format!(
+            r#"
+nickname = "laptop"
+state_dir = "{}"
+
+[server]
+host = "example.invalid"
+
+[[root]]
+name = "videos"
+path = "{}"
+
+[[sync]]
+from = "videos"
+to = "univ/videos"
+match = "**/*dog*.png"
+delete_after_import = true
+"#,
+            tmp.path().join("state").display(),
+            source.display()
+        ))
+        .unwrap();
+
+        let manifest = build_manifest(&config, &RunId::new("matched".into()).unwrap()).unwrap();
+        let paths: Vec<_> = manifest
+            .entries
+            .iter()
+            .map(|entry| entry.relative_path.as_str())
+            .collect();
+        assert_eq!(paths, ["dogs", "dogs/dog-beach.png"]);
+        assert!(manifest
+            .entries
+            .iter()
+            .all(|entry| entry.sync_name.as_str() == "sync-0001"));
+
+        let cleanup =
+            crate::cleanup::build_pre_rsync_cleanup_entries(&config, &config.sync[0]).unwrap();
+        let cleanup_paths: Vec<_> = cleanup
+            .iter()
+            .map(|entry| entry.relative_path.as_str())
+            .collect();
+        assert_eq!(cleanup_paths, ["dogs/dog-beach.png", "dogs"]);
+        assert!(source.join("dogs/readme.txt").exists());
+        assert!(source.join("trips/baku-arrival.mp4").exists());
+    }
+
+    #[test]
+    fn root_based_match_attaches_ordered_postprocess_steps_and_sha256() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("Videos");
+        fs::create_dir_all(source.join("dogs")).unwrap();
+        fs::write(source.join("dogs/dog-park.png"), b"dog").unwrap();
+        fs::write(source.join("dogs/readme.txt"), b"notes").unwrap();
+
+        let config = ClientConfig::from_toml(&format!(
+            r#"
+nickname = "laptop"
+state_dir = "{}"
+
+[server]
+host = "example.invalid"
+
+[[root]]
+name = "videos"
+path = "{}"
+
+[[sync]]
+from = "videos"
+to = "univ/videos"
+match = "**/*dog*.png"
+postprocess = ["decode", "compress-image"]
+delete_after_import = true
+"#,
+            tmp.path().join("state").display(),
+            source.display()
+        ))
+        .unwrap();
+
+        let manifest = build_manifest(&config, &RunId::new("postprocess".into()).unwrap()).unwrap();
+        let file = manifest
+            .entries
+            .iter()
+            .find(|entry| entry.kind == ManifestEntryKind::RegularFile)
+            .unwrap();
+        assert_eq!(file.relative_path.as_str(), "dogs/dog-park.png");
+        assert_eq!(file.postprocess_steps, ["decode", "compress-image"]);
+        assert!(file.sha256.is_some());
+        assert!(!manifest
+            .entries
+            .iter()
+            .any(|entry| entry.relative_path.as_str() == "dogs/readme.txt"));
     }
 }

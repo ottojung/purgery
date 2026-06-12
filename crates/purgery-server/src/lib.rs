@@ -31,12 +31,12 @@ pub(crate) use commit::{
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use phases::{write_progress, write_progress_best_effort};
 
-/// A compiled postprocess rule with resolved step definitions.
+/// A validated ordered postprocess selection with resolved server step definitions.
 #[derive(Debug)]
 pub struct CompiledRule {
     pub pattern: String,
     pub steps: Vec<ResolvedStep>,
-    /// Optional sync group scoping (None means all groups).
+    /// Generated sync IDs whose entries use this selection.
     pub sync_names: Option<Vec<purgery_core::SyncName>>,
 }
 
@@ -61,7 +61,7 @@ pub struct ResolvedStep {
     pub step_def: purgery_core::PostprocessStepDefinition,
 }
 
-/// A validated run plan: precompiled rsync patterns and resolved step definitions.
+/// A validated run plan with resolved destinations and server step definitions.
 #[derive(Debug)]
 pub struct RunPlan {
     pub rules: Vec<CompiledRule>,

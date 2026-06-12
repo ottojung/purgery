@@ -11,13 +11,13 @@ use walkdir::WalkDir;
 
 use crate::cleanup::compute_sha256;
 
-/// Walk one sync group and return manifest entries plus whether any are postprocess.
-/// Uses only the provided applicable rules for classification.
+/// Walk one resolved sync source and return its selected manifest entries.
+/// Selection uses the sync match pattern; transformation uses its ordered step names.
 pub(crate) fn walk_and_classify_sync(
     _config: &ClientConfig,
     sync: &purgery_core::SyncMapping,
     _run_id: &RunId,
-    applicable_rules: &[&PostprocessRule],
+    _applicable_rules: &[&PostprocessRule],
 ) -> Result<(Vec<ManifestEntry>, bool)> {
     let from_path = sync.from_path.as_str();
     let to_path = sync.to_path.qualified_path();
@@ -30,6 +30,7 @@ pub(crate) fn walk_and_classify_sync(
 
     let mut entries = Vec::new();
     let mut has_postprocess = false;
+    let mut walked = Vec::new();
 
     for walk_entry in WalkDir::new(from).follow_links(false).min_depth(1) {
         let walk_entry = walk_entry.with_context(|| format!("error walking {from_path}"))?;
@@ -41,31 +42,57 @@ pub(crate) fn walk_and_classify_sync(
             camino::Utf8PathBuf::from_path_buf(relative.to_path_buf()).map_err(|path| {
                 anyhow::anyhow!("non-UTF-8 relative path is unsupported: {}", path.display())
             })?;
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("failed to read metadata: {}", path.display()))?;
+        walked.push((path.to_path_buf(), relative_path, metadata));
+    }
+
+    let selected_leaf_paths: Vec<camino::Utf8PathBuf> = walked
+        .iter()
+        .filter(|(_, _, metadata)| !metadata.file_type().is_dir())
+        .filter(|(_, relative, _)| {
+            sync.match_pattern
+                .as_ref()
+                .is_none_or(|pattern| purgery_core::rsync_pattern_match(pattern, relative.as_str()))
+        })
+        .map(|(_, relative, _)| relative.clone())
+        .collect();
+
+    for (path, relative_path, metadata) in walked {
+        let file_type = metadata.file_type();
+        let selected = if file_type.is_dir() {
+            sync.match_pattern.is_none()
+                || selected_leaf_paths.iter().any(|selected| {
+                    selected.starts_with(&relative_path) && selected != &relative_path
+                })
+        } else {
+            selected_leaf_paths.contains(&relative_path)
+        };
+        if !selected {
+            continue;
+        }
+
         let staged_path = camino::Utf8Path::new("files")
             .join(&to_path)
             .join(&relative_path);
-        let metadata = fs::symlink_metadata(path)
-            .with_context(|| format!("failed to read metadata: {}", path.display()))?;
-        let file_type = metadata.file_type();
-        let normalized_path = relative_path.as_str().to_owned();
-
-        // Classify using only applicable rules for this sync
-        let matched_rule = applicable_rules
-            .iter()
-            .find(|r| purgery_core::rsync_pattern_match(&r.pattern, &normalized_path));
-        let mode = if matched_rule.is_some() {
+        let postprocess = !sync.postprocess_steps.is_empty()
+            && (!file_type.is_dir() || sync.match_pattern.is_none());
+        let mode = if postprocess {
             has_postprocess = true;
             ManifestEntryMode::Postprocess
         } else {
             ManifestEntryMode::Passthrough
         };
-        let postprocess_steps: Vec<String> =
-            matched_rule.map(|r| r.steps.clone()).unwrap_or_default();
+        let postprocess_steps = if postprocess {
+            sync.postprocess_steps.clone()
+        } else {
+            Vec::new()
+        };
 
         let (kind, size, mtime_ns, sha256, link_target) = if file_type.is_dir() {
             (ManifestEntryKind::Directory, 0, 0, None, None)
         } else if file_type.is_file() {
-            let (mtime_ns, sha256) = if matched_rule.is_some() {
+            let (mtime_ns, sha256) = if postprocess {
                 // Postprocess entries require SHA-256 for server-side identity verification
                 let mtime_ns = metadata
                     .modified()
@@ -73,7 +100,7 @@ pub(crate) fn walk_and_classify_sync(
                     .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
                     .map(|duration| duration.as_nanos() as i64)
                     .unwrap_or(0);
-                let sha256 = compute_sha256(path).with_context(|| {
+                let sha256 = compute_sha256(&path).with_context(|| {
                     format!(
                         "failed to compute SHA-256 for postprocess entry: {}",
                         path.display()
@@ -88,7 +115,7 @@ pub(crate) fn walk_and_classify_sync(
                     .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
                     .map(|duration| duration.as_nanos() as i64)
                     .unwrap_or(0);
-                let sha256 = compute_sha256(path).with_context(|| {
+                let sha256 = compute_sha256(&path).with_context(|| {
                     format!(
                         "failed to compute SHA-256 for delete-after-import entry: {}",
                         path.display()
@@ -106,7 +133,7 @@ pub(crate) fn walk_and_classify_sync(
                 None,
             )
         } else if file_type.is_symlink() {
-            let target = fs::read_link(path)
+            let target = fs::read_link(&path)
                 .with_context(|| format!("failed to read symlink: {}", path.display()))?;
             let target = camino::Utf8PathBuf::from_path_buf(target).map_err(|path| {
                 anyhow::anyhow!(
@@ -138,25 +165,26 @@ pub(crate) fn walk_and_classify_sync(
         });
     }
 
-    // Identify covered entries under postprocessed directories.
+    // Entries beneath a selected postprocess directory are represented by the
+    // directory transform and remain available for cleanup identity checks.
     let covering_dirs: Vec<String> = entries
         .iter()
-        .filter(|e| {
-            e.kind == ManifestEntryKind::Directory && e.mode == ManifestEntryMode::Postprocess
+        .filter(|entry| {
+            entry.kind == ManifestEntryKind::Directory
+                && entry.mode == ManifestEntryMode::Postprocess
         })
-        .map(|e| e.relative_path.as_str().to_owned())
+        .map(|entry| entry.relative_path.as_str().to_owned())
         .collect();
-    for entry in entries.iter_mut() {
-        let rp = entry.relative_path.as_str();
-        for dir_path in &covering_dirs {
-            if rp == dir_path.as_str() {
-                continue;
-            }
-            if rp.starts_with(dir_path.as_str()) && rp.as_bytes().get(dir_path.len()) == Some(&b'/')
+    for entry in &mut entries {
+        for directory in &covering_dirs {
+            let relative = entry.relative_path.as_str();
+            if relative != directory
+                && relative.starts_with(directory)
+                && relative.as_bytes().get(directory.len()) == Some(&b'/')
             {
                 entry.mode = ManifestEntryMode::Covered;
-                entry.covered_by = Some(dir_path.clone());
-                entry.postprocess_steps = Vec::new();
+                entry.covered_by = Some(directory.clone());
+                entry.postprocess_steps.clear();
                 break;
             }
         }
@@ -184,9 +212,8 @@ pub(crate) fn walk_and_classify_sync(
     Ok((entries, has_postprocess))
 }
 
-/// Walk all sync directories and build the manifest using the current
-/// per-sync walk-and-classify model. Test-only; production code uses
-/// classify_sync_groups + walk_and_classify_sync per purgatory group.
+/// Build a manifest from selected entries in every configured sync group.
+/// Test-only; production code classifies and transfers groups by execution mode.
 #[cfg(test)]
 pub(crate) fn build_manifest(
     config: &ClientConfig,

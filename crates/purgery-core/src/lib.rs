@@ -47,6 +47,8 @@ pub enum ConfigError {
     StateDir(String),
     #[error("server roots: {0}")]
     ServerRoots(#[from] ServerRootsError),
+    #[error("client roots: {0}")]
+    ClientRoots(#[from] ClientRootsError),
 }
 
 #[derive(Error, Debug)]
@@ -635,9 +637,12 @@ nickname = "laptop"
 [server]
 host = "example.com"
 
-[[sync]]
+[[root]]
 name = "videos"
-from = "/home/user/Videos"
+path = "/home/user/Videos"
+
+[[sync]]
+from = "videos"
 to = "../escape"
 "#;
         let result = ClientConfig::from_toml(toml);
@@ -872,6 +877,10 @@ state_dir = "/tmp/purgery-state"
 
 [server]
 host = "example.com"
+
+[[root]]
+name = "data"
+path = "/tmp/data"
 "#;
         let config = ClientConfig::from_toml(toml).unwrap();
         assert_eq!(config.nickname.as_str(), "laptop");
@@ -890,43 +899,31 @@ state_dir = "/tmp/purgery-state"
 host = "example.com"
 command = "purgery-server --config /etc/purgery/server.toml"
 
-[[sync]]
+[[root]]
 name = "videos"
-from = "/home/vitalik/Videos"
+path = "/home/vitalik/Videos"
+
+[[sync]]
+from = "videos"
 to = "videos"
+match = "*.mp4"
+postprocess = ["compress-video"]
 delete_after_import = true
 
-[[sync]]
+[[root]]
 name = "pictures"
-from = "/home/vitalik/Pictures"
+path = "/home/vitalik/Pictures"
+
+[[sync]]
+from = "pictures"
 to = "pictures"
-
-[[postprocess.rules]]
-match = "*.mp4"
-steps = ["compress-video"]
-for = ["videos"]
-
-[[postprocess.rules]]
-match = "*.mov"
-steps = ["compress-video"]
-for = ["videos"]
-
-[[postprocess.rules]]
-match = "*.mkv"
-steps = ["compress-video"]
-for = ["videos"]
-
-[[postprocess.rules]]
-match = "*.webm"
-steps = ["compress-video"]
-for = ["videos"]
 "#;
         let config = ClientConfig::from_toml(toml).unwrap();
         assert_eq!(config.sync.len(), 2);
-        assert_eq!(config.sync[0].name.as_str(), "videos");
+        assert_eq!(config.sync[0].name.as_str(), "sync-0001");
         assert!(config.sync[0].delete_after_import);
         assert!(!config.sync[1].delete_after_import);
-        assert_eq!(config.postprocess.rules.len(), 4);
+        assert_eq!(config.postprocess.rules.len(), 1);
         assert_eq!(config.postprocess.rules[0].pattern, "*.mp4");
         assert_eq!(config.postprocess.rules[0].steps, vec!["compress-video"]);
         assert_eq!(
@@ -1799,14 +1796,18 @@ files = []
         let toml = include_str!("../../../examples/client.toml");
         let config = ClientConfig::from_toml(toml).unwrap();
         assert_eq!(config.nickname.as_str(), "laptop");
-        assert_eq!(config.sync.len(), 2);
+        assert_eq!(config.sync.len(), 3);
+        assert_eq!(
+            config.sync[0].source.qualified_path().as_str(),
+            "videos/cats"
+        );
         assert_eq!(
             config.sync[0].to_path.qualified_path().as_str(),
-            "univ/videos"
+            "univ/videos/cats"
         );
         assert_eq!(
             config.sync[1].to_path.qualified_path().as_str(),
-            "univ/pictures"
+            "sys/server-configs"
         );
     }
 
@@ -1814,10 +1815,10 @@ files = []
     fn parse_example_server_config() {
         let toml = include_str!("../../../examples/server.toml");
         let config = ServerConfig::from_toml(toml).unwrap();
-        let step = config.postprocess.steps.get("compress-video").unwrap();
+        let step = config.postprocess.steps.get("compress-image").unwrap();
         assert_eq!(step.kind, PostprocessKind::Subprocess);
-        assert_eq!(step.program, "my-compress-video");
-        assert!(step.keep_original);
+        assert_eq!(step.program, "my-compress-image");
+        assert!(!step.keep_original);
     }
 
     // ── normalize_relative helper tests ──
@@ -1987,9 +1988,12 @@ host = "example.com"
         let toml = r#"
 nickname = "laptop"
 
-[[sync]]
+[[root]]
 name = "videos"
-from = "/home/user/Videos"
+path = "/home/user/Videos"
+
+[[sync]]
+from = "videos"
 to = "videos"
 "#;
         let result = RunConfig::from_toml(toml);
@@ -2274,15 +2278,16 @@ nickname = "laptop"
 [server]
 host = "example.com"
 
-[[sync]]
+[[root]]
 name = "videos"
-from = "/home/user/Videos"
-to = "videos"
-delete_after_import = false
+path = "/home/user/Videos"
 
-[[postprocess.rules]]
+[[sync]]
+from = "videos"
+to = "videos"
 match = "*.mp4"
-steps = ["compress-video"]
+postprocess = ["compress-video"]
+delete_after_import = false
 "#;
         let result = ClientConfig::from_toml(toml);
         assert!(
@@ -2299,15 +2304,16 @@ nickname = "laptop"
 [server]
 host = "example.com"
 
-[[sync]]
+[[root]]
 name = "videos"
-from = "/home/user/Videos"
-to = "videos"
-delete_after_import = false
+path = "/home/user/Videos"
 
-[[postprocess.rules]]
+[[sync]]
+from = "videos"
+to = "videos"
 match = "*.mp4"
-steps = ["compress-video"]
+postprocess = ["compress-video"]
+delete_after_import = false
 "#;
         let result = ClientConfig::from_toml(toml);
         assert!(
@@ -2325,15 +2331,16 @@ state_dir = "/tmp/purgery-state"
 [server]
 host = "example.com"
 
-[[sync]]
+[[root]]
 name = "videos"
-from = "/home/user/Videos"
-to = "videos"
-delete_after_import = true
+path = "/home/user/Videos"
 
-[[postprocess.rules]]
+[[sync]]
+from = "videos"
+to = "videos"
 match = "*.mp4"
-steps = ["compress-video"]
+postprocess = ["compress-video"]
+delete_after_import = true
 "#;
         let config = ClientConfig::from_toml(toml).unwrap();
         assert!(config.sync[0].delete_after_import);
@@ -2349,22 +2356,25 @@ state_dir = "/tmp/purgery-state"
 [server]
 host = "example.com"
 
-[[sync]]
+[[root]]
 name = "videos"
-from = "/home/user/Videos"
+path = "/home/user/Videos"
+
+[[sync]]
+from = "videos"
 to = "videos"
 delete_after_import = false
 
-[[sync]]
+[[root]]
 name = "pictures"
-from = "/home/user/Pictures"
-to = "pictures"
-delete_after_import = true
+path = "/home/user/Pictures"
 
-[[postprocess.rules]]
+[[sync]]
+from = "pictures"
+to = "pictures"
 match = "*.mp4"
-steps = ["compress-video"]
-for = ["pictures"]
+postprocess = ["compress-video"]
+delete_after_import = true
 "#;
         let config = ClientConfig::from_toml(toml).unwrap();
         assert!(!config.sync[0].delete_after_import);
@@ -2381,9 +2391,12 @@ nickname = "laptop"
 [server]
 host = "example.com"
 
-[[sync]]
+[[root]]
 name = "videos"
-from = "/home/user/Videos"
+path = "/home/user/Videos"
+
+[[sync]]
+from = "videos"
 to = "videos"
 
 [[postprocess.rules]]
@@ -2403,9 +2416,12 @@ nickname = "laptop"
 [server]
 host = "example.com"
 
-[[sync]]
+[[root]]
 name = "videos"
-from = "/home/user/Videos"
+path = "/home/user/Videos"
+
+[[sync]]
+from = "videos"
 to = "videos"
 
 [[postprocess.rules]]
@@ -2429,22 +2445,22 @@ state_dir = "/tmp/purgery-state"
 [server]
 host = "example.com"
 
-[[sync]]
+[[root]]
 name = "videos"
-from = "/home/user/Videos"
-to = "videos"
-delete_after_import = true
+path = "/home/user/Videos"
 
-[[postprocess.rules]]
+[[sync]]
+from = "videos"
+to = "videos"
 match = "*.mp4"
-steps = ["compress-video"]
-for = ["videos"]
+postprocess = ["compress-video"]
+delete_after_import = true
 "#;
         let config = ClientConfig::from_toml(toml).unwrap();
         let rule = &config.postprocess.rules[0];
         assert_eq!(rule.pattern, "*.mp4");
         assert!(rule.sync_names.is_some());
-        assert_eq!(rule.sync_names.as_deref().unwrap()[0].as_str(), "videos");
+        assert_eq!(rule.sync_names.as_deref().unwrap()[0].as_str(), "sync-0001");
     }
 
     #[test]
@@ -2455,9 +2471,12 @@ nickname = "laptop"
 [server]
 host = "example.com"
 
-[[sync]]
+[[root]]
 name = "videos"
-from = "/home/user/Videos"
+path = "/home/user/Videos"
+
+[[sync]]
+from = "videos"
 to = "videos"
 
 [[postprocess.rules]]
@@ -2477,9 +2496,12 @@ nickname = "laptop"
 [server]
 host = "example.com"
 
-[[sync]]
+[[root]]
 name = "videos"
-from = "/home/user/Videos"
+path = "/home/user/Videos"
+
+[[sync]]
+from = "videos"
 to = "videos"
 
 [[postprocess.rules]]
@@ -2533,9 +2555,12 @@ state_dir = ""
 [server]
 host = "example.com"
 
-[[sync]]
+[[root]]
 name = "videos"
-from = "/home/user/Videos"
+path = "/home/user/Videos"
+
+[[sync]]
+from = "videos"
 to = "videos"
 "#;
         let result = ClientConfig::from_toml(toml);
@@ -2551,9 +2576,12 @@ state_dir = "relative/path"
 [server]
 host = "example.com"
 
-[[sync]]
+[[root]]
 name = "videos"
-from = "/home/user/Videos"
+path = "/home/user/Videos"
+
+[[sync]]
+from = "videos"
 to = "videos"
 "#;
         let result = ClientConfig::from_toml(toml);
@@ -2569,9 +2597,12 @@ state_dir = "/custom/state/purgery"
 [server]
 host = "example.com"
 
-[[sync]]
+[[root]]
 name = "videos"
-from = "/home/user/Videos"
+path = "/home/user/Videos"
+
+[[sync]]
+from = "videos"
 to = "videos"
 "#;
         let config = ClientConfig::from_toml(toml).unwrap();
@@ -2587,23 +2618,24 @@ state_dir = "/tmp/purgery-state"
 [server]
 host = "example.com"
 
-[[sync]]
+[[root]]
 name = "videos"
-from = "/home/user/Videos"
-to = "videos"
-delete_after_import = false
+path = "/home/user/Videos"
 
-[[postprocess.rules]]
+[[sync]]
+from = "videos"
+to = "videos"
 match = "*.mp4"
-steps = ["compress-video"]
+postprocess = ["compress-video"]
+delete_after_import = false
 "#;
         let result = ClientConfig::from_toml(toml);
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("conformance")
-                || err.contains("import-and-retire")
-                || err.contains("indefinite"),
-            "rejection must explain conformance tradeoff, got: {err}"
+            err.contains("requires delete_after_import")
+                || err.contains("without cleanup")
+                || err.contains("import-and-retire"),
+            "rejection must explain the cleanup requirement, got: {err}"
         );
     }
 
@@ -2625,10 +2657,10 @@ steps = ["pack"]
         let result = config.validate_uploaded_purgatory_run();
         let err = result.unwrap_err();
         assert!(
-            err.contains("conformance")
-                || err.contains("import-and-retire")
-                || err.contains("indefinite"),
-            "rejection must explain conformance tradeoff, got: {err}"
+            err.contains("requires delete_after_import")
+                || err.contains("without cleanup")
+                || err.contains("import-and-retire"),
+            "rejection must explain the cleanup requirement, got: {err}"
         );
     }
 
@@ -2801,15 +2833,21 @@ state_dir = "/var/lib/purgery"
 [server]
 host = "example.com"
 
-[[sync]]
+[[root]]
 name = "videos-phone"
-from = "/home/phone/Videos"
+path = "/home/phone/Videos"
+
+[[sync]]
+from = "videos-phone"
 to = "univ/videos"
 delete_after_import = true
 
-[[sync]]
+[[root]]
 name = "videos-laptop"
-from = "/home/laptop/Videos"
+path = "/home/laptop/Videos"
+
+[[sync]]
+from = "videos-laptop"
 to = "univ/videos"
 delete_after_import = true
 "#;
@@ -2838,13 +2876,13 @@ delete_after_import = true
     fn parse_example_client_config_semantic_parse() {
         let toml = include_str!("../../../examples/client.toml");
         let config = ClientConfig::from_toml(toml).unwrap();
-        assert_eq!(config.sync.len(), 2);
+        assert_eq!(config.sync.len(), 3);
         let dest0 = ClientDest::parse(config.sync[0].to_path.qualified_path().as_str()).unwrap();
         assert_eq!(dest0.root_name.as_str(), "univ");
-        assert_eq!(dest0.path_under_root.unwrap().as_str(), "videos");
+        assert_eq!(dest0.path_under_root.unwrap().as_str(), "videos/cats");
         let dest1 = ClientDest::parse(config.sync[1].to_path.qualified_path().as_str()).unwrap();
-        assert_eq!(dest1.root_name.as_str(), "univ");
-        assert_eq!(dest1.path_under_root.unwrap().as_str(), "pictures");
+        assert_eq!(dest1.root_name.as_str(), "sys");
+        assert_eq!(dest1.path_under_root.unwrap().as_str(), "server-configs");
     }
 
     // ── production to-path validation ──────────────
@@ -2858,9 +2896,12 @@ state_dir = "/var/lib/purgery"
 [server]
 host = "example.com"
 
-[[sync]]
+[[root]]
 name = "videos"
-from = "/home/user/Videos"
+path = "/home/user/Videos"
+
+[[sync]]
+from = "videos"
 to = "univ//videos"
 "#;
         let result = ClientConfig::from_toml(toml);
@@ -2876,9 +2917,12 @@ state_dir = "/var/lib/purgery"
 [server]
 host = "example.com"
 
-[[sync]]
+[[root]]
 name = "videos"
-from = "/home/user/Videos"
+path = "/home/user/Videos"
+
+[[sync]]
+from = "videos"
 to = "."
 "#;
         let result = ClientConfig::from_toml(toml);
@@ -2901,9 +2945,12 @@ state_dir = "/var/lib/purgery"
 [server]
 host = "example.com"
 
-[[sync]]
+[[root]]
 name = "videos"
-from = "/home/user/Videos"
+path = "/home/user/Videos"
+
+[[sync]]
+from = "videos"
 to = "./univ/videos"
 "#;
         let result = ClientConfig::from_toml(toml);

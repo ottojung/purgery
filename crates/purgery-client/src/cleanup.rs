@@ -207,6 +207,14 @@ pub(crate) fn build_pre_rsync_cleanup_entries(
         let local_path_str = local_path.to_string_lossy().into_owned();
 
         let file_type = metadata.file_type();
+        if !file_type.is_dir()
+            && sync
+                .match_pattern
+                .as_ref()
+                .is_some_and(|pattern| !purgery_core::rsync_pattern_match(pattern, &relative_str))
+        {
+            continue;
+        }
         if file_type.is_dir() {
             dirs.push((relative_str, local_path_str));
         } else if file_type.is_symlink() {
@@ -263,6 +271,14 @@ pub(crate) fn build_pre_rsync_cleanup_entries(
                 cleaned: false,
             });
         }
+    }
+    if sync.match_pattern.is_some() {
+        dirs.retain(|(relative, _)| {
+            entries.iter().any(|entry| {
+                entry.relative_path.starts_with(relative)
+                    && entry.relative_path.as_bytes().get(relative.len()) == Some(&b'/')
+            })
+        });
     }
     // Add directories bottom-up (reverse walk order so children precede parents)
     for (relative_str, local_path_str) in dirs.into_iter().rev() {

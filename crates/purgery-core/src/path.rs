@@ -62,6 +62,24 @@ pub enum PathValidationError {
 }
 
 #[derive(Error, Debug, PartialEq, Eq)]
+pub enum ClientSourceError {
+    #[error("source is empty")]
+    Empty,
+    #[error("invalid client root name: {0}")]
+    InvalidRootName(#[from] RootNameError),
+    #[error("source starts with '/': {0}")]
+    AbsolutePath(String),
+    #[error("source contains '..' component: {0}")]
+    ContainsDotDot(String),
+    #[error("source contains empty path component: {0}")]
+    EmptyComponent(String),
+    #[error("source is '.'")]
+    IsDot,
+    #[error("source starts with './': {0}")]
+    StartsWithDotSlash(String),
+}
+
+#[derive(Error, Debug, PartialEq, Eq)]
 pub enum SyncDestinationError {
     #[error("destination is empty")]
     Empty,
@@ -229,6 +247,120 @@ impl FromStr for RootName {
     type Err = RootNameError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         RootName::new(s.to_owned())
+    }
+}
+
+/// A validated client root name. Validation is established by `new` or serde.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ClientRootName(RootName);
+
+impl ClientRootName {
+    pub fn new(value: String) -> Result<Self, RootNameError> {
+        RootName::new(value).map(Self)
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl std::fmt::Display for ClientRootName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for ClientRootName {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.as_str().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ClientRootName {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// A root-qualified client source. Parsing proves the value is relative,
+/// normalized, and starts with a valid client root name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientSource {
+    root_name: ClientRootName,
+    path_under_root: Option<NormalizedRelativePath>,
+}
+
+impl ClientSource {
+    pub fn parse(input: &str) -> Result<Self, ClientSourceError> {
+        if input.is_empty() {
+            return Err(ClientSourceError::Empty);
+        }
+        if input == "." {
+            return Err(ClientSourceError::IsDot);
+        }
+        if input.starts_with('/') {
+            return Err(ClientSourceError::AbsolutePath(input.to_owned()));
+        }
+        if input.starts_with("./") {
+            return Err(ClientSourceError::StartsWithDotSlash(input.to_owned()));
+        }
+        for component in input.split('/') {
+            if component == ".." {
+                return Err(ClientSourceError::ContainsDotDot(input.to_owned()));
+            }
+            if component.is_empty() {
+                return Err(ClientSourceError::EmptyComponent(input.to_owned()));
+            }
+        }
+        let mut parts = input.splitn(2, '/');
+        let root_name = ClientRootName::new(parts.next().expect("non-empty source").to_owned())?;
+        let path_under_root = parts
+            .next()
+            .map(|rest| NormalizedRelativePath::new(Utf8PathBuf::from(rest)))
+            .transpose()
+            .map_err(|error| match error {
+                PathValidationError::ContainsDotDot => {
+                    ClientSourceError::ContainsDotDot(input.to_owned())
+                }
+                PathValidationError::EmptyComponent => {
+                    ClientSourceError::EmptyComponent(input.to_owned())
+                }
+                PathValidationError::NotRelative | PathValidationError::NotAbsolute => {
+                    ClientSourceError::AbsolutePath(input.to_owned())
+                }
+            })?;
+        Ok(Self {
+            root_name,
+            path_under_root,
+        })
+    }
+
+    pub fn root_name(&self) -> &ClientRootName {
+        &self.root_name
+    }
+
+    pub fn path_under_root(&self) -> Option<&NormalizedRelativePath> {
+        self.path_under_root.as_ref()
+    }
+
+    pub fn qualified_path(&self) -> Utf8PathBuf {
+        let mut path = Utf8PathBuf::from(self.root_name.as_str());
+        if let Some(rest) = &self.path_under_root {
+            path.push(rest.as_path());
+        }
+        path
+    }
+}
+
+impl Serialize for ClientSource {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.qualified_path().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ClientSource {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::parse(&String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
     }
 }
 
@@ -1113,20 +1245,26 @@ state_dir = "/var/lib/purgery"
 [server]
 host = "example.com"
 
-[[sync]]
+[[root]]
 name = "videos"
-from = "/home/user/Videos"
-to = "univ/videos"
+path = "/home/user/Videos"
 
 [[sync]]
+from = "videos"
+to = "univ/videos"
+
+[[root]]
 name = "server-configs"
-from = "/home/user/my/server-configs"
+path = "/home/user/my/server-configs"
+
+[[sync]]
+from = "server-configs"
 to = "system/server-configs"
 "#;
         let config = crate::ClientConfig::from_toml(toml).unwrap();
         assert_eq!(config.sync.len(), 2);
-        assert_eq!(config.sync[0].name.as_str(), "videos");
-        assert_eq!(config.sync[1].name.as_str(), "server-configs");
+        assert_eq!(config.sync[0].name.as_str(), "sync-0001");
+        assert_eq!(config.sync[1].name.as_str(), "sync-0002");
     }
 
     #[test]
@@ -1138,9 +1276,12 @@ state_dir = "/var/lib/purgery"
 [server]
 host = "example.com"
 
-[[sync]]
+[[root]]
 name = "videos"
-from = "/home/user/Videos"
+path = "/home/user/Videos"
+
+[[sync]]
+from = "videos"
 to = ""
 "#;
         let result = crate::ClientConfig::from_toml(toml);
@@ -1156,9 +1297,12 @@ state_dir = "/var/lib/purgery"
 [server]
 host = "example.com"
 
-[[sync]]
+[[root]]
 name = "videos"
-from = "/home/user/Videos"
+path = "/home/user/Videos"
+
+[[sync]]
+from = "videos"
 to = "/univ/videos"
 "#;
         let result = crate::ClientConfig::from_toml(toml);
@@ -1174,9 +1318,12 @@ state_dir = "/var/lib/purgery"
 [server]
 host = "example.com"
 
-[[sync]]
+[[root]]
 name = "videos"
-from = "/home/user/Videos"
+path = "/home/user/Videos"
+
+[[sync]]
+from = "videos"
 to = "univ/../videos"
 "#;
         let result = crate::ClientConfig::from_toml(toml);

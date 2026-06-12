@@ -1,3 +1,4 @@
+use crate::classify::walk_and_classify_sync;
 use crate::cleanup::{
     build_cleanup_entries_from_manifest, build_pre_rsync_cleanup_entries, mark_rsync_succeeded,
     process_cleanup_state_file, write_cleanup_state,
@@ -20,9 +21,7 @@ use std::thread;
 use std::time::Duration;
 use tracing::{debug, info, span, Level};
 
-/// Run a pure passthrough invocation (no postprocess entries in any sync group).
-///
-/// Every passthrough group uses direct unfiltered rsync.
+/// Run an invocation whose selected entries are all passthrough entries.
 /// PassthroughDeleteAfterImport groups additionally use the cleanup ledger
 /// protocol: pre-rsync identity, cleanup state, rsync, success marker,
 /// cleanup deletion.
@@ -103,17 +102,22 @@ pub(crate) fn run_passthrough_path(
         let state_path = write_cleanup_state(&cleanup_state, &config.state_dir)
             .with_context(|| "failed to write pre-rsync cleanup state")?;
 
-        // 2. Direct unfiltered rsync
+        // 2. Direct rsync of the selected transfer set
         info!(
             sync = sync_name,
+            from = %sync.source.qualified_path(),
+            to = %sync.to_path.qualified_path(),
             dest = %dest.passthrough_dest,
             "passthrough direct rsync with cleanup"
         );
-        let rsync_args = build_rsync_args(sync.from_path.as_str(), &rsync_dest);
+        let (rsync_args, filter_path) = selected_rsync_args(config, sync, &rsync_dest)?;
         let status = Command::new("rsync")
             .args(&rsync_args)
             .status()
             .with_context(|| format!("failed to execute rsync for {}", sync.from_path.as_str()))?;
+        if let Some(path) = filter_path {
+            let _ = fs::remove_file(path.as_std_path());
+        }
         if !status.success() {
             anyhow::bail!("rsync failed for sync mapping '{sync_name}'");
         }
@@ -131,7 +135,38 @@ pub(crate) fn run_passthrough_path(
     Ok(())
 }
 
-/// Run unfiltered rsync for a direct-rsync-only sync group (no filter file needed).
+fn selected_rsync_args(
+    config: &ClientConfig,
+    sync: &purgery_core::SyncMapping,
+    destination: &str,
+) -> Result<(Vec<String>, Option<camino::Utf8PathBuf>)> {
+    let mut args = build_rsync_args(sync.from_path.as_str(), destination);
+    let Some(_) = sync.match_pattern else {
+        return Ok((args, None));
+    };
+
+    let run_id = RunId::generate();
+    let (entries, _) = walk_and_classify_sync(config, sync, &run_id, &[])?;
+    let roots: Vec<purgery_core::TransferRoot> = entries
+        .iter()
+        .map(|entry| purgery_core::TransferRoot::Exact(entry.relative_path.as_str().to_owned()))
+        .collect();
+    let filter = purgery_core::transfer_set_filter(&roots);
+    let directory = Utf8Path::new(&config.state_dir)
+        .join("filters")
+        .join(run_id.as_str());
+    fs::create_dir_all(directory.as_std_path())
+        .with_context(|| format!("failed to create filter directory: {directory}"))?;
+    let path = directory.join(format!("{}.filter", sync.name.as_str()));
+    fs::write(path.as_std_path(), filter)
+        .with_context(|| format!("failed to write match filter: {path}"))?;
+    let option = format!("--filter=merge {}", path.as_str());
+    purgery_core::insert_rsync_option_before_operands(&mut args, option)
+        .map_err(|error| anyhow::anyhow!("failed to insert match filter: {error}"))?;
+    Ok((args, Some(path)))
+}
+
+/// Transfer every selected entry in a passthrough sync group directly.
 pub(crate) fn run_unfiltered_rsync(
     _config: &ClientConfig,
     host: &str,
@@ -146,16 +181,20 @@ pub(crate) fn run_unfiltered_rsync(
     let rsync_dest = format!("{}:{}/", host, dest.passthrough_dest);
     info!(
         sync = sync_name,
-        from = from_path,
+        from = %sync.source.qualified_path(),
+        to = %sync.to_path.qualified_path(),
+        resolved_from = from_path,
         dest = %dest.passthrough_dest,
-        "direct rsync (no postprocess rules)"
+        "direct rsync"
     );
-    let rsync_args = build_rsync_args(from_path, &rsync_dest);
-    // No filter needed for direct-rsync-only groups
+    let (rsync_args, filter_path) = selected_rsync_args(_config, sync, &rsync_dest)?;
     let status = Command::new("rsync")
         .args(&rsync_args)
         .status()
         .with_context(|| format!("failed to execute rsync for {from_path}"))?;
+    if let Some(path) = filter_path {
+        let _ = fs::remove_file(path.as_std_path());
+    }
     if !status.success() {
         anyhow::bail!("rsync failed for sync mapping '{sync_name}'");
     }
@@ -163,13 +202,13 @@ pub(crate) fn run_unfiltered_rsync(
     Ok(())
 }
 
-/// Run a postprocess invocation (one or more sync groups have postprocess roots).
+/// Run an invocation containing one or more postprocess sync groups.
 ///
 /// Creates a server run: begin-run, upload filtered manifest, prepare-run,
 /// rsync passthrough + purgatory, finish-run, poll status, cleanup from status.
 ///
-/// Passthrough-only sync groups (no applicable rules) are handled outside
-/// the purgatory run lifecycle via resolve-destinations + direct rsync.
+/// Sync groups without postprocessing are handled outside the server run
+/// lifecycle via destination resolution and direct rsync of their selected set.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_postprocess_path(
     config: &ClientConfig,

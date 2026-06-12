@@ -5,14 +5,14 @@ name = "univ"
 path = "/universe/synced"
 
 [[root]]
-name = "system"
+name = "sys"
 path = "/etc/system"
 
 [postprocess]
 
-[postprocess.steps.compress-video]
+[postprocess.steps.compress-image]
 kind = "subprocess"
-program = "my-compress-video"
+program = "my-compress-image"
 args = ["--input", "{input}"]
-expected_outputs = ["{file_stem}.Z.webm"]
-keep_original = true
+expected_outputs = ["{file_stem}.jpeg"]
+keep_original = false

@@ -4,30 +4,26 @@ state_dir = "/var/lib/purgery"
 [server]
 host = "example.com"
 
-[[sync]]
+[[root]]
 name = "videos"
-from = "/home/vitalik/Videos"
-to = "univ/videos"
+path = "/home/user/Videos"
+
+[[root]]
+name = "configs"
+path = "/home/user/my/server-configs"
+
+[[sync]]
+from = "videos/cats"
+to = "univ/videos/cats"
+
+[[sync]]
+from = "configs"
+to = "sys/server-configs"
 delete_after_import = true
 
 [[sync]]
-name = "pictures"
-from = "/home/vitalik/Pictures"
-to = "univ/pictures"
+from = "videos"
+to = "univ/videos"
+match = "**/*dog*.png"
+postprocess = ["compress-image"]
 delete_after_import = true
-
-[[postprocess.rules]]
-match = "*.mp4"
-steps = ["compress-video"]
-
-[[postprocess.rules]]
-match = "*.mov"
-steps = ["compress-video"]
-
-[[postprocess.rules]]
-match = "*.mkv"
-steps = ["compress-video"]
-
-[[postprocess.rules]]
-match = "*.webm"
-steps = ["compress-video"]

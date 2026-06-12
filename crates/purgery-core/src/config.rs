@@ -256,43 +256,169 @@ impl ServerConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ClientRootsError {
+    #[error("at least one named client root is required")]
+    Empty,
+    #[error("duplicate client root name '{0}'")]
+    Duplicate(ClientRootName),
+    #[error("client root '{name}' path must be absolute: {path}")]
+    RelativePath { name: ClientRootName, path: String },
+    #[error("unknown client root '{0}'")]
+    Unknown(ClientRootName),
+}
+
+/// A named absolute client source tree. Serde validates the root name; the
+/// `ClientRoots` collection establishes absolute-path and uniqueness proofs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientRoot {
+    pub name: ClientRootName,
+    pub path: LocalSourcePath,
+}
+
+/// Validated client roots keyed by name.
+#[derive(Debug, Clone)]
+pub struct ClientRoots(BTreeMap<ClientRootName, LocalSourcePath>);
+
+impl ClientRoots {
+    pub fn new(roots: Vec<ClientRoot>) -> Result<Self, ClientRootsError> {
+        if roots.is_empty() {
+            return Err(ClientRootsError::Empty);
+        }
+        let mut by_name = BTreeMap::new();
+        for root in roots {
+            if !root.path.as_str().starts_with('/') {
+                return Err(ClientRootsError::RelativePath {
+                    name: root.name,
+                    path: root.path.as_str().to_owned(),
+                });
+            }
+            if by_name.insert(root.name.clone(), root.path).is_some() {
+                return Err(ClientRootsError::Duplicate(root.name));
+            }
+        }
+        Ok(Self(by_name))
+    }
+
+    pub fn resolve(&self, source: &ClientSource) -> Result<LocalSourcePath, ClientRootsError> {
+        let root = self
+            .0
+            .get(source.root_name())
+            .ok_or_else(|| ClientRootsError::Unknown(source.root_name().clone()))?;
+        let path = match source.path_under_root() {
+            Some(rest) => camino::Utf8Path::new(root.as_str()).join(rest.as_path()),
+            None => camino::Utf8PathBuf::from(root.as_str()),
+        };
+        LocalSourcePath::new(path.into_string()).map_err(|_| ClientRootsError::RelativePath {
+            name: source.root_name().clone(),
+            path: root.as_str().to_owned(),
+        })
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&ClientRootName, &LocalSourcePath)> {
+        self.0.iter()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClientConfigFile {
+    nickname: Nickname,
+    server: ServerConnection,
+    #[serde(rename = "root")]
+    roots: Vec<ClientRoot>,
+    #[serde(default)]
+    sync: Vec<SyncMappingFile>,
+    #[serde(default)]
+    logging: LoggingConfig,
+    state_dir: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SyncMappingFile {
+    #[serde(rename = "from")]
+    source: ClientSource,
+    #[serde(rename = "to")]
+    to_path: ClientDest,
+    #[serde(rename = "match")]
+    match_pattern: Option<String>,
+    postprocess: Option<Vec<String>>,
+    #[serde(default = "default_delete_after_import")]
+    delete_after_import: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
     pub nickname: Nickname,
     pub server: ServerConnection,
-    #[serde(default)]
+    pub roots: Vec<ClientRoot>,
     pub sync: Vec<SyncMapping>,
-    #[serde(default)]
+    #[serde(skip)]
     pub postprocess: ClientPostprocessConfig,
-    #[serde(default)]
     pub logging: LoggingConfig,
     pub state_dir: String,
 }
 
 impl ClientConfig {
     pub fn from_toml(input: &str) -> Result<Self, ConfigError> {
-        let config: ClientConfig = toml::from_str(input)?;
-        if config.state_dir.is_empty() {
+        let file: ClientConfigFile = toml::from_str(input)?;
+        if file.state_dir.is_empty() {
             return Err(ConfigError::StateDir("must be non-empty".into()));
         }
-        if !config.state_dir.starts_with('/') {
+        if !file.state_dir.starts_with('/') {
             return Err(ConfigError::StateDir("must be an absolute path".into()));
         }
-        let sync_names: Vec<SyncName> = config.sync.iter().map(|s| s.name.clone()).collect();
-        config
-            .postprocess
-            .validate(&sync_names)
-            .map_err(ConfigError::PostprocessConfig)?;
-        config
-            .postprocess
-            .validate_delete_after_import(&config.sync)
-            .map_err(ConfigError::PostprocessConfig)?;
-        Ok(config)
+        let roots = ClientRoots::new(file.roots.clone())?;
+        let mut rules = Vec::new();
+        let mut sync = Vec::with_capacity(file.sync.len());
+        for (index, mapping) in file.sync.into_iter().enumerate() {
+            if let Some(steps) = &mapping.postprocess {
+                if steps.is_empty() {
+                    return Err(ConfigError::PostprocessConfig(
+                        "postprocess must be a non-empty list".into(),
+                    ));
+                }
+                if !mapping.delete_after_import {
+                    return Err(ConfigError::PostprocessConfig(
+                        "postprocess requires delete_after_import = true".into(),
+                    ));
+                }
+            }
+            let name = SyncName::new(format!("sync-{:04}", index + 1))?;
+            let from_path = roots.resolve(&mapping.source)?;
+            if let Some(steps) = &mapping.postprocess {
+                rules.push(PostprocessRule {
+                    pattern: mapping.match_pattern.clone().unwrap_or_else(|| "**".into()),
+                    steps: steps.clone(),
+                    sync_names: Some(vec![name.clone()]),
+                });
+            }
+            sync.push(SyncMapping {
+                name,
+                source: mapping.source,
+                from_path,
+                to_path: mapping.to_path,
+                match_pattern: mapping.match_pattern,
+                postprocess_steps: mapping.postprocess.unwrap_or_default(),
+                delete_after_import: mapping.delete_after_import,
+            });
+        }
+        Ok(Self {
+            nickname: file.nickname,
+            server: file.server,
+            roots: file.roots,
+            sync,
+            postprocess: ClientPostprocessConfig { rules },
+            logging: file.logging,
+            state_dir: file.state_dir,
+        })
     }
 
     pub fn find_sync(&self, name: &str) -> Option<&SyncMapping> {
-        self.sync.iter().find(|s| s.name.as_str() == name)
+        self.sync.iter().find(|sync| sync.name.as_str() == name)
     }
 }
 
@@ -308,15 +434,20 @@ fn default_server_command() -> String {
     "purgery-server".to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SyncMapping {
     pub name: SyncName,
     #[serde(rename = "from")]
+    pub source: ClientSource,
+    #[serde(skip)]
     pub from_path: LocalSourcePath,
     #[serde(rename = "to")]
     pub to_path: ClientDest,
-    #[serde(default = "default_delete_after_import")]
+    #[serde(rename = "match", skip_serializing_if = "Option::is_none")]
+    pub match_pattern: Option<String>,
+    #[serde(rename = "postprocess", skip_serializing_if = "Vec::is_empty")]
+    pub postprocess_steps: Vec<String>,
     pub delete_after_import: bool,
 }
 
@@ -345,7 +476,7 @@ impl PostprocessRule {
     pub fn applies_to(&self, sync_name: &str) -> bool {
         match &self.sync_names {
             None => true,
-            Some(names) => names.iter().any(|n| n.as_str() == sync_name),
+            Some(names) => names.iter().any(|name| name.as_str() == sync_name),
         }
     }
 }
@@ -354,21 +485,27 @@ pub fn applicable_rules<'a>(
     rules: &'a [PostprocessRule],
     sync_name: &str,
 ) -> Vec<&'a PostprocessRule> {
-    rules.iter().filter(|r| r.applies_to(sync_name)).collect()
+    rules
+        .iter()
+        .filter(|rule| rule.applies_to(sync_name))
+        .collect()
 }
 
 impl ClientPostprocessConfig {
     pub fn validate(&self, sync_names: &[SyncName]) -> Result<(), String> {
         for rule in &self.rules {
-            if let Some(ref names) = rule.sync_names {
+            if rule.steps.is_empty() {
+                return Err("postprocess selection has no steps".into());
+            }
+            if let Some(names) = &rule.sync_names {
                 if names.is_empty() {
-                    return Err("postprocess rule has empty for list".into());
+                    return Err("postprocess selection has no sync IDs".into());
                 }
                 for name in names {
-                    if !sync_names.iter().any(|s| s == name) {
+                    if !sync_names.contains(name) {
                         return Err(format!(
-                            "postprocess rule references unknown sync name '{}' in for",
-                            name.as_str()
+                            "postprocess selection references unknown sync ID '{}'",
+                            name
                         ));
                     }
                 }
@@ -379,15 +516,10 @@ impl ClientPostprocessConfig {
 
     pub fn validate_delete_after_import(&self, syncs: &[SyncMapping]) -> Result<(), String> {
         for sync in syncs {
-            let applicable = applicable_rules(&self.rules, sync.name.as_str());
-            if !applicable.is_empty() && !sync.delete_after_import {
+            if !sync.postprocess_steps.is_empty() && !sync.delete_after_import {
                 return Err(format!(
-                    "sync group '{}' has applicable postprocess rules but \
-                     delete_after_import is false; \
-                     postprocessing transforms the original and the server does not retain \
-                     indefinite source metadata, so confirmed originals must be retired \
-                     locally (import-and-retire)",
-                    sync.name.as_str()
+                    "sync '{}' selects postprocess steps without cleanup",
+                    sync.name
                 ));
             }
         }
@@ -404,31 +536,27 @@ pub enum SyncExecutionClass {
 
 pub fn classify_sync_groups<'a>(
     syncs: &'a [SyncMapping],
-    rules: &'a [PostprocessRule],
+    _rules: &'a [PostprocessRule],
 ) -> Result<Vec<(SyncExecutionClass, &'a SyncMapping)>, String> {
-    let mut result = Vec::with_capacity(syncs.len());
-    for sync in syncs {
-        let applicable = applicable_rules(rules, sync.name.as_str());
-        if !applicable.is_empty() && !sync.delete_after_import {
-            return Err(format!(
-                "sync group '{}' has applicable postprocess rules but \
-                 delete_after_import is false; \
-                 postprocessing transforms the original and the server does not retain \
-                 indefinite source metadata, so confirmed originals must be retired \
-                 locally (import-and-retire)",
-                sync.name.as_str()
-            ));
-        }
-        let class = if !applicable.is_empty() {
-            SyncExecutionClass::Purgatory
-        } else if sync.delete_after_import {
-            SyncExecutionClass::PassthroughDeleteAfterImport
-        } else {
-            SyncExecutionClass::PassthroughNoDelete
-        };
-        result.push((class, sync));
-    }
-    Ok(result)
+    syncs
+        .iter()
+        .map(|sync| {
+            if !sync.postprocess_steps.is_empty() && !sync.delete_after_import {
+                return Err(format!(
+                    "sync '{}' selects postprocess steps without cleanup",
+                    sync.name
+                ));
+            }
+            let class = if !sync.postprocess_steps.is_empty() {
+                SyncExecutionClass::Purgatory
+            } else if sync.delete_after_import {
+                SyncExecutionClass::PassthroughDeleteAfterImport
+            } else {
+                SyncExecutionClass::PassthroughNoDelete
+            };
+            Ok((class, sync))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -478,12 +606,14 @@ impl RunConfig {
     pub fn validate_uploaded_purgatory_run(&self) -> Result<(), String> {
         self.validate_sync_scoped_rules()?;
         for sync in &self.sync {
-            if !sync.delete_after_import {
+            let has_postprocess = self
+                .postprocess
+                .rules
+                .iter()
+                .any(|rule| rule.applies_to(sync.name.as_str()));
+            if has_postprocess && !sync.delete_after_import {
                 return Err(format!(
-                    "sync group '{}' in purgatory run config has delete_after_import = false; \
-                     postprocessing transforms the original and the server does not retain \
-                     indefinite source metadata, so confirmed originals must be retired \
-                     locally (import-and-retire)",
+                    "sync group '{}' selects postprocess steps but delete_after_import = false; postprocessing requires import-and-retire cleanup",
                     sync.name.as_str()
                 ));
             }
