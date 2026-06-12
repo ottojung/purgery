@@ -199,159 +199,6 @@ fn failed_entry(entry: &ManifestEntry, error: impl Into<String>) -> EntryOutcome
     }
 }
 
-pub(crate) fn planned_entry_outputs(
-    server_config: &ServerConfig,
-    nickname: &Nickname,
-    sync: &RunConfigSync,
-    entry: &ManifestEntry,
-    run_plan: &RunPlan,
-) -> Vec<String> {
-    let entry_final_path =
-        server_config
-            .root
-            .final_path(nickname, &sync.to_path, &entry.relative_path);
-
-    let normalized_path = entry.relative_path.as_str().to_owned();
-
-    let synthetic_work_path = Utf8Path::new(entry.relative_path.as_str());
-
-    let mut outputs: Vec<String> = Vec::new();
-
-    if let Some(rule) = run_plan.first_matching_rule(entry.sync_name.as_str(), &normalized_path) {
-        for step in &rule.steps {
-            if step.step_def.keep_original {
-                outputs.push(entry_final_path.as_str().to_owned());
-            }
-            for pat in &step.step_def.expected_outputs {
-                if purgery_core::validate_expected_output_name(pat).is_err() {
-                    continue;
-                }
-                let resolved = step.step_def.resolve_placeholders(synthetic_work_path, pat);
-                let p = Utf8Path::new(&resolved);
-                let fname = p.file_name().unwrap_or(resolved.as_str());
-                let output_path = entry_final_path
-                    .parent()
-                    .map(|parent| parent.join(fname))
-                    .unwrap_or_else(|| Utf8PathBuf::from(fname));
-                outputs.push(output_path.as_str().to_owned());
-            }
-        }
-    }
-
-    if outputs.is_empty() {
-        outputs.push(entry_final_path.as_str().to_owned());
-    }
-
-    let mut seen = std::collections::HashSet::new();
-    outputs.retain(|p| seen.insert(p.clone()));
-    outputs
-}
-
-pub(crate) fn validate_unique_final_paths(
-    server_config: &ServerConfig,
-    nickname: &Nickname,
-    run_config: &RunConfig,
-    manifest: &Manifest,
-    run_plan: &RunPlan,
-    covered_indices: &std::collections::HashSet<usize>,
-) -> Result<(), String> {
-    let sync_map: HashMap<&str, &RunConfigSync> = run_config.sync_map().into_iter().collect();
-    let mut destinations: HashMap<String, &ManifestEntry> = HashMap::new();
-
-    for (entry_idx, entry) in manifest.entries.iter().enumerate() {
-        if covered_indices.contains(&entry_idx) {
-            continue;
-        }
-        let Some(sync) = sync_map.get(entry.sync_name.as_str()) else {
-            continue;
-        };
-
-        let planned = planned_entry_outputs(server_config, nickname, sync, entry, run_plan);
-        for destination in &planned {
-            if let Some(previous) = destinations.insert(destination.clone(), entry) {
-                return Err(format!(
-                    "duplicate final path '{}' from '{}:{}' and '{}:{}'",
-                    destination,
-                    previous.sync_name.as_str(),
-                    previous.relative_path.as_str(),
-                    entry.sync_name.as_str(),
-                    entry.relative_path.as_str()
-                ));
-            }
-        }
-    }
-
-    let entries_with_rules: std::collections::HashSet<usize> = manifest
-        .entries
-        .iter()
-        .enumerate()
-        .filter(|(_, e)| {
-            sync_map
-                .get(e.sync_name.as_str())
-                .map(|_sync| {
-                    let np = e.relative_path.as_str().to_owned();
-                    let sync = e.sync_name.as_str();
-                    run_plan
-                        .rules
-                        .iter()
-                        .any(|r| r.applies_to(sync) && r.is_match(&np))
-                })
-                .unwrap_or(false)
-        })
-        .map(|(i, _)| i)
-        .collect();
-
-    for (i, entry_a) in manifest.entries.iter().enumerate() {
-        if covered_indices.contains(&i) {
-            continue;
-        }
-        let Some(sync_a) = sync_map.get(entry_a.sync_name.as_str()) else {
-            continue;
-        };
-        let planned_a = planned_entry_outputs(server_config, nickname, sync_a, entry_a, run_plan);
-        for dest_a in &planned_a {
-            for (j, entry_b) in manifest.entries.iter().enumerate() {
-                if i == j || covered_indices.contains(&j) {
-                    continue;
-                }
-                if !entries_with_rules.contains(&i) && !entries_with_rules.contains(&j) {
-                    continue;
-                }
-                let Some(sync_b) = sync_map.get(entry_b.sync_name.as_str()) else {
-                    continue;
-                };
-                let planned_b =
-                    planned_entry_outputs(server_config, nickname, sync_b, entry_b, run_plan);
-                for dest_b in &planned_b {
-                    if dest_a == dest_b {
-                        continue;
-                    }
-                    let a_prefix_of_b = dest_b.as_str().starts_with(dest_a.as_str())
-                        && dest_b.as_str().len() > dest_a.as_str().len()
-                        && dest_b.as_str().as_bytes().get(dest_a.as_str().len()) == Some(&b'/');
-                    let b_prefix_of_a = dest_a.as_str().starts_with(dest_b.as_str())
-                        && dest_a.as_str().len() > dest_b.as_str().len()
-                        && dest_a.as_str().as_bytes().get(dest_b.as_str().len()) == Some(&b'/');
-                    if a_prefix_of_b || b_prefix_of_a {
-                        return Err(format!(
-                            "planned output subtree overlap between '{}:{}' ({}) and \
-                             '{}:{}' ({})",
-                            entry_a.sync_name.as_str(),
-                            entry_a.relative_path.as_str(),
-                            dest_a,
-                            entry_b.sync_name.as_str(),
-                            entry_b.relative_path.as_str(),
-                            dest_b,
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 fn process_manifest_entry(
     server_config: &ServerConfig,
@@ -550,9 +397,7 @@ fn process_manifest_entry(
 }
 
 pub fn process_ready_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> Result<()> {
-    let ready_path = config
-        .work_dir
-        .run_dir(nickname, run_id, RunPhase::Ready);
+    let ready_path = config.work_dir.run_dir(nickname, run_id, RunPhase::Ready);
     let processing_path = config
         .work_dir
         .run_dir(nickname, run_id, RunPhase::Processing);
@@ -683,41 +528,6 @@ pub fn process_processing_run(
             }
         })
         .collect();
-
-    let covered_indices: std::collections::HashSet<usize> = manifest
-        .entries
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| {
-            let Some(_sync) = sync_map.get(entry.sync_name.as_str()) else {
-                return false;
-            };
-            let np = entry.relative_path.as_str().to_owned();
-            let entry_sync = entry.sync_name.as_str();
-            covered_by_dir.iter().any(|(sync_name, prefix)| {
-                sync_name.as_str() == entry_sync
-                    && match np.as_str().strip_prefix(prefix.as_str()) {
-                        Some(tail) => tail.starts_with('/'),
-                        None => false,
-                    }
-            })
-        })
-        .map(|(i, _)| i)
-        .collect();
-
-    if let Err(error) = validate_unique_final_paths(
-        config,
-        nickname,
-        &run_config,
-        &manifest,
-        &run_plan,
-        &covered_indices,
-    ) {
-        let msg = format!("manifest destination validation failed: {error}");
-        warn!("{}", msg);
-        write_run_failure(&config.work_dir, nickname, run_id, &msg)?;
-        anyhow::bail!("{msg}");
-    }
 
     // Write initial progress before processing entries
     write_progress_best_effort(
@@ -871,10 +681,9 @@ pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
                 error = %error,
                 "processing run recovery failed"
             );
-            let processing_path =
-                config
-                    .work_dir
-                    .run_dir(nickname, run_id, RunPhase::Processing);
+            let processing_path = config
+                .work_dir
+                .run_dir(nickname, run_id, RunPhase::Processing);
             if processing_path.exists() {
                 write_run_failure(
                     &config.work_dir,

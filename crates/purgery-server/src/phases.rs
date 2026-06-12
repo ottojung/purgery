@@ -308,11 +308,7 @@ pub(crate) fn finalize_processing_run(
     Ok(())
 }
 
-pub fn move_to_failed(
-    work_dir: &PurgeryRoot,
-    nickname: &Nickname,
-    run_id: &RunId,
-) -> Result<()> {
+pub fn move_to_failed(work_dir: &PurgeryRoot, nickname: &Nickname, run_id: &RunId) -> Result<()> {
     let processing_path = work_dir.run_dir(nickname, run_id, RunPhase::Processing);
     let failed_path = work_dir.run_dir(nickname, run_id, RunPhase::Failed);
 
@@ -503,9 +499,7 @@ pub fn finish_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) ->
         anyhow::bail!("cannot finish run: no lease file found, run may be incomplete");
     }
 
-    let ready_path = config
-        .work_dir
-        .run_dir(nickname, run_id, RunPhase::Ready);
+    let ready_path = config.work_dir.run_dir(nickname, run_id, RunPhase::Ready);
     if ready_path.exists() {
         anyhow::bail!(
             "ready directory already exists for run {}/{} at '{}'",

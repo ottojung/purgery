@@ -9,9 +9,7 @@ use tracing::info;
 #[cfg_attr(not(test), allow(unused_imports))]
 use camino::Utf8Path;
 #[cfg_attr(not(test), allow(unused_imports))]
-use purgery_core::{
-    work_dir, FileStatus, Manifest, ManifestEntryKind, PurgeryRoot, RunConfig, RunState,
-};
+use purgery_core::{FileStatus, Manifest, ManifestEntryKind, PurgeryRoot, RunConfig, RunState};
 
 mod commit;
 mod gc;
@@ -26,16 +24,12 @@ pub use postprocess::{apply_postprocessing, apply_postprocessing_with_heartbeat}
 pub use process::{process_once_raw, process_processing_run, process_ready_run};
 pub use recover::recover_or_process_processing_run;
 
-pub(crate) use process::validate_unique_final_paths;
-
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use commit::{
     commit_directory_entry, commit_regular_file_entry, commit_symlink_entry, CommitDisposition,
 };
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use phases::{write_progress, write_progress_best_effort};
-#[cfg_attr(not(test), allow(unused_imports))]
-pub(crate) use process::planned_entry_outputs;
 
 /// A compiled postprocess rule with resolved step definitions.
 #[derive(Debug)]
@@ -288,60 +282,8 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
         }
     }
 
-    let run_plan = RunPlan::build(config, &run_config)
+    RunPlan::build(config, &run_config)
         .map_err(|e| anyhow::anyhow!("run plan validation failed: {e}"))?;
-
-    let sync_map = run_config.sync_map();
-    let covered_by_dir: std::collections::HashSet<(String, String)> = manifest
-        .entries
-        .iter()
-        .filter(|e| e.kind == purgery_core::ManifestEntryKind::Directory)
-        .filter_map(|dir_entry| {
-            let _sync = sync_map.get(dir_entry.sync_name.as_str())?;
-            let np = dir_entry.relative_path.as_str().to_owned();
-            let matched = run_plan
-                .rules
-                .iter()
-                .any(|rule| rule.applies_to(dir_entry.sync_name.as_str()) && rule.is_match(&np));
-            if matched {
-                Some((dir_entry.sync_name.as_str().to_owned(), np))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    let sync_map2 = run_config.sync_map();
-    let covered_indices: std::collections::HashSet<usize> = manifest
-        .entries
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| {
-            let Some(_sync) = sync_map2.get(entry.sync_name.as_str()) else {
-                return false;
-            };
-            let np2 = entry.relative_path.as_str().to_owned();
-            let entry_sync = entry.sync_name.as_str();
-            covered_by_dir.iter().any(|(sync_name, prefix)| {
-                sync_name.as_str() == entry_sync
-                    && match np2.as_str().strip_prefix(prefix.as_str()) {
-                        Some(tail) => tail.starts_with('/'),
-                        None => false,
-                    }
-            })
-        })
-        .map(|(i, _)| i)
-        .collect();
-
-    validate_unique_final_paths(
-        config,
-        nickname,
-        &run_config,
-        &manifest,
-        &run_plan,
-        &covered_indices,
-    )
-    .map_err(|e| anyhow::anyhow!("destination validation failed: {e}"))?;
 
     let final_root = config.root.as_path().join(nickname.as_str());
     let purgatory_root = incoming_path.join("files");
@@ -942,9 +884,7 @@ delete_after_import = true
         content: &[u8],
     ) -> (ServerConfig, Utf8PathBuf) {
         let config = test_server_config(work_dir, server_root);
-        let ready_path = config
-            .work_dir
-            .run_dir(nickname, run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(nickname, run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
 
         let staged_path = ready_path.join(staged_rel);
@@ -1012,9 +952,7 @@ delete_after_import = true
         );
 
         process_run(&config, &nickname, &run_id).unwrap();
-        let done_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(done_path.exists());
 
         let status_content = fs::read_to_string(done_path.join("status.toml")).unwrap();
@@ -1043,9 +981,7 @@ delete_after_import = true
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-run-002".into()).unwrap();
 
-        let ready_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
 
         // Run config has no sync mappings
@@ -1095,9 +1031,7 @@ delete_after_import = true
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-run-003".into()).unwrap();
 
-        let ready_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
 
         write_run_toml_with_sync(&ready_path, &nickname, "videos", "videos");
@@ -1260,9 +1194,7 @@ delete_after_import = true
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-bad-manifest".into()).unwrap();
 
-        let ready_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
 
         write_run_toml(&ready_path, &nickname);
@@ -1291,9 +1223,7 @@ delete_after_import = true
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-bad-config".into()).unwrap();
 
-        let ready_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
 
         fs::write(ready_path.join("run.toml"), "not valid toml {{{").unwrap();
@@ -1727,9 +1657,7 @@ steps = ["compress-video"]
         process_run(&config, &nickname, &run_id).unwrap();
 
         assert_eq!(fs::read_to_string(&final_path).unwrap(), "new content");
-        let done_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         let status =
             RunStatus::from_toml(&fs::read_to_string(done_path.join("status.toml")).unwrap())
                 .unwrap();
@@ -1760,9 +1688,7 @@ steps = ["compress-video"]
         process_run(&config, &nickname, &run_id).unwrap();
 
         assert_eq!(fs::read_to_string(&final_path).unwrap(), "content");
-        let done_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         let status =
             RunStatus::from_toml(&fs::read_to_string(done_path.join("status.toml")).unwrap())
                 .unwrap();
@@ -1811,9 +1737,7 @@ steps = ["compress-video"]
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-ns".into()).unwrap();
 
-        let ready_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(ready_path.join("files/videos")).unwrap();
         fs::create_dir_all(ready_path.join("files/pictures")).unwrap();
         fs::write(ready_path.join("files/videos/a.mp4"), b"video content").unwrap();
@@ -1887,9 +1811,7 @@ delete_after_import = true
             "picture content"
         );
 
-        let done_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         let status_content = fs::read_to_string(done_path.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
         assert_eq!(status.state, RunState::Done);
@@ -1909,9 +1831,7 @@ delete_after_import = true
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-sp-mismatch".into()).unwrap();
 
-        let ready_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(ready_path.join("files/videos")).unwrap();
         fs::write(ready_path.join("files/videos/a.mp4"), b"content").unwrap();
 
@@ -1978,9 +1898,7 @@ delete_after_import = true
 
         process_run(&config, &nickname, &run_id).unwrap();
 
-        let done_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         let status_content = fs::read_to_string(done_path.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
         assert_eq!(status.state, RunState::Done);
@@ -1998,9 +1916,7 @@ delete_after_import = true
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-symlink".into()).unwrap();
 
-        let ready_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(ready_path.join("files/videos")).unwrap();
 
         let real_file = ready_path.join("files/videos/real.mp4");
@@ -2067,9 +1983,7 @@ delete_after_import = true
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-bad-pattern".into()).unwrap();
 
-        let ready_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(ready_path.join("files/videos")).unwrap();
         fs::write(ready_path.join("files/videos/a.mp4"), b"content").unwrap();
 
@@ -2541,10 +2455,9 @@ steps = ["compress-video"]
         // Begin the run
         begin_run(&server_config, &nickname, &run_id).unwrap();
 
-        let incoming_path =
-            server_config
-                .work_dir
-                .run_dir(&nickname, &run_id, RunPhase::Incoming);
+        let incoming_path = server_config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Incoming);
         assert!(incoming_path.exists());
 
         // Finish it
@@ -2627,10 +2540,9 @@ steps = ["compress-video"]
 
         begin_run(&server_config, &nickname, &run_id).unwrap();
 
-        let incoming_path =
-            server_config
-                .work_dir
-                .run_dir(&nickname, &run_id, RunPhase::Incoming);
+        let incoming_path = server_config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Incoming);
         let lease_path = incoming_path.join("lease.toml");
         let mut lease: purgery_core::LeaseFile =
             toml::from_str(&fs::read_to_string(&lease_path).unwrap()).unwrap();
@@ -2665,10 +2577,9 @@ steps = ["compress-video"]
 
         begin_run(&server_config, &nickname, &run_id).unwrap();
 
-        let incoming_path =
-            server_config
-                .work_dir
-                .run_dir(&nickname, &run_id, RunPhase::Incoming);
+        let incoming_path = server_config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Incoming);
         let lease_path = incoming_path.join("lease.toml");
         let mut lease: purgery_core::LeaseFile =
             toml::from_str(&fs::read_to_string(&lease_path).unwrap()).unwrap();
@@ -2731,24 +2642,20 @@ steps = ["compress-video"]
             "files/documents/a.txt",
             b"hello",
         );
-        let ready = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         let processing = config
             .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Processing);
         fs::create_dir_all(processing.parent().unwrap()).unwrap();
         fs::rename(&ready, &processing).unwrap();
-        let stale_work = work_dir(&config.work_dir, &nickname, &run_id);
+        let stale_work = purgery_core::work_dir(&config.work_dir, &nickname, &run_id);
         fs::create_dir_all(&stale_work).unwrap();
         fs::write(stale_work.join("stale"), b"stale").unwrap();
 
         process_once_raw(&config).unwrap();
 
         assert!(!processing.exists());
-        let done = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(done.join("status.toml").exists());
         assert_eq!(
             fs::read_to_string(server_root.join("laptop/documents/a.txt")).unwrap(),
@@ -2968,9 +2875,7 @@ steps = ["compress-video"]
             "files/documents/a.txt",
             b"new",
         );
-        let ready = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         let processing = config
             .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Processing);
@@ -2984,9 +2889,7 @@ steps = ["compress-video"]
         process_once_raw(&config).unwrap();
 
         assert_eq!(fs::read_to_string(&final_path).unwrap(), "new");
-        let done = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         let status =
             RunStatus::from_toml(&fs::read_to_string(done.join("status.toml")).unwrap()).unwrap();
         assert_eq!(status.state, RunState::Done);
@@ -3281,9 +3184,7 @@ steps = ["compress-video"]
         let config = test_server_config(&work_dir, &server_root);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("tree-overlay".into()).unwrap();
-        let ready = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         let staged = ready.join("files/data/tree");
         fs::create_dir_all(&staged).unwrap();
         fs::write(staged.join("new.txt"), "new").unwrap();
@@ -3338,9 +3239,7 @@ steps = ["compress-video"]
             fs::read_link(final_tree.join("link")).unwrap(),
             std::path::Path::new("../target")
         );
-        let done = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         let status =
             RunStatus::from_toml(&fs::read_to_string(done.join("status.toml")).unwrap()).unwrap();
         assert_eq!(status.state, RunState::Done);
@@ -3358,9 +3257,7 @@ steps = ["compress-video"]
         let config = test_server_config(&work_dir, &server_root);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("requested".into()).unwrap();
-        let done = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         fs::create_dir_all(&done).unwrap();
         let status = RunStatus {
             run_id: RunId::new("different".into()).unwrap(),
@@ -3512,632 +3409,6 @@ steps = ["compress-video"]
         )
         .unwrap_err();
         assert!(error.contains("expected output is not a supported entry type"));
-    }
-
-    fn duplicate_path_test_entry(
-        sync_name: &str,
-        relative_path: &str,
-        kind: ManifestEntryKind,
-    ) -> ManifestEntry {
-        ManifestEntry {
-            sync_name: SyncName::new(sync_name.into()).unwrap(),
-            local_path: ClientLocalPath::new(format!("/source/{sync_name}/{relative_path}"))
-                .unwrap(),
-            staged_path: NormalizedRelativePath::new(
-                format!("files/{sync_name}/{relative_path}").into(),
-            )
-            .unwrap(),
-            relative_path: NormalizedRelativePath::new(relative_path.into()).unwrap(),
-            kind,
-            size: 0,
-            mtime_ns: 0,
-            sha256: None,
-            link_target: None,
-            mode: purgery_core::ManifestEntryMode::Postprocess,
-            postprocess_steps: Vec::new(),
-            covered_by: None,
-        }
-    }
-
-    fn duplicate_path_run_config(first_to: &str, second_to: &str) -> RunConfig {
-        RunConfig::from_toml(&format!(
-            r#"
-nickname = "laptop"
-
-[[sync]]
-name = "first"
-to = "{first_to}"
-
-[[sync]]
-name = "second"
-to = "{second_to}"
-"#,
-        ))
-        .unwrap()
-    }
-
-    #[test]
-    fn duplicate_final_file_paths_across_syncs_are_rejected() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let purgery = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let config = test_server_config(&purgery, &root);
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_config = duplicate_path_run_config("shared", "shared");
-        let manifest = Manifest {
-            run_id: RunId::new("duplicate-files".into()).unwrap(),
-            nickname: nickname.clone(),
-            entries: vec![
-                duplicate_path_test_entry("first", "same.txt", ManifestEntryKind::RegularFile),
-                duplicate_path_test_entry("second", "same.txt", ManifestEntryKind::RegularFile),
-            ],
-        };
-
-        let empty_plan = RunPlan { rules: vec![] };
-        let empty_covered = std::collections::HashSet::new();
-        let error = validate_unique_final_paths(
-            &config,
-            &nickname,
-            &run_config,
-            &manifest,
-            &empty_plan,
-            &empty_covered,
-        )
-        .unwrap_err();
-        assert!(error.contains("duplicate final path"));
-    }
-
-    #[test]
-    fn identical_relative_paths_under_different_destinations_are_allowed() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let purgery = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let config = test_server_config(&purgery, &root);
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_config = duplicate_path_run_config("first-dest", "second-dest");
-        let empty_plan = RunPlan { rules: vec![] };
-        let empty_covered = std::collections::HashSet::new();
-        let manifest = Manifest {
-            run_id: RunId::new("distinct-files".into()).unwrap(),
-            nickname: nickname.clone(),
-            entries: vec![
-                duplicate_path_test_entry("first", "same.txt", ManifestEntryKind::RegularFile),
-                duplicate_path_test_entry("second", "same.txt", ManifestEntryKind::RegularFile),
-            ],
-        };
-
-        validate_unique_final_paths(
-            &config,
-            &nickname,
-            &run_config,
-            &manifest,
-            &empty_plan,
-            &empty_covered,
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn duplicate_final_directory_paths_across_syncs_are_rejected() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let purgery = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let config = test_server_config(&purgery, &root);
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_config = duplicate_path_run_config("shared", "shared");
-        let empty_plan = RunPlan { rules: vec![] };
-        let empty_covered = std::collections::HashSet::new();
-        let manifest = Manifest {
-            run_id: RunId::new("duplicate-directories".into()).unwrap(),
-            nickname: nickname.clone(),
-            entries: vec![
-                duplicate_path_test_entry("first", "same-dir", ManifestEntryKind::Directory),
-                duplicate_path_test_entry("second", "same-dir", ManifestEntryKind::Directory),
-            ],
-        };
-
-        let error = validate_unique_final_paths(
-            &config,
-            &nickname,
-            &run_config,
-            &manifest,
-            &empty_plan,
-            &empty_covered,
-        )
-        .unwrap_err();
-        assert!(error.contains("duplicate final path"));
-    }
-
-    #[test]
-    fn processing_rejects_duplicate_final_paths_before_importing_entries() {
-        let tmp = tempfile::tempdir().unwrap();
-        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_id = RunId::new("duplicate-run".into()).unwrap();
-        let ready = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
-        fs::create_dir_all(ready.join("files/shared")).unwrap();
-        fs::write(ready.join("files/shared/same.txt"), "staged").unwrap();
-        fs::write(
-            ready.join("run.toml"),
-            r#"
-nickname = "laptop"
-
-[[sync]]
-name = "first"
-to = "shared"
-delete_after_import = true
-
-[[sync]]
-name = "second"
-to = "shared"
-delete_after_import = true
-"#,
-        )
-        .unwrap();
-        let manifest = Manifest {
-            run_id: run_id.clone(),
-            nickname: nickname.clone(),
-            entries: vec![
-                ManifestEntry {
-                    sync_name: SyncName::new("first".into()).unwrap(),
-                    local_path: ClientLocalPath::new("/source/first/same.txt".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/shared/same.txt".into())
-                        .unwrap(),
-                    relative_path: NormalizedRelativePath::new("same.txt".into()).unwrap(),
-                    kind: ManifestEntryKind::RegularFile,
-                    size: 6,
-                    mtime_ns: 0,
-                    sha256: None,
-                    link_target: None,
-                    mode: Default::default(),
-                    postprocess_steps: Vec::new(),
-                    covered_by: None,
-                },
-                ManifestEntry {
-                    sync_name: SyncName::new("second".into()).unwrap(),
-                    local_path: ClientLocalPath::new("/source/second/same.txt".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/shared/same.txt".into())
-                        .unwrap(),
-                    relative_path: NormalizedRelativePath::new("same.txt".into()).unwrap(),
-                    kind: ManifestEntryKind::RegularFile,
-                    size: 6,
-                    mtime_ns: 0,
-                    sha256: None,
-                    link_target: None,
-                    mode: Default::default(),
-                    postprocess_steps: Vec::new(),
-                    covered_by: None,
-                },
-            ],
-        };
-        fs::write(ready.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
-
-        assert!(process_run(&config, &nickname, &run_id).is_err());
-        assert!(!server_root.join("laptop/shared/same.txt").exists());
-        let failed = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Failed);
-        let status =
-            RunStatus::from_toml(&fs::read_to_string(failed.join("status.toml")).unwrap()).unwrap();
-        assert!(status.entries.is_empty());
-        assert!(status
-            .error
-            .as_deref()
-            .unwrap()
-            .contains("duplicate final path"));
-    }
-
-    // ── Postprocess-derived duplicate final path tests ──
-
-    #[test]
-    fn postprocessed_directory_does_not_cause_false_overlap_rejection() {
-        // Postprocessed directory + descendant file must not trigger a false
-        // overlap validation failure.  The descendant should be skipped as
-        // covered, not rejected as a planned-path conflict.
-        let tmp = tempfile::tempdir().unwrap();
-        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_id = RunId::new("dir-transform".into()).unwrap();
-        let ready = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
-
-        // Create staged directory with child file
-        fs::create_dir_all(ready.join("files/data/photos")).unwrap();
-        fs::write(ready.join("files/data/photos/photo.txt"), "content").unwrap();
-
-        // Run config with a postprocess rule that matches the directory
-        let run_config_src = r#"
-nickname = "laptop"
-
-[[sync]]
-name = "data"
-to = "data"
-delete_after_import = true
-
-[[postprocess.rules]]
-match = "photos"
-steps = ["pack"]
-"#;
-        fs::write(ready.join("run.toml"), run_config_src).unwrap();
-        // Server config with a matching step
-        let config = ServerConfig {
-            root: ServerRoot::new(server_root.clone()).unwrap(),
-            work_dir: PurgeryRoot::new(work_dir.clone()).unwrap(),
-            gc: Default::default(),
-            postprocess: PostprocessConfig {
-                steps: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        "pack".to_owned(),
-                        PostprocessStepDefinition {
-                            kind: PostprocessKind::Subprocess,
-                            program: "true".into(),
-                            args: vec![],
-                            expected_outputs: vec![],
-                            keep_original: true,
-                        },
-                    );
-                    m
-                },
-            },
-            logging: Default::default(),
-        };
-
-        let manifest = Manifest {
-            run_id: run_id.clone(),
-            nickname: nickname.clone(),
-            entries: vec![
-                ManifestEntry {
-                    sync_name: SyncName::new("data".into()).unwrap(),
-                    local_path: ClientLocalPath::new("/source/photos".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/data/photos".into()).unwrap(),
-                    relative_path: NormalizedRelativePath::new("photos".into()).unwrap(),
-                    kind: ManifestEntryKind::Directory,
-                    size: 0,
-                    mtime_ns: 0,
-                    sha256: None,
-                    link_target: None,
-                    mode: Default::default(),
-                    postprocess_steps: Vec::new(),
-                    covered_by: None,
-                },
-                ManifestEntry {
-                    sync_name: SyncName::new("data".into()).unwrap(),
-                    local_path: ClientLocalPath::new("/source/photos/photo.txt".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/data/photos/photo.txt".into())
-                        .unwrap(),
-                    relative_path: NormalizedRelativePath::new("photos/photo.txt".into()).unwrap(),
-                    kind: ManifestEntryKind::RegularFile,
-                    size: 7,
-                    mtime_ns: 0,
-                    sha256: None,
-                    link_target: None,
-                    mode: Default::default(),
-                    postprocess_steps: Vec::new(),
-                    covered_by: None,
-                },
-            ],
-        };
-        fs::write(ready.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
-
-        // This must succeed — no false overlap rejection.
-        assert!(
-            process_run(&config, &nickname, &run_id).is_ok(),
-            "postprocessed directory with descendant must not be rejected by overlap validation"
-        );
-
-        // The descendant should be skipped, not imported independently.
-        let status = read_run_status(&config, &nickname, &run_id).unwrap();
-        assert_eq!(status.entries.len(), 2);
-        let dir_entry = &status.entries[0];
-        let child_entry = &status.entries[1];
-        assert_eq!(dir_entry.kind, ManifestEntryKind::Directory);
-        assert_eq!(dir_entry.status, FileStatus::Imported);
-        assert_eq!(child_entry.status, FileStatus::Skipped);
-        assert!(
-            child_entry
-                .error
-                .as_deref()
-                .unwrap()
-                .contains("covered by postprocessed ancestor"),
-            "child must be skipped: {:?}",
-            child_entry.error
-        );
-    }
-
-    fn postprocess_collision_run_config() -> RunConfig {
-        RunConfig::from_toml(
-            r#"
-nickname = "laptop"
-
-[[sync]]
-name = "data"
-to = "data"
-
-[[postprocess.rules]]
-match = "*.txt"
-steps = ["compress"]
-"#,
-        )
-        .unwrap()
-    }
-
-    fn postprocess_collision_run_plan() -> RunPlan {
-        RunPlan {
-            rules: vec![CompiledRule {
-                pattern: "*.txt".into(),
-                sync_names: None,
-                steps: vec![ResolvedStep {
-                    step_name: "compress".into(),
-                    step_def: PostprocessStepDefinition {
-                        kind: PostprocessKind::Subprocess,
-                        program: "true".into(),
-                        args: vec![],
-                        expected_outputs: vec!["{stem}.Z.webm".into()],
-                        keep_original: true,
-                    },
-                }],
-            }],
-        }
-    }
-
-    #[test]
-    fn postprocess_output_collides_with_manifest_entry() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let purgery = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let config = test_server_config(&purgery, &root);
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_config = postprocess_collision_run_config();
-        let run_plan = postprocess_collision_run_plan();
-
-        let manifest = Manifest {
-            run_id: RunId::new("pp-collision".into()).unwrap(),
-            nickname: nickname.clone(),
-            entries: vec![
-                // document.txt → postprocess (keep_original) produces document.txt + document.Z.webm
-                ManifestEntry {
-                    sync_name: SyncName::new("data".into()).unwrap(),
-                    local_path: ClientLocalPath::new("/source/data/document.txt".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/data/document.txt".into())
-                        .unwrap(),
-                    relative_path: NormalizedRelativePath::new("document.txt".into()).unwrap(),
-                    kind: ManifestEntryKind::RegularFile,
-                    size: 100,
-                    mtime_ns: 0,
-                    sha256: None,
-                    link_target: None,
-                    mode: Default::default(),
-                    postprocess_steps: Vec::new(),
-                    covered_by: None,
-                },
-                // document.Z.webm — would collide with the postprocess output above
-                ManifestEntry {
-                    sync_name: SyncName::new("data".into()).unwrap(),
-                    local_path: ClientLocalPath::new("/source/data/document.Z.webm".into())
-                        .unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/data/document.Z.webm".into())
-                        .unwrap(),
-                    relative_path: NormalizedRelativePath::new("document.Z.webm".into()).unwrap(),
-                    kind: ManifestEntryKind::RegularFile,
-                    size: 200,
-                    mtime_ns: 0,
-                    sha256: None,
-                    link_target: None,
-                    mode: Default::default(),
-                    postprocess_steps: Vec::new(),
-                    covered_by: None,
-                },
-            ],
-        };
-
-        let empty_covered = std::collections::HashSet::new();
-        let error = validate_unique_final_paths(
-            &config,
-            &nickname,
-            &run_config,
-            &manifest,
-            &run_plan,
-            &empty_covered,
-        )
-        .unwrap_err();
-        assert!(
-            error.contains("duplicate final path"),
-            "error must mention duplicate final path: {error}"
-        );
-        assert!(
-            error.contains("document.Z.webm"),
-            "error must mention the colliding filename: {error}"
-        );
-    }
-
-    #[test]
-    fn postprocess_output_from_two_entries_collides() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let purgery = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let config = test_server_config(&purgery, &root);
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_config = RunConfig::from_toml(
-            r#"
-nickname = "laptop"
-
-[[sync]]
-name = "data"
-to = "data"
-
-[[postprocess.rules]]
-match = "*.txt"
-steps = ["compress"]
-"#,
-        )
-        .unwrap();
-
-        let pp_plan = RunPlan {
-            rules: vec![CompiledRule {
-                pattern: "*.txt".into(),
-                sync_names: None,
-                steps: vec![ResolvedStep {
-                    step_name: "generate".into(),
-                    step_def: PostprocessStepDefinition {
-                        kind: PostprocessKind::Subprocess,
-                        program: "true".into(),
-                        args: vec![],
-                        expected_outputs: vec!["result.bin".into()],
-                        keep_original: false,
-                    },
-                }],
-            }],
-        };
-
-        let manifest = Manifest {
-            run_id: RunId::new("pp-cross-entry".into()).unwrap(),
-            nickname: nickname.clone(),
-            entries: vec![
-                ManifestEntry {
-                    sync_name: SyncName::new("data".into()).unwrap(),
-                    local_path: ClientLocalPath::new("/source/data/a.txt".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/data/a.txt".into()).unwrap(),
-                    relative_path: NormalizedRelativePath::new("a.txt".into()).unwrap(),
-                    kind: ManifestEntryKind::RegularFile,
-                    size: 50,
-                    mtime_ns: 0,
-                    sha256: None,
-                    link_target: None,
-                    mode: Default::default(),
-                    postprocess_steps: Vec::new(),
-                    covered_by: None,
-                },
-                ManifestEntry {
-                    sync_name: SyncName::new("data".into()).unwrap(),
-                    local_path: ClientLocalPath::new("/source/data/b.txt".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/data/b.txt".into()).unwrap(),
-                    relative_path: NormalizedRelativePath::new("b.txt".into()).unwrap(),
-                    kind: ManifestEntryKind::RegularFile,
-                    size: 60,
-                    mtime_ns: 0,
-                    sha256: None,
-                    link_target: None,
-                    mode: Default::default(),
-                    postprocess_steps: Vec::new(),
-                    covered_by: None,
-                },
-            ],
-        };
-
-        let empty_covered = std::collections::HashSet::new();
-        let error = validate_unique_final_paths(
-            &config,
-            &nickname,
-            &run_config,
-            &manifest,
-            &pp_plan,
-            &empty_covered,
-        )
-        .unwrap_err();
-        assert!(
-            error.contains("duplicate final path"),
-            "error must mention duplicate final path: {error}"
-        );
-    }
-
-    #[test]
-    fn postprocess_output_collides_with_directory_entry() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let purgery = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let config = test_server_config(&purgery, &root);
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_config = RunConfig::from_toml(
-            r#"
-nickname = "laptop"
-
-[[sync]]
-name = "data"
-to = "data"
-
-[[postprocess.rules]]
-match = "*.txt"
-steps = ["compress"]
-"#,
-        )
-        .unwrap();
-        let run_plan = RunPlan {
-            rules: vec![CompiledRule {
-                pattern: "*.txt".into(),
-                sync_names: None,
-                steps: vec![ResolvedStep {
-                    step_name: "compress".into(),
-                    step_def: PostprocessStepDefinition {
-                        kind: PostprocessKind::Subprocess,
-                        program: "true".into(),
-                        args: vec![],
-                        expected_outputs: vec!["output_dir".into()],
-                        keep_original: true,
-                    },
-                }],
-            }],
-        };
-
-        let manifest = Manifest {
-            run_id: RunId::new("pp-dir-collision".into()).unwrap(),
-            nickname: nickname.clone(),
-            entries: vec![
-                ManifestEntry {
-                    sync_name: SyncName::new("data".into()).unwrap(),
-                    local_path: ClientLocalPath::new("/source/data/input.txt".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/data/input.txt".into())
-                        .unwrap(),
-                    relative_path: NormalizedRelativePath::new("input.txt".into()).unwrap(),
-                    kind: ManifestEntryKind::RegularFile,
-                    size: 50,
-                    mtime_ns: 0,
-                    sha256: None,
-                    link_target: None,
-                    mode: Default::default(),
-                    postprocess_steps: Vec::new(),
-                    covered_by: None,
-                },
-                // Directory with the same name as the postprocess output
-                ManifestEntry {
-                    sync_name: SyncName::new("data".into()).unwrap(),
-                    local_path: ClientLocalPath::new("/source/data/output_dir".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/data/output_dir".into())
-                        .unwrap(),
-                    relative_path: NormalizedRelativePath::new("output_dir".into()).unwrap(),
-                    kind: ManifestEntryKind::Directory,
-                    size: 0,
-                    mtime_ns: 0,
-                    sha256: None,
-                    link_target: None,
-                    mode: Default::default(),
-                    postprocess_steps: Vec::new(),
-                    covered_by: None,
-                },
-            ],
-        };
-
-        let empty_covered = std::collections::HashSet::new();
-        let error = validate_unique_final_paths(
-            &config,
-            &nickname,
-            &run_config,
-            &manifest,
-            &run_plan,
-            &empty_covered,
-        )
-        .unwrap_err();
-        assert!(
-            error.contains("duplicate final path"),
-            "error must mention duplicate final path: {error}"
-        );
     }
 
     #[test]
@@ -4660,9 +3931,7 @@ steps = ["pack"]
         let run_id = RunId::new("no-passthrough-status".into()).unwrap();
 
         // Create a ready run with only postprocess/covered entries (no passthrough)
-        let ready_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(ready_path.join("files/data/photos")).unwrap();
         fs::write(ready_path.join("files/data/photos/photo.txt"), b"photo").unwrap();
 
@@ -4726,9 +3995,7 @@ steps = ["pack"]
 
         process_run(&config, &nickname, &run_id).unwrap();
 
-        let done_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         let status_content = fs::read_to_string(done_path.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
 
@@ -4950,9 +4217,7 @@ steps = ["pack"]
         };
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("scoped-coverage".into()).unwrap();
-        let ready = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
 
         // Set up two sync groups: "videos" (with album dir) and "docs" (with album dir)
         fs::create_dir_all(ready.join("files/videos/album")).unwrap();
@@ -5057,9 +4322,7 @@ for = ["videos"]
         // Processing must succeed — the docs entries are valid passthrough
         process_run(&config, &nickname, &run_id).unwrap();
 
-        let done = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         let status_content = fs::read_to_string(done.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
 
@@ -5214,9 +4477,7 @@ postprocess_steps = ["pack"]
         };
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("scoped-processing".into()).unwrap();
-        let ready = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
 
         // videos/ has a matching file pattern, but the rule is scoped to "pictures"
         fs::create_dir_all(ready.join("files/videos")).unwrap();
@@ -5264,9 +4525,7 @@ for = ["pictures"]
 
         // process_run must succeed — the rule is out of scope for videos
         process_run(&config, &nickname, &run_id).unwrap();
-        let done = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         let status_content = fs::read_to_string(done.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
         // videos/a.mp4 must be imported as passthrough, not processed by pack
@@ -5275,122 +4534,6 @@ for = ["pictures"]
         assert!(
             status.entries[0].postprocess.is_none()
                 || status.entries[0].postprocess.as_deref() == Some(&[])
-        );
-    }
-
-    #[test]
-    fn out_of_scope_rule_does_not_affect_planned_outputs() {
-        let tmp = tempfile::tempdir().unwrap();
-        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir, &server_root);
-        let config = ServerConfig {
-            postprocess: PostprocessConfig {
-                steps: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        "pack".to_owned(),
-                        PostprocessStepDefinition {
-                            kind: PostprocessKind::Subprocess,
-                            program: "true".into(),
-                            args: vec![],
-                            expected_outputs: vec!["{file_stem}.out".into()],
-                            keep_original: true,
-                        },
-                    );
-                    m
-                },
-            },
-            ..config
-        };
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_id = RunId::new("scoped-outputs".into()).unwrap();
-        let incoming = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Incoming);
-        fs::create_dir_all(&incoming).unwrap();
-        fs::create_dir_all(incoming.join("files/videos")).unwrap();
-        fs::write(incoming.join("files/videos/album"), b"video-data").unwrap();
-        fs::write(
-            incoming.join("run.toml"),
-            br#"nickname = "laptop"
-[[sync]]
-name = "videos"
-to = "videos"
-delete_after_import = true
-
-[[sync]]
-name = "pictures"
-to = "pictures"
-delete_after_import = true
-
-[[postprocess.rules]]
-match = "album"
-steps = ["pack"]
-for = ["videos"]
-"#,
-        )
-        .unwrap();
-
-        // Build the run config and run plan
-        let run_config_content = fs::read_to_string(incoming.join("run.toml")).unwrap();
-        let run_config = purgery_core::RunConfig::from_toml(&run_config_content).unwrap();
-        let run_plan = RunPlan::build(&config, &run_config).unwrap();
-        let sync_map = run_config.sync_map();
-
-        // Create entries with the same relative path but different sync groups
-        let videos_entry = ManifestEntry {
-            sync_name: SyncName::new("videos".into()).unwrap(),
-            local_path: ClientLocalPath::new("/src/videos/album".into()).unwrap(),
-            staged_path: NormalizedRelativePath::new("files/videos/album".into()).unwrap(),
-            relative_path: NormalizedRelativePath::new("album".into()).unwrap(),
-            kind: ManifestEntryKind::RegularFile,
-            size: 9,
-            mtime_ns: 100,
-            sha256: None,
-            link_target: None,
-            mode: purgery_core::ManifestEntryMode::Postprocess,
-            postprocess_steps: vec!["pack".into()],
-            covered_by: None,
-        };
-        let pictures_entry = ManifestEntry {
-            sync_name: SyncName::new("pictures".into()).unwrap(),
-            local_path: ClientLocalPath::new("/src/pictures/album".into()).unwrap(),
-            staged_path: NormalizedRelativePath::new("files/pictures/album".into()).unwrap(),
-            relative_path: NormalizedRelativePath::new("album".into()).unwrap(),
-            kind: ManifestEntryKind::RegularFile,
-            size: 12,
-            mtime_ns: 200,
-            sha256: None,
-            link_target: None,
-            mode: purgery_core::ManifestEntryMode::Postprocess,
-            postprocess_steps: vec!["pack".into()],
-            covered_by: None,
-        };
-
-        let videos_sync = sync_map.get("videos").unwrap();
-        let pictures_sync = sync_map.get("pictures").unwrap();
-
-        let videos_outputs =
-            planned_entry_outputs(&config, &nickname, videos_sync, &videos_entry, &run_plan);
-        let pictures_outputs = planned_entry_outputs(
-            &config,
-            &nickname,
-            pictures_sync,
-            &pictures_entry,
-            &run_plan,
-        );
-
-        // videos/album should have postprocess outputs (keep_original + .out)
-        assert!(
-            videos_outputs.len() >= 2,
-            "videos/album should have postprocess outputs, got: {videos_outputs:?}"
-        );
-        // pictures/album should have only its own final path (no rule applies)
-        assert_eq!(
-            pictures_outputs.len(),
-            1,
-            "pictures/album should have only its own final path, got: {pictures_outputs:?}"
         );
     }
 
@@ -5421,9 +4564,7 @@ for = ["videos"]
         };
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("processing-no-delete".into()).unwrap();
-        let ready = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(ready.join("files/videos")).unwrap();
         fs::write(ready.join("files/videos/a.mp4"), b"content").unwrap();
 
@@ -6675,9 +5816,7 @@ steps = ["pack"]
 
         process_run(&config, &nickname, &run_id).unwrap();
 
-        let done_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(done_path.exists());
 
         let expected = vec![
@@ -6697,9 +5836,7 @@ steps = ["pack"]
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-fail".into()).unwrap();
 
-        let ready_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
 
         write_run_toml_with_sync(&ready_path, &nickname, "videos", "videos");
@@ -6770,9 +5907,7 @@ steps = ["pack"]
             logging: Default::default(),
         };
 
-        let ready_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
         let staged_dir = ready_path.join("files/videos");
         fs::create_dir_all(&staged_dir).unwrap();
@@ -7132,9 +6267,7 @@ steps = ["echo-args"]
         let processing_path = config
             .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Processing);
-        let ready_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(processing_path.parent().unwrap()).unwrap();
         fs::rename(&ready_path, &processing_path).unwrap();
 
@@ -7147,9 +6280,7 @@ steps = ["echo-args"]
         // Replay: process_once_raw handles recovery from processing/ directory
         process_once_raw(&config).unwrap();
 
-        let done_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(
             done_path.exists(),
             "run should be in done phase after replay"
@@ -7583,9 +6714,7 @@ steps = ["make-tree"]
 
         // Add a second entry that will fail (missing staged file) after the
         // first one succeeds.
-        let ready_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         let mut manifest: Manifest =
             toml::from_str(&fs::read_to_string(ready_path.join("manifest.toml")).unwrap()).unwrap();
         manifest.entries.push(ManifestEntry {
@@ -7611,9 +6740,7 @@ steps = ["make-tree"]
 
         process_run(&config, &nickname, &run_id).unwrap();
 
-        let done_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(
             done_path.exists(),
             "run with one success and one failure should be in done phase"
@@ -7662,9 +6789,7 @@ steps = ["make-tree"]
         let run_id = RunId::new("test-symlink-staged".into()).unwrap();
 
         let config = test_server_config(&work_dir, &server_root);
-        let ready_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
 
         // Create staged symlink under files/.
@@ -7719,9 +6844,7 @@ steps = ["make-tree"]
 
         process_run(&config, &nickname, &run_id).unwrap();
 
-        let done_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(done_path.exists());
 
         let status: RunStatus =
@@ -7780,9 +6903,7 @@ steps = ["make-tree"]
         let processing_path = config
             .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Processing);
-        let ready_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(processing_path.parent().unwrap()).unwrap();
         fs::rename(&ready_path, &processing_path).unwrap();
 
@@ -7798,9 +6919,7 @@ steps = ["make-tree"]
         // Replay.
         process_once_raw(&config).unwrap();
 
-        let done_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(done_path.exists());
 
         // Staged file must still exist after replay and contain unchanged
@@ -7853,9 +6972,7 @@ steps = ["make-tree"]
 
         process_run(&config, &nickname, &run_id).unwrap();
 
-        let done_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(done_path.exists());
 
         // Staged original must still exist.
@@ -7901,9 +7018,7 @@ steps = ["make-tree"]
         let run_id = RunId::new("test-symlink-consumed".into()).unwrap();
 
         let config = test_server_config(&work_dir, &server_root);
-        let ready_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
 
         let staged_dir = ready_path.join("files/data");
@@ -7939,9 +7054,7 @@ steps = ["make-tree"]
 
         process_run(&config, &nickname, &run_id).unwrap();
 
-        let done_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(done_path.exists());
 
         // Staged original symlink must still exist.
