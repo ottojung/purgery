@@ -219,7 +219,7 @@ Purgatory (Mode 3) entries are prepared into the work area before final material
 * **Symlink**: created in the work area with the same literal target as the staged symlink. Symlinks are never followed.
 * **Directory**: the staged subtree is copied into the work area, preserving directories, regular files, and symlinks as symlinks. Unsupported filesystem objects inside the subtree fail the directory entry.
 
-For postprocess entries, the work-area copy serves as input to the subprocess. For non-postprocess purgatory entries, the work-area copy is moved to final storage, consuming it; the original staged file is preserved.
+For postprocess entries, the work-area copy serves as input to the subprocess. For Mode 3 entries, the work-area copy serves as input to the subprocess and/or as the materialization source for postprocess outputs. Passthrough entries, including nonmatching entries in a purgatory sync group, do not use a work area.
 
 Passthrough entries (Modes 1 and 2) do not use a work area. They are transferred directly to final storage.
 
