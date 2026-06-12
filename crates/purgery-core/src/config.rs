@@ -317,5 +317,5 @@ pub struct ClientRunState {
     pub run_config: String,
     pub phase: ClientRunPhase,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub status_toml: Option<String>,
+    pub terminal_status: Option<String>,
 }

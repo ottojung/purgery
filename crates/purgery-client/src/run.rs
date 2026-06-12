@@ -259,7 +259,7 @@ fn persist_client_run_state(
     server_command: &str,
     manifest: &Manifest,
     run_config: &RunConfig,
-    status_toml: Option<&str>,
+    terminal_status: Option<&str>,
     phase: ClientRunPhase,
 ) -> Result<()> {
     let run_state = ClientRunState {
@@ -270,7 +270,7 @@ fn persist_client_run_state(
         server_command: server_command.to_owned(),
         manifest: manifest.to_toml()?,
         run_config: run_config.to_toml()?,
-        status_toml: status_toml.map(|s| s.to_owned()),
+        terminal_status: terminal_status.map(|s| s.to_owned()),
         phase,
     };
     let dir = camino::Utf8PathBuf::from(state_dir)
@@ -439,7 +439,7 @@ fn resume_one(state_dir: &str, state: &ClientRunState) -> Result<bool> {
             if status.nickname != nickname || status.run_id != run_id {
                 anyhow::bail!("server status envelope does not match persisted run");
             }
-            let status_toml = toml::to_string(&status)
+            let terminal_status = toml::to_string(&status)
                 .map_err(|e| anyhow::anyhow!("status serialization: {e}"))?;
             persist_client_run_state(
                 state_dir,
@@ -449,7 +449,7 @@ fn resume_one(state_dir: &str, state: &ClientRunState) -> Result<bool> {
                 server_cmd,
                 &manifest,
                 &run_config,
-                Some(&status_toml),
+                Some(&terminal_status),
                 ClientRunPhase::TerminalStatusSeen,
             )?;
             process_cleanup_from_status(
@@ -465,7 +465,7 @@ fn resume_one(state_dir: &str, state: &ClientRunState) -> Result<bool> {
             Ok(true)
         }
         ClientRunPhase::TerminalStatusSeen => {
-            let status = match &state.status_toml {
+            let status = match &state.terminal_status {
                 Some(toml_str) => {
                     toml::from_str(toml_str).with_context(|| "failed to parse persisted status")?
                 }
@@ -787,7 +787,7 @@ pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
         anyhow::bail!("server status envelope does not match requested run");
     }
 
-    let status_toml =
+    let terminal_status =
         toml::to_string(&status).map_err(|e| anyhow::anyhow!("status serialization: {e}"))?;
     persist_client_run_state(
         &state_dir,
@@ -797,7 +797,7 @@ pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
         server_cmd,
         &manifest,
         &run_config,
-        Some(&status_toml),
+        Some(&terminal_status),
         ClientRunPhase::TerminalStatusSeen,
     )?;
 
@@ -1002,7 +1002,7 @@ mod tests {
             delete_after_import: true,
         };
 
-        // Simulate TerminalStatusSeen with persisted status_toml
+        // Simulate TerminalStatusSeen with persisted terminal status
         let status = RunStatus {
             run_id: RunId::new("test-tss".into()).unwrap(),
             nickname: Nickname::new("laptop".into()).unwrap(),
@@ -1010,7 +1010,7 @@ mod tests {
             entries: vec![],
             error: None,
         };
-        let status_toml = toml::to_string(&status).unwrap();
+        let terminal_status = toml::to_string(&status).unwrap();
 
         persist_client_run_state(
             &state_dir,
@@ -1020,15 +1020,15 @@ mod tests {
             "purgery-server",
             &manifest,
             &run_config,
-            Some(&status_toml),
+            Some(&terminal_status),
             ClientRunPhase::TerminalStatusSeen,
         )
         .unwrap();
 
-        // Resume should complete immediately without SSH (using persisted status)
+        // Resume should complete immediately without SSH (using persisted terminal status)
         let result = resume_runs(&state_dir);
         // Should succeed because cleanup is a no-op for empty entries,
-        // and the persisted status_toml avoids needing SSH.
+        // and the persisted terminal_status avoids needing SSH.
         assert!(result.is_ok());
     }
 
