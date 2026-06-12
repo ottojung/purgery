@@ -883,9 +883,7 @@ delete_after_import = true
         content: &[u8],
     ) -> (ServerConfig, Utf8PathBuf) {
         let config = test_server_config(work_dir, server_root);
-        let ready_path = config
-            .work_dir
-            .run_dir(nickname, run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(nickname, run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
 
         let staged_path = ready_path.join(staged_rel);
@@ -953,9 +951,7 @@ delete_after_import = true
         );
 
         process_run(&config, &nickname, &run_id).unwrap();
-        let done_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(done_path.exists());
 
         let status_content = fs::read_to_string(done_path.join("status.toml")).unwrap();
@@ -984,9 +980,7 @@ delete_after_import = true
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-run-002".into()).unwrap();
 
-        let ready_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
 
         // Run config has no sync mappings
@@ -1036,9 +1030,7 @@ delete_after_import = true
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-run-003".into()).unwrap();
 
-        let ready_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
 
         write_run_toml_with_sync(&ready_path, &nickname, "videos", "videos");
@@ -1201,9 +1193,7 @@ delete_after_import = true
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-bad-manifest".into()).unwrap();
 
-        let ready_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
 
         write_run_toml(&ready_path, &nickname);
@@ -1232,9 +1222,7 @@ delete_after_import = true
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-bad-config".into()).unwrap();
 
-        let ready_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
 
         fs::write(ready_path.join("run.toml"), "not valid toml {{{").unwrap();
@@ -1668,9 +1656,7 @@ steps = ["compress-video"]
         process_run(&config, &nickname, &run_id).unwrap();
 
         assert_eq!(fs::read_to_string(&final_path).unwrap(), "new content");
-        let done_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         let status =
             RunStatus::from_toml(&fs::read_to_string(done_path.join("status.toml")).unwrap())
                 .unwrap();
@@ -1701,9 +1687,7 @@ steps = ["compress-video"]
         process_run(&config, &nickname, &run_id).unwrap();
 
         assert_eq!(fs::read_to_string(&final_path).unwrap(), "content");
-        let done_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         let status =
             RunStatus::from_toml(&fs::read_to_string(done_path.join("status.toml")).unwrap())
                 .unwrap();
@@ -1752,9 +1736,7 @@ steps = ["compress-video"]
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-ns".into()).unwrap();
 
-        let ready_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(ready_path.join("files/videos")).unwrap();
         fs::create_dir_all(ready_path.join("files/pictures")).unwrap();
         fs::write(ready_path.join("files/videos/a.mp4"), b"video content").unwrap();
@@ -1828,9 +1810,7 @@ delete_after_import = true
             "picture content"
         );
 
-        let done_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         let status_content = fs::read_to_string(done_path.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
         assert_eq!(status.state, RunState::Done);
@@ -1850,9 +1830,7 @@ delete_after_import = true
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-sp-mismatch".into()).unwrap();
 
-        let ready_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(ready_path.join("files/videos")).unwrap();
         fs::write(ready_path.join("files/videos/a.mp4"), b"content").unwrap();
 
@@ -1919,9 +1897,7 @@ delete_after_import = true
 
         process_run(&config, &nickname, &run_id).unwrap();
 
-        let done_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         let status_content = fs::read_to_string(done_path.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
         assert_eq!(status.state, RunState::Done);
@@ -1939,9 +1915,7 @@ delete_after_import = true
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-symlink".into()).unwrap();
 
-        let ready_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(ready_path.join("files/videos")).unwrap();
 
         let real_file = ready_path.join("files/videos/real.mp4");
@@ -2008,9 +1982,7 @@ delete_after_import = true
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-bad-pattern".into()).unwrap();
 
-        let ready_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(ready_path.join("files/videos")).unwrap();
         fs::write(ready_path.join("files/videos/a.mp4"), b"content").unwrap();
 
@@ -2482,10 +2454,9 @@ steps = ["compress-video"]
         // Begin the run
         begin_run(&server_config, &nickname, &run_id).unwrap();
 
-        let incoming_path =
-            server_config
-                .work_dir
-                .run_dir(&nickname, &run_id, RunPhase::Incoming);
+        let incoming_path = server_config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Incoming);
         assert!(incoming_path.exists());
 
         // Finish it
@@ -2568,10 +2539,9 @@ steps = ["compress-video"]
 
         begin_run(&server_config, &nickname, &run_id).unwrap();
 
-        let incoming_path =
-            server_config
-                .work_dir
-                .run_dir(&nickname, &run_id, RunPhase::Incoming);
+        let incoming_path = server_config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Incoming);
         let lease_path = incoming_path.join("lease.toml");
         let mut lease: purgery_core::LeaseFile =
             toml::from_str(&fs::read_to_string(&lease_path).unwrap()).unwrap();
@@ -2606,10 +2576,9 @@ steps = ["compress-video"]
 
         begin_run(&server_config, &nickname, &run_id).unwrap();
 
-        let incoming_path =
-            server_config
-                .work_dir
-                .run_dir(&nickname, &run_id, RunPhase::Incoming);
+        let incoming_path = server_config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Incoming);
         let lease_path = incoming_path.join("lease.toml");
         let mut lease: purgery_core::LeaseFile =
             toml::from_str(&fs::read_to_string(&lease_path).unwrap()).unwrap();
@@ -2672,9 +2641,7 @@ steps = ["compress-video"]
             "files/documents/a.txt",
             b"hello",
         );
-        let ready = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         let processing = config
             .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Processing);
@@ -2687,9 +2654,7 @@ steps = ["compress-video"]
         process_once_raw(&config).unwrap();
 
         assert!(!processing.exists());
-        let done = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(done.join("status.toml").exists());
         assert_eq!(
             fs::read_to_string(server_root.join("laptop/documents/a.txt")).unwrap(),
@@ -2909,9 +2874,7 @@ steps = ["compress-video"]
             "files/documents/a.txt",
             b"new",
         );
-        let ready = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         let processing = config
             .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Processing);
@@ -2925,9 +2888,7 @@ steps = ["compress-video"]
         process_once_raw(&config).unwrap();
 
         assert_eq!(fs::read_to_string(&final_path).unwrap(), "new");
-        let done = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         let status =
             RunStatus::from_toml(&fs::read_to_string(done.join("status.toml")).unwrap()).unwrap();
         assert_eq!(status.state, RunState::Done);
@@ -3222,9 +3183,7 @@ steps = ["compress-video"]
         let config = test_server_config(&work_dir, &server_root);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("tree-overlay".into()).unwrap();
-        let ready = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         let staged = ready.join("files/data/tree");
         fs::create_dir_all(&staged).unwrap();
         fs::write(staged.join("new.txt"), "new").unwrap();
@@ -3279,9 +3238,7 @@ steps = ["compress-video"]
             fs::read_link(final_tree.join("link")).unwrap(),
             std::path::Path::new("../target")
         );
-        let done = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         let status =
             RunStatus::from_toml(&fs::read_to_string(done.join("status.toml")).unwrap()).unwrap();
         assert_eq!(status.state, RunState::Done);
@@ -3299,9 +3256,7 @@ steps = ["compress-video"]
         let config = test_server_config(&work_dir, &server_root);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("requested".into()).unwrap();
-        let done = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         fs::create_dir_all(&done).unwrap();
         let status = RunStatus {
             run_id: RunId::new("different".into()).unwrap(),
@@ -3975,9 +3930,7 @@ steps = ["pack"]
         let run_id = RunId::new("no-passthrough-status".into()).unwrap();
 
         // Create a ready run with only postprocess/covered entries (no passthrough)
-        let ready_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(ready_path.join("files/data/photos")).unwrap();
         fs::write(ready_path.join("files/data/photos/photo.txt"), b"photo").unwrap();
 
@@ -4041,9 +3994,7 @@ steps = ["pack"]
 
         process_run(&config, &nickname, &run_id).unwrap();
 
-        let done_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         let status_content = fs::read_to_string(done_path.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
 
@@ -4265,9 +4216,7 @@ steps = ["pack"]
         };
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("scoped-coverage".into()).unwrap();
-        let ready = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
 
         // Set up two sync groups: "videos" (with album dir) and "docs" (with album dir)
         fs::create_dir_all(ready.join("files/videos/album")).unwrap();
@@ -4372,9 +4321,7 @@ for = ["videos"]
         // Processing must succeed — the docs entries are valid passthrough
         process_run(&config, &nickname, &run_id).unwrap();
 
-        let done = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         let status_content = fs::read_to_string(done.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
 
@@ -4529,9 +4476,7 @@ postprocess_steps = ["pack"]
         };
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("scoped-processing".into()).unwrap();
-        let ready = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
 
         // videos/ has a matching file pattern, but the rule is scoped to "pictures"
         fs::create_dir_all(ready.join("files/videos")).unwrap();
@@ -4579,9 +4524,7 @@ for = ["pictures"]
 
         // process_run must succeed — the rule is out of scope for videos
         process_run(&config, &nickname, &run_id).unwrap();
-        let done = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         let status_content = fs::read_to_string(done.join("status.toml")).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
         // videos/a.mp4 must be imported as passthrough, not processed by pack
@@ -4620,9 +4563,7 @@ for = ["pictures"]
         };
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("processing-no-delete".into()).unwrap();
-        let ready = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(ready.join("files/videos")).unwrap();
         fs::write(ready.join("files/videos/a.mp4"), b"content").unwrap();
 
@@ -5874,9 +5815,7 @@ steps = ["pack"]
 
         process_run(&config, &nickname, &run_id).unwrap();
 
-        let done_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(done_path.exists());
 
         let expected = vec![
@@ -5896,9 +5835,7 @@ steps = ["pack"]
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-fail".into()).unwrap();
 
-        let ready_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
 
         write_run_toml_with_sync(&ready_path, &nickname, "videos", "videos");
@@ -5969,9 +5906,7 @@ steps = ["pack"]
             logging: Default::default(),
         };
 
-        let ready_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
         let staged_dir = ready_path.join("files/videos");
         fs::create_dir_all(&staged_dir).unwrap();
@@ -6331,9 +6266,7 @@ steps = ["echo-args"]
         let processing_path = config
             .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Processing);
-        let ready_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(processing_path.parent().unwrap()).unwrap();
         fs::rename(&ready_path, &processing_path).unwrap();
 
@@ -6346,9 +6279,7 @@ steps = ["echo-args"]
         // Replay: process_once_raw handles recovery from processing/ directory
         process_once_raw(&config).unwrap();
 
-        let done_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(
             done_path.exists(),
             "run should be in done phase after replay"
@@ -6782,9 +6713,7 @@ steps = ["make-tree"]
 
         // Add a second entry that will fail (missing staged file) after the
         // first one succeeds.
-        let ready_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         let mut manifest: Manifest =
             toml::from_str(&fs::read_to_string(ready_path.join("manifest.toml")).unwrap()).unwrap();
         manifest.entries.push(ManifestEntry {
@@ -6810,9 +6739,7 @@ steps = ["make-tree"]
 
         process_run(&config, &nickname, &run_id).unwrap();
 
-        let done_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(
             done_path.exists(),
             "run with one success and one failure should be in done phase"
@@ -6861,9 +6788,7 @@ steps = ["make-tree"]
         let run_id = RunId::new("test-symlink-staged".into()).unwrap();
 
         let config = test_server_config(&work_dir, &server_root);
-        let ready_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
 
         // Create staged symlink under files/.
@@ -6918,9 +6843,7 @@ steps = ["make-tree"]
 
         process_run(&config, &nickname, &run_id).unwrap();
 
-        let done_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(done_path.exists());
 
         let status: RunStatus =
@@ -6979,9 +6902,7 @@ steps = ["make-tree"]
         let processing_path = config
             .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Processing);
-        let ready_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(processing_path.parent().unwrap()).unwrap();
         fs::rename(&ready_path, &processing_path).unwrap();
 
@@ -6997,9 +6918,7 @@ steps = ["make-tree"]
         // Replay.
         process_once_raw(&config).unwrap();
 
-        let done_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(done_path.exists());
 
         // Staged file must still exist after replay and contain unchanged
@@ -7052,9 +6971,7 @@ steps = ["make-tree"]
 
         process_run(&config, &nickname, &run_id).unwrap();
 
-        let done_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(done_path.exists());
 
         // Staged original must still exist.
@@ -7100,9 +7017,7 @@ steps = ["make-tree"]
         let run_id = RunId::new("test-symlink-consumed".into()).unwrap();
 
         let config = test_server_config(&work_dir, &server_root);
-        let ready_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
 
         let staged_dir = ready_path.join("files/data");
@@ -7138,9 +7053,7 @@ steps = ["make-tree"]
 
         process_run(&config, &nickname, &run_id).unwrap();
 
-        let done_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(done_path.exists());
 
         // Staged original symlink must still exist.

@@ -397,9 +397,7 @@ fn process_manifest_entry(
 }
 
 pub fn process_ready_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> Result<()> {
-    let ready_path = config
-        .work_dir
-        .run_dir(nickname, run_id, RunPhase::Ready);
+    let ready_path = config.work_dir.run_dir(nickname, run_id, RunPhase::Ready);
     let processing_path = config
         .work_dir
         .run_dir(nickname, run_id, RunPhase::Processing);
@@ -683,10 +681,9 @@ pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
                 error = %error,
                 "processing run recovery failed"
             );
-            let processing_path =
-                config
-                    .work_dir
-                    .run_dir(nickname, run_id, RunPhase::Processing);
+            let processing_path = config
+                .work_dir
+                .run_dir(nickname, run_id, RunPhase::Processing);
             if processing_path.exists() {
                 write_run_failure(
                     &config.work_dir,
