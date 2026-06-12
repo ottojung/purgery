@@ -109,7 +109,7 @@ fn prepare_work_entry(
     work_area: &Utf8Path,
 ) -> Result<Utf8PathBuf, String> {
     let work_path = work_area
-        .join(sync.to_path.as_str())
+        .join(sync.to_path.qualified_path())
         .join(entry.relative_path.as_str());
 
     match entry.kind {
@@ -213,7 +213,7 @@ fn process_manifest_entry(
     entry_total: usize,
 ) -> EntryOutcome {
     let expected_staged = Utf8Path::new("files")
-        .join(sync.to_path.as_str())
+        .join(sync.to_path.qualified_path())
         .join(entry.relative_path.as_str());
     let Ok(expected_staged) = NormalizedRelativePath::new(expected_staged) else {
         return failed_entry(entry, "failed to normalize expected staged path");
@@ -268,60 +268,61 @@ fn process_manifest_entry(
         ManifestEntryKind::Directory => {}
     }
 
-    let final_path = server_config
-        .root
-        .final_path(nickname, &sync.to_path, &entry.relative_path);
-    if !path_is_within_root(&final_path, server_config.root.as_path()) {
+    let root = match server_config.roots.get(sync.to_path.root_name()) {
+        Some(root) => root,
+        None => {
+            return failed_entry(
+                entry,
+                format!(
+                    "unknown server root '{}'",
+                    sync.to_path.root_name().as_str()
+                ),
+            )
+        }
+    };
+    let final_path = match server_config
+        .roots
+        .resolve_final_path(&sync.to_path, &entry.relative_path)
+    {
+        Ok(path) => path,
+        Err(error) => return failed_entry(entry, error.to_string()),
+    };
+    if !path_is_within_root(&final_path, root.as_path()) {
         return failed_entry(
             entry,
             format!("final path escapes root: {}", final_path.as_str()),
         );
     }
-    let final_relative = final_path
-        .strip_prefix(server_config.root.as_path())
-        .unwrap_or(&final_path)
-        .to_string();
+    let final_relative = sync.to_path.status_path_for(&entry.relative_path);
     let normalized_path = entry.relative_path.as_str().to_owned();
 
     let matched = run_plan.entry_is_postprocess(entry.sync_name.as_str(), &normalized_path);
 
     let result = if !matched {
         match entry.kind {
-            ManifestEntryKind::Directory => {
-                commit_directory_entry(&final_path, server_config.root.as_path())
-                    .map(|_| (vec![final_relative], None))
-            }
+            ManifestEntryKind::Directory => commit_directory_entry(&final_path, root.as_path())
+                .map(|_| (vec![final_relative], None)),
             ManifestEntryKind::Symlink => {
                 let work_path = match prepare_work_entry(entry, sync, &source_path, work_area) {
                     Ok(p) => p,
-                    Err(error) => return failed_entry(entry, error),
+                    Err(error) => return failed_entry(entry, error.to_string()),
                 };
-                commit_symlink_entry(
-                    &work_path,
-                    &final_path,
-                    server_config.root.as_path(),
-                    run_id,
-                )
-                .map(|_| (vec![final_relative], None))
+                commit_symlink_entry(&work_path, &final_path, root.as_path(), run_id)
+                    .map(|_| (vec![final_relative], None))
             }
             ManifestEntryKind::RegularFile => {
                 let work_path = match prepare_work_entry(entry, sync, &source_path, work_area) {
                     Ok(p) => p,
-                    Err(error) => return failed_entry(entry, error),
+                    Err(error) => return failed_entry(entry, error.to_string()),
                 };
-                commit_regular_file_entry(
-                    &work_path,
-                    &final_path,
-                    server_config.root.as_path(),
-                    run_id,
-                )
-                .map(|_| (vec![final_relative], None))
+                commit_regular_file_entry(&work_path, &final_path, root.as_path(), run_id)
+                    .map(|_| (vec![final_relative], None))
             }
         }
     } else {
         let work_path = match prepare_work_entry(entry, sync, &source_path, work_area) {
             Ok(p) => p,
-            Err(error) => return failed_entry(entry, error),
+            Err(error) => return failed_entry(entry, error.to_string()),
         };
         let mut pp_helper = |update: &purgery_core::ProgressUpdate| {
             write_progress_best_effort(
@@ -357,23 +358,30 @@ fn process_manifest_entry(
                             |parent| parent.join(filename),
                         )
                     };
-                    if !path_is_within_root(&output_final, server_config.root.as_path()) {
+                    if !path_is_within_root(&output_final, root.as_path()) {
                         return failed_entry(entry, "output escapes root");
                     }
-                    if let Err(error) = commit_output_entry(
-                        &output,
-                        &output_final,
-                        server_config.root.as_path(),
-                        run_id,
-                    ) {
+                    if let Err(error) =
+                        commit_output_entry(&output, &output_final, root.as_path(), run_id)
+                    {
                         return failed_entry(entry, format!("commit failed: {error}"));
                     }
-                    final_paths.push(
-                        output_final
-                            .strip_prefix(server_config.root.as_path())
-                            .unwrap_or(&output_final)
-                            .to_string(),
-                    );
+                    let output_relative = if output == work_path {
+                        entry.relative_path.clone()
+                    } else {
+                        let filename = output.file_name().unwrap_or("");
+                        let relative = entry.relative_path.as_path().parent().map_or_else(
+                            || Utf8PathBuf::from(filename),
+                            |parent| parent.join(filename),
+                        );
+                        match NormalizedRelativePath::new(relative) {
+                            Ok(path) => path,
+                            Err(error) => {
+                                return failed_entry(entry, format!("invalid output path: {error}"))
+                            }
+                        }
+                    };
+                    final_paths.push(sync.to_path.status_path_for(&output_relative));
                 }
                 let steps: Vec<String> =
                     run_plan.selected_steps_for(entry.sync_name.as_str(), &normalized_path);

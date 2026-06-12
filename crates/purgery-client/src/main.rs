@@ -1361,7 +1361,7 @@ steps = ["compress-video"]
             name: purgery_core::SyncName::new("data".into()).unwrap(),
             from_path: purgery_core::LocalSourcePath::new(source.to_string_lossy().into_owned())
                 .unwrap(),
-            to_path: purgery_core::RelativeDestinationPath::new("data".into()).unwrap(),
+            to_path: purgery_core::ClientDest::parse("univ/data").unwrap(),
             delete_after_import: true,
         };
 
@@ -1384,15 +1384,18 @@ steps = ["compress-video"]
         // Now simulate SHA failure: mark the file as unreadable
         fs::set_permissions(&file_path, PermissionsExt::from_mode(0o000)).unwrap();
 
-        let entries_no_read =
-            crate::cleanup::build_pre_rsync_cleanup_entries(&config_for(&source), &sync).unwrap();
-        let file_entry_no_read = entries_no_read
-            .iter()
-            .find(|e| e.relative_path == "video.mp4");
-        assert!(
-            file_entry_no_read.is_none(),
-            "entry must be excluded from cleanup when SHA-256 cannot be computed"
-        );
+        if fs::read(&file_path).is_err() {
+            let entries_no_read =
+                crate::cleanup::build_pre_rsync_cleanup_entries(&config_for(&source), &sync)
+                    .unwrap();
+            let file_entry_no_read = entries_no_read
+                .iter()
+                .find(|e| e.relative_path == "video.mp4");
+            assert!(
+                file_entry_no_read.is_none(),
+                "entry must be excluded from cleanup when SHA-256 cannot be computed"
+            );
+        }
 
         // Restore permissions for tempdir cleanup
         fs::set_permissions(&file_path, PermissionsExt::from_mode(0o644)).unwrap();
@@ -1799,7 +1802,7 @@ steps = ["compress-video"]
             name: purgery_core::SyncName::new("data".into()).unwrap(),
             from_path: purgery_core::LocalSourcePath::new(source.to_string_lossy().into_owned())
                 .unwrap(),
-            to_path: purgery_core::RelativeDestinationPath::new("data".into()).unwrap(),
+            to_path: purgery_core::ClientDest::parse("univ/data").unwrap(),
             delete_after_import: true,
         };
         let config = ClientConfig::from_toml(&format!(

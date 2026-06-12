@@ -9,9 +9,9 @@ fn write_config(temp: &tempfile::TempDir) -> std::path::PathBuf {
     fs::write(
         &config_path,
         format!(
-            "root = {:?}\nwork_dir = {:?}\n",
-            root.to_string_lossy(),
-            work_dir.to_string_lossy()
+            "work_dir = {:?}\n\n[[root]]\nname = \"univ\"\npath = {:?}\n",
+            work_dir.to_string_lossy(),
+            root.to_string_lossy()
         ),
     )
     .unwrap();

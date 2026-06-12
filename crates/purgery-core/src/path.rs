@@ -185,7 +185,7 @@ impl<'de> Deserialize<'de> for SyncName {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RootName(String);
 
 impl RootName {
@@ -203,6 +203,12 @@ impl RootName {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl std::fmt::Display for RootName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -239,7 +245,8 @@ impl FromStr for RootName {
 /// ```text
 /// <server root named "univ"> / videos / <relative uploaded path>
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NamedRoot {
     pub name: RootName,
     pub path: ServerRoot,
@@ -324,6 +331,34 @@ impl ClientDest {
 
     pub fn path_under_root(&self) -> Option<&NormalizedRelativePath> {
         self.path_under_root.as_ref()
+    }
+
+    /// Returns the root-qualified relative destination used in staging and status paths.
+    pub fn qualified_path(&self) -> Utf8PathBuf {
+        let mut path = Utf8PathBuf::from(self.root_name.as_str());
+        if let Some(path_under_root) = &self.path_under_root {
+            path.push(path_under_root.as_path());
+        }
+        path
+    }
+
+    pub fn status_path_for(&self, relative_path: &NormalizedRelativePath) -> String {
+        self.qualified_path()
+            .join(relative_path.as_path())
+            .to_string()
+    }
+}
+
+impl Serialize for ClientDest {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.qualified_path().as_str().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ClientDest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        ClientDest::parse(&value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -479,18 +514,6 @@ impl ServerRoot {
 
     pub fn as_str(&self) -> &str {
         self.0.as_str()
-    }
-
-    pub fn final_path(
-        &self,
-        nickname: &Nickname,
-        sync_to: &RelativeDestinationPath,
-        rel_path: &NormalizedRelativePath,
-    ) -> Utf8PathBuf {
-        self.0
-            .join(nickname.as_str())
-            .join(sync_to.as_path())
-            .join(rel_path.as_path())
     }
 
     /// Build the final archive path under a named root.
@@ -926,11 +949,10 @@ mod tests {
         assert_eq!(result.as_str(), "/etc/system/nginx/site.conf");
     }
 
-    // ── Issue #26 xfail tests: server config parsing ──────────────────
+    // ── server config parsing ──────────────────
 
     #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
-    fn xfail_issue_26_server_config_accepts_multiple_roots() {
+    fn server_config_accepts_multiple_roots() {
         let toml = r#"
 work_dir = "/var/lib/purgery/work"
 
@@ -946,8 +968,19 @@ path = "/etc/system"
     }
 
     #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
-    fn xfail_issue_26_server_config_rejects_duplicate_root_names() {
+    fn server_config_rejects_missing_roots() {
+        let toml = r#"
+work_dir = "/var/lib/purgery/work"
+"#;
+        let result = crate::ServerConfig::from_toml(toml);
+        assert!(
+            result.is_err(),
+            "server config requires at least one [[root]]"
+        );
+    }
+
+    #[test]
+    fn server_config_rejects_duplicate_root_names() {
         let toml = r#"
 work_dir = "/var/lib/purgery/work"
 
@@ -969,8 +1002,7 @@ path = "/other/path"
     }
 
     #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
-    fn xfail_issue_26_server_config_rejects_empty_root_name() {
+    fn server_config_rejects_empty_root_name() {
         let toml = r#"
 work_dir = "/var/lib/purgery/work"
 
@@ -988,8 +1020,7 @@ path = "/universe/synced"
     }
 
     #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
-    fn xfail_issue_26_server_config_rejects_invalid_root_name_chars() {
+    fn server_config_rejects_invalid_root_name_chars() {
         let toml = r#"
 work_dir = "/var/lib/purgery/work"
 
@@ -1007,8 +1038,7 @@ path = "/universe/synced"
     }
 
     #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
-    fn xfail_issue_26_server_config_rejects_relative_root_path() {
+    fn server_config_rejects_relative_root_path() {
         let toml = r#"
 work_dir = "/var/lib/purgery/work"
 
@@ -1026,8 +1056,7 @@ path = "relative/path"
     }
 
     #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
-    fn xfail_issue_26_server_config_rejects_missing_work_dir() {
+    fn server_config_rejects_missing_work_dir() {
         let toml = r#"
 [[root]]
 name = "univ"
@@ -1041,8 +1070,7 @@ path = "/universe/synced"
     }
 
     #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
-    fn xfail_issue_26_server_config_rejects_top_level_root_field() {
+    fn server_config_rejects_top_level_root_field() {
         let toml = r#"
 root = "/universe/synced"
 work_dir = "/var/lib/purgery/work"
@@ -1062,8 +1090,7 @@ work_dir = "/var/lib/purgery/work"
     }
 
     #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
-    fn xfail_issue_26_server_config_keeps_work_dir() {
+    fn server_config_keeps_work_dir() {
         let toml = r#"
 work_dir = "/var/lib/purgery/work"
 

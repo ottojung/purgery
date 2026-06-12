@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
+use thiserror::Error;
 
 use crate::path::*;
 use crate::postprocess::PostprocessConfig;
@@ -150,11 +151,80 @@ impl FromStr for ColorMode {
     }
 }
 
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ServerRootsError {
+    #[error("at least one named root is required")]
+    Empty,
+    #[error("duplicate root name '{0}'")]
+    Duplicate(RootName),
+    #[error("invalid root name: {0}")]
+    InvalidName(#[from] RootNameError),
+    #[error("unknown server root '{0}'")]
+    Unknown(RootName),
+}
+
+#[derive(Debug, Clone)]
+pub struct ServerRoots(BTreeMap<RootName, ServerRoot>);
+
+impl ServerRoots {
+    pub fn single(name: &str, path: ServerRoot) -> Result<Self, ServerRootsError> {
+        let name = RootName::new(name.to_owned())?;
+        Self::new(vec![NamedRoot { name, path }])
+    }
+
+    pub fn new(roots: Vec<NamedRoot>) -> Result<Self, ServerRootsError> {
+        if roots.is_empty() {
+            return Err(ServerRootsError::Empty);
+        }
+        let mut names = BTreeSet::new();
+        let mut by_name = BTreeMap::new();
+        for root in roots {
+            if !names.insert(root.name.clone()) {
+                return Err(ServerRootsError::Duplicate(root.name));
+            }
+            by_name.insert(root.name, root.path);
+        }
+        Ok(Self(by_name))
+    }
+
+    pub fn get(&self, name: &RootName) -> Option<&ServerRoot> {
+        self.0.get(name)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&RootName, &ServerRoot)> {
+        self.0.iter()
+    }
+
+    pub fn resolve_archive_dir(
+        &self,
+        dest: &ClientDest,
+    ) -> Result<camino::Utf8PathBuf, ServerRootsError> {
+        let root = self
+            .get(dest.root_name())
+            .ok_or_else(|| ServerRootsError::Unknown(dest.root_name().clone()))?;
+        Ok(match dest.path_under_root() {
+            Some(path) => root.as_path().join(path.as_path()),
+            None => root.as_path().to_owned(),
+        })
+    }
+
+    pub fn resolve_final_path(
+        &self,
+        dest: &ClientDest,
+        relative_path: &NormalizedRelativePath,
+    ) -> Result<camino::Utf8PathBuf, ServerRootsError> {
+        Ok(self
+            .resolve_archive_dir(dest)?
+            .join(relative_path.as_path()))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ServerConfig {
-    pub root: ServerRoot,
+struct ServerConfigFile {
     pub work_dir: PurgeryRoot,
+    #[serde(rename = "root")]
+    pub roots: Vec<NamedRoot>,
     #[serde(default)]
     pub postprocess: PostprocessConfig,
     #[serde(default)]
@@ -163,10 +233,26 @@ pub struct ServerConfig {
     pub logging: LoggingConfig,
 }
 
+#[derive(Debug, Clone)]
+pub struct ServerConfig {
+    pub work_dir: PurgeryRoot,
+    pub roots: ServerRoots,
+    pub postprocess: PostprocessConfig,
+    pub gc: GCConfig,
+    pub logging: LoggingConfig,
+}
+
 impl ServerConfig {
     pub fn from_toml(input: &str) -> Result<Self, ConfigError> {
-        let config: ServerConfig = toml::from_str(input)?;
-        Ok(config)
+        let config: ServerConfigFile = toml::from_str(input)?;
+        let roots = ServerRoots::new(config.roots)?;
+        Ok(Self {
+            work_dir: config.work_dir,
+            roots,
+            postprocess: config.postprocess,
+            gc: config.gc,
+            logging: config.logging,
+        })
     }
 }
 
@@ -229,7 +315,7 @@ pub struct SyncMapping {
     #[serde(rename = "from")]
     pub from_path: LocalSourcePath,
     #[serde(rename = "to")]
-    pub to_path: RelativeDestinationPath,
+    pub to_path: ClientDest,
     #[serde(default = "default_delete_after_import")]
     pub delete_after_import: bool,
 }
@@ -360,7 +446,7 @@ pub struct RunConfig {
 pub struct RunConfigSync {
     pub name: SyncName,
     #[serde(rename = "to")]
-    pub to_path: RelativeDestinationPath,
+    pub to_path: ClientDest,
     #[serde(default = "default_delete_after_import")]
     pub delete_after_import: bool,
 }
