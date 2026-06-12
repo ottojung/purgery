@@ -20,7 +20,7 @@ pub(crate) fn walk_and_classify_sync(
     applicable_rules: &[&PostprocessRule],
 ) -> Result<(Vec<ManifestEntry>, bool)> {
     let from_path = sync.from_path.as_str();
-    let to_path = sync.to_path.as_str();
+    let to_path = sync.to_path.qualified_path();
     let from = Path::new(from_path);
 
     if !from.exists() {
@@ -42,7 +42,7 @@ pub(crate) fn walk_and_classify_sync(
                 anyhow::anyhow!("non-UTF-8 relative path is unsupported: {}", path.display())
             })?;
         let staged_path = camino::Utf8Path::new("files")
-            .join(to_path)
+            .join(&to_path)
             .join(&relative_path);
         let metadata = fs::symlink_metadata(path)
             .with_context(|| format!("failed to read metadata: {}", path.display()))?;

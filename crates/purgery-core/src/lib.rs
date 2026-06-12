@@ -45,6 +45,8 @@ pub enum ConfigError {
     PostprocessConfig(String),
     #[error("state dir: {0}")]
     StateDir(String),
+    #[error("server roots: {0}")]
+    ServerRoots(#[from] ServerRootsError),
 }
 
 #[derive(Error, Debug)]
@@ -529,13 +531,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
-    fn xfail_issue_26_server_root_final_path_does_not_contain_nickname() {
-        let root = ServerRoot::new("/universe/synced".into()).unwrap();
-        let nick = Nickname::new("laptop".into()).unwrap();
-        let dest = RelativeDestinationPath::new("videos".into()).unwrap();
+    fn server_root_final_path_does_not_contain_nickname() {
+        let roots =
+            ServerRoots::single("univ", ServerRoot::new("/universe/synced".into()).unwrap())
+                .unwrap();
+        let dest = ClientDest::parse("univ/videos").unwrap();
         let rel = NormalizedRelativePath::new("a.mp4".into()).unwrap();
-        let result = root.final_path(&nick, &dest, &rel);
+        let result = roots.resolve_final_path(&dest, &rel).unwrap();
         assert!(
             !result.as_str().contains("laptop"),
             "final archive path must not contain nickname: {}",
@@ -757,19 +759,33 @@ to = "../escape"
     #[test]
     fn parse_server_config_minimal() {
         let toml = r#"
-root = "/universe/synced"
 work_dir = "/universe/tmp/purgery"
+
+[[root]]
+name = "univ"
+path = "/universe/synced"
 "#;
         let config = ServerConfig::from_toml(toml).unwrap();
-        assert_eq!(config.root.as_str(), "/universe/synced");
+        assert_eq!(
+            config
+                .roots
+                .get(&RootName::new("univ".into()).unwrap())
+                .unwrap()
+                .as_str(),
+            "/universe/synced"
+        );
         assert_eq!(config.work_dir.as_str(), "/universe/tmp/purgery");
     }
 
     #[test]
     fn parse_server_config_full() {
         let toml = r#"
-root = "/universe/synced"
 work_dir = "/universe/tmp/purgery"
+
+[[root]]
+name = "univ"
+path = "/universe/synced"
+
 [postprocess]
 
 [postprocess.steps.compress-video]
@@ -780,7 +796,14 @@ expected_outputs = ["{stem}.Z.webm"]
 keep_original = true
 "#;
         let config = ServerConfig::from_toml(toml).unwrap();
-        assert_eq!(config.root.as_str(), "/universe/synced");
+        assert_eq!(
+            config
+                .roots
+                .get(&RootName::new("univ".into()).unwrap())
+                .unwrap()
+                .as_str(),
+            "/universe/synced"
+        );
         let step = config.postprocess.steps.get("compress-video").unwrap();
         assert_eq!(step.kind, PostprocessKind::Subprocess);
         assert_eq!(step.program, "my-compress-video");
@@ -790,8 +813,11 @@ keep_original = true
     #[test]
     fn parse_server_config_subprocess_kind() {
         let toml = r#"
-root = "/universe/synced"
 work_dir = "/universe/tmp/purgery"
+
+[[root]]
+name = "univ"
+path = "/universe/synced"
 
 [postprocess.steps.compress-video]
 kind = "subprocess"
@@ -1774,12 +1800,17 @@ files = []
         let config = ClientConfig::from_toml(toml).unwrap();
         assert_eq!(config.nickname.as_str(), "laptop");
         assert_eq!(config.sync.len(), 2);
-        assert_eq!(config.sync[0].to_path.as_str(), "univ/videos");
-        assert_eq!(config.sync[1].to_path.as_str(), "univ/pictures");
+        assert_eq!(
+            config.sync[0].to_path.qualified_path().as_str(),
+            "univ/videos"
+        );
+        assert_eq!(
+            config.sync[1].to_path.qualified_path().as_str(),
+            "univ/pictures"
+        );
     }
 
     #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
     fn parse_example_server_config() {
         let toml = include_str!("../../../examples/server.toml");
         let config = ServerConfig::from_toml(toml).unwrap();
@@ -1928,7 +1959,7 @@ for = ["videos"]
             nickname: Nickname::new("laptop".into()).unwrap(),
             sync: vec![RunConfigSync {
                 name: SyncName::new("videos".into()).unwrap(),
-                to_path: RelativeDestinationPath::new("videos".into()).unwrap(),
+                to_path: ClientDest::parse("univ/videos").unwrap(),
                 delete_after_import: false,
             }],
             postprocess: ClientPostprocessConfig::default(),
@@ -2020,12 +2051,12 @@ to = "videos"
             sync: vec![
                 RunConfigSync {
                     name: SyncName::new("videos".into()).unwrap(),
-                    to_path: RelativeDestinationPath::new("videos".into()).unwrap(),
+                    to_path: ClientDest::parse("univ/videos").unwrap(),
                     delete_after_import: false,
                 },
                 RunConfigSync {
                     name: SyncName::new("pictures".into()).unwrap(),
-                    to_path: RelativeDestinationPath::new("pictures".into()).unwrap(),
+                    to_path: ClientDest::parse("univ/pictures").unwrap(),
                     delete_after_import: false,
                 },
             ],
@@ -2033,8 +2064,18 @@ to = "videos"
         };
         let map = config.sync_map();
         assert_eq!(map.len(), 2);
-        assert_eq!(map.get("videos").unwrap().to_path.as_str(), "videos");
-        assert_eq!(map.get("pictures").unwrap().to_path.as_str(), "pictures");
+        assert_eq!(
+            map.get("videos").unwrap().to_path.qualified_path().as_str(),
+            "univ/videos"
+        );
+        assert_eq!(
+            map.get("pictures")
+                .unwrap()
+                .to_path
+                .qualified_path()
+                .as_str(),
+            "univ/pictures"
+        );
         assert!(!map.contains_key("music"));
     }
 
@@ -2681,7 +2722,7 @@ steps = ["pack"]
         );
     }
 
-    // ── Issue #26: named-root regression tests ────────────────────────
+    // ── Named-root regression tests ──────────────────────────────────
 
     /// Verify that documentation does not describe nickname
     /// as part of final archive paths.
@@ -2698,7 +2739,7 @@ steps = ["pack"]
             if readme.contains(pattern) {
                 panic!(
                     "README.md contains a nickname-in-archive-path pattern: {pattern:?}. \
-                     Nicknames must not appear in final archive paths per issue #26."
+                     Nicknames must not appear in final archive paths."
                 );
             }
         }
@@ -2749,7 +2790,7 @@ steps = ["pack"]
         }
     }
 
-    // ── Issue #26 xfail: remaining desired-behavior tests ─────────────
+    // ── remaining desired-behavior tests ─────────────
 
     #[test]
     fn two_sync_groups_can_target_same_univ_videos() {
@@ -2774,8 +2815,14 @@ delete_after_import = true
 "#;
         let config = ClientConfig::from_toml(toml).unwrap();
         assert_eq!(config.sync.len(), 2);
-        assert_eq!(config.sync[0].to_path.as_str(), "univ/videos");
-        assert_eq!(config.sync[1].to_path.as_str(), "univ/videos");
+        assert_eq!(
+            config.sync[0].to_path.qualified_path().as_str(),
+            "univ/videos"
+        );
+        assert_eq!(
+            config.sync[1].to_path.qualified_path().as_str(),
+            "univ/videos"
+        );
     }
 
     #[test]
@@ -2785,27 +2832,25 @@ delete_after_import = true
         assert!(d.path_under_root.is_none());
     }
 
-    // ── Issue #26 xfail: production ClientConfig semantic parse ─────
+    // ── production ClientConfig semantic parse ─────
 
     #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
-    fn xfail_issue_26_parse_example_client_config_semantic_parse() {
+    fn parse_example_client_config_semantic_parse() {
         let toml = include_str!("../../../examples/client.toml");
         let config = ClientConfig::from_toml(toml).unwrap();
         assert_eq!(config.sync.len(), 2);
-        let dest0 = ClientDest::parse(config.sync[0].to_path.as_str()).unwrap();
+        let dest0 = ClientDest::parse(config.sync[0].to_path.qualified_path().as_str()).unwrap();
         assert_eq!(dest0.root_name.as_str(), "univ");
         assert_eq!(dest0.path_under_root.unwrap().as_str(), "videos");
-        let dest1 = ClientDest::parse(config.sync[1].to_path.as_str()).unwrap();
+        let dest1 = ClientDest::parse(config.sync[1].to_path.qualified_path().as_str()).unwrap();
         assert_eq!(dest1.root_name.as_str(), "univ");
         assert_eq!(dest1.path_under_root.unwrap().as_str(), "pictures");
     }
 
-    // ── Issue #26 xfail: production to-path validation ──────────────
+    // ── production to-path validation ──────────────
 
     #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
-    fn xfail_issue_26_client_config_rejects_to_double_slash() {
+    fn client_config_rejects_to_double_slash() {
         let toml = r#"
 nickname = "laptop"
 state_dir = "/var/lib/purgery"
@@ -2823,8 +2868,7 @@ to = "univ//videos"
     }
 
     #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
-    fn xfail_issue_26_client_config_rejects_to_dot() {
+    fn client_config_rejects_to_dot() {
         let toml = r#"
 nickname = "laptop"
 state_dir = "/var/lib/purgery"
@@ -2841,14 +2885,15 @@ to = "."
         assert!(result.is_err(), "to='.' must be rejected");
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("dot") || err_msg.contains("invalid to"),
+            err_msg.contains("dot")
+                || err_msg.contains("destination is '.'")
+                || err_msg.contains("invalid to"),
             "error must indicate to='.' is not a valid destination, got: {err_msg}"
         );
     }
 
     #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
-    fn xfail_issue_26_client_config_rejects_to_dot_slash() {
+    fn client_config_rejects_to_dot_slash() {
         let toml = r#"
 nickname = "laptop"
 state_dir = "/var/lib/purgery"
