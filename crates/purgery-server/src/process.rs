@@ -443,20 +443,32 @@ fn process_manifest_entry(
                 commit_directory_entry(&final_path, server_config.root.as_path())
                     .map(|_| (vec![final_relative], None))
             }
-            ManifestEntryKind::Symlink => commit_symlink_entry(
-                &source_path,
-                &final_path,
-                server_config.root.as_path(),
-                run_id,
-            )
-            .map(|_| (vec![final_relative], None)),
-            ManifestEntryKind::RegularFile => commit_regular_file_entry(
-                &source_path,
-                &final_path,
-                server_config.root.as_path(),
-                run_id,
-            )
-            .map(|_| (vec![final_relative], None)),
+            ManifestEntryKind::Symlink => {
+                let work_path = match prepare_work_entry(entry, sync, &source_path, work_area) {
+                    Ok(p) => p,
+                    Err(error) => return failed_entry(entry, error),
+                };
+                commit_symlink_entry(
+                    &work_path,
+                    &final_path,
+                    server_config.root.as_path(),
+                    run_id,
+                )
+                .map(|_| (vec![final_relative], None))
+            }
+            ManifestEntryKind::RegularFile => {
+                let work_path = match prepare_work_entry(entry, sync, &source_path, work_area) {
+                    Ok(p) => p,
+                    Err(error) => return failed_entry(entry, error),
+                };
+                commit_regular_file_entry(
+                    &work_path,
+                    &final_path,
+                    server_config.root.as_path(),
+                    run_id,
+                )
+                .map(|_| (vec![final_relative], None))
+            }
         }
     } else {
         let work_path = match prepare_work_entry(entry, sync, &source_path, work_area) {
