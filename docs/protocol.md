@@ -64,7 +64,7 @@ The purgatory transfer loop operates only on purgatory groups — it never looks
 
 No final-archive rsync happens before `prepare-run` succeeds. The side-effect-free `resolve-destinations` call may happen earlier, but actual archive-affecting transfers are deferred until after the purgatory run passes server validation.
 
-Postprocess entries are transferred to a staging area (`incoming/files/<sync.to>/`), not to final storage. The server processes them in the staging area using isolated work areas, and only commits outputs to final storage under the named archive root after processing succeeds. If processing fails, no output reaches the final archive.
+Postprocess entries are transferred to a staging area (`incoming/files/<root-name>/<path-under-root>/`), not to final storage. The server processes them in the staging area using isolated work areas, and only commits outputs to final storage under the named archive root after processing succeeds. If processing fails, no output reaches the final archive.
 
 ## Server subcommands
 
@@ -108,7 +108,7 @@ Passthrough entries do not appear in:
 
 ### Postprocess entries
 
-Postprocess entries are transferred by a separate bulk rsync call into the run's purgatory/staging area (`incoming/files/<sync.to>/`). The server prepares work-area input roots, runs subprocesses there, then commits selected output entry roots to final storage under the named archive root.
+Postprocess entries are transferred by a separate bulk rsync call into the run's purgatory/staging area (`incoming/files/<root-name>/<path-under-root>/`). The server prepares work-area input roots, runs subprocesses there, then commits selected output entry roots to final storage under the named archive root.
 
 ### Covered entries
 
@@ -258,12 +258,12 @@ run_id = "01ARZ..."
 [[destinations]]
 sync_name = "videos"
 passthrough_dest = "/universe/synced/videos"
-purgatory_dest = "/var/lib/purgery/work/laptop/incoming/01ARZ.../files/videos"
+purgatory_dest = "/var/lib/purgery/work/laptop/incoming/01ARZ.../files/univ/videos"
 
 [[destinations]]
 sync_name = "pictures"
 passthrough_dest = "/universe/synced/pictures"
-purgatory_dest = "/var/lib/purgery/work/laptop/incoming/01ARZ.../files/pictures"
+purgatory_dest = "/var/lib/purgery/work/laptop/incoming/01ARZ.../files/univ/pictures"
 ```
 
 The client uses the per-sync destinations as rsync targets. For passthrough, it constructs `host:<passthrough_dest>/`. For purgatory, it constructs `host:<purgatory_dest>/`.

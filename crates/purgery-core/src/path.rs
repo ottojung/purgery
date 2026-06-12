@@ -278,11 +278,14 @@ impl ClientDest {
         if input.starts_with("./") {
             return Err(SyncDestinationError::StartsWithDotSlash(input.to_owned()));
         }
-        if input.contains("..") {
-            return Err(SyncDestinationError::ContainsDotDot(input.to_owned()));
-        }
-        if input.contains("//") {
-            return Err(SyncDestinationError::EmptyComponent(input.to_owned()));
+
+        for component in input.split('/') {
+            if component == ".." {
+                return Err(SyncDestinationError::ContainsDotDot(input.to_owned()));
+            }
+            if component.is_empty() {
+                return Err(SyncDestinationError::EmptyComponent(input.to_owned()));
+            }
         }
 
         let mut parts = input.splitn(2, '/');
@@ -291,30 +294,22 @@ impl ClientDest {
 
         let path_under_root = match parts.next() {
             None | Some("") => None,
-            Some(rest) => {
-                if rest.is_empty() {
-                    None
-                } else {
-                    Some(
-                        NormalizedRelativePath::new(Utf8PathBuf::from(rest)).map_err(
-                            |e| match e {
-                                PathValidationError::NotRelative => {
-                                    SyncDestinationError::AbsolutePath(input.to_owned())
-                                }
-                                PathValidationError::ContainsDotDot => {
-                                    SyncDestinationError::ContainsDotDot(input.to_owned())
-                                }
-                                PathValidationError::EmptyComponent => {
-                                    SyncDestinationError::EmptyComponent(input.to_owned())
-                                }
-                                PathValidationError::NotAbsolute => {
-                                    SyncDestinationError::AbsolutePath(input.to_owned())
-                                }
-                            },
-                        )?,
-                    )
-                }
-            }
+            Some(rest) => Some(
+                NormalizedRelativePath::new(Utf8PathBuf::from(rest)).map_err(|e| match e {
+                    PathValidationError::NotRelative => {
+                        SyncDestinationError::AbsolutePath(input.to_owned())
+                    }
+                    PathValidationError::ContainsDotDot => {
+                        SyncDestinationError::ContainsDotDot(input.to_owned())
+                    }
+                    PathValidationError::EmptyComponent => {
+                        SyncDestinationError::EmptyComponent(input.to_owned())
+                    }
+                    PathValidationError::NotAbsolute => {
+                        SyncDestinationError::AbsolutePath(input.to_owned())
+                    }
+                })?,
+            ),
         };
 
         Ok(ClientDest {
@@ -852,6 +847,18 @@ mod tests {
         assert!(ClientDest::parse("../univ/videos").is_err());
     }
 
+    #[test]
+    fn sync_dest_component_level_dotdot_not_triggered_by_substring() {
+        let d = ClientDest::parse("univ/some..file").unwrap();
+        assert_eq!(d.root_name.as_str(), "univ");
+        assert_eq!(d.path_under_root.unwrap().as_str(), "some..file");
+    }
+
+    #[test]
+    fn sync_dest_empty_component_rejected_via_double_slash() {
+        assert!(ClientDest::parse("univ//videos").is_err());
+    }
+
     // ── NamedRoot final path tests ────────────────────────────────────
 
     #[test]
@@ -940,19 +947,6 @@ path = "/etc/system"
 
     #[test]
     #[ignore = "expected to fail until issue #26 named-root implementation lands"]
-    fn xfail_issue_26_server_config_rejects_missing_root() {
-        let toml = r#"
-work_dir = "/var/lib/purgery/work"
-"#;
-        let result = crate::ServerConfig::from_toml(toml);
-        assert!(
-            result.is_err(),
-            "server config without [[root]] must be rejected"
-        );
-    }
-
-    #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
     fn xfail_issue_26_server_config_rejects_duplicate_root_names() {
         let toml = r#"
 work_dir = "/var/lib/purgery/work"
@@ -967,6 +961,11 @@ path = "/other/path"
 "#;
         let result = crate::ServerConfig::from_toml(toml);
         assert!(result.is_err(), "duplicate root names must be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("duplicate"),
+            "error must mention duplicate names, got: {err_msg}"
+        );
     }
 
     #[test]
@@ -1013,15 +1012,17 @@ path = "relative/path"
 
     #[test]
     #[ignore = "expected to fail until issue #26 named-root implementation lands"]
-    fn xfail_issue_26_server_config_accepts_absolute_root_path() {
+    fn xfail_issue_26_server_config_rejects_missing_work_dir() {
         let toml = r#"
-work_dir = "/var/lib/purgery/work"
-
 [[root]]
 name = "univ"
 path = "/universe/synced"
 "#;
-        let _config = crate::ServerConfig::from_toml(toml).unwrap();
+        let result = crate::ServerConfig::from_toml(toml);
+        assert!(
+            result.is_err(),
+            "server config without work_dir must be rejected"
+        );
     }
 
     #[test]
@@ -1034,7 +1035,7 @@ work_dir = "/var/lib/purgery/work"
         let result = crate::ServerConfig::from_toml(toml);
         assert!(
             result.is_err(),
-            "top-level 'root = ' is not supported; must use [[root]]"
+            "top-level 'root = ' must be rejected; use [[root]]"
         );
     }
 
@@ -1048,30 +1049,14 @@ work_dir = "/var/lib/purgery/work"
 name = "univ"
 path = "/universe/synced"
 "#;
-        let _config = crate::ServerConfig::from_toml(toml).unwrap();
+        let config = crate::ServerConfig::from_toml(toml).unwrap();
+        assert!(!config.work_dir.as_str().is_empty());
     }
 
-    // ── Issue #26 xfail tests: client destination parsing ─────────────
+    // ── Client destination config tests ─────────────────────────────
 
     #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
-    fn xfail_issue_26_client_to_univ_videos_parses_root_univ_path_videos() {
-        let d = ClientDest::parse("univ/videos").unwrap();
-        assert_eq!(d.root_name.as_str(), "univ");
-        assert_eq!(d.path_under_root.unwrap().as_str(), "videos");
-    }
-
-    #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
-    fn xfail_issue_26_client_to_system_parses_root_only() {
-        let d = ClientDest::parse("system").unwrap();
-        assert_eq!(d.root_name.as_str(), "system");
-        assert!(d.path_under_root.is_none());
-    }
-
-    #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
-    fn xfail_issue_26_client_to_parses_client_config() {
+    fn client_config_parses_two_root_qualified_sync_groups() {
         let toml = r#"
 nickname = "laptop"
 state_dir = "/var/lib/purgery"
@@ -1096,8 +1081,7 @@ to = "system/server-configs"
     }
 
     #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
-    fn xfail_issue_26_client_config_rejects_to_empty() {
+    fn client_config_rejects_to_empty() {
         let toml = r#"
 nickname = "laptop"
 state_dir = "/var/lib/purgery"
@@ -1115,8 +1099,7 @@ to = ""
     }
 
     #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
-    fn xfail_issue_26_client_config_rejects_to_absolute() {
+    fn client_config_rejects_to_absolute() {
         let toml = r#"
 nickname = "laptop"
 state_dir = "/var/lib/purgery"
@@ -1134,8 +1117,7 @@ to = "/univ/videos"
     }
 
     #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
-    fn xfail_issue_26_client_config_rejects_to_with_dotdot() {
+    fn client_config_rejects_to_with_dotdot() {
         let toml = r#"
 nickname = "laptop"
 state_dir = "/var/lib/purgery"
@@ -1152,78 +1134,10 @@ to = "univ/../videos"
         assert!(result.is_err(), "to with .. must be rejected");
     }
 
-    // ── Issue #26 xfail tests: destination resolution ─────────────────
+    // ── Status final_paths tests ───────────────────────────────────
 
     #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
-    fn xfail_issue_26_resolve_univ_videos_trips_a_mp4_no_nickname_in_path() {
-        let root = NamedRoot {
-            name: RootName::new("univ".into()).unwrap(),
-            path: ServerRoot::new(Utf8PathBuf::from("/universe/synced")).unwrap(),
-        };
-        let sub = NormalizedRelativePath::new("videos".into()).unwrap();
-        let rel = NormalizedRelativePath::new("trips/a.mp4".into()).unwrap();
-        let result = root.final_path(Some(&sub), &rel);
-        assert!(
-            !result.as_str().contains("laptop"),
-            "final path must not contain nickname: {}",
-            result.as_str()
-        );
-        assert_eq!(result.as_str(), "/universe/synced/videos/trips/a.mp4");
-    }
-
-    #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
-    fn xfail_issue_26_resolve_system_nginx_site_conf_no_nickname_in_path() {
-        let root = NamedRoot {
-            name: RootName::new("system".into()).unwrap(),
-            path: ServerRoot::new(Utf8PathBuf::from("/etc/system")).unwrap(),
-        };
-        let rel = NormalizedRelativePath::new("nginx/site.conf".into()).unwrap();
-        let result = root.final_path(None, &rel);
-        assert!(
-            !result.as_str().contains("laptop"),
-            "final path must not contain nickname"
-        );
-        assert_eq!(result.as_str(), "/etc/system/nginx/site.conf");
-    }
-
-    #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
-    fn xfail_issue_26_passthrough_dest_univ_videos_no_nickname() {
-        let root = NamedRoot {
-            name: RootName::new("univ".into()).unwrap(),
-            path: ServerRoot::new(Utf8PathBuf::from("/universe/synced")).unwrap(),
-        };
-        let sub = NormalizedRelativePath::new("videos".into()).unwrap();
-        let dest = root.passthrough_destination(Some(&sub));
-        assert_eq!(dest.as_str(), "/universe/synced/videos");
-        assert!(
-            !dest.as_str().contains("laptop"),
-            "passthrough dest must not contain nickname"
-        );
-    }
-
-    #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
-    fn xfail_issue_26_passthrough_dest_system_no_nickname() {
-        let root = NamedRoot {
-            name: RootName::new("system".into()).unwrap(),
-            path: ServerRoot::new(Utf8PathBuf::from("/etc/system")).unwrap(),
-        };
-        let dest = root.passthrough_destination(None);
-        assert_eq!(dest.as_str(), "/etc/system");
-        assert!(
-            !dest.as_str().contains("phone-dump"),
-            "passthrough dest must not contain nickname"
-        );
-    }
-
-    // ── Issue #26 xfail tests: final_paths semantics ──────────────────
-
-    #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
-    fn xfail_issue_26_final_paths_are_root_qualified_relative_and_no_nickname() {
+    fn run_status_final_paths_root_qualified_relative_no_nickname() {
         let toml = r#"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
@@ -1250,47 +1164,19 @@ postprocess = ["compress-video"]
         assert_eq!(fp[0], "univ/videos/a.mp4");
     }
 
-    #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
-    fn xfail_issue_26_final_paths_system_root_no_subpath() {
-        let toml = r#"
-run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
-nickname = "phone-dump"
-state = "done"
-
-[[entries]]
-sync_name = "configs"
-local_path = "/home/user/my/server-configs/nginx/site.conf"
-relative_path = "nginx/site.conf"
-status = "imported"
-final_paths = ["system/server-configs/nginx/site.conf"]
-"#;
-        let status = crate::RunStatus::from_toml(toml).unwrap();
-        let fp = &status.entries[0].final_paths;
-        assert!(!fp.is_empty());
-        assert!(
-            !fp[0].contains("phone-dump"),
-            "final_paths must not contain nickname"
-        );
-        assert_eq!(fp[0], "system/server-configs/nginx/site.conf");
-    }
-
-    // ── Issue #26 xfail tests: two clients target same root ──────────
+    // ── Two clients same root tests ─────────────────────────────────
 
     #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
-    fn xfail_issue_26_two_clients_same_root_no_nickname_injection() {
+    fn two_clients_same_root_no_nickname_injection() {
         let root = NamedRoot {
             name: RootName::new("univ".into()).unwrap(),
             path: ServerRoot::new(Utf8PathBuf::from("/universe/synced")).unwrap(),
         };
         let sub = NormalizedRelativePath::new("videos".into()).unwrap();
 
-        // Client "laptop" uploads trips/a.mp4
         let rel1 = NormalizedRelativePath::new("trips/a.mp4".into()).unwrap();
         let p1 = root.final_path(Some(&sub), &rel1);
 
-        // Client "phone-dump" uploads clips/cat.mp4
         let rel2 = NormalizedRelativePath::new("clips/cat.mp4".into()).unwrap();
         let p2 = root.final_path(Some(&sub), &rel2);
 

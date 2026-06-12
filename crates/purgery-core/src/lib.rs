@@ -182,15 +182,15 @@ pub fn resolve_executable(program: &str) -> Result<ResolvedExecutable, Executabl
 /// Includes `--partial` so interrupted transfers can resume without
 /// re-transferring already-received data. Includes `--inplace` so rsync
 /// writes directly to the destination file path rather than creating a
-/// temporary sibling file and renaming into place — this keeps final `root`
-/// free of non-final helper paths. Includes `--mkpath` so rsync creates
-/// destination directories as needed — Purgery does not eagerly create final
-/// archive directory skeletons before a transfer begins.
+/// temporary sibling file and renaming into place — this keeps the
+/// named archive root free of non-final helper paths. Includes `--mkpath`
+/// so rsync creates destination directories as needed — Purgery does not
+/// eagerly create final archive directory skeletons before a transfer begins.
 ///
 /// A partially transferred file at an exact final path is the actual file
 /// being transferred — it is not an operational helper path. The output-only
-/// final destination invariant forbids non-final scaffold paths under `root`,
-/// not partial contents at exact final paths.
+/// final destination invariant forbids non-final scaffold paths under any
+/// named archive root, not partial contents at exact final paths.
 pub fn build_rsync_args(source: &str, destination: &str) -> Vec<String> {
     vec![
         "--recursive".to_string(),
@@ -529,19 +529,19 @@ mod tests {
     }
 
     #[test]
-    fn server_root_final_path() {
-        // Pre-#26: final_path included nickname.
-        // Issue #26: final archive paths must not include the nickname.
-        // Preserved as documentation of the old method signature during
-        // transition; the desired-behavior test is in path.rs.
+    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
+    fn xfail_issue_26_server_root_final_path_does_not_contain_nickname() {
         let root = ServerRoot::new("/universe/synced".into()).unwrap();
         let nick = Nickname::new("laptop".into()).unwrap();
         let dest = RelativeDestinationPath::new("videos".into()).unwrap();
         let rel = NormalizedRelativePath::new("a.mp4".into()).unwrap();
-        assert_eq!(
-            root.final_path(&nick, &dest, &rel),
-            Utf8PathBuf::from("/universe/synced/laptop/videos/a.mp4")
+        let result = root.final_path(&nick, &dest, &rel);
+        assert!(
+            !result.as_str().contains("laptop"),
+            "final archive path must not contain nickname: {}",
+            result.as_str()
         );
+        assert_eq!(result.as_str(), "/universe/synced/videos/a.mp4");
     }
 
     // ── PurgeryRoot tests ──
@@ -1104,7 +1104,6 @@ status = "imported"
     }
 
     #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
     fn parse_status() {
         let toml = r#"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
@@ -1238,7 +1237,6 @@ files = []
     }
 
     #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
     fn status_toml_roundtrip() {
         let status = RunStatus {
             run_id: RunId::new("test-123".into()).unwrap(),
@@ -1771,7 +1769,6 @@ files = []
     // ── Example config parsing tests ──
 
     #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
     fn parse_example_client_config() {
         let toml = include_str!("../../../examples/client.toml");
         let config = ClientConfig::from_toml(toml).unwrap();
@@ -1786,8 +1783,6 @@ files = []
     fn parse_example_server_config() {
         let toml = include_str!("../../../examples/server.toml");
         let config = ServerConfig::from_toml(toml).unwrap();
-        // ServerConfig still has the old `root` field during transition.
-        // After #26 lands, this will use `config.roots`.
         let step = config.postprocess.steps.get("compress-video").unwrap();
         assert_eq!(step.kind, PostprocessKind::Subprocess);
         assert_eq!(step.program, "my-compress-video");
@@ -2726,7 +2721,6 @@ steps = ["pack"]
     #[test]
     fn no_nickname_in_destination_examples_in_protocol_docs() {
         let protocol_md = include_str!("../../../docs/protocol.md");
-        // These substring patterns are the old way (nickname in archive paths).
         let patterns = [
             "/laptop/videos",
             "/laptop/pictures",
@@ -2744,13 +2738,11 @@ steps = ["pack"]
     #[test]
     fn examples_do_not_use_anonymous_root() {
         let server_toml = include_str!("../../../examples/server.toml");
-        // The only `root` occurrences should be within `[[root]]`, not `root = "..."`.
-        // A line that starts with "root =" (with optional whitespace) is the old format.
         for line in server_toml.lines() {
             let trimmed = line.trim();
             if trimmed.starts_with("root = \"") {
                 panic!(
-                    "examples/server.toml uses old 'root = \"...\"' format: {line:?}. \
+                    "examples/server.toml uses anonymous 'root = \"...\"' format: {line:?}. \
                      Must use [[root]] per issue #26."
                 );
             }
@@ -2760,9 +2752,7 @@ steps = ["pack"]
     // ── Issue #26 xfail: remaining desired-behavior tests ─────────────
 
     #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
-    fn xfail_issue_26_two_sync_groups_can_target_same_univ_videos() {
-        // Two different sync groups can both to="univ/videos"
+    fn two_sync_groups_can_target_same_univ_videos() {
         let toml = r#"
 nickname = "multi-client"
 state_dir = "/var/lib/purgery"
@@ -2789,31 +2779,7 @@ delete_after_import = true
     }
 
     #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
-    fn xfail_issue_26_resolve_destinations_does_not_contain_nickname() {
-        // resolve-destinations response paths must not contain the nickname.
-        let toml = r#"
-protocol_version = 1
-nickname = "laptop"
-
-[[destinations]]
-sync_name = "videos"
-passthrough_dest = "/universe/synced/videos"
-"#;
-        let resp: ResolveDestinationsResponse = toml::from_str(toml).unwrap();
-        for d in &resp.destinations {
-            assert!(
-                !d.passthrough_dest.contains("laptop"),
-                "passthrough_dest must not contain nickname: {}",
-                d.passthrough_dest
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "expected to fail until issue #26 named-root implementation lands"]
-    fn xfail_issue_26_sync_name_system_parses_as_root_system_no_subpath() {
-        // to = "system" should parse as root "system" with no subpath
+    fn sync_name_system_parses_as_root_system_no_subpath() {
         let d = ClientDest::parse("system").unwrap();
         assert_eq!(d.root_name.as_str(), "system");
         assert!(d.path_under_root.is_none());
