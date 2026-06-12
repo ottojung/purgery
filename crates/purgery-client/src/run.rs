@@ -368,6 +368,10 @@ fn resume_runs(state_dir: &str) -> Result<()> {
             Ok(s) => s,
             Err(e) => {
                 error!("failed to parse client run state {:?}: {e}", state_path);
+                let corrupt_path = state_path.with_extension("toml.corrupt");
+                if let Err(rename_err) = fs::rename(&state_path, &corrupt_path) {
+                    error!("failed to rename corrupt state to {:?}: {rename_err}", corrupt_path);
+                }
                 any_error = true;
                 continue;
             }
@@ -485,9 +489,16 @@ fn resume_one(state_dir: &str, state: &ClientRunState) -> Result<bool> {
             Ok(true)
         }
         ClientRunPhase::CleanupComplete => Ok(true),
-        ClientRunPhase::Abandoned | ClientRunPhase::Corrupt => {
-            warn!("abandoned or corrupt run state, removing");
+        ClientRunPhase::Abandoned => {
+            warn!("abandoned run state, removing");
             Ok(true)
+        }
+        ClientRunPhase::Corrupt => {
+            anyhow::bail!(
+                "persisted run state {}/{} is marked corrupt; manual intervention required",
+                state.nickname,
+                state.run_id
+            );
         }
     }
 }
