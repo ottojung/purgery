@@ -13,8 +13,6 @@ use crate::ssh;
 use crate::transfer;
 use crate::SyncArgs;
 
-const SERVER_COMMAND: &str = "purgery-server";
-
 fn parse_destination(destination: &str) -> Result<(&str, &str)> {
     let colon_pos = destination.rfind(':').ok_or_else(|| {
         anyhow::anyhow!("destination must be in format USER@HOST:PATH or HOST:PATH")
@@ -42,10 +40,15 @@ fn derive_nickname(destination: &str) -> Result<Nickname> {
     Ok(Nickname::new(sanitized).or_else(|_| Nickname::new("default".to_owned()))?)
 }
 
-fn begin_run(host: &str, nickname: &Nickname, run_id: &RunId) -> Result<BeginRunResponse> {
+fn begin_run(
+    host: &str,
+    server_cmd: &str,
+    nickname: &Nickname,
+    run_id: &RunId,
+) -> Result<BeginRunResponse> {
     let output = ssh::server_cmd(
         host,
-        SERVER_COMMAND,
+        server_cmd,
         &[
             "begin-run",
             "--nickname",
@@ -65,10 +68,15 @@ fn begin_run(host: &str, nickname: &Nickname, run_id: &RunId) -> Result<BeginRun
     Ok(resp)
 }
 
-fn prepare_run(host: &str, nickname: &Nickname, run_id: &RunId) -> Result<PrepareRunResponse> {
+fn prepare_run(
+    host: &str,
+    server_cmd: &str,
+    nickname: &Nickname,
+    run_id: &RunId,
+) -> Result<PrepareRunResponse> {
     let output = ssh::server_cmd(
         host,
-        SERVER_COMMAND,
+        server_cmd,
         &[
             "prepare-run",
             "--nickname",
@@ -88,10 +96,10 @@ fn prepare_run(host: &str, nickname: &Nickname, run_id: &RunId) -> Result<Prepar
     Ok(resp)
 }
 
-fn finish_run(host: &str, nickname: &Nickname, run_id: &RunId) -> Result<()> {
+fn finish_run(host: &str, server_cmd: &str, nickname: &Nickname, run_id: &RunId) -> Result<()> {
     ssh::server_cmd(
         host,
-        SERVER_COMMAND,
+        server_cmd,
         &[
             "finish-run",
             "--nickname",
@@ -103,10 +111,15 @@ fn finish_run(host: &str, nickname: &Nickname, run_id: &RunId) -> Result<()> {
     Ok(())
 }
 
-fn run_state(host: &str, nickname: &Nickname, run_id: &RunId) -> Result<RunStateResponse> {
+fn run_state(
+    host: &str,
+    server_cmd: &str,
+    nickname: &Nickname,
+    run_id: &RunId,
+) -> Result<RunStateResponse> {
     let output = ssh::server_cmd(
         host,
-        SERVER_COMMAND,
+        server_cmd,
         &[
             "run-state",
             "--nickname",
@@ -120,10 +133,15 @@ fn run_state(host: &str, nickname: &Nickname, run_id: &RunId) -> Result<RunState
     Ok(resp)
 }
 
-fn read_status(host: &str, nickname: &Nickname, run_id: &RunId) -> Result<RunStatus> {
+fn read_status(
+    host: &str,
+    server_cmd: &str,
+    nickname: &Nickname,
+    run_id: &RunId,
+) -> Result<RunStatus> {
     let output = ssh::server_cmd(
         host,
-        SERVER_COMMAND,
+        server_cmd,
         &[
             "status",
             "--nickname",
@@ -137,13 +155,18 @@ fn read_status(host: &str, nickname: &Nickname, run_id: &RunId) -> Result<RunSta
     Ok(status)
 }
 
-fn wait_for_terminal(host: &str, nickname: &Nickname, run_id: &RunId) -> Result<RunStateResponse> {
+fn wait_for_terminal(
+    host: &str,
+    server_cmd: &str,
+    nickname: &Nickname,
+    run_id: &RunId,
+) -> Result<RunStateResponse> {
     let poll_interval = Duration::from_secs(5);
     let mut last_phase = String::new();
     let mut attempts_since_report = 0u64;
 
     loop {
-        let response = run_state(host, nickname, run_id)?;
+        let response = run_state(host, server_cmd, nickname, run_id)?;
 
         if response.terminal {
             info!(
@@ -235,19 +258,25 @@ fn remove_client_run_state(state_dir: &str, nickname: &Nickname, run_id: &RunId)
 }
 
 pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
-    let postprocess_steps: Vec<String> = match args.postprocess.as_deref() {
-        Some(s) if !s.is_empty() => s.split(',').map(|p| p.trim().to_owned()).collect(),
-        _ => Vec::new(),
-    };
-    let has_postprocess = !postprocess_steps.is_empty();
+    let has_postprocess = !args.postprocess.is_empty();
 
     if has_postprocess && !args.delete_after_import {
         anyhow::bail!("--delete-after-import is required when --postprocess is used");
     }
 
-    let (host, _dest_path) = parse_destination(&args.destination)?;
+    let (host, dest_path) = parse_destination(&args.destination)?;
     let nickname = derive_nickname(&args.destination)?;
     let run_id = RunId::generate();
+    let state_dir = args.state_dir.clone().unwrap_or_else(|| {
+        if let Ok(dir) = std::env::var("XDG_STATE_HOME") {
+            format!("{dir}/purgery")
+        } else if let Ok(home) = std::env::var("HOME") {
+            format!("{home}/.local/state/purgery")
+        } else {
+            "/tmp/purgery-client".to_string()
+        }
+    });
+    let server_cmd = &args.server_command;
 
     info!(
         nickname = %nickname.as_str(),
@@ -259,11 +288,11 @@ pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
 
     let run_config = RunConfig {
         nickname: nickname.clone(),
-        to: args.destination.clone(),
+        to: dest_path.to_owned(),
         delete_after_import: args.delete_after_import,
     };
 
-    let manifest = classify::build_manifest(&args.source, &run_id, &nickname, &postprocess_steps)?;
+    let manifest = classify::build_manifest(&args.source, &run_id, &nickname, &args.postprocess)?;
 
     let cleanup_state_path = if args.delete_after_import {
         let entries = cleanup::build_cleanup_entries(&args.source, &manifest)?;
@@ -273,7 +302,7 @@ pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
                 operation_id: run_id.as_str().to_owned(),
                 entries,
             };
-            Some(cleanup::write_cleanup_state(&state, &args.state_dir)?)
+            Some(cleanup::write_cleanup_state(&state, &state_dir)?)
         } else {
             None
         }
@@ -282,7 +311,7 @@ pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
     };
 
     info!("starting server run");
-    let begin_resp = begin_run(host, &nickname, &run_id)?;
+    let begin_resp = begin_run(host, server_cmd, &nickname, &run_id)?;
 
     info!("transferring files");
     transfer::run_rsync(&args.source, host, &begin_resp.files_dir)?;
@@ -295,10 +324,10 @@ pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
     ssh::write_remote_file(host, &begin_resp.manifest_path, &manifest.to_toml()?)?;
 
     info!("preparing run");
-    prepare_run(host, &nickname, &run_id)?;
+    prepare_run(host, server_cmd, &nickname, &run_id)?;
 
     persist_client_run_state(
-        &args.state_dir,
+        &state_dir,
         &nickname,
         &run_id,
         &manifest,
@@ -306,10 +335,10 @@ pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
         ClientRunPhase::UploadCompleteFinishPending,
     )?;
 
-    finish_run(host, &nickname, &run_id)?;
+    finish_run(host, server_cmd, &nickname, &run_id)?;
 
     persist_client_run_state(
-        &args.state_dir,
+        &state_dir,
         &nickname,
         &run_id,
         &manifest,
@@ -319,25 +348,25 @@ pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
 
     if has_postprocess {
         info!("waiting for server processing");
-        wait_for_terminal(host, &nickname, &run_id)?;
+        wait_for_terminal(host, server_cmd, &nickname, &run_id)?;
     }
 
     info!("reading run status");
-    let status = read_status(host, &nickname, &run_id)?;
+    let status = read_status(host, server_cmd, &nickname, &run_id)?;
 
     if let Some(ref state_path) = cleanup_state_path {
         cleanup::process_cleanup_state_file(state_path)?;
     }
 
     persist_client_run_state(
-        &args.state_dir,
+        &state_dir,
         &nickname,
         &run_id,
         &manifest,
         &run_config,
         ClientRunPhase::CleanupComplete,
     )?;
-    remove_client_run_state(&args.state_dir, &nickname, &run_id);
+    remove_client_run_state(&state_dir, &nickname, &run_id);
 
     info!(state = %status.state.as_str(), "sync complete");
     Ok(())

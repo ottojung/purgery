@@ -29,32 +29,16 @@ Both binaries support global flags that override config file and environment:
 
 Precedence: CLI flags > config file > default. The `RUST_LOG` environment variable is not consulted; logging is controlled entirely through the config file and CLI flags.
 
-## Setup
+## Server setup
 
 ```sh
-# Create archive root and work_dir directories
-purgery-server bootstrap --config server.toml
-
 # Verify configuration and dependencies
 purgery-server check --config server.toml
 ```
 
-`bootstrap` creates each named root directory and `work_dir` if missing. It does not process runs or run GC.
+Server checks: parse config, verify `work_dir` exists (but does not create it), resolve every postprocess `program`, validate step invariants.
 
-## Boot-time checks
-
-Both binaries support a `check` subcommand that is local and side-effect-free — no SSH, no directory creation, no mutations.
-
-```sh
-purgery-client check --config client.toml
-purgery-server check --config server.toml
-```
-
-Client checks: parse config, resolve `ssh` and `rsync` executables, validate config fields.
-
-Server checks: parse config, verify each named root and `work_dir` exist (but do not create them), resolve every postprocess `program`, validate step invariants.
-
-If server directories do not exist, `check` reports an error and suggests running `bootstrap` first.
+If server directories do not exist, `check` reports an error.
 
 ## Normal operation
 
@@ -63,15 +47,19 @@ If server directories do not exist, `check` reports an error and suggests runnin
 purgery-server process-once --config server.toml
 
 # Client: sync files and clean up confirmed imports
-purgery-client sync-and-cleanup --config client.toml
+purgery-client sync -- ~/Videos user@server:/universe/synced/videos
+
+# Client: sync with postprocessing and cleanup
+purgery-client sync \
+  --postprocess compress-video \
+  --delete-after-import \
+  -- ~/Videos user@server:/universe/synced/videos
 
 # Server: run garbage collection manually
 purgery-server gc --config server.toml
 ```
 
 `process-once` runs side-effect-free server validation first, then GC opportunistically, then recovers processing runs and processes ready runs.
-
-`sync-and-cleanup` runs local checks first, then uploads, waits for processing, and cleans up confirmed local entries.
 
 ## Heartbeat and leases
 
@@ -86,7 +74,7 @@ last_heartbeat_unix_secs = 1234567890
 expires_at_unix_secs = 1234569690
 ```
 
-During `sync-and-cleanup`, the client spawns a background thread that calls `heartbeat-run` at the configured interval, covering the entire upload phase including long single rsync transfers. If the heartbeat thread fails, the client aborts before `finish-run`.
+During sync, the client spawns a background thread that calls `heartbeat-run` at the configured interval, covering the entire upload phase including long single rsync transfers. If the heartbeat thread fails, the client aborts before `finish-run`.
 
 The heartbeat updates `last_heartbeat_unix_secs` and extends `expires_at_unix_secs` by `incoming_lease_secs`.
 
@@ -120,9 +108,9 @@ If `failed/<run_id>` already exists, the abandoned run is moved to a GC quaranti
 
 GC is run opportunistically at the start of `process-once` and `begin-run`. It is never run from `check`. Expose separately for cron/systemd timers.
 
-## `server.command` trust model
+## `--server-command` trust model
 
-The client's `[server].command` value is a trusted shell command prefix executed on the remote host via SSH. Purgery appends shell-escaped arguments. This is not intended to accept untrusted input.
+The client's `--server-command` value is a trusted command name executed on the remote host via SSH. Purgery appends shell-escaped arguments. This is not intended to accept untrusted input.
 
 ## Executable resolution
 
@@ -140,8 +128,8 @@ This is used for client `ssh`, `rsync`, and server postprocess `program` values.
 
 ## Final-storage overlay
 
-Each run overlays its uploaded tree onto final storage with recursive archive-mode rsync semantics and no delete option. Existing directories are merged, regular files and symlinks replace compatible destination entries, and extra final descendants remain. A regular file or symlink does not replace a non-empty destination directory. Source directory entries can replace conflicting file or symlink parents before descendants are imported.
+Each run overlays its uploaded tree onto the destination with recursive archive-mode rsync semantics and no delete option. Existing directories are merged, regular files and symlinks replace compatible destination entries, and extra final descendants remain. A regular file or symlink does not replace a non-empty destination directory. Source directory entries can replace conflicting file or symlink parents before descendants are imported.
 
-Symlink targets are stored and recreated literally. Neither staged symlinks nor final-storage symlinks are traversed as directories. Postprocessing applies to regular files, directories, and symlinks. Client cleanup removes only confirmed unchanged local originals, respecting entry-kind identity checks.
+Symlink targets are stored and recreated literally. Neither staged symlinks nor destination symlinks are traversed as directories. Postprocessing applies to regular files, directories, and symlinks.
 
 A crash can expose a prefix of the entry overlay. This is expected: the run remains in `processing/` without a terminal status and `process-once` replays it until the final tree converges. The operation is not an all-or-nothing filesystem transaction.
