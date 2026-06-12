@@ -706,38 +706,31 @@ delete_after_import = true
         work_dir: &Utf8Path,
         nickname: &Nickname,
         run_id: &RunId,
-        sync_name: &str,
+        _sync_name: &str,
         to_path: &str,
-        staged_rel: &str,
+        relative_path: &str,
         content: &[u8],
     ) -> (ServerConfig, Utf8PathBuf) {
         let config = test_server_config(work_dir);
         let ready_path = config.work_dir.run_dir(nickname, run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
 
-        let staged_path = ready_path.join(staged_rel);
+        let staged_rel = format!("files/{relative_path}");
+        let staged_path = ready_path.join(&staged_rel);
         if let Some(parent) = staged_path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(&staged_path, content).unwrap();
 
-        write_run_toml_with_sync(&ready_path, nickname, sync_name, to_path);
+        write_run_toml_with_sync(&ready_path, nickname, _sync_name, to_path);
 
         let manifest = Manifest {
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
-                local_path: ClientLocalPath::new(format!("/home/user/{sync_name}/{staged_rel}"))
-                    .unwrap(),
+                local_path: ClientLocalPath::new(format!("/home/user/{relative_path}")).unwrap(),
                 staged_path: NormalizedRelativePath::new(staged_rel.into()).unwrap(),
-                relative_path: NormalizedRelativePath::new(
-                    staged_rel
-                        .rsplit_once('/')
-                        .map(|(_, f)| f)
-                        .unwrap_or(staged_rel)
-                        .into(),
-                )
-                .unwrap(),
+                relative_path: NormalizedRelativePath::new(relative_path.into()).unwrap(),
                 kind: ManifestEntryKind::RegularFile,
                 size: content.len() as u64,
                 mtime_ns: 1000000,
@@ -773,7 +766,7 @@ delete_after_import = true
             &run_id,
             "videos",
             "univ/videos",
-            "files/univ/videos/test.mp4",
+            "test.mp4",
             b"hello world",
         );
 
@@ -822,7 +815,7 @@ delete_after_import = true
             &run_id,
             "videos",
             "videos",
-            "files/univ/videos/test.mp4",
+            "test.mp4",
             b"hello world",
         );
 
@@ -859,7 +852,7 @@ delete_after_import = true
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
                 local_path: ClientLocalPath::new("/home/user/Videos/missing.mp4".into()).unwrap(),
-                staged_path: NormalizedRelativePath::new("files/univ/videos/missing.mp4".into())
+                staged_path: NormalizedRelativePath::new("files/missing.mp4".into())
                     .unwrap(),
                 relative_path: NormalizedRelativePath::new("missing.mp4".into()).unwrap(),
                 kind: ManifestEntryKind::RegularFile,
@@ -972,7 +965,7 @@ delete_after_import = true
             nickname: Nickname::new("other-machine".into()).unwrap(),
             entries: vec![ManifestEntry {
                 local_path: ClientLocalPath::new("/tmp/a.mp4".into()).unwrap(),
-                staged_path: NormalizedRelativePath::new("files/univ/a.mp4".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/a.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
                 kind: ManifestEntryKind::RegularFile,
                 size: 10,
@@ -1052,7 +1045,7 @@ delete_after_import = true
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
                 local_path: ClientLocalPath::new("/tmp/a.mp4".into()).unwrap(),
-                staged_path: NormalizedRelativePath::new("files/univ/a.mp4".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/a.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
                 kind: ManifestEntryKind::RegularFile,
                 size: 10,
@@ -1170,9 +1163,9 @@ delete_after_import = true
         let ready_path = server_config
             .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
-        fs::create_dir_all(ready_path.join("files/univ/videos")).unwrap();
+        fs::create_dir_all(ready_path.join("files")).unwrap();
         fs::write(
-            ready_path.join("files/univ/videos/test.mp4"),
+            ready_path.join("files/test.mp4"),
             b"video content",
         )
         .unwrap();
@@ -1190,7 +1183,7 @@ delete_after_import = true
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
                 local_path: ClientLocalPath::new("/home/user/Videos/test.mp4".into()).unwrap(),
-                staged_path: NormalizedRelativePath::new("files/univ/videos/test.mp4".into())
+                staged_path: NormalizedRelativePath::new("files/test.mp4".into())
                     .unwrap(),
                 relative_path: NormalizedRelativePath::new("test.mp4".into()).unwrap(),
                 kind: ManifestEntryKind::RegularFile,
@@ -1365,7 +1358,7 @@ delete_after_import = true
             &run_id,
             "videos",
             "videos",
-            "files/univ/videos/test.mp4",
+            "test.mp4",
             b"hello",
         );
 
@@ -1392,15 +1385,7 @@ delete_after_import = true
             config
                 .work_dir
                 .as_path()
-                .join("laptop/done/test-tmp-commit/files/univ"),
-            config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-tmp-commit/files/univ/videos"),
-            config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-tmp-commit/files/univ/videos/test.mp4"),
+                .join("laptop/done/test-tmp-commit/files/test.mp4"),
             config
                 .work_dir
                 .as_path()
@@ -1438,7 +1423,7 @@ delete_after_import = true
             &run_id,
             "videos",
             "videos",
-            "files/univ/videos/test.mp4",
+            "test.mp4",
             b"new content",
         );
 
@@ -1469,7 +1454,7 @@ delete_after_import = true
             &run_id,
             "videos",
             "videos",
-            "files/univ/videos/test.mp4",
+            "test.mp4",
             b"content",
         );
         let final_path = config.work_dir.as_path().join("univ/videos/test.mp4");
@@ -1498,7 +1483,7 @@ delete_after_import = true
             &run_id,
             "documents",
             "documents",
-            "files/univ/documents/a.txt",
+            "a.txt",
             b"content",
         );
         let final_path = config.work_dir.as_path().join("univ/documents/a.txt");
@@ -1525,8 +1510,8 @@ delete_after_import = true
         let run_id = RunId::new("test-ns".into()).unwrap();
 
         let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
-        fs::create_dir_all(ready_path.join("files/univ/videos")).unwrap();
-        fs::write(ready_path.join("files/univ/videos/a.mp4"), b"video content").unwrap();
+        fs::create_dir_all(ready_path.join("files")).unwrap();
+        fs::write(ready_path.join("files/a.mp4"), b"video content").unwrap();
 
         let run_config_content = r#"nickname = "laptop"
 to = "univ/videos"
@@ -1539,7 +1524,7 @@ delete_after_import = true
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
                 local_path: ClientLocalPath::new("/home/user/Videos/a.mp4".into()).unwrap(),
-                staged_path: NormalizedRelativePath::new("files/univ/videos/a.mp4".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/a.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
                 kind: ManifestEntryKind::RegularFile,
                 size: 13,
@@ -1583,8 +1568,8 @@ delete_after_import = true
         let run_id = RunId::new("test-sp-mismatch".into()).unwrap();
 
         let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
-        fs::create_dir_all(ready_path.join("files/univ/videos")).unwrap();
-        fs::write(ready_path.join("files/univ/videos/a.mp4"), b"content").unwrap();
+        fs::create_dir_all(ready_path.join("files/videos")).unwrap();
+        fs::write(ready_path.join("files/videos/a.mp4"), b"content").unwrap();
 
         write_run_toml_with_sync(&ready_path, &nickname, "videos", "videos");
 
@@ -1593,7 +1578,7 @@ delete_after_import = true
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
                 local_path: ClientLocalPath::new("/home/user/Videos/a.mp4".into()).unwrap(),
-                staged_path: NormalizedRelativePath::new("files/univ/other/a.mp4".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/other/a.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
                 kind: ManifestEntryKind::RegularFile,
                 size: 13,
@@ -1641,7 +1626,7 @@ delete_after_import = true
             &run_id,
             "videos",
             "videos",
-            "files/univ/videos/a.mp4",
+            "a.mp4",
             b"content",
         );
 
@@ -1666,11 +1651,11 @@ delete_after_import = true
         let run_id = RunId::new("test-symlink".into()).unwrap();
 
         let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
-        fs::create_dir_all(ready_path.join("files/univ/videos")).unwrap();
+        fs::create_dir_all(ready_path.join("files")).unwrap();
 
-        let real_file = ready_path.join("files/univ/videos/real.mp4");
+        let real_file = ready_path.join("files/real.mp4");
         fs::write(&real_file, b"real content").unwrap();
-        let staged_link = ready_path.join("files/univ/videos/a.mp4");
+        let staged_link = ready_path.join("files/a.mp4");
         std::os::unix::fs::symlink(&real_file, &staged_link).unwrap();
 
         write_run_toml_with_sync(&ready_path, &nickname, "videos", "videos");
@@ -1680,7 +1665,7 @@ delete_after_import = true
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
                 local_path: ClientLocalPath::new("/home/user/Videos/a.mp4".into()).unwrap(),
-                staged_path: NormalizedRelativePath::new("files/univ/videos/a.mp4".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/a.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
                 kind: ManifestEntryKind::RegularFile,
                 size: 12,
@@ -1738,7 +1723,7 @@ delete_after_import = true
             &run_id,
             "videos",
             "videos",
-            "files/univ/videos/a.mp4",
+            "a.mp4",
             b"hello",
         );
 
@@ -1781,9 +1766,9 @@ delete_after_import = true
         let ready_path = server_config
             .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
-        fs::create_dir_all(ready_path.join("files/univ/videos")).unwrap();
+        fs::create_dir_all(ready_path.join("files/videos")).unwrap();
         fs::write(
-            ready_path.join("files/univ/videos/test.mp4"),
+            ready_path.join("files/videos/test.mp4"),
             b"video content",
         )
         .unwrap();
@@ -1799,7 +1784,7 @@ delete_after_import = true
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
                 local_path: ClientLocalPath::new("/home/user/Videos/test.mp4".into()).unwrap(),
-                staged_path: NormalizedRelativePath::new("files/univ/videos/test.mp4".into())
+                staged_path: NormalizedRelativePath::new("files/videos/test.mp4".into())
                     .unwrap(),
                 relative_path: NormalizedRelativePath::new("test.mp4".into()).unwrap(),
                 kind: ManifestEntryKind::RegularFile,
@@ -1879,8 +1864,8 @@ delete_after_import = true
         let ready_path = server_config
             .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
-        fs::create_dir_all(ready_path.join("files/univ/videos")).unwrap();
-        fs::write(ready_path.join("files/univ/videos/video.mp4"), b"video").unwrap();
+        fs::create_dir_all(ready_path.join("files")).unwrap();
+        fs::write(ready_path.join("files/video.mp4"), b"video").unwrap();
 
         let run_config_content = r#"nickname = "laptop"
 to = "univ/videos"
@@ -1893,7 +1878,7 @@ delete_after_import = true
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
                 local_path: ClientLocalPath::new("/home/user/Videos/video.mp4".into()).unwrap(),
-                staged_path: NormalizedRelativePath::new("files/univ/videos/video.mp4".into())
+                staged_path: NormalizedRelativePath::new("files/video.mp4".into())
                     .unwrap(),
                 relative_path: NormalizedRelativePath::new("video.mp4".into()).unwrap(),
                 kind: ManifestEntryKind::RegularFile,
@@ -1979,8 +1964,8 @@ delete_after_import = true
         let ready_path = server_config
             .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
-        fs::create_dir_all(ready_path.join("files/univ/videos")).unwrap();
-        fs::write(ready_path.join("files/univ/videos/video.mp4"), b"video").unwrap();
+        fs::create_dir_all(ready_path.join("files")).unwrap();
+        fs::write(ready_path.join("files/video.mp4"), b"video").unwrap();
 
         let run_config_content = r#"nickname = "laptop"
 to = "univ/videos"
@@ -1993,7 +1978,7 @@ delete_after_import = true
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
                 local_path: ClientLocalPath::new("/home/user/Videos/video.mp4".into()).unwrap(),
-                staged_path: NormalizedRelativePath::new("files/univ/videos/video.mp4".into())
+                staged_path: NormalizedRelativePath::new("files/video.mp4".into())
                     .unwrap(),
                 relative_path: NormalizedRelativePath::new("video.mp4".into()).unwrap(),
                 kind: ManifestEntryKind::RegularFile,
@@ -2121,7 +2106,7 @@ delete_after_import = true
             &run_id,
             "videos",
             "videos",
-            "files/univ/videos/a.mp4",
+            "a.mp4",
             b"data",
         );
 
@@ -2238,7 +2223,7 @@ delete_after_import = true
             &run_id,
             "documents",
             "documents",
-            "files/univ/documents/a.txt",
+            "a.txt",
             b"ready",
         );
 
@@ -2266,7 +2251,7 @@ delete_after_import = true
             &run_id,
             "documents",
             "documents",
-            "files/univ/documents/a.txt",
+            "a.txt",
             b"hello",
         );
         let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
@@ -2498,7 +2483,7 @@ delete_after_import = true
             &run_id,
             "documents",
             "documents",
-            "files/univ/documents/a.txt",
+            "a.txt",
             b"new",
         );
         let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
@@ -2536,7 +2521,7 @@ delete_after_import = true
                 &run_id,
                 "documents",
                 "documents",
-                "files/univ/documents/a.txt",
+                "a.txt",
                 content,
             );
             process_run(&config, &nickname, &run_id).unwrap();
@@ -2566,7 +2551,7 @@ delete_after_import = true
                 &run_id,
                 "documents",
                 "documents",
-                "files/univ/documents/a.txt",
+                "a.txt",
                 content,
             );
             process_run(&config, &nickname, &run_id).unwrap();
@@ -2591,7 +2576,7 @@ delete_after_import = true
             .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Incoming);
         fs::create_dir_all(incoming.join("files/univ")).unwrap();
-        fs::write(incoming.join("files/univ/partial.txt"), b"partial").unwrap();
+        fs::write(incoming.join("files/partial.txt"), b"partial").unwrap();
         let lease_path = incoming.join("lease.toml");
         let mut lease: purgery_core::LeaseFile =
             toml::from_str(&fs::read_to_string(&lease_path).unwrap()).unwrap();
@@ -2654,7 +2639,7 @@ delete_after_import = true
             &run_id,
             "videos",
             "videos",
-            "files/univ/videos/test.mp4",
+            "test.mp4",
             b"hello",
         );
 
@@ -2807,7 +2792,7 @@ delete_after_import = true
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("tree-overlay".into()).unwrap();
         let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
-        let staged = ready.join("files/univ/data/tree");
+        let staged = ready.join("files/tree");
         fs::create_dir_all(&staged).unwrap();
         fs::write(staged.join("new.txt"), "new").unwrap();
         std::os::unix::fs::symlink("../target", staged.join("link")).unwrap();
@@ -2815,7 +2800,7 @@ delete_after_import = true
 
         let entry = |relative: &str, kind, size, target: Option<&str>| ManifestEntry {
             local_path: ClientLocalPath::new(format!("/source/{relative}")).unwrap(),
-            staged_path: NormalizedRelativePath::new(format!("files/univ/data/{relative}").into())
+            staged_path: NormalizedRelativePath::new(format!("files/{relative}").into())
                 .unwrap(),
             relative_path: NormalizedRelativePath::new(relative.into()).unwrap(),
             kind,
@@ -3013,7 +2998,7 @@ delete_after_import = true
     fn covered_entries_have_covered_mode_and_covered_by() {
         let entry_descendant = ManifestEntry {
             local_path: ClientLocalPath::new("/source/photos/photo.txt".into()).unwrap(),
-            staged_path: NormalizedRelativePath::new("files/univ/data/photos/photo.txt".into())
+            staged_path: NormalizedRelativePath::new("files/data/photos/photo.txt".into())
                 .unwrap(),
             relative_path: NormalizedRelativePath::new("photos/photo.txt".into()).unwrap(),
             kind: ManifestEntryKind::RegularFile,
@@ -3079,7 +3064,7 @@ delete_after_import = true
             entries: vec![
                 ManifestEntry {
                     local_path: ClientLocalPath::new("/source/album".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/univ/data/album".into())
+                    staged_path: NormalizedRelativePath::new("files/data/album".into())
                         .unwrap(),
                     relative_path: NormalizedRelativePath::new("album".into()).unwrap(),
                     kind: ManifestEntryKind::Directory,
@@ -3094,7 +3079,7 @@ delete_after_import = true
                 ManifestEntry {
                     local_path: ClientLocalPath::new("/source/album/song.mp3".into()).unwrap(),
                     staged_path: NormalizedRelativePath::new(
-                        "files/univ/data/album/song.mp3".into(),
+                        "files/data/album/song.mp3".into(),
                     )
                     .unwrap(),
                     relative_path: NormalizedRelativePath::new("album/song.mp3".into()).unwrap(),
@@ -3162,7 +3147,7 @@ delete_after_import = true
             entries: vec![
                 ManifestEntry {
                     local_path: ClientLocalPath::new("/source/album".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/univ/data/album".into())
+                    staged_path: NormalizedRelativePath::new("files/data/album".into())
                         .unwrap(),
                     relative_path: NormalizedRelativePath::new("album".into()).unwrap(),
                     kind: ManifestEntryKind::Directory,
@@ -3177,7 +3162,7 @@ delete_after_import = true
                 ManifestEntry {
                     local_path: ClientLocalPath::new("/source/album/song.mp3".into()).unwrap(),
                     staged_path: NormalizedRelativePath::new(
-                        "files/univ/data/album/song.mp3".into(),
+                        "files/data/album/song.mp3".into(),
                     )
                     .unwrap(),
                     relative_path: NormalizedRelativePath::new("album/song.mp3".into()).unwrap(),
@@ -3245,7 +3230,7 @@ delete_after_import = true
             entries: vec![
                 ManifestEntry {
                     local_path: ClientLocalPath::new("/source/album".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/univ/data/album".into())
+                    staged_path: NormalizedRelativePath::new("files/data/album".into())
                         .unwrap(),
                     relative_path: NormalizedRelativePath::new("album".into()).unwrap(),
                     kind: ManifestEntryKind::Directory,
@@ -3260,7 +3245,7 @@ delete_after_import = true
                 ManifestEntry {
                     local_path: ClientLocalPath::new("/source/album/song.mp3".into()).unwrap(),
                     staged_path: NormalizedRelativePath::new(
-                        "files/univ/data/album/song.mp3".into(),
+                        "files/data/album/song.mp3".into(),
                     )
                     .unwrap(),
                     relative_path: NormalizedRelativePath::new("album/song.mp3".into()).unwrap(),
@@ -3328,7 +3313,7 @@ delete_after_import = true
             entries: vec![
                 ManifestEntry {
                     local_path: ClientLocalPath::new("/source/album".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/univ/data/album".into())
+                    staged_path: NormalizedRelativePath::new("files/data/album".into())
                         .unwrap(),
                     relative_path: NormalizedRelativePath::new("album".into()).unwrap(),
                     kind: ManifestEntryKind::Directory,
@@ -3343,7 +3328,7 @@ delete_after_import = true
                 ManifestEntry {
                     local_path: ClientLocalPath::new("/source/album/song.mp3".into()).unwrap(),
                     staged_path: NormalizedRelativePath::new(
-                        "files/univ/data/album/song.mp3".into(),
+                        "files/data/album/song.mp3".into(),
                     )
                     .unwrap(),
                     relative_path: NormalizedRelativePath::new("album/song.mp3".into()).unwrap(),
@@ -3411,7 +3396,7 @@ delete_after_import = true
             entries: vec![
                 ManifestEntry {
                     local_path: ClientLocalPath::new("/source/album".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/univ/data/album".into())
+                    staged_path: NormalizedRelativePath::new("files/data/album".into())
                         .unwrap(),
                     relative_path: NormalizedRelativePath::new("album".into()).unwrap(),
                     kind: ManifestEntryKind::Directory,
@@ -3426,7 +3411,7 @@ delete_after_import = true
                 ManifestEntry {
                     local_path: ClientLocalPath::new("/source/album/song.mp3".into()).unwrap(),
                     staged_path: NormalizedRelativePath::new(
-                        "files/univ/data/album/song.mp3".into(),
+                        "files/data/album/song.mp3".into(),
                     )
                     .unwrap(),
                     relative_path: NormalizedRelativePath::new("album/song.mp3".into()).unwrap(),
@@ -3479,9 +3464,9 @@ delete_after_import = true
 
         // Create a ready run with only postprocess/covered entries (no passthrough)
         let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
-        fs::create_dir_all(ready_path.join("files/univ/data/photos")).unwrap();
+        fs::create_dir_all(ready_path.join("files/photos")).unwrap();
         fs::write(
-            ready_path.join("files/univ/data/photos/photo.txt"),
+            ready_path.join("files/photos/photo.txt"),
             b"photo",
         )
         .unwrap();
@@ -3501,7 +3486,7 @@ delete_after_import = true
             entries: vec![
                 ManifestEntry {
                     local_path: ClientLocalPath::new("/source/photos".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/univ/data/photos".into())
+                    staged_path: NormalizedRelativePath::new("files/photos".into())
                         .unwrap(),
                     relative_path: NormalizedRelativePath::new("photos".into()).unwrap(),
                     kind: ManifestEntryKind::Directory,
@@ -3516,7 +3501,7 @@ delete_after_import = true
                 ManifestEntry {
                     local_path: ClientLocalPath::new("/source/photos/photo.txt".into()).unwrap(),
                     staged_path: NormalizedRelativePath::new(
-                        "files/univ/data/photos/photo.txt".into(),
+                        "files/photos/photo.txt".into(),
                     )
                     .unwrap(),
                     relative_path: NormalizedRelativePath::new("photos/photo.txt".into()).unwrap(),
@@ -3601,7 +3586,7 @@ delete_after_import = true
             entries: vec![
                 ManifestEntry {
                     local_path: ClientLocalPath::new("/source/photos".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/univ/data/photos".into())
+                    staged_path: NormalizedRelativePath::new("files/data/photos".into())
                         .unwrap(),
                     relative_path: NormalizedRelativePath::new("photos".into()).unwrap(),
                     kind: ManifestEntryKind::Directory,
@@ -3616,7 +3601,7 @@ delete_after_import = true
                 ManifestEntry {
                     local_path: ClientLocalPath::new("/source/photos/photo.txt".into()).unwrap(),
                     staged_path: NormalizedRelativePath::new(
-                        "files/univ/data/photos/photo.txt".into(),
+                        "files/data/photos/photo.txt".into(),
                     )
                     .unwrap(),
                     relative_path: NormalizedRelativePath::new("photos/photo.txt".into()).unwrap(),
@@ -3672,8 +3657,8 @@ delete_after_import = true
         let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
 
         // videos/ has a matching file pattern, but the rule is scoped to "pictures"
-        fs::create_dir_all(ready.join("files/univ/videos")).unwrap();
-        fs::write(ready.join("files/univ/videos/a.mp4"), b"video").unwrap();
+        fs::create_dir_all(ready.join("files")).unwrap();
+        fs::write(ready.join("files/a.mp4"), b"video").unwrap();
         fs::write(
             ready.join("run.toml"),
             br#"nickname = "laptop"
@@ -3688,7 +3673,7 @@ delete_after_import = true
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
                 local_path: ClientLocalPath::new("/src/a.mp4".into()).unwrap(),
-                staged_path: NormalizedRelativePath::new("files/univ/videos/a.mp4".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/a.mp4".into()).unwrap(),
                 relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
                 kind: ManifestEntryKind::RegularFile,
                 size: 5,
@@ -3845,8 +3830,8 @@ delete_after_import = true
             .join("laptop")
             .join("ready")
             .join(run_id.as_str());
-        fs::create_dir_all(ready_path.join("files/univ/data")).unwrap();
-        fs::write(ready_path.join("files/univ/data/file.txt"), b"content").unwrap();
+        fs::create_dir_all(ready_path.join("files")).unwrap();
+        fs::write(ready_path.join("files/file.txt"), b"content").unwrap();
 
         fs::write(
             ready_path.join("run.toml"),
@@ -3862,7 +3847,7 @@ delete_after_import = true
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
                 local_path: ClientLocalPath::new("/src/file.txt".into()).unwrap(),
-                staged_path: NormalizedRelativePath::new("files/univ/data/file.txt".into())
+                staged_path: NormalizedRelativePath::new("files/file.txt".into())
                     .unwrap(),
                 relative_path: NormalizedRelativePath::new("file.txt".into()).unwrap(),
                 kind: ManifestEntryKind::RegularFile,
@@ -4815,7 +4800,7 @@ delete_after_import = true
             &run_id,
             "videos",
             "videos",
-            "files/univ/videos/test.mp4",
+            "test.mp4",
             b"hello world",
         );
 
@@ -4841,15 +4826,7 @@ delete_after_import = true
             config
                 .work_dir
                 .as_path()
-                .join("laptop/done/test-run-final-only/files/univ"),
-            config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-run-final-only/files/univ/videos"),
-            config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-run-final-only/files/univ/videos/test.mp4"),
+                .join("laptop/done/test-run-final-only/files/test.mp4"),
             config
                 .work_dir
                 .as_path()
@@ -4890,7 +4867,7 @@ delete_after_import = true
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
                 local_path: ClientLocalPath::new("/home/user/missing.mp4".into()).unwrap(),
-                staged_path: NormalizedRelativePath::new("files/univ/videos/missing.mp4".into())
+                staged_path: NormalizedRelativePath::new("files/videos/missing.mp4".into())
                     .unwrap(),
                 relative_path: NormalizedRelativePath::new("missing.mp4".into()).unwrap(),
                 kind: ManifestEntryKind::RegularFile,
@@ -4952,7 +4929,7 @@ delete_after_import = true
 
         let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
-        let staged_dir = ready_path.join("files/univ/videos");
+        let staged_dir = ready_path.join("files/videos");
         fs::create_dir_all(&staged_dir).unwrap();
         fs::write(staged_dir.join("a.mp4"), b"video a data").unwrap();
         fs::write(staged_dir.join("b.mp4"), b"video b data").unwrap();
@@ -4972,7 +4949,7 @@ delete_after_import = true
             entries: vec![
                 ManifestEntry {
                     local_path: ClientLocalPath::new("/home/user/a.mp4".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/univ/videos/a.mp4".into())
+                    staged_path: NormalizedRelativePath::new("files/videos/a.mp4".into())
                         .unwrap(),
                     relative_path: NormalizedRelativePath::new("a.mp4".into()).unwrap(),
                     kind: ManifestEntryKind::RegularFile,
@@ -4986,7 +4963,7 @@ delete_after_import = true
                 },
                 ManifestEntry {
                     local_path: ClientLocalPath::new("/home/user/b.mp4".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/univ/videos/b.mp4".into())
+                    staged_path: NormalizedRelativePath::new("files/videos/b.mp4".into())
                         .unwrap(),
                     relative_path: NormalizedRelativePath::new("b.mp4".into()).unwrap(),
                     kind: ManifestEntryKind::RegularFile,
@@ -5068,8 +5045,8 @@ delete_after_import = true
         let ready_path = server_config
             .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
-        fs::create_dir_all(ready_path.join("files/univ/data")).unwrap();
-        fs::write(ready_path.join("files/univ/data/input.dat"), b"input").unwrap();
+        fs::create_dir_all(ready_path.join("files")).unwrap();
+        fs::write(ready_path.join("files/input.dat"), b"input").unwrap();
 
         fs::write(
             ready_path.join("run.toml"),
@@ -5088,7 +5065,7 @@ delete_after_import = true
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
                 local_path: ClientLocalPath::new("/home/user/input.dat".into()).unwrap(),
-                staged_path: NormalizedRelativePath::new("files/univ/data/input.dat".into())
+                staged_path: NormalizedRelativePath::new("files/input.dat".into())
                     .unwrap(),
                 relative_path: NormalizedRelativePath::new("input.dat".into()).unwrap(),
                 kind: ManifestEntryKind::RegularFile,
@@ -5137,15 +5114,7 @@ delete_after_import = true
             server_config
                 .work_dir
                 .as_path()
-                .join("laptop/done/test-pp-cwd/files/univ"),
-            server_config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-pp-cwd/files/univ/data"),
-            server_config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-pp-cwd/files/univ/data/input.dat"),
+                .join("laptop/done/test-pp-cwd/files/input.dat"),
             server_config
                 .work_dir
                 .as_path()
@@ -5320,7 +5289,7 @@ delete_after_import = true
             &run_id,
             "videos",
             "videos",
-            "files/univ/videos/test.mp4",
+            "test.mp4",
             b"replay content",
         );
 
@@ -5368,15 +5337,7 @@ delete_after_import = true
             config
                 .work_dir
                 .as_path()
-                .join("laptop/done/test-replay/files/univ"),
-            config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-replay/files/univ/videos"),
-            config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-replay/files/univ/videos/test.mp4"),
+                .join("laptop/done/test-replay/files/test.mp4"),
             config
                 .work_dir
                 .as_path()
@@ -5437,8 +5398,8 @@ delete_after_import = true
         let ready_path = server_config
             .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
-        fs::create_dir_all(ready_path.join("files/univ/data")).unwrap();
-        fs::write(ready_path.join("files/univ/data/input.dat"), b"data").unwrap();
+        fs::create_dir_all(ready_path.join("files")).unwrap();
+        fs::write(ready_path.join("files/input.dat"), b"data").unwrap();
 
         fs::write(
             ready_path.join("run.toml"),
@@ -5457,7 +5418,7 @@ delete_after_import = true
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
                 local_path: ClientLocalPath::new("/home/user/input.dat".into()).unwrap(),
-                staged_path: NormalizedRelativePath::new("files/univ/data/input.dat".into())
+                staged_path: NormalizedRelativePath::new("files/input.dat".into())
                     .unwrap(),
                 relative_path: NormalizedRelativePath::new("input.dat".into()).unwrap(),
                 kind: ManifestEntryKind::RegularFile,
@@ -5504,15 +5465,11 @@ delete_after_import = true
             server_config
                 .work_dir
                 .as_path()
-                .join("laptop/done/test-pp-symlink/files/univ"),
+                .join("laptop/done/test-pp-symlink/files"),
             server_config
                 .work_dir
                 .as_path()
-                .join("laptop/done/test-pp-symlink/files/univ/data"),
-            server_config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-pp-symlink/files/univ/data/input.dat"),
+                .join("laptop/done/test-pp-symlink/files/input.dat"),
             server_config
                 .work_dir
                 .as_path()
@@ -5741,8 +5698,8 @@ delete_after_import = true
         let ready_path = server_config
             .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
-        fs::create_dir_all(ready_path.join("files/univ/data")).unwrap();
-        fs::write(ready_path.join("files/univ/data/input.dat"), b"data").unwrap();
+        fs::create_dir_all(ready_path.join("files")).unwrap();
+        fs::write(ready_path.join("files/input.dat"), b"data").unwrap();
 
         fs::write(
             ready_path.join("run.toml"),
@@ -5761,7 +5718,7 @@ delete_after_import = true
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
                 local_path: ClientLocalPath::new("/home/user/input.dat".into()).unwrap(),
-                staged_path: NormalizedRelativePath::new("files/univ/data/input.dat".into())
+                staged_path: NormalizedRelativePath::new("files/input.dat".into())
                     .unwrap(),
                 relative_path: NormalizedRelativePath::new("input.dat".into()).unwrap(),
                 kind: ManifestEntryKind::RegularFile,
@@ -5814,15 +5771,7 @@ delete_after_import = true
             server_config
                 .work_dir
                 .as_path()
-                .join("laptop/done/test-pp-dir/files/univ"),
-            server_config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-pp-dir/files/univ/data"),
-            server_config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-pp-dir/files/univ/data/input.dat"),
+                .join("laptop/done/test-pp-dir/files/input.dat"),
             server_config
                 .work_dir
                 .as_path()
@@ -5864,7 +5813,7 @@ delete_after_import = true
             &run_id,
             "videos",
             "videos",
-            "files/univ/videos/a.mp4",
+            "a.mp4",
             b"video a content",
         );
 
@@ -5875,7 +5824,7 @@ delete_after_import = true
             toml::from_str(&fs::read_to_string(ready_path.join("manifest.toml")).unwrap()).unwrap();
         manifest.entries.push(ManifestEntry {
             local_path: ClientLocalPath::new("/home/user/nonexistent.mp4".into()).unwrap(),
-            staged_path: NormalizedRelativePath::new("files/univ/videos/nonexistent.mp4".into())
+            staged_path: NormalizedRelativePath::new("files/nonexistent.mp4".into())
                 .unwrap(),
             relative_path: NormalizedRelativePath::new("nonexistent.mp4".into()).unwrap(),
             kind: ManifestEntryKind::RegularFile,
@@ -5907,7 +5856,7 @@ delete_after_import = true
         assert_eq!(status.state, RunState::Partial);
 
         // Staged file for the successful entry must still exist.
-        let staged_after = done_path.join("files/univ/videos/a.mp4");
+        let staged_after = done_path.join("files/a.mp4");
         assert!(
             staged_after.exists(),
             "staged file for successful entry must be preserved, \
@@ -5941,15 +5890,7 @@ delete_after_import = true
             config
                 .work_dir
                 .as_path()
-                .join("laptop/done/test-staged-preserved/files/univ"),
-            config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-staged-preserved/files/univ/videos"),
-            config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-staged-preserved/files/univ/videos/a.mp4"),
+                .join("laptop/done/test-staged-preserved/files/a.mp4"),
             config
                 .work_dir
                 .as_path()
@@ -5970,14 +5911,6 @@ delete_after_import = true
                 .work_dir
                 .as_path()
                 .join("laptop/done/test-staged-preserved/work"),
-            config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-staged-preserved/work/univ"),
-            config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-staged-preserved/work/univ/videos"),
             config.work_dir.as_path().join("laptop/processing"),
             config.work_dir.as_path().join("laptop/ready"),
         ];
@@ -5999,7 +5932,7 @@ delete_after_import = true
         fs::create_dir_all(&ready_path).unwrap();
 
         // Create staged symlink under files/.
-        let staged_symlink_dir = ready_path.join("files/univ/data");
+        let staged_symlink_dir = ready_path.join("files");
         fs::create_dir_all(&staged_symlink_dir).unwrap();
         let staged_symlink = staged_symlink_dir.join("mylink");
         std::os::unix::fs::symlink("/usr/share/data", &staged_symlink).unwrap();
@@ -6012,7 +5945,7 @@ delete_after_import = true
             entries: vec![
                 ManifestEntry {
                     local_path: ClientLocalPath::new("/home/user/mylink".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/univ/data/mylink".into())
+                    staged_path: NormalizedRelativePath::new("files/mylink".into())
                         .unwrap(),
                     relative_path: NormalizedRelativePath::new("mylink".into()).unwrap(),
                     kind: ManifestEntryKind::Symlink,
@@ -6027,7 +5960,7 @@ delete_after_import = true
                 // Second entry fails (missing staged file).
                 ManifestEntry {
                     local_path: ClientLocalPath::new("/home/user/missing.dat".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/univ/data/missing.dat".into())
+                    staged_path: NormalizedRelativePath::new("files/missing.dat".into())
                         .unwrap(),
                     relative_path: NormalizedRelativePath::new("missing.dat".into()).unwrap(),
                     kind: ManifestEntryKind::RegularFile,
@@ -6057,7 +5990,7 @@ delete_after_import = true
         assert_eq!(status.state, RunState::Partial);
 
         // Staged symlink must still exist.
-        let staged_after = done_path.join("files/univ/data/mylink");
+        let staged_after = done_path.join("files/mylink");
         assert!(
             fs::symlink_metadata(staged_after.as_std_path()).is_ok(),
             "staged symlink must be preserved after materialization"
@@ -6091,15 +6024,7 @@ delete_after_import = true
             config
                 .work_dir
                 .as_path()
-                .join("laptop/done/test-symlink-staged/files/univ"),
-            config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-symlink-staged/files/univ/data"),
-            config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-symlink-staged/files/univ/data/mylink"),
+                .join("laptop/done/test-symlink-staged/files/mylink"),
             config
                 .work_dir
                 .as_path()
@@ -6120,14 +6045,6 @@ delete_after_import = true
                 .work_dir
                 .as_path()
                 .join("laptop/done/test-symlink-staged/work"),
-            config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-symlink-staged/work/univ"),
-            config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-symlink-staged/work/univ/data"),
             config.work_dir.as_path().join("laptop/processing"),
             config.work_dir.as_path().join("laptop/ready"),
         ];
@@ -6150,7 +6067,7 @@ delete_after_import = true
             &run_id,
             "videos",
             "videos",
-            "files/univ/videos/test.mp4",
+            "test.mp4",
             b"replay content",
         );
 
@@ -6167,7 +6084,7 @@ delete_after_import = true
         fs::write(&final_path, b"partial remnant").unwrap();
 
         // Record the staged file content before replay.
-        let staged_before = processing_path.join("files/univ/videos/test.mp4");
+        let staged_before = processing_path.join("files/test.mp4");
         assert!(staged_before.exists());
         let staged_content_before = fs::read_to_string(&staged_before).unwrap();
 
@@ -6179,7 +6096,7 @@ delete_after_import = true
 
         // Staged file must still exist after replay and contain unchanged
         // content.
-        let staged_after = done_path.join("files/univ/videos/test.mp4");
+        let staged_after = done_path.join("files/videos/test.mp4");
         assert!(
             staged_after.exists(),
             "staged upload source must survive replay, expected: {}",
@@ -6259,7 +6176,7 @@ delete_after_import = true
             &run_id,
             "data",
             "data",
-            "files/univ/data/doc.txt",
+            "doc.txt",
             b"original content",
         );
 
@@ -6269,7 +6186,7 @@ delete_after_import = true
         assert!(done_path.exists());
 
         // Staged original must still exist.
-        let staged_path = done_path.join("files/univ/data/doc.txt");
+        let staged_path = done_path.join("files/doc.txt");
         assert!(staged_path.exists(), "staged original must be preserved");
         assert_eq!(
             fs::read_to_string(&staged_path).unwrap(),
@@ -6308,15 +6225,7 @@ delete_after_import = true
             config
                 .work_dir
                 .as_path()
-                .join("laptop/done/test-work-consumed/files/univ"),
-            config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-work-consumed/files/univ/data"),
-            config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-work-consumed/files/univ/data/doc.txt"),
+                .join("laptop/done/test-work-consumed/files/doc.txt"),
             config
                 .work_dir
                 .as_path()
@@ -6353,7 +6262,7 @@ delete_after_import = true
         let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(&ready_path).unwrap();
 
-        let staged_dir = ready_path.join("files/univ/data");
+        let staged_dir = ready_path.join("files");
         fs::create_dir_all(&staged_dir).unwrap();
         let staged_symlink = staged_dir.join("the-link");
         std::os::unix::fs::symlink("/etc/config", &staged_symlink).unwrap();
@@ -6365,7 +6274,7 @@ delete_after_import = true
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
                 local_path: ClientLocalPath::new("/home/user/the-link".into()).unwrap(),
-                staged_path: NormalizedRelativePath::new("files/univ/data/the-link".into())
+                staged_path: NormalizedRelativePath::new("files/the-link".into())
                     .unwrap(),
                 relative_path: NormalizedRelativePath::new("the-link".into()).unwrap(),
                 kind: ManifestEntryKind::Symlink,
@@ -6390,7 +6299,7 @@ delete_after_import = true
         assert!(done_path.exists());
 
         // Staged original symlink must still exist.
-        let staged_after = done_path.join("files/univ/data/the-link");
+        let staged_after = done_path.join("files/the-link");
         assert!(
             fs::symlink_metadata(staged_after.as_std_path()).is_ok(),
             "staged symlink original must be preserved"
@@ -6498,8 +6407,8 @@ delete_after_import = true
         let ready_path = server_config
             .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
-        fs::create_dir_all(ready_path.join("files/univ/data")).unwrap();
-        fs::write(ready_path.join("files/univ/data/input.bin"), b"binary data").unwrap();
+        fs::create_dir_all(ready_path.join("files")).unwrap();
+        fs::write(ready_path.join("files/input.bin"), b"binary data").unwrap();
 
         fs::write(
             ready_path.join("run.toml"),
@@ -6518,7 +6427,7 @@ delete_after_import = true
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
                 local_path: ClientLocalPath::new("/home/user/input.bin".into()).unwrap(),
-                staged_path: NormalizedRelativePath::new("files/univ/data/input.bin".into())
+                staged_path: NormalizedRelativePath::new("files/input.bin".into())
                     .unwrap(),
                 relative_path: NormalizedRelativePath::new("input.bin".into()).unwrap(),
                 kind: ManifestEntryKind::RegularFile,
@@ -6650,8 +6559,8 @@ delete_after_import = true
         let ready_path = server_config
             .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready);
-        fs::create_dir_all(ready_path.join("files/univ/data")).unwrap();
-        fs::write(ready_path.join("files/univ/data/input.bin"), b"binary data").unwrap();
+        fs::create_dir_all(ready_path.join("files")).unwrap();
+        fs::write(ready_path.join("files/input.bin"), b"binary data").unwrap();
 
         fs::write(
             ready_path.join("run.toml"),
@@ -6670,7 +6579,7 @@ delete_after_import = true
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
                 local_path: ClientLocalPath::new("/home/user/input.bin".into()).unwrap(),
-                staged_path: NormalizedRelativePath::new("files/univ/data/input.bin".into())
+                staged_path: NormalizedRelativePath::new("files/input.bin".into())
                     .unwrap(),
                 relative_path: NormalizedRelativePath::new("input.bin".into()).unwrap(),
                 kind: ManifestEntryKind::RegularFile,
@@ -6698,7 +6607,7 @@ delete_after_import = true
         assert!(done_path.exists());
 
         // Staged original must still exist.
-        let staged_after = done_path.join("files/univ/data/input.bin");
+        let staged_after = done_path.join("files/input.bin");
         assert!(staged_after.exists());
         assert_eq!(fs::read_to_string(&staged_after).unwrap(), "binary data");
 
@@ -6723,7 +6632,7 @@ delete_after_import = true
             &run_id,
             "videos",
             "univ/videos",
-            "files/univ/videos/test.mp4",
+            "test.mp4",
             b"hello world",
         );
 

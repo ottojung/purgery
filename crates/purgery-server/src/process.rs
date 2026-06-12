@@ -94,11 +94,10 @@ impl EntryOutcome {
 #[cfg(unix)]
 fn prepare_work_entry(
     entry: &ManifestEntry,
-    to_path: &str,
     source_path: &Utf8Path,
     work_area: &Utf8Path,
 ) -> Result<Utf8PathBuf, String> {
-    let work_path = work_area.join(to_path).join(entry.relative_path.as_str());
+    let work_path = work_area.join(entry.relative_path.as_str());
 
     match entry.kind {
         ManifestEntryKind::Directory => {
@@ -199,9 +198,7 @@ fn process_manifest_entry(
     entry_total: usize,
     to_path: &str,
 ) -> EntryOutcome {
-    let expected_staged = Utf8Path::new("files")
-        .join(to_path)
-        .join(entry.relative_path.as_str());
+    let expected_staged = Utf8Path::new("files").join(entry.relative_path.as_str());
     let Ok(expected_staged) = NormalizedRelativePath::new(expected_staged) else {
         return failed_entry(entry, "failed to normalize expected staged path");
     };
@@ -279,7 +276,7 @@ fn process_manifest_entry(
                     .map(|_| (vec![final_relative], None))
             }
             ManifestEntryKind::Symlink => {
-                let work_path = match prepare_work_entry(entry, to_path, &source_path, work_area) {
+                let work_path = match prepare_work_entry(entry, &source_path, work_area) {
                     Ok(p) => p,
                     Err(error) => return failed_entry(entry, error.to_string()),
                 };
@@ -287,7 +284,7 @@ fn process_manifest_entry(
                     .map(|_| (vec![final_relative], None))
             }
             ManifestEntryKind::RegularFile => {
-                let work_path = match prepare_work_entry(entry, to_path, &source_path, work_area) {
+                let work_path = match prepare_work_entry(entry, &source_path, work_area) {
                     Ok(p) => p,
                     Err(error) => return failed_entry(entry, error.to_string()),
                 };
@@ -296,7 +293,7 @@ fn process_manifest_entry(
             }
         }
     } else {
-        let work_path = match prepare_work_entry(entry, to_path, &source_path, work_area) {
+        let work_path = match prepare_work_entry(entry, &source_path, work_area) {
             Ok(p) => p,
             Err(error) => return failed_entry(entry, error.to_string()),
         };
