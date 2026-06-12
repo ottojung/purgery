@@ -339,7 +339,7 @@ For each `[[sync]]` group, the client generates at most two rsync calls:
 1. **Purgatory call**: transfers entries matching any `match` rule to the server's staging area.
 2. **Passthrough call**: transfers all other entries directly to final storage.
 
-Both calls use `rsync --archive --no-inc-recursive --protect-args --no-delete` with include/exclude filters.
+Both calls use `rsync --archive --protect-args --no-delete` with include/exclude filters.
 
 The purgatory filter includes ancestor traversal directories needed to reach selected roots, then the roots themselves (exact or subtree), then excludes everything else.
 
