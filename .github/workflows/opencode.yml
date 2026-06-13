@@ -9,15 +9,19 @@ on:
 jobs:
   opencode:
     if: |
-      startsWith(github.event.comment.body, 'plsoc') ||
-      startsWith(github.event.comment.body, '/opencode') ||
-      startsWith(github.event.comment.body, '/opencode-pro')
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association) &&
+      (
+        startsWith(github.event.comment.body, 'plsoc') ||
+        startsWith(github.event.comment.body, 'plsocz') ||
+        startsWith(github.event.comment.body, '/opencode')
+      )
     runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: read
       pull-requests: read
       issues: read
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -29,16 +33,40 @@ jobs:
         env:
           COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
-          if printf '%s' "$COMMENT_BODY" | grep -Eiq '(^|[[:space:]])/opencode-pro([[:space:]]|$)'; then
-            echo 'model=opencode-go/deepseek-v4-pro' >> "$GITHUB_OUTPUT"
-          else
-            echo 'model=opencode-go/deepseek-v4-flash' >> "$GITHUB_OUTPUT"
-          fi
+          first_token="$(printf '%s\n' "$COMMENT_BODY" | awk 'NF { print $1; exit }')"
+
+          case "$first_token" in
+            /opencode-pro-zen)
+              echo 'run=true' >> "$GITHUB_OUTPUT"
+              echo 'model=opencode/deepseek-v4-pro' >> "$GITHUB_OUTPUT"
+              ;;
+
+            plsocz)
+              echo 'run=true' >> "$GITHUB_OUTPUT"
+              echo 'model=opencode/deepseek-v4-flash' >> "$GITHUB_OUTPUT"
+              ;;
+
+            /opencode-pro)
+              echo 'run=true' >> "$GITHUB_OUTPUT"
+              echo 'model=opencode-go/deepseek-v4-pro' >> "$GITHUB_OUTPUT"
+              ;;
+
+            /opencode|plsoc)
+              echo 'run=true' >> "$GITHUB_OUTPUT"
+              echo 'model=opencode-go/deepseek-v4-flash' >> "$GITHUB_OUTPUT"
+              ;;
+
+            *)
+              echo 'run=false' >> "$GITHUB_OUTPUT"
+              echo "Ignoring non-opencode command: $first_token"
+              ;;
+          esac
 
       - name: Run opencode
+        if: steps.select-model.outputs.run == 'true'
         uses: anomalyco/opencode/github@latest
         env:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
         with:
           model: ${{ steps.select-model.outputs.model }}
-          mentions: /opencode-pro,/opencode,plsoc
+          mentions: /opencode-pro-zen,/opencode-pro,/opencode,plsocz,plsoc
