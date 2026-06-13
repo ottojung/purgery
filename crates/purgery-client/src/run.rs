@@ -1820,4 +1820,307 @@ state = "done"
             "persisted UploadCompleteFinishPending must contain resolved destination"
         );
     }
+
+    // ── Source normalization integration tests ──
+
+    #[test]
+    fn trailing_slash_source_uses_normalized_operand_in_rsync() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let src = tmp.path().join("Videos");
+        fs::create_dir(&src).unwrap();
+        // Use trailing slash to exercise normalization.
+        let src_slash = format!("{}/", src.to_str().unwrap());
+        let args = SyncArgs {
+            postprocess: vec![],
+            delete_after_import: false,
+            split: None,
+            state_dir: Some(state_dir),
+            source: src_slash,
+            destination: "host:/dest".to_string(),
+            server_command: "purgery-server".to_string(),
+        };
+        run_sync_with_runner(&runner, &args).unwrap();
+        let log = runner.command_log();
+        assert_eq!(log.len(), 1, "passthrough should produce exactly one command");
+        let rsync_cmd = &log[0];
+        // rsync source operand must NOT have trailing slash.
+        let after_sep: Vec<&str> = rsync_cmd.split(" -- ").collect();
+        assert_eq!(after_sep.len(), 2);
+        let operands: Vec<&str> = after_sep[1].split_whitespace().collect();
+        let source_op = operands[0];
+        assert!(
+            !source_op.ends_with('/'),
+            "rsync source operand must not have trailing slash, got: {source_op}"
+        );
+    }
+
+    #[test]
+    fn trailing_slash_passthrough_cleanup_uses_normalized_name() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let src = tmp.path().join("Videos");
+        fs::create_dir(&src).unwrap();
+        let src_slash = format!("{}/", src.to_str().unwrap());
+        let args = SyncArgs {
+            postprocess: vec![],
+            delete_after_import: true,
+            split: None,
+            state_dir: Some(state_dir.clone()),
+            source: src_slash,
+            destination: "host:/dest".to_string(),
+            server_command: "purgery-server".to_string(),
+        };
+        run_sync_with_runner(&runner, &args).unwrap();
+        // Cleanup state file must use the normalized source entry name.
+        let cleanup_files: Vec<_> = fs::read_dir(
+            camino::Utf8PathBuf::from(&state_dir).as_std_path(),
+        )
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with("cleanup-"))
+        })
+        .collect();
+        assert!(
+            !cleanup_files.is_empty(),
+            "cleanup state file must be created"
+        );
+    }
+
+    #[test]
+    fn postprocess_trailing_slash_stages_as_files_source_name() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let src = tmp.path().join("Videos");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("a.mp4"), "data").unwrap();
+        let src_slash = format!("{}/", src.to_str().unwrap());
+        let args = SyncArgs {
+            postprocess: vec!["transform".to_string()],
+            delete_after_import: true,
+            split: None,
+            state_dir: Some(state_dir.clone()),
+            source: src_slash,
+            destination: "host:/dest".to_string(),
+            server_command: "purgery-server".to_string(),
+        };
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        // Destination is "host:/dest" → nickname = "host"
+        let begin = begin_resp_toml().replace("laptop", "host").replace(
+            "heartbeat_interval_secs = 60",
+            "heartbeat_interval_secs = 1",
+        );
+        runner.add_response("begin-run", &begin);
+        runner.add_response(
+            "prepare-run",
+            "protocol_version = 1\nnickname = \"host\"\nrun_id = \"test-run\"\n",
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response(
+            "run-state",
+            &done_run_state_toml()
+                .replace("laptop", "host"),
+        );
+        let status_toml =
+            "run_id = \"test-run\"\nnickname = \"host\"\nstate = \"done\"\n".to_string();
+        runner.add_response("status", &status_toml);
+        runner.add_response("finish-run", "");
+
+        run_sync_with_run_id(&runner, &args, &run_id).unwrap();
+
+        let written = runner.written_files();
+        let manifest_content = written
+            .values()
+            .find(|v| v.contains("files/Videos"))
+            .expect("manifest must contain staged_path files/Videos");
+        assert!(
+            manifest_content.contains("files/Videos"),
+            "staged path must be files/Videos for trailing-slash source"
+        );
+    }
+
+    #[test]
+    fn root_path_rejected_in_all_modes() {
+        // Pure passthrough
+        {
+            let tmp = tempdir().unwrap();
+            let runner = mk_runner();
+            let args = SyncArgs {
+                postprocess: vec![],
+                delete_after_import: false,
+                split: None,
+                state_dir: Some(mk_state_dir(&tmp)),
+                source: "/".to_string(),
+                destination: "host:/dest".to_string(),
+                server_command: "purgery-server".to_string(),
+            };
+            let result = run_sync_with_runner(&runner, &args);
+            assert!(
+                result.is_err(),
+                "/ must be rejected in pure passthrough mode"
+            );
+            assert!(result.unwrap_err().to_string().contains("root"));
+        }
+        // Passthrough cleanup
+        {
+            let tmp = tempdir().unwrap();
+            let runner = mk_runner();
+            let args = SyncArgs {
+                postprocess: vec![],
+                delete_after_import: true,
+                split: None,
+                state_dir: Some(mk_state_dir(&tmp)),
+                source: "/".to_string(),
+                destination: "host:/dest".to_string(),
+                server_command: "purgery-server".to_string(),
+            };
+            let result = run_sync_with_runner(&runner, &args);
+            assert!(
+                result.is_err(),
+                "/ must be rejected in passthrough cleanup mode"
+            );
+            assert!(result.unwrap_err().to_string().contains("root"));
+        }
+        // Postprocess
+        {
+            let tmp = tempdir().unwrap();
+            let runner = mk_runner();
+            let args = SyncArgs {
+                postprocess: vec!["transform".to_string()],
+                delete_after_import: true,
+                split: None,
+                state_dir: Some(mk_state_dir(&tmp)),
+                source: "/".to_string(),
+                destination: "host:/dest".to_string(),
+                server_command: "purgery-server".to_string(),
+            };
+            let result = run_sync_with_runner(&runner, &args);
+            assert!(
+                result.is_err(),
+                "/ must be rejected in postprocess mode"
+            );
+            assert!(result.unwrap_err().to_string().contains("root"));
+        }
+        // Split
+        {
+            let tmp = tempdir().unwrap();
+            let runner = mk_runner();
+            let args = SyncArgs {
+                postprocess: vec![],
+                delete_after_import: false,
+                split: Some("*.mp4".to_string()),
+                state_dir: Some(mk_state_dir(&tmp)),
+                source: "/".to_string(),
+                destination: "host:/dest".to_string(),
+                server_command: "purgery-server".to_string(),
+            };
+            let result = run_sync_with_runner(&runner, &args);
+            assert!(
+                result.is_err(),
+                "/ must be rejected in split mode"
+            );
+            assert!(result.unwrap_err().to_string().contains("root"));
+        }
+    }
+
+    #[test]
+    fn pure_passthrough_split_transfers_only_selected_roots() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let src = tmp.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("a.mp4"), "mp4").unwrap();
+        fs::write(src.join("b.txt"), "txt").unwrap();
+        fs::create_dir(src.join("sub")).unwrap();
+        fs::write(src.join("sub/c.mp4"), "mp4").unwrap();
+
+        let args = SyncArgs {
+            postprocess: vec![],
+            delete_after_import: false,
+            split: Some("*.mp4".to_string()),
+            state_dir: Some(state_dir),
+            source: src.to_str().unwrap().to_string(),
+            destination: "host:/dest".to_string(),
+            server_command: "purgery-server".to_string(),
+        };
+        run_sync_with_runner(&runner, &args).unwrap();
+
+        let log = runner.command_log();
+        assert_eq!(
+            log.len(),
+            1,
+            "pure passthrough split must use exactly one rsync process"
+        );
+        assert!(
+            !log.iter().any(|c| c.contains("ssh")),
+            "pure passthrough split must not use ssh"
+        );
+
+        let file_lists = runner.file_lists();
+        assert_eq!(file_lists.len(), 1, "must record one file list");
+        let files = &file_lists[0];
+        assert!(
+            files.iter().any(|f| f == "a.mp4"),
+            "must include a.mp4"
+        );
+        assert!(
+            files.iter().any(|f| f.contains("c.mp4")),
+            "must include sub/c.mp4"
+        );
+        assert!(
+            !files.iter().any(|f| f == "b.txt" || f.contains("b.txt")),
+            "must not include b.txt"
+        );
+    }
+
+    #[test]
+    fn pure_passthrough_split_no_server_run_no_cleanup() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let src = tmp.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("a.mp4"), "data").unwrap();
+
+        let args = SyncArgs {
+            postprocess: vec![],
+            delete_after_import: false,
+            split: Some("*.mp4".to_string()),
+            state_dir: Some(state_dir.clone()),
+            source: src.to_str().unwrap().to_string(),
+            destination: "host:/dest".to_string(),
+            server_command: "purgery-server".to_string(),
+        };
+        run_sync_with_runner(&runner, &args).unwrap();
+
+        let log = runner.command_log();
+        assert!(
+            !log.iter().any(|c| c.contains("ssh")),
+            "pure passthrough split must not create a server run"
+        );
+        // No cleanup state files should exist
+        let cleanup_files: Vec<_> = fs::read_dir(
+            camino::Utf8PathBuf::from(&state_dir).as_std_path(),
+        )
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with("cleanup-"))
+        })
+        .collect();
+        assert!(
+            cleanup_files.is_empty(),
+            "pure passthrough split must not create cleanup state"
+        );
+    }
 }
