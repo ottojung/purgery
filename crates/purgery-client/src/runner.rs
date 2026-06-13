@@ -35,6 +35,7 @@ pub(crate) struct FakeState {
     log: Mutex<Vec<String>>,
     written_files: Mutex<HashMap<String, String>>,
     finish_run_hook: Mutex<Option<Box<dyn Fn() + Send>>>,
+    rsync_hook: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 impl std::fmt::Debug for FakeState {
@@ -66,6 +67,7 @@ impl RemoteRunner {
                 log: Mutex::new(Vec::new()),
                 written_files: Mutex::new(HashMap::new()),
                 finish_run_hook: Mutex::new(None),
+                rsync_hook: Mutex::new(None),
             }),
         }
     }
@@ -117,6 +119,16 @@ impl RemoteRunner {
         match self {
             RemoteRunner::Fake { inner } => {
                 inner.finish_run_hook.lock().unwrap().replace(hook);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_rsync_hook(&self, hook: Box<dyn Fn() + Send>) {
+        match self {
+            RemoteRunner::Fake { inner } => {
+                inner.rsync_hook.lock().unwrap().replace(hook);
             }
             _ => unreachable!(),
         }
@@ -276,6 +288,11 @@ impl RemoteRunner {
                 Ok(())
             }
             RemoteRunner::Fake { inner } => {
+                // Call rsync hook before processing errors and log, so
+                // tests using a blocking hook can synchronize with staging.
+                if let Some(hook) = inner.rsync_hook.lock().unwrap().take() {
+                    hook();
+                }
                 for (rc, err) in inner.rsync_errors.lock().unwrap().iter() {
                     if rsync_cmd.contains(rc.as_str()) {
                         anyhow::bail!("{err}");

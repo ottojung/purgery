@@ -290,6 +290,7 @@ fn remove_client_run_state(state_dir: &str, nickname: &Nickname, run_id: &RunId)
     let _ = fs::remove_dir_all(dir.as_std_path());
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_heartbeat(
     runner: RemoteRunner,
     host: String,
@@ -298,6 +299,7 @@ fn start_heartbeat(
     run_id: RunId,
     interval_secs: u64,
     stop: Arc<AtomicBool>,
+    first_attempt_completed: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<Result<()>> {
     let half_interval = Duration::from_millis((interval_secs.max(2) * 500).min(600_000));
     std::thread::spawn(move || {
@@ -307,6 +309,7 @@ fn start_heartbeat(
                 run_id = %run_id.as_str(),
                 "sending heartbeat"
             );
+            first_attempt_completed.store(true, Ordering::Relaxed);
             if let Err(e) = heartbeat_run(&runner, &host, &server_cmd, &nickname, &run_id) {
                 error!(
                     nickname = %nickname.as_str(),
@@ -459,7 +462,19 @@ fn drain_one(runner: &RemoteRunner, state_dir: &str, state: &ClientRunState) -> 
             ClientRunPhase::TerminalStatusSeen => {
                 let status = match &terminal_status {
                     Some(ts) => {
-                        toml::from_str(ts).with_context(|| "failed to parse persisted status")?
+                        let s: purgery_core::RunStatus = toml::from_str(ts)
+                            .with_context(|| "failed to parse persisted status")?;
+                        if s.nickname != nickname || s.run_id != run_id {
+                            anyhow::bail!(
+                                "persisted terminal status envelope does not match: \
+                                 expected {}/{} but got {}/{}",
+                                nickname.as_str(),
+                                run_id.as_str(),
+                                s.nickname.as_str(),
+                                s.run_id.as_str()
+                            );
+                        }
+                        s
                     }
                     None => read_status(runner, host, server_cmd, &nickname, &run_id)
                         .with_context(|| {
@@ -510,6 +525,13 @@ fn process_cleanup_from_status(
     if cleanup_path.as_std_path().exists() {
         cleanup::confirm_imports_from_status(&cleanup_path, status)?;
         cleanup::process_cleanup_state_file(&cleanup_path)?;
+    } else if run_config.delete_after_import && !manifest.entries.is_empty() {
+        anyhow::bail!(
+            "cleanup state file '{cleanup_filename}' is required for run {}/{} \
+             with delete_after_import but is missing or corrupt",
+            nickname.as_str(),
+            run_id.as_str()
+        );
     }
     persist_client_run_state(
         state_dir,
@@ -555,6 +577,7 @@ struct HeartbeatGuard {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<Result<()>>>,
     result: Option<Result<()>>,
+    first_attempt_completed: Arc<AtomicBool>,
 }
 
 impl HeartbeatGuard {
@@ -567,6 +590,7 @@ impl HeartbeatGuard {
         interval_secs: u64,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
+        let first_attempt_completed = Arc::new(AtomicBool::new(false));
         let handle = start_heartbeat(
             runner,
             host,
@@ -575,15 +599,22 @@ impl HeartbeatGuard {
             run_id,
             interval_secs,
             Arc::clone(&stop),
+            Arc::clone(&first_attempt_completed),
         );
         Self {
             stop,
             handle: Some(handle),
             result: None,
+            first_attempt_completed,
         }
     }
 
     fn stop_and_join(&mut self) {
+        // Wait for at least one heartbeat attempt to complete so that
+        // stop_and_join always captures a definitive heartbeat result.
+        while !self.first_attempt_completed.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         self.stop.store(true, Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {
             self.result = Some(match handle.join() {
@@ -618,6 +649,15 @@ pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
 }
 
 pub(crate) fn run_sync_with_runner(runner: &RemoteRunner, args: &SyncArgs) -> Result<()> {
+    let run_id = RunId::generate();
+    run_sync_with_run_id(runner, args, &run_id)
+}
+
+pub(crate) fn run_sync_with_run_id(
+    runner: &RemoteRunner,
+    args: &SyncArgs,
+    run_id: &RunId,
+) -> Result<()> {
     let state_dir = resolve_state_dir(args);
 
     // Phase 1: resume pending cleanup and run states before validating the
@@ -635,7 +675,6 @@ pub(crate) fn run_sync_with_runner(runner: &RemoteRunner, args: &SyncArgs) -> Re
 
     let remote = parse_destination(&args.destination)?;
     let nickname = derive_nickname(&args.destination)?;
-    let run_id = RunId::generate();
 
     info!(
         nickname = %nickname.as_str(),
@@ -656,7 +695,7 @@ pub(crate) fn run_sync_with_runner(runner: &RemoteRunner, args: &SyncArgs) -> Re
 
     let manifest = classify::build_manifest(
         &args.source,
-        &run_id,
+        run_id,
         &nickname,
         &args.postprocess,
         args.delete_after_import,
@@ -691,14 +730,14 @@ pub(crate) fn run_sync_with_runner(runner: &RemoteRunner, args: &SyncArgs) -> Re
 
     // Postprocess: server run flow with heartbeat and crash-safe persistence
     let server_cmd = &args.server_command;
-    let run_config = RunConfig {
+    let mut run_config = RunConfig {
         nickname: nickname.clone(),
         destination: remote.path.clone(),
         delete_after_import: true,
     };
 
     info!("starting server run");
-    let begin_resp = begin_run(runner, &remote.host, server_cmd, &nickname, &run_id)?;
+    let begin_resp = begin_run(runner, &remote.host, server_cmd, &nickname, run_id)?;
 
     let mut hb_guard = HeartbeatGuard::new(
         runner.clone(),
@@ -722,7 +761,18 @@ pub(crate) fn run_sync_with_runner(runner: &RemoteRunner, args: &SyncArgs) -> Re
         )?;
 
         info!("validating server run plan");
-        prepare_run(runner, &remote.host, server_cmd, &nickname, &run_id)?;
+        let prepare_resp = prepare_run(runner, &remote.host, server_cmd, &nickname, run_id)?;
+
+        // If the server resolved a relative destination, update our local
+        // copy so that persisted state contains the resolved (absolute) path.
+        if let Some(ref dest) = prepare_resp.destination {
+            run_config = RunConfig {
+                nickname: nickname.clone(),
+                destination: DestinationPath::new(camino::Utf8PathBuf::from(dest))
+                    .with_context(|| "server returned invalid resolved destination")?,
+                delete_after_import: true,
+            };
+        }
 
         info!("transferring files to server staging");
         runner.run_rsync(&args.source, &remote.host, &begin_resp.files_dir)?;
@@ -739,7 +789,7 @@ pub(crate) fn run_sync_with_runner(runner: &RemoteRunner, args: &SyncArgs) -> Re
     persist_client_run_state(
         &state_dir,
         &nickname,
-        &run_id,
+        run_id,
         &remote.host,
         server_cmd,
         &manifest,
@@ -748,20 +798,24 @@ pub(crate) fn run_sync_with_runner(runner: &RemoteRunner, args: &SyncArgs) -> Re
         ClientRunPhase::UploadCompleteFinishPending,
     )?;
 
-    // finish-run while heartbeat is still alive
-    info!("finishing server run");
-    finish_run(runner, &remote.host, server_cmd, &nickname, &run_id)?;
-
+    // Check heartbeat health before finish-run. If heartbeat failed while
+    // we were staging, the lease may have expired — do not transition the
+    // run to ready, and leave the persisted UploadCompleteFinishPending
+    // state for later recovery.
     hb_guard.stop_and_join();
     if let Err(e) = hb_guard.check_heartbeat() {
-        warn!("heartbeat error after successful finish-run: {e}");
+        return Err(e).context("heartbeat failed before finish-run");
     }
+
+    // finish-run while heartbeat is still alive
+    info!("finishing server run");
+    finish_run(runner, &remote.host, server_cmd, &nickname, run_id)?;
 
     // Update persisted state to WaitingForTerminalState
     persist_client_run_state(
         &state_dir,
         &nickname,
-        &run_id,
+        run_id,
         &remote.host,
         server_cmd,
         &manifest,
@@ -771,11 +825,11 @@ pub(crate) fn run_sync_with_runner(runner: &RemoteRunner, args: &SyncArgs) -> Re
     )?;
 
     info!("waiting for server processing");
-    wait_for_terminal(runner, &remote.host, server_cmd, &nickname, &run_id)?;
+    wait_for_terminal(runner, &remote.host, server_cmd, &nickname, run_id)?;
 
     info!("reading run status");
-    let status = read_status(runner, &remote.host, server_cmd, &nickname, &run_id)?;
-    if status.nickname != nickname || status.run_id != run_id {
+    let status = read_status(runner, &remote.host, server_cmd, &nickname, run_id)?;
+    if status.nickname != nickname || status.run_id != *run_id {
         anyhow::bail!("server status envelope does not match requested run");
     }
 
@@ -784,7 +838,7 @@ pub(crate) fn run_sync_with_runner(runner: &RemoteRunner, args: &SyncArgs) -> Re
     persist_client_run_state(
         &state_dir,
         &nickname,
-        &run_id,
+        run_id,
         &remote.host,
         server_cmd,
         &manifest,
@@ -801,7 +855,7 @@ pub(crate) fn run_sync_with_runner(runner: &RemoteRunner, args: &SyncArgs) -> Re
     persist_client_run_state(
         &state_dir,
         &nickname,
-        &run_id,
+        run_id,
         &remote.host,
         server_cmd,
         &manifest,
@@ -809,7 +863,7 @@ pub(crate) fn run_sync_with_runner(runner: &RemoteRunner, args: &SyncArgs) -> Re
         None,
         ClientRunPhase::CleanupComplete,
     )?;
-    remove_client_run_state(&state_dir, &nickname, &run_id);
+    remove_client_run_state(&state_dir, &nickname, run_id);
 
     info!(state = %status.state.as_str(), "sync complete");
     Ok(())
@@ -942,7 +996,10 @@ state = "done"
         let panic_handle = std::thread::spawn(|| {
             panic!("simulated heartbeat panic");
         });
+        // Replace the handle and mark first attempt as completed so
+        // stop_and_join doesn't hang waiting for the original thread.
         guard.handle = Some(panic_handle);
+        guard.first_attempt_completed.store(true, Ordering::Relaxed);
         guard.stop_and_join();
         assert!(guard.check_heartbeat().is_err());
         let err = guard.check_heartbeat().unwrap_err().to_string();
@@ -1212,6 +1269,7 @@ state = "done"
         let runner = mk_runner();
         runner.add_error("heartbeat-run", "expected — not a real host");
         let stop = Arc::new(AtomicBool::new(false));
+        let first_attempt = Arc::new(AtomicBool::new(false));
         let handle = start_heartbeat(
             runner,
             "fake-host".to_string(),
@@ -1220,8 +1278,11 @@ state = "done"
             RunId::new("test-sleep".into()).unwrap(),
             1,
             Arc::clone(&stop),
+            Arc::clone(&first_attempt),
         );
-        std::thread::sleep(Duration::from_millis(100));
+        while !first_attempt.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         stop.store(true, Ordering::Relaxed);
         let _ = handle.join();
     }
@@ -1427,16 +1488,74 @@ state = "done"
     }
 
     #[test]
-    fn postprocess_heartbeat_ordering() {
+    fn heartbeat_failure_before_finish_run_prevents_finish_run() {
         let tmp = tempdir().unwrap();
         let state_dir = mk_state_dir(&tmp);
         let runner = mk_runner();
         let args = postprocess_args(&tmp, &state_dir);
 
-        // Use a short heartbeat interval so the thread fires quickly.
         let begin = begin_resp_toml().replace(
             "heartbeat_interval_secs = 60",
-            "heartbeat_interval_secs = 2",
+            "heartbeat_interval_secs = 1",
+        );
+        runner.add_response("begin-run", &begin);
+        runner.add_response(
+            "prepare-run",
+            "protocol_version = 1\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+        );
+        runner.add_error("heartbeat-run", "simulated heartbeat failure");
+
+        let result = run_sync_with_runner(&runner, &args);
+        assert!(result.is_err());
+        let err_text = result.unwrap_err().to_string();
+        assert!(
+            err_text.contains("heartbeat"),
+            "error must mention heartbeat, got: {err_text}"
+        );
+
+        let log = runner.command_log();
+        assert!(log.iter().any(|c| c.contains("begin-run")));
+        assert!(log.iter().any(|c| c.contains("prepare-run")));
+        assert!(log.iter().any(|c| c.contains("rsync")));
+        assert!(
+            !log.iter().any(|c| c.contains("finish-run")),
+            "finish-run must NOT be called when heartbeat failed"
+        );
+
+        // UploadCompleteFinishPending must be persisted for recovery
+        let runs_dir = camino::Utf8PathBuf::from(&state_dir).join("runs");
+        assert!(runs_dir.as_std_path().exists());
+        let mut found = false;
+        for entry in fs::read_dir(runs_dir.as_std_path()).unwrap() {
+            let entry = entry.unwrap();
+            let state_path = entry.path().join("state.toml");
+            if state_path.exists() {
+                if let Ok(content) = fs::read_to_string(&state_path) {
+                    if content.contains("upload_complete_finish_pending") {
+                        found = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            found,
+            "UploadCompleteFinishPending must be persisted when heartbeat fails"
+        );
+    }
+
+    #[test]
+    fn heartbeat_runs_concurrently_with_staging() {
+        // Uses a blocking rsync hook to prove the heartbeat thread fires
+        // before finish-run, without relying on scheduling timing.
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = postprocess_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        let begin = begin_resp_toml().replace(
+            "heartbeat_interval_secs = 60",
+            "heartbeat_interval_secs = 1",
         );
         runner.add_response("begin-run", &begin);
         runner.add_response(
@@ -1445,82 +1564,73 @@ state = "done"
         );
         runner.add_response("heartbeat-run", "");
         runner.add_response("run-state", &done_run_state_toml());
-
-        // Use the finish-run hook to prove UploadCompleteFinishPending is
-        // persisted before finish-run executes.
-        let check_state = Arc::new(Mutex::new(false));
-        let check_state_clone = Arc::clone(&check_state);
-        let state_dir_clone = state_dir.clone();
-        runner.set_finish_run_hook(Box::new(move || {
-            let runs_dir = camino::Utf8PathBuf::from(&state_dir_clone).join("runs");
-            if let Ok(entries) = fs::read_dir(runs_dir.as_std_path()) {
-                for entry in entries.flatten() {
-                    let state_path = entry.path().join("state.toml");
-                    if state_path.exists() {
-                        if let Ok(content) = fs::read_to_string(&state_path) {
-                            if content.contains("upload_complete_finish_pending") {
-                                *check_state_clone.lock().unwrap() = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }));
+        let status_toml =
+            "run_id = \"test-run\"\nnickname = \"laptop\"\nstate = \"done\"\n".to_string();
+        runner.add_response("status", &status_toml);
         runner.add_response("finish-run", "");
 
-        runner.add_response("status", &done_status_toml());
+        // Block rsync so we can verify heartbeat has fired while staging
+        // is still in progress.
+        let rsync_reached = Arc::new(AtomicBool::new(false));
+        let rsync_reached_clone = Arc::clone(&rsync_reached);
+        let proceed = Arc::new(AtomicBool::new(false));
+        let proceed_clone = Arc::clone(&proceed);
+        runner.set_rsync_hook(Box::new(move || {
+            rsync_reached_clone.store(true, Ordering::Relaxed);
+            while !proceed_clone.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }));
 
-        let _ = run_sync_with_runner(&runner, &args);
+        // Run sync in background thread
+        let runner_for_sync = runner.clone();
+        let result = Arc::new(Mutex::new(None::<Result<()>>));
+        let result_clone = Arc::clone(&result);
+        let sync_handle = std::thread::spawn(move || {
+            *result_clone.lock().unwrap() =
+                Some(run_sync_with_run_id(&runner_for_sync, &args, &run_id));
+        });
+
+        // Wait for rsync hook to fire (staging in progress)
+        while !rsync_reached.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Heartbeat thread started at HeartbeatGuard creation (after
+        // begin-run). By now it should have fired at least once.
+        std::thread::sleep(Duration::from_millis(50));
         let log = runner.command_log();
-
-        // The finish-run hook verified UploadCompleteFinishPending was
-        // persisted before finish-run executed.
         assert!(
-            *check_state.lock().unwrap(),
-            "UploadCompleteFinishPending must be persisted before finish-run"
+            log.iter().any(|c| c.contains("heartbeat-run")),
+            "heartbeat must have fired while rsync is blocked (staging in progress)"
         );
 
-        let begin_pos = log.iter().position(|c| c.contains("begin-run"));
-        let prepare_pos = log.iter().position(|c| c.contains("prepare-run"));
-        let rsync_pos = log.iter().position(|c| c.contains("rsync"));
-        let finish_pos = log.iter().position(|c| c.contains("finish-run"));
+        // Let rsync complete
+        proceed.store(true, Ordering::Relaxed);
+        sync_handle.join().unwrap();
 
-        assert!(begin_pos.is_some(), "begin-run must be called");
-        assert!(prepare_pos.is_some(), "prepare-run must be called");
-        assert!(rsync_pos.is_some(), "rsync must be called");
+        let final_result = result.lock().unwrap().take().unwrap();
+        assert!(
+            final_result.is_ok(),
+            "sync should succeed when heartbeat is healthy"
+        );
+
+        let final_log = runner.command_log();
+        let finish_pos = final_log.iter().position(|c| c.contains("finish-run"));
         assert!(finish_pos.is_some(), "finish-run must be called");
-        assert!(
-            begin_pos.unwrap() < prepare_pos.unwrap(),
-            "begin-run before prepare-run"
-        );
-        assert!(
-            prepare_pos.unwrap() < rsync_pos.unwrap(),
-            "prepare-run before rsync"
-        );
-        assert!(
-            rsync_pos.unwrap() < finish_pos.unwrap(),
-            "rsync before finish-run"
-        );
-
-        // Heartbeat commands may or may not appear in the log depending on
-        // thread scheduling in the fake-runner test environment. The
-        // heartbeat lifecycle is verified statically by the code (heartbeat
-        // starts after begin-run, stops via stop_and_join after finish-run).
-        // Log entries before finish-run prove the heartbeat fired while
-        // the run was still incoming.
-        let heartbeats_before_finish: Vec<_> = log
+        let hb_positions: Vec<_> = final_log
             .iter()
             .enumerate()
             .filter(|(_, c)| c.contains("heartbeat-run"))
             .map(|(i, _)| i)
             .collect();
-        if !heartbeats_before_finish.is_empty() {
-            assert!(
-                heartbeats_before_finish
-                    .iter()
-                    .all(|&pos| pos < finish_pos.unwrap()),
-                "heartbeats must occur before finish-run when they appear"
-            );
-        }
+        assert!(
+            !hb_positions.is_empty(),
+            "heartbeat must have run at least once"
+        );
+        assert!(
+            hb_positions.iter().all(|&p| p < finish_pos.unwrap()),
+            "all heartbeats must occur before finish-run"
+        );
     }
 }

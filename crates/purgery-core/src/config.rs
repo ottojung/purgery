@@ -220,6 +220,8 @@ pub struct PrepareRunResponse {
     pub protocol_version: u32,
     pub nickname: String,
     pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
 }
 
 // ── Run State / Progress ─────────────────────────────────────────────

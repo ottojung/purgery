@@ -97,11 +97,16 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
     process_ready_run(config, nickname, run_id)
 }
 
-/// Server-side subcommand: validate the run plan.
+/// Server-side subcommand: validate the run plan and resolve relative
+/// destinations.
 ///
 /// Must be called after the client has written `run.toml` and `manifest.toml`
 /// into the incoming directory but before any rsync transfer.
 /// This is the gate that prevents an invalid run plan from being processed.
+///
+/// If the destination in `run.toml` is relative, it is resolved against the
+/// server's current working directory and `run.toml` is atomically rewritten
+/// so that later `process-once` does not depend on cwd.
 pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> Result<String> {
     let incoming_path = config
         .work_dir
@@ -191,10 +196,42 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
             })?;
     }
 
+    // Resolve relative destination against server cwd.
+    let resolved_destination = if !run_config.destination.is_absolute() {
+        let cwd =
+            std::env::current_dir().with_context(|| "failed to get current working directory")?;
+        let resolved = cwd.join(run_config.destination.as_str());
+        let resolved_utf8 = camino::Utf8PathBuf::from_path_buf(resolved)
+            .map_err(|_| anyhow::anyhow!("resolved destination path is not valid UTF-8"))?;
+        let resolved_dest = purgery_core::DestinationPath::new(resolved_utf8)
+            .with_context(|| "resolved destination path is invalid")?;
+
+        // Atomically rewrite run.toml with the resolved destination so that
+        // later process-once does not depend on cwd.
+        let updated = purgery_core::RunConfig {
+            nickname: run_config.nickname.clone(),
+            destination: resolved_dest.clone(),
+            delete_after_import: run_config.delete_after_import,
+        };
+        let updated_toml = updated
+            .to_toml()
+            .with_context(|| "failed to serialize updated run config")?;
+        let tmp_path = run_config_path.with_extension("toml.tmp");
+        fs::write(tmp_path.as_std_path(), &updated_toml)
+            .with_context(|| "failed to write updated run config")?;
+        fs::rename(tmp_path.as_std_path(), run_config_path.as_std_path())
+            .with_context(|| "failed to commit updated run config")?;
+
+        Some(resolved_dest.as_str().to_owned())
+    } else {
+        None
+    };
+
     let response = purgery_core::PrepareRunResponse {
         protocol_version: 1,
         nickname: nickname.as_str().to_owned(),
         run_id: run_id.as_str().to_owned(),
+        destination: resolved_destination,
     };
 
     toml::to_string(&response)
