@@ -35,7 +35,7 @@ client: persist local state as cleanup_complete
 
 ### Path C: Split (with --split)
 
-Each split entry is processed as a separate server run when --postprocess or --delete-after-import is present. Pure passthrough splits use a single filtered rsync transfer.
+Each split entry is processed as a separate server run when --postprocess or --delete-after-import is present. Pure passthrough split performs one transfer of the selected roots only.
 
 ```
 client: validate args
@@ -44,8 +44,8 @@ client: apply rsync-style pattern to select non-overlapping roots
 if no match:
   log info, exit 0
 if pure passthrough:
-  construct single rsync command with include/exclude filters
-  run rsync, exit
+  perform one selected-root transfer preserving parent paths
+  exit
 if cleanup or postprocess:
   for each matched root (in deterministic order):
     run non-split sync with root as source and target suffix

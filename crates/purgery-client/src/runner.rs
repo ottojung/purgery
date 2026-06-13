@@ -345,7 +345,15 @@ impl RemoteRunner {
         match self {
             RemoteRunner::Real => {
                 let tmp_dir = std::env::temp_dir();
-                let list_path = tmp_dir.join(format!("purgery-rsync-{}.list", std::process::id()));
+                let unique = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                let list_path = tmp_dir.join(format!(
+                    "purgery-rsync-{}-{}.list",
+                    std::process::id(),
+                    unique
+                ));
                 let list_content = file_list.join("\0");
                 let files_arg = format!("--files-from={}", list_path.display());
 

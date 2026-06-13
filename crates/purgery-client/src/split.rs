@@ -221,9 +221,6 @@ fn glob_match(pattern: &str, path: &str) -> bool {
         let segment = segments[seg_idx];
         if i == 0 && seg_idx == 0 {
             // First part matches at start.
-            if !simple_glob(segment, path) {
-                return false;
-            }
             if let Some(len) = first_match_len(segment, path, 0) {
                 search_start = len;
             } else {
@@ -464,10 +461,138 @@ mod tests {
         fs::create_dir(&dir).unwrap();
         fs::write(dir.join("a.jpg"), "").unwrap();
         fs::write(tmp.path().join("readme.txt"), "").unwrap();
-        // Pattern "*/" should select photos directory but not readme.txt
         let entries = discover_split_entries(tmp.path().to_str().unwrap(), "*/").unwrap();
         assert_eq!(entries.len(), 1);
         let path = std::path::Path::new(&entries[0].path);
         assert_eq!(path.file_name().unwrap().to_str().unwrap(), "photos");
+    }
+
+    #[test]
+    fn split_dot_selects_source_itself() {
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("a.txt"), "").unwrap();
+        let entries = discover_split_entries(tmp.path().to_str().unwrap(), ".").unwrap();
+        // Source itself should be the only entry.
+        assert!(!entries.is_empty());
+        let sources: Vec<&str> = entries
+            .iter()
+            .map(|c| {
+                std::path::Path::new(&c.path)
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+            })
+            .collect();
+        assert!(sources
+            .iter()
+            .any(|s| *s == tmp.path().file_name().unwrap().to_str().unwrap()));
+    }
+
+    #[test]
+    fn split_mp4_matches_top_level_and_nested() {
+        let tmp = tempdir().unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        fs::write(tmp.path().join("a.mp4"), "").unwrap();
+        fs::write(tmp.path().join("b.txt"), "").unwrap();
+        fs::write(tmp.path().join("sub/c.mp4"), "").unwrap();
+        let entries = discover_split_entries(tmp.path().to_str().unwrap(), "*.mp4").unwrap();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn split_anchored_matches_only_root_level() {
+        let tmp = tempdir().unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        fs::write(tmp.path().join("a.mp4"), "").unwrap();
+        fs::write(tmp.path().join("sub/a.mp4"), "").unwrap();
+        let entries = discover_split_entries(tmp.path().to_str().unwrap(), "/a.mp4").unwrap();
+        // Only the root-level a.mp4 should match.
+        assert_eq!(entries.len(), 1);
+        let path = std::path::Path::new(&entries[0].path);
+        assert_eq!(path.file_name().unwrap(), "a.mp4");
+        assert!(path.parent().unwrap() == tmp.path());
+    }
+
+    #[test]
+    fn split_doublestar_mp4_matches_any_depth() {
+        let tmp = tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("a/b")).unwrap();
+        fs::write(tmp.path().join("a.mp4"), "").unwrap();
+        fs::write(tmp.path().join("a/b/c.mp4"), "").unwrap();
+        let entries = discover_split_entries(tmp.path().to_str().unwrap(), "**/*.mp4").unwrap();
+        assert!(!entries.is_empty());
+    }
+
+    #[test]
+    fn split_pattern_with_slash_limits_depth() {
+        let tmp = tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("2024/sub")).unwrap();
+        fs::write(tmp.path().join("2024/a.mp4"), "").unwrap();
+        fs::write(tmp.path().join("2024/sub/b.mp4"), "").unwrap();
+        // Pattern "2024/*.mp4" should match a.mp4 but not sub/b.mp4
+        let entries = discover_split_entries(tmp.path().to_str().unwrap(), "2024/*.mp4").unwrap();
+        assert_eq!(entries.len(), 1);
+        let name = std::path::Path::new(&entries[0].path)
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(name, "a.mp4");
+    }
+
+    #[test]
+    fn split_doublestar_under_dir_matches_nested() {
+        let tmp = tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("2024/sub")).unwrap();
+        fs::write(tmp.path().join("2024/a.mp4"), "").unwrap();
+        fs::write(tmp.path().join("2024/sub/b.mp4"), "").unwrap();
+        // Pattern "2024/**/*.mp4" should match both
+        let entries =
+            discover_split_entries(tmp.path().to_str().unwrap(), "2024/**/*.mp4").unwrap();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn split_ancestor_pruning_removes_descendants() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("photos");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("a.jpg"), "").unwrap();
+        let entries = discover_split_entries(tmp.path().to_str().unwrap(), "**").unwrap();
+        // ** matches everything, so only source itself should remain
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn split_deterministic_ordering() {
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("c.txt"), "").unwrap();
+        fs::write(tmp.path().join("a.txt"), "").unwrap();
+        fs::write(tmp.path().join("b.txt"), "").unwrap();
+        let entries = discover_split_entries(tmp.path().to_str().unwrap(), "*.txt").unwrap();
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|e| {
+                std::path::Path::new(&e.path)
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["a.txt", "b.txt", "c.txt"],
+            "must be alphabetically sorted"
+        );
+    }
+
+    #[test]
+    fn split_question_matches_single_char() {
+        let m = PatternMatcher::new("a?c.mp4");
+        assert!(m.is_match("abc.mp4", false));
+        assert!(!m.is_match("abbc.mp4", false));
     }
 }

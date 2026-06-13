@@ -64,7 +64,7 @@ purgery-server gc --config server.toml
 
 ## Split
 
-The `--split <PATTERN>` flag selects source entries to process individually. The pattern uses rsync-style single-pattern matching as a positive selector. It supports the documented rsync include/exclude pattern forms without implementing a full ordered rule list.
+The `--split <PATTERN>` flag selects source entries to process individually. The pattern is an rsync-style single positive selector. It supports a documented subset of rsync include/exclude pattern forms without implementing a full ordered rule list.
 
 ### Pattern syntax
 

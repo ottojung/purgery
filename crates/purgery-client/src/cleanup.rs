@@ -819,4 +819,169 @@ mod tests {
             "no entries should be confirmed when the parent directory is absent from status"
         );
     }
+
+    #[test]
+    fn directory_cleanup_deletes_unchanged_descendants_then_source_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_name = "Videos";
+        let dir = tmp.path().join(source_name);
+        let sub = dir.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        let file1 = dir.join("a.mp4");
+        fs::write(&file1, "data").unwrap();
+        let file2 = sub.join("b.mp4");
+        fs::write(&file2, "data2").unwrap();
+
+        let file1_sha = compute_sha256(&file1).unwrap();
+        let file2_sha = compute_sha256(&file2).unwrap();
+
+        let mut entries: Vec<CleanupEntry> = Vec::new();
+
+        // File descendant: Videos/a.mp4
+        let m1 = fs::metadata(&file1).unwrap();
+        entries.push(CleanupEntry {
+            relative_path: format!("{source_name}/a.mp4"),
+            local_path: file1.to_str().unwrap().to_owned(),
+            kind: ManifestEntryKind::RegularFile,
+            size: m1.len(),
+            mtime_ns: m1
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as i64,
+            sha256: Some(file1_sha),
+            link_target: None,
+            import_confirmed: true,
+            cleaned: false,
+        });
+
+        // File descendant: Videos/sub/b.mp4
+        let m2 = fs::metadata(&file2).unwrap();
+        entries.push(CleanupEntry {
+            relative_path: format!("{source_name}/sub/b.mp4"),
+            local_path: file2.to_str().unwrap().to_owned(),
+            kind: ManifestEntryKind::RegularFile,
+            size: m2.len(),
+            mtime_ns: m2
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as i64,
+            sha256: Some(file2_sha),
+            link_target: None,
+            import_confirmed: true,
+            cleaned: false,
+        });
+
+        // Directory descendant: Videos/sub
+        entries.push(CleanupEntry {
+            relative_path: format!("{source_name}/sub"),
+            local_path: sub.to_str().unwrap().to_owned(),
+            kind: ManifestEntryKind::Directory,
+            size: 0,
+            mtime_ns: 0,
+            sha256: None,
+            link_target: None,
+            import_confirmed: true,
+            cleaned: false,
+        });
+
+        // Top-level source directory: Videos
+        entries.push(CleanupEntry {
+            relative_path: source_name.to_owned(),
+            local_path: dir.to_str().unwrap().to_owned(),
+            kind: ManifestEntryKind::Directory,
+            size: 0,
+            mtime_ns: 0,
+            sha256: None,
+            link_target: None,
+            import_confirmed: true,
+            cleaned: false,
+        });
+
+        let state = DurableCleanupState {
+            nickname: "host".to_owned(),
+            operation_id: "run-dir-cleanup".to_owned(),
+            entries,
+        };
+        let state_path = write_cleanup_state(&state, tmp.path().to_str().unwrap()).unwrap();
+
+        process_cleanup_state_file(&state_path).unwrap();
+
+        assert!(
+            !file1.exists(),
+            "unchanged descendant file should be deleted"
+        );
+        assert!(
+            !file2.exists(),
+            "unchanged nested descendant file should be deleted"
+        );
+        assert!(
+            !sub.exists(),
+            "empty descendant directory should be removed"
+        );
+        assert!(
+            !dir.exists(),
+            "empty top-level source directory should be removed"
+        );
+    }
+
+    #[test]
+    fn directory_cleanup_preserves_changed_descendant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("Videos");
+        fs::create_dir(&dir).unwrap();
+        let file = dir.join("a.mp4");
+        fs::write(&file, "original").unwrap();
+
+        let file_sha = compute_sha256(&file).unwrap();
+        let meta = fs::metadata(&file).unwrap();
+
+        let entries = vec![
+            CleanupEntry {
+                relative_path: "Videos/a.mp4".to_owned(),
+                local_path: file.to_str().unwrap().to_owned(),
+                kind: ManifestEntryKind::RegularFile,
+                size: meta.len(),
+                mtime_ns: meta
+                    .modified()
+                    .unwrap()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos() as i64,
+                sha256: Some(file_sha),
+                link_target: None,
+                import_confirmed: true,
+                cleaned: false,
+            },
+            CleanupEntry {
+                relative_path: "Videos".to_owned(),
+                local_path: dir.to_str().unwrap().to_owned(),
+                kind: ManifestEntryKind::Directory,
+                size: 0,
+                mtime_ns: 0,
+                sha256: None,
+                link_target: None,
+                import_confirmed: true,
+                cleaned: false,
+            },
+        ];
+
+        // Change the file after capturing identity
+        fs::write(&file, "modified").unwrap();
+
+        let state = DurableCleanupState {
+            nickname: "host".to_owned(),
+            operation_id: "run-changed-dir".to_owned(),
+            entries,
+        };
+        let state_path = write_cleanup_state(&state, tmp.path().to_str().unwrap()).unwrap();
+
+        process_cleanup_state_file(&state_path).unwrap();
+
+        assert!(file.exists(), "changed descendant file must remain");
+        assert!(dir.exists(), "directory with changed content must remain");
+    }
 }
