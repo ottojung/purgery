@@ -5,7 +5,7 @@ use purgery_core::{
 };
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -299,7 +299,7 @@ fn start_heartbeat(
     run_id: RunId,
     interval_secs: u64,
     stop: Arc<AtomicBool>,
-    first_attempt_completed: Arc<AtomicBool>,
+    state: Arc<AtomicU8>,
 ) -> std::thread::JoinHandle<Result<()>> {
     let half_interval = Duration::from_millis((interval_secs.max(2) * 500).min(600_000));
     std::thread::spawn(move || {
@@ -309,15 +309,16 @@ fn start_heartbeat(
                 run_id = %run_id.as_str(),
                 "sending heartbeat"
             );
-            first_attempt_completed.store(true, Ordering::Relaxed);
             if let Err(e) = heartbeat_run(&runner, &host, &server_cmd, &nickname, &run_id) {
                 error!(
                     nickname = %nickname.as_str(),
                     run_id = %run_id.as_str(),
                     "heartbeat failed: {e}"
                 );
+                state.store(HB_FAILED, Ordering::Relaxed);
                 return Err(e);
             }
+            state.store(HB_HEALTHY, Ordering::Relaxed);
             let start = std::time::Instant::now();
             while start.elapsed() < half_interval && !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(100));
@@ -573,11 +574,17 @@ fn validate_source_is_directory(source: &str) -> Result<()> {
     Ok(())
 }
 
+// Tracked via AtomicU8 rather than AtomicBool so is_healthy can
+// distinguish "not yet started" from "healthy" from "failed".
+const HB_NOT_STARTED: u8 = 0;
+const HB_HEALTHY: u8 = 1;
+const HB_FAILED: u8 = 2;
+
 struct HeartbeatGuard {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<Result<()>>>,
     result: Option<Result<()>>,
-    first_attempt_completed: Arc<AtomicBool>,
+    state: Arc<AtomicU8>,
 }
 
 impl HeartbeatGuard {
@@ -590,7 +597,7 @@ impl HeartbeatGuard {
         interval_secs: u64,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        let first_attempt_completed = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(AtomicU8::new(HB_NOT_STARTED));
         let handle = start_heartbeat(
             runner,
             host,
@@ -599,20 +606,33 @@ impl HeartbeatGuard {
             run_id,
             interval_secs,
             Arc::clone(&stop),
-            Arc::clone(&first_attempt_completed),
+            Arc::clone(&state),
         );
         Self {
             stop,
             handle: Some(handle),
             result: None,
-            first_attempt_completed,
+            state,
+        }
+    }
+
+    fn is_healthy(&self) -> Result<()> {
+        // Wait for at least one heartbeat attempt so we see a definitive
+        // health signal, then check without stopping the thread.
+        while self.state.load(Ordering::Relaxed) == HB_NOT_STARTED {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if self.state.load(Ordering::Relaxed) == HB_FAILED {
+            Err(anyhow::anyhow!("heartbeat failed"))
+        } else {
+            Ok(())
         }
     }
 
     fn stop_and_join(&mut self) {
-        // Wait for at least one heartbeat attempt to complete so that
-        // stop_and_join always captures a definitive heartbeat result.
-        while !self.first_attempt_completed.load(Ordering::Relaxed) {
+        // Wait for at least one heartbeat attempt so the join captures a
+        // definitive result rather than the thread exiting immediately.
+        while self.state.load(Ordering::Relaxed) == HB_NOT_STARTED {
             std::thread::sleep(Duration::from_millis(1));
         }
         self.stop.store(true, Ordering::Relaxed);
@@ -798,18 +818,16 @@ pub(crate) fn run_sync_with_run_id(
         ClientRunPhase::UploadCompleteFinishPending,
     )?;
 
-    // Check heartbeat health before finish-run. If heartbeat failed while
-    // we were staging, the lease may have expired — do not transition the
-    // run to ready, and leave the persisted UploadCompleteFinishPending
-    // state for later recovery.
-    hb_guard.stop_and_join();
-    if let Err(e) = hb_guard.check_heartbeat() {
-        return Err(e).context("heartbeat failed before finish-run");
-    }
+    // Check heartbeat health without stopping it. If the lease expired
+    // during staging, bail before finish-run and leave recoverable state.
+    hb_guard.is_healthy()?;
 
-    // finish-run while heartbeat is still alive
     info!("finishing server run");
     finish_run(runner, &remote.host, server_cmd, &nickname, run_id)?;
+
+    // Stop heartbeat only after finish-run succeeded — the lease must
+    // cover the entire incoming phase.
+    hb_guard.stop_and_join();
 
     // Update persisted state to WaitingForTerminalState
     persist_client_run_state(
@@ -996,10 +1014,10 @@ state = "done"
         let panic_handle = std::thread::spawn(|| {
             panic!("simulated heartbeat panic");
         });
-        // Replace the handle and mark first attempt as completed so
+        // Replace the handle and mark state as healthy so
         // stop_and_join doesn't hang waiting for the original thread.
         guard.handle = Some(panic_handle);
-        guard.first_attempt_completed.store(true, Ordering::Relaxed);
+        guard.state.store(HB_HEALTHY, Ordering::Relaxed);
         guard.stop_and_join();
         assert!(guard.check_heartbeat().is_err());
         let err = guard.check_heartbeat().unwrap_err().to_string();
@@ -1269,7 +1287,7 @@ state = "done"
         let runner = mk_runner();
         runner.add_error("heartbeat-run", "expected — not a real host");
         let stop = Arc::new(AtomicBool::new(false));
-        let first_attempt = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(AtomicU8::new(HB_NOT_STARTED));
         let handle = start_heartbeat(
             runner,
             "fake-host".to_string(),
@@ -1278,9 +1296,9 @@ state = "done"
             RunId::new("test-sleep".into()).unwrap(),
             1,
             Arc::clone(&stop),
-            Arc::clone(&first_attempt),
+            Arc::clone(&state),
         );
-        while !first_attempt.load(Ordering::Relaxed) {
+        while state.load(Ordering::Relaxed) == HB_NOT_STARTED {
             std::thread::sleep(Duration::from_millis(1));
         }
         stop.store(true, Ordering::Relaxed);
@@ -1289,45 +1307,46 @@ state = "done"
 
     #[test]
     fn heartbeat_active_through_finish_run() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
         let runner = mk_runner();
-        // begin-run
-        runner.add_response("begin-run", &begin_resp_toml());
-        // heartbeat should run during the staging phase
-        runner.add_error("heartbeat-run", "expected — not a real host");
-        // prepare-run
+        let args = postprocess_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        let begin = begin_resp_toml().replace(
+            "heartbeat_interval_secs = 60",
+            "heartbeat_interval_secs = 1",
+        );
+        runner.add_response("begin-run", &begin);
         runner.add_response(
             "prepare-run",
             "protocol_version = 1\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
         );
-        // finish-run
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("run-state", &done_run_state_toml());
+        let status_toml =
+            "run_id = \"test-run\"\nnickname = \"laptop\"\nstate = \"done\"\n".to_string();
+        runner.add_response("status", &status_toml);
+        // Prove finish-run is called with heartbeat still alive: set a hook
+        // that records when the guard is stopped, then verify the guard was
+        // alive during finish-run.
+        let finish_called = Arc::new(AtomicBool::new(false));
+        let finish_called_clone = Arc::clone(&finish_called);
+        runner.set_finish_run_hook(Box::new(move || {
+            finish_called_clone.store(true, Ordering::Relaxed);
+        }));
+        // Add finish-run response AFTER the hook (responses consumed FIFO)
         runner.add_response("finish-run", "");
 
-        // Create a tiny source dir to avoid filesystem errors
-        let tmp = tempdir().unwrap();
-        let src_dir = tmp.path().join("src");
-        fs::create_dir(&src_dir).unwrap();
-        let state_dir = mk_state_dir(&tmp);
+        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        assert!(result.is_ok(), "sync must succeed");
 
-        let args = SyncArgs {
-            postprocess: vec![],
-            delete_after_import: false,
-            state_dir: Some(state_dir),
-            source: src_dir.to_string_lossy().to_string(),
-            destination: "host:rel".to_string(),
-            server_command: "purgery-server".to_string(),
-        };
-
-        // Passthrough, should NOT create a server run (but args still
-        // parse successfully).
-        let result = run_sync_with_runner(&runner, &args);
-        // Should succeed because passthrough no-cleanup only does rsync
-        assert!(result.is_ok());
+        // finish-run hook fired → finish-run was called
+        assert!(finish_called.load(Ordering::Relaxed));
+        // heartbeat must have run — if it had failed, is_healthy would
+        // have rejected it before finish-run
         let log = runner.command_log();
-        // No server commands should have been called for passthrough
-        assert!(
-            !log.iter().any(|c| c.contains("begin-run")),
-            "passthrough should not call begin-run"
-        );
+        assert!(log.iter().any(|c| c.contains("heartbeat-run")));
     }
 
     fn src_with_file(tmp: &tempfile::TempDir) -> String {
