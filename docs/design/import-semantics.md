@@ -35,7 +35,19 @@ After processing, the client waits for a terminal state and reads a valid status
 
 ## Split
 
-With `--split <PATTERN>`, the client discovers matching source entries under `<SOURCE>` and processes each as a separate operation. `<SOURCE>` itself is matched as the relative sentinel `"."`. Pure passthrough split performs one transfer of the selected roots. Cleanup and postprocess splits run serially.
+With `--split <PATTERN>`, Purgery processes matching source entries under `<SOURCE>`.
+
+### Pure passthrough split
+
+Without `--delete-after-import` and `--postprocess`, the client builds constant rsync filter rules from the pattern and runs one rsync filter transfer. No Purgery-side candidate discovery, server run, manifest, or cleanup state is created. The contract is final destination effect under the generated filter rules.
+
+`--split "."` uses ordinary source-entry rsync. All other patterns use one rsync with `--include=*/`, `--include=<dir-payload>`, `--include=<entry>`, and `--exclude=*`. The transfer uses `--prune-empty-dirs`, so traversal-only empty directories are removed and selected empty directories may not be created at the destination.
+
+### Cleanup/postprocess split
+
+With `--delete-after-import` or `--postprocess`, the client discovers candidates using Purgery's own pattern matcher, ancestor-prunes matched roots (descendants of matched ancestors are not scheduled as separate operations, but their data remains in the ancestor payload), sorts deterministically, and runs each root as a serialized non-split sync operation. Each operation completes entirely before the next begins.
+
+`<SOURCE>` itself is matched as the relative sentinel `"."`. Source trailing slashes, `.`, and `..` are normalized before split discovery.
 
 ## Destination overlay
 

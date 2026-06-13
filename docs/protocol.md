@@ -35,38 +35,31 @@ client: persist local state as cleanup_complete
 
 ### Path C: Split (with --split)
 
-Each split entry is processed as a separate operation. With `--postprocess`, each operation creates a server run. With `--delete-after-import` only, each operation uses direct rsync plus cleanup. Pure passthrough split performs one transfer with rsync include/exclude filter rules.
+Split has two paths: pure passthrough (one rsync filter transfer) and cleanup/postprocess (explicit discovery with serialized operations). They use different mechanisms and have different guarantees.
 
-Source trailing slashes, `.`, and `..` are normalized before split discovery. `<SOURCE>` itself is matched as the relative sentinel `"."`.
+#### Pure passthrough split
+
+With `--split` and neither `--delete-after-import` nor `--postprocess`:
 
 ```
 client: validate args
-client: discover split candidates under SOURCE
-client: apply rsync-style pattern to select non-overlapping roots
-if no match:
-  log info, exit 0
-if pure passthrough:
-  --split "." simply runs ordinary rsync
-  otherwise construct filter rules and run one rsync with --include/--exclude
-  exit
-if cleanup or postprocess:
-  for each matched root (in deterministic order):
-    run non-split sync with root as source and target suffix
-    wait for completion before next root
+client: if pattern is ".", run ordinary source-entry rsync
+client: otherwise build constant filter rules and run one rsync
+  (no Purgery-side discovery, no server run, no manifest, no cleanup state)
 ```
 
-#### Pure passthrough split filter rules
+Pure passthrough split uses rsync filter semantics for the transfer. There is no Purgery-side candidate discovery or ancestor pruning. The contract is final destination effect under the generated filter rules.
 
-For `--split "."` (source entry itself matched), ordinary source-entry rsync is used with no filters.
+For `--split "."` (source entry itself matched), ordinary source-entry rsync is used with no filters and no source trailing slash.
 
-For all other patterns, one rsync invocation is constructed with these filter rules:
+For all other patterns, one rsync invocation is constructed with these constant filter rules:
 
 ```
 rsync -a -m \
-  --include='*/' \
-  --include='<P-as-directory-payload>' \
-  --include='<P-as-entry>' \
-  --exclude='*' \
+  --include=*/ \
+  --include=<P-as-directory-payload> \
+  --include=<P-as-entry> \
+  --exclude=* \
   -- <SOURCE>/ <HOST>:<TARGET>/
 ```
 
@@ -75,15 +68,37 @@ The source operand has a trailing slash so selected entries land under `<TARGET>
 - `<P-as-entry>` is the pattern unchanged.
 - `<P-as-directory-payload>` is the pattern with a trailing `/***` appended (after stripping any existing trailing `/`).
 
-`--include='*/'` keeps parent directories traversable. `--include='<P-as-directory-payload>'` ensures matched directories transfer their full payload. `--include='<P-as-entry>'` selects matching files, symlinks, and directory entries. `--exclude='*'` prevents unrelated entries from being copied. `-m` prunes traversal-only directory scaffolding.
+`--include=*/` keeps parent directories traversable. `--include=<P-as-directory-payload>` ensures matched directories transfer their full payload. `--include=<P-as-entry>` selects matching files, symlinks, and directory entries. `--exclude=*` prevents unrelated entries from being copied. `-m` / `--prune-empty-dirs` removes traversal-only directory scaffolding.
 
 Examples:
 
 ```
---split "*.mp4"   → include='*/' include='*.mp4/***' include='*.mp4' exclude='*'
---split "**/*.mp4" → include='*/' include='**/*.mp4/***' include='**/*.mp4' exclude='*'
---split "Photos/" → include='*/' include='Photos/***' include='Photos/' exclude='*'
+--split "*.mp4"    → include=*/ include=*.mp4/*** include=*.mp4 exclude=*
+--split "**/*.mp4" → include=*/ include=**/*.mp4/*** include=**/*.mp4 exclude=*
+--split "Photos/"  → include=*/ include=Photos/*** include=Photos/ exclude=*
 ```
+
+Pure passthrough split uses `--prune-empty-dirs` and prunes traversal-only empty directories. Empty directories selected only by the filter may not be created at the destination. Cleanup and postprocess split do not use this filter optimization.
+
+#### Cleanup/postprocess split
+
+With `--split` and either `--delete-after-import` or `--postprocess`:
+
+```
+client: validate args
+client: discover split candidates under SOURCE using Purgery matcher
+client: ancestor-prune matched roots
+client: sort deterministically
+if no match:
+  log info, exit 0
+for each matched root:
+  run serialized non-split sync with root as source and target suffix
+  wait for completion before next root
+```
+
+Cleanup/postprocess split uses Purgery's own pattern matcher for candidate discovery. Matched roots are ancestor-pruned (descendants of matched ancestors are not scheduled as separate operations, but their data remains part of the ancestor directory payload). The roots are sorted deterministically and processed serially — each operation completes entirely (transfer, status, cleanup, state resolution) before the next begins.
+
+Source trailing slashes, `.`, and `..` are normalized before split discovery. `<SOURCE>` itself is matched as the relative sentinel `"."`.
 
 ## Server subcommands
 

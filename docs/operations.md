@@ -110,11 +110,15 @@ Each matched root gets a target suffix that preserves its relative layout under 
 
 ### Pure passthrough split
 
-Without `--delete-after-import` or `--postprocess`, the split performs one transfer of the selected roots and their payloads. Nested entries preserve their relative parent paths under `<TARGET>`. No server run or client state is created. No destination collision preflight is added.
+Without `--delete-after-import` or `--postprocess`, the split performs one rsync filter transfer of the selected roots and their payloads. No Purgery-side discovery is performed — the pattern is translated into constant rsync include/exclude rules. Nested entries preserve their relative parent paths under `<TARGET>`. No server run, manifest, or client state is created. No destination collision preflight is added.
+
+`--split "."` uses ordinary source-entry rsync.
+
+Pure passthrough split uses `--prune-empty-dirs` to remove traversal-only directory scaffolding. Empty directories selected only by the filter may not be created at the destination. Cleanup and postprocess split do not use this optimization.
 
 ### Serialized split for cleanup and postprocess
 
-With `--delete-after-import` or `--postprocess`, each matched entry is processed as a serialized non-split sync operation. The next operation starts only after the previous one is completely done: transfer finished, server run reached terminal (if postprocess), status read, cleanup confirmed, local deletion completed.
+With `--delete-after-import` or `--postprocess`, the client discovers matching entries using Purgery's own pattern matcher. Matched roots are ancestor-pruned and sorted deterministically. Each root is processed as a serialized non-split sync operation. The next operation starts only after the previous one is completely done: transfer finished, server run reached terminal (if postprocess), status read, cleanup confirmed, local deletion completed.
 
 ## Heartbeat and leases
 
