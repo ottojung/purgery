@@ -56,11 +56,21 @@ purgery-client sync \
   --delete-after-import \
   --split "**/*.mp4" \
   -- ~/Videos user@server:/archive
-
-purgery-server gc --config server.toml
 ```
 
 `process-once` runs side-effect-free server validation first, then GC opportunistically, then recovers processing runs and processes ready runs.
+
+### Source entry model
+
+The `SOURCE` operand may be a regular file, directory, or symlink. The target is a destination parent. The source entry is imported under the target using the source entry name.
+
+- Trailing slashes on source operands do not change source-entry semantics. `~/Videos` and `~/Videos/` both import the directory named `Videos`.
+- `.` imports the current directory as a source entry named after that directory. `.` is resolved to a concrete directory path before rsync.
+- `..` imports the parent directory as a source entry named after that directory. `..` is resolved to a concrete directory path before rsync.
+- `/` is invalid in every mode — it has no source entry name.
+- Symlink sources remain symlink sources. Source paths are not canonicalized through symlinks.
+
+The source entry name is used consistently for the manifest `relative_path`, staged path, cleanup root, server expected staged path, and server final path.
 
 ## Split
 
@@ -79,7 +89,7 @@ The `--split <PATTERN>` flag selects source entries to process individually. The
 ### Pattern matching behavior
 
 - `--split` is a positive selector, not an ordered include/exclude filter list.
-- The source entry itself is candidate `.`.
+- `<SOURCE>` itself is candidate `.` (matched by its relative sentinel, not by basename).
 - Every descendant is a candidate, represented by its normalized relative path from `<SOURCE>`.
 - Candidates are tested against the single pattern. If a matched entry has a matched ancestor, only the ancestor is kept (ancestor pruning).
 - The result is a deterministic non-overlapping set of roots in normalized path order.

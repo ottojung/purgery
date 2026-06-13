@@ -7,7 +7,7 @@
 ```
 client: validate args
 client: if --delete-after-import, capture durable local cleanup identity
-client: source entry is transferred via rsync as-is (no trailing / appended)
+client: source entry is transferred via rsync with trailing slashes stripped
 client: direct rsync to USER@HOST:DESTINATION
 client: if --delete-after-import, mark the transfer successful and remove only unchanged originals
 (no server run, manifest, status polling, or finish-run)
@@ -36,6 +36,8 @@ client: persist local state as cleanup_complete
 ### Path C: Split (with --split)
 
 Each split entry is processed as a separate operation. With `--postprocess`, each operation creates a server run. With `--delete-after-import` only, each operation uses direct rsync plus cleanup. Pure passthrough split performs one transfer of the selected roots only.
+
+Source trailing slashes, `.`, and `..` are normalized before split discovery. `<SOURCE>` itself is matched as the relative sentinel `"."`.
 
 ```
 client: validate args

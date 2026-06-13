@@ -93,7 +93,9 @@ pub(crate) fn normalize_source(source: &str) -> Result<SourceSpec> {
         let stripped = trimmed.trim_end_matches('/');
         let name = Path::new(stripped)
             .file_name()
-            .ok_or_else(|| anyhow::anyhow!("cannot determine source entry name from path: {source}"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!("cannot determine source entry name from path: {source}")
+            })?
             .to_string_lossy()
             .to_string();
         if name.is_empty() {
@@ -123,18 +125,16 @@ pub(crate) fn build_manifest(
         .with_context(|| format!("failed to read metadata: {}", spec.operation_path))?;
     let file_type = metadata.file_type();
 
-    let relative_path = NormalizedRelativePath::new(Utf8PathBuf::from(
-        spec.source_entry_name.clone(),
-    ))
-    .with_context(|| format!("invalid source name: {}", spec.source_entry_name))?;
+    let relative_path =
+        NormalizedRelativePath::new(Utf8PathBuf::from(spec.source_entry_name.clone()))
+            .with_context(|| format!("invalid source name: {}", spec.source_entry_name))?;
 
     let staged_path =
         NormalizedRelativePath::new(Utf8PathBuf::from("files").join(&spec.source_entry_name))
             .with_context(|| "invalid staged path".to_string())?;
 
-    let local_path =
-        ClientLocalPath::new(spec.operation_path.clone())
-            .with_context(|| format!("invalid local path: {}", spec.operation_path))?;
+    let local_path = ClientLocalPath::new(spec.operation_path.clone())
+        .with_context(|| format!("invalid local path: {}", spec.operation_path))?;
 
     let has_postprocess = !postprocess_steps.is_empty();
 
@@ -144,7 +144,11 @@ pub(crate) fn build_manifest(
         SourceKind::Symlink => ManifestEntryKind::Symlink,
     };
 
-    let size = if file_type.is_file() { metadata.len() } else { 0 };
+    let size = if file_type.is_file() {
+        metadata.len()
+    } else {
+        0
+    };
 
     let (mtime_ns, sha256) = if file_type.is_file() && has_postprocess {
         let mtime = metadata
@@ -165,9 +169,8 @@ pub(crate) fn build_manifest(
     };
 
     let link_target = if file_type.is_symlink() {
-        let target = fs::read_link(source_path).with_context(|| {
-            format!("failed to read symlink: {}", spec.operation_path)
-        })?;
+        let target = fs::read_link(source_path)
+            .with_context(|| format!("failed to read symlink: {}", spec.operation_path))?;
         let target = Utf8PathBuf::from_path_buf(target)
             .map_err(|p| anyhow::anyhow!("non-UTF-8 symlink target: {}", p.display()))?;
         Some(target)
@@ -216,9 +219,8 @@ pub(crate) fn capture_cleanup_identity(spec: &SourceSpec) -> Result<Vec<CleanupE
             .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
-        let utf8_path = Utf8Path::from_path(source_path).ok_or_else(|| {
-            anyhow::anyhow!("non-UTF-8 path: {}", spec.operation_path)
-        })?;
+        let utf8_path = Utf8Path::from_path(source_path)
+            .ok_or_else(|| anyhow::anyhow!("non-UTF-8 path: {}", spec.operation_path))?;
         let sha = Some(
             compute_sha256(utf8_path)
                 .with_context(|| format!("SHA-256 failed: {}", spec.operation_path))?,
@@ -259,10 +261,7 @@ pub(crate) fn capture_cleanup_identity(spec: &SourceSpec) -> Result<Vec<CleanupE
     let mut dirs: Vec<(String, String)> = Vec::new();
 
     // Top-level directory entry.
-    dirs.push((
-        spec.source_entry_name.clone(),
-        spec.operation_path.clone(),
-    ));
+    dirs.push((spec.source_entry_name.clone(), spec.operation_path.clone()));
 
     for walk_entry in WalkDir::new(source_path).follow_links(false).min_depth(1) {
         let walk_entry = match walk_entry {
@@ -641,10 +640,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(manifest.entries[0].relative_path.as_str(), "Videos");
-        assert_eq!(
-            manifest.entries[0].staged_path.as_str(),
-            "files/Videos"
-        );
+        assert_eq!(manifest.entries[0].staged_path.as_str(), "files/Videos");
     }
 
     #[test]

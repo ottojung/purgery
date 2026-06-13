@@ -714,7 +714,11 @@ pub(crate) fn run_sync_with_run_id(
     // Passthrough, no cleanup: direct rsync only
     if !has_postprocess && !args.delete_after_import {
         info!("starting direct rsync");
-        runner.run_rsync(&source_spec.operation_path, &remote.host, remote.path.as_str())?;
+        runner.run_rsync(
+            &source_spec.operation_path,
+            &remote.host,
+            remote.path.as_str(),
+        )?;
         info!("sync complete");
         return Ok(());
     }
@@ -739,7 +743,11 @@ pub(crate) fn run_sync_with_run_id(
     // Passthrough with cleanup: direct rsync + durable cleanup
     if !has_postprocess {
         info!("starting direct rsync with durable cleanup");
-        runner.run_rsync(&source_spec.operation_path, &remote.host, remote.path.as_str())?;
+        runner.run_rsync(
+            &source_spec.operation_path,
+            &remote.host,
+            remote.path.as_str(),
+        )?;
         if let Some(ref state_path) = cleanup_state_path {
             cleanup::confirm_all_imports(state_path)?;
             cleanup::process_cleanup_state_file(state_path)?;
@@ -793,7 +801,11 @@ pub(crate) fn run_sync_with_run_id(
         }
 
         info!("transferring files to server staging");
-        runner.run_rsync(&source_spec.operation_path, &remote.host, &begin_resp.files_dir)?;
+        runner.run_rsync(
+            &source_spec.operation_path,
+            &remote.host,
+            &begin_resp.files_dir,
+        )?;
 
         Ok(())
     })();
@@ -1843,7 +1855,11 @@ state = "done"
         };
         run_sync_with_runner(&runner, &args).unwrap();
         let log = runner.command_log();
-        assert_eq!(log.len(), 1, "passthrough should produce exactly one command");
+        assert_eq!(
+            log.len(),
+            1,
+            "passthrough should produce exactly one command"
+        );
         let rsync_cmd = &log[0];
         // rsync source operand must NOT have trailing slash.
         let after_sep: Vec<&str> = rsync_cmd.split(" -- ").collect();
@@ -1875,17 +1891,16 @@ state = "done"
         };
         run_sync_with_runner(&runner, &args).unwrap();
         // Cleanup state file must use the normalized source entry name.
-        let cleanup_files: Vec<_> = fs::read_dir(
-            camino::Utf8PathBuf::from(&state_dir).as_std_path(),
-        )
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| n.starts_with("cleanup-"))
-        })
-        .collect();
+        let cleanup_files: Vec<_> =
+            fs::read_dir(camino::Utf8PathBuf::from(&state_dir).as_std_path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.starts_with("cleanup-"))
+                })
+                .collect();
         assert!(
             !cleanup_files.is_empty(),
             "cleanup state file must be created"
@@ -1925,8 +1940,7 @@ state = "done"
         runner.add_response("heartbeat-run", "");
         runner.add_response(
             "run-state",
-            &done_run_state_toml()
-                .replace("laptop", "host"),
+            &done_run_state_toml().replace("laptop", "host"),
         );
         let status_toml =
             "run_id = \"test-run\"\nnickname = \"host\"\nstate = \"done\"\n".to_string();
@@ -2002,10 +2016,7 @@ state = "done"
                 server_command: "purgery-server".to_string(),
             };
             let result = run_sync_with_runner(&runner, &args);
-            assert!(
-                result.is_err(),
-                "/ must be rejected in postprocess mode"
-            );
+            assert!(result.is_err(), "/ must be rejected in postprocess mode");
             assert!(result.unwrap_err().to_string().contains("root"));
         }
         // Split
@@ -2022,10 +2033,7 @@ state = "done"
                 server_command: "purgery-server".to_string(),
             };
             let result = run_sync_with_runner(&runner, &args);
-            assert!(
-                result.is_err(),
-                "/ must be rejected in split mode"
-            );
+            assert!(result.is_err(), "/ must be rejected in split mode");
             assert!(result.unwrap_err().to_string().contains("root"));
         }
     }
@@ -2067,10 +2075,7 @@ state = "done"
         let file_lists = runner.file_lists();
         assert_eq!(file_lists.len(), 1, "must record one file list");
         let files = &file_lists[0];
-        assert!(
-            files.iter().any(|f| f == "a.mp4"),
-            "must include a.mp4"
-        );
+        assert!(files.iter().any(|f| f == "a.mp4"), "must include a.mp4");
         assert!(
             files.iter().any(|f| f.contains("c.mp4")),
             "must include sub/c.mp4"
@@ -2107,17 +2112,16 @@ state = "done"
             "pure passthrough split must not create a server run"
         );
         // No cleanup state files should exist
-        let cleanup_files: Vec<_> = fs::read_dir(
-            camino::Utf8PathBuf::from(&state_dir).as_std_path(),
-        )
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| n.starts_with("cleanup-"))
-        })
-        .collect();
+        let cleanup_files: Vec<_> =
+            fs::read_dir(camino::Utf8PathBuf::from(&state_dir).as_std_path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.starts_with("cleanup-"))
+                })
+                .collect();
         assert!(
             cleanup_files.is_empty(),
             "pure passthrough split must not create cleanup state"
