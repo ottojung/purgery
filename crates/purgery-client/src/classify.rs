@@ -167,3 +167,164 @@ pub(crate) fn build_manifest(
         entries,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use purgery_core::{ManifestEntryKind, ManifestEntryMode, Nickname, RunId};
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    use tempfile::tempdir;
+
+    #[test]
+    fn postprocess_top_level_regular_file() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("video.mp4"), b"content").unwrap();
+
+        let run_id = RunId::new("test-run".into()).unwrap();
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let steps = vec!["compress-video".to_string()];
+
+        let manifest =
+            build_manifest(source.to_str().unwrap(), &run_id, &nickname, &steps, false).unwrap();
+
+        assert_eq!(manifest.entries.len(), 1);
+        let entry = &manifest.entries[0];
+        assert_eq!(entry.mode, ManifestEntryMode::Postprocess);
+        assert_eq!(entry.postprocess_steps, vec!["compress-video".to_string()]);
+        assert_eq!(entry.kind, ManifestEntryKind::RegularFile);
+        assert_eq!(entry.covered_by, None);
+    }
+
+    #[test]
+    fn postprocess_top_level_symlink() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let target = dir.path().join("target_file");
+        fs::write(&target, b"link-target-content").unwrap();
+        symlink(&target, source.join("link.mp4")).unwrap();
+
+        let run_id = RunId::new("test-run".into()).unwrap();
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let steps = vec!["compress-video".to_string()];
+
+        let manifest =
+            build_manifest(source.to_str().unwrap(), &run_id, &nickname, &steps, false).unwrap();
+
+        assert_eq!(manifest.entries.len(), 1);
+        let entry = &manifest.entries[0];
+        assert_eq!(entry.mode, ManifestEntryMode::Postprocess);
+        assert_eq!(entry.postprocess_steps, vec!["compress-video".to_string()]);
+        assert_eq!(entry.kind, ManifestEntryKind::Symlink);
+        assert!(entry.link_target.is_some());
+    }
+
+    #[test]
+    fn postprocess_top_level_directory() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(source.join("videos")).unwrap();
+
+        let run_id = RunId::new("test-run".into()).unwrap();
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let steps = vec!["compress-video".to_string()];
+
+        let manifest =
+            build_manifest(source.to_str().unwrap(), &run_id, &nickname, &steps, false).unwrap();
+
+        assert_eq!(manifest.entries.len(), 1);
+        let entry = &manifest.entries[0];
+        assert_eq!(entry.mode, ManifestEntryMode::Postprocess);
+        assert_eq!(entry.postprocess_steps, vec!["compress-video".to_string()]);
+        assert_eq!(entry.kind, ManifestEntryKind::Directory);
+    }
+
+    #[test]
+    fn descendant_covered_by_directory_root() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let subdir = source.join("videos");
+        fs::create_dir(&subdir).unwrap();
+        fs::write(subdir.join("clip.mp4"), b"clip-content").unwrap();
+
+        let run_id = RunId::new("test-run".into()).unwrap();
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let steps = vec!["compress-video".to_string()];
+
+        let manifest =
+            build_manifest(source.to_str().unwrap(), &run_id, &nickname, &steps, false).unwrap();
+
+        assert_eq!(manifest.entries.len(), 2);
+
+        let dir_entry = manifest
+            .entries
+            .iter()
+            .find(|e| e.relative_path.as_str() == "videos")
+            .unwrap();
+        assert_eq!(dir_entry.mode, ManifestEntryMode::Postprocess);
+        assert_eq!(
+            dir_entry.postprocess_steps,
+            vec!["compress-video".to_string()]
+        );
+        assert_eq!(dir_entry.kind, ManifestEntryKind::Directory);
+
+        let file_entry = manifest
+            .entries
+            .iter()
+            .find(|e| e.relative_path.as_str() == "videos/clip.mp4")
+            .unwrap();
+        assert_eq!(file_entry.mode, ManifestEntryMode::Covered);
+        assert_eq!(file_entry.covered_by, Some("videos".to_string()));
+    }
+
+    #[test]
+    fn covered_entry_has_no_steps() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let subdir = source.join("videos");
+        fs::create_dir(&subdir).unwrap();
+        fs::write(subdir.join("clip.mp4"), b"clip-content").unwrap();
+
+        let run_id = RunId::new("test-run".into()).unwrap();
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let steps = vec!["compress-video".to_string()];
+
+        let manifest =
+            build_manifest(source.to_str().unwrap(), &run_id, &nickname, &steps, false).unwrap();
+
+        let file_entry = manifest
+            .entries
+            .iter()
+            .find(|e| e.relative_path.as_str() == "videos/clip.mp4")
+            .unwrap();
+        assert!(file_entry.postprocess_steps.is_empty());
+    }
+
+    #[test]
+    fn passthrough_has_no_steps_or_covered() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("readme.txt"), b"readme").unwrap();
+        let subdir = source.join("docs");
+        fs::create_dir(&subdir).unwrap();
+
+        let run_id = RunId::new("test-run".into()).unwrap();
+        let nickname = Nickname::new("laptop".into()).unwrap();
+
+        let manifest =
+            build_manifest(source.to_str().unwrap(), &run_id, &nickname, &[], false).unwrap();
+
+        for entry in &manifest.entries {
+            assert_eq!(entry.mode, ManifestEntryMode::Passthrough);
+            assert!(entry.postprocess_steps.is_empty());
+            assert_eq!(entry.covered_by, None);
+        }
+    }
+}

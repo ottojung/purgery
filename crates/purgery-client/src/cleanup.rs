@@ -59,6 +59,7 @@ pub(crate) fn confirm_imports_from_status(state_path: &Utf8Path, status: &RunSta
     let mut state: DurableCleanupState = toml::from_str(&content)
         .map_err(|e| anyhow::anyhow!("failed to parse cleanup state: {e}"))?;
 
+    // First pass: match cleanup entries to status entries by exact path/kind.
     for cleanup_entry in &mut state.entries {
         cleanup_entry.import_confirmed = status.entries.iter().any(|status_entry| {
             status_entry.status == FileStatus::Imported
@@ -66,6 +67,27 @@ pub(crate) fn confirm_imports_from_status(state_path: &Utf8Path, status: &RunSta
                 && status_entry.relative_path == cleanup_entry.relative_path
                 && status_entry.kind == cleanup_entry.kind
         });
+    }
+
+    // Second pass: propagate imported directory confirmation to all
+    // descendants in the cleanup state. When a directory was imported,
+    // every file or directory nested under it is assured to have been
+    // postprocessed and can be cleaned regardless of whether the status
+    // contains an individual entry for each descendant.
+    for cleanup_entry in &mut state.entries {
+        if cleanup_entry.import_confirmed {
+            continue;
+        }
+        let parent_imported = status.entries.iter().any(|s| {
+            s.status == FileStatus::Imported
+                && s.kind == ManifestEntryKind::Directory
+                && cleanup_entry
+                    .relative_path
+                    .starts_with(&format!("{}/", s.relative_path))
+        });
+        if parent_imported {
+            cleanup_entry.import_confirmed = true;
+        }
     }
 
     let tmp_path = state_path.with_extension("toml.tmp");
@@ -643,5 +665,227 @@ mod tests {
             process_cleanup_state_file(&state_path).unwrap();
             assert!(file.exists());
         }
+    }
+
+    #[test]
+    fn cleanup_confirms_covered_descendants_when_covering_dir_imported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("photos");
+        fs::create_dir(&dir).unwrap();
+        let file = dir.join("photo1.jpg");
+        fs::write(&file, "image data").unwrap();
+
+        let file_sha = compute_sha256(&file).unwrap();
+        let file_meta = fs::metadata(&file).unwrap();
+        let file_mtime = file_meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+
+        let entries = vec![
+            CleanupEntry {
+                relative_path: "photos/photo1.jpg".to_owned(),
+                local_path: file.to_str().unwrap().to_owned(),
+                kind: ManifestEntryKind::RegularFile,
+                size: file_meta.len(),
+                mtime_ns: file_mtime,
+                sha256: Some(file_sha),
+                link_target: None,
+                import_confirmed: false,
+                cleaned: false,
+            },
+            CleanupEntry {
+                relative_path: "photos".to_owned(),
+                local_path: dir.to_str().unwrap().to_owned(),
+                kind: ManifestEntryKind::Directory,
+                size: 0,
+                mtime_ns: 0,
+                sha256: None,
+                link_target: None,
+                import_confirmed: false,
+                cleaned: false,
+            },
+        ];
+
+        let state = DurableCleanupState {
+            nickname: "host".to_owned(),
+            operation_id: "run-covered".to_owned(),
+            entries,
+        };
+        let state_path = write_cleanup_state(&state, tmp.path().to_str().unwrap()).unwrap();
+
+        // Status only mentions the directory as imported — no individual descendant entry.
+        let status = RunStatus {
+            run_id: RunId::new("run-covered".to_owned()).unwrap(),
+            nickname: Nickname::new("host".to_owned()).unwrap(),
+            state: RunState::Done,
+            entries: vec![EntryStatusEntry {
+                kind: ManifestEntryKind::Directory,
+                local_path: dir.to_str().unwrap().to_owned(),
+                relative_path: "photos".to_owned(),
+                status: FileStatus::Imported,
+                final_paths: vec!["/dest/photos".to_owned()],
+                postprocess: Some(vec!["transform".to_owned()]),
+                error: None,
+            }],
+            error: None,
+        };
+
+        confirm_imports_from_status(&state_path, &status).unwrap();
+
+        let content = fs::read_to_string(state_path.as_std_path()).unwrap();
+        let state: DurableCleanupState = toml::from_str(&content).unwrap();
+
+        let dir_confirmed = state
+            .entries
+            .iter()
+            .any(|e| e.kind == ManifestEntryKind::Directory && e.import_confirmed);
+        let file_confirmed = state
+            .entries
+            .iter()
+            .any(|e| e.kind == ManifestEntryKind::RegularFile && e.import_confirmed);
+
+        assert!(dir_confirmed, "covering directory must be confirmed");
+        assert!(
+            file_confirmed,
+            "covered descendant must be confirmed via covering directory"
+        );
+    }
+
+    #[test]
+    fn cleanup_does_not_confirm_covered_descendants_when_covering_dir_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("photos");
+        fs::create_dir(&dir).unwrap();
+        let file = dir.join("photo1.jpg");
+        fs::write(&file, "image data").unwrap();
+
+        let entries = vec![
+            CleanupEntry {
+                relative_path: "photos/photo1.jpg".to_owned(),
+                local_path: file.to_str().unwrap().to_owned(),
+                kind: ManifestEntryKind::RegularFile,
+                size: fs::metadata(&file).unwrap().len(),
+                mtime_ns: 0,
+                sha256: None,
+                link_target: None,
+                import_confirmed: false,
+                cleaned: false,
+            },
+            CleanupEntry {
+                relative_path: "photos".to_owned(),
+                local_path: dir.to_str().unwrap().to_owned(),
+                kind: ManifestEntryKind::Directory,
+                size: 0,
+                mtime_ns: 0,
+                sha256: None,
+                link_target: None,
+                import_confirmed: false,
+                cleaned: false,
+            },
+        ];
+
+        let state = DurableCleanupState {
+            nickname: "host".to_owned(),
+            operation_id: "run-failed".to_owned(),
+            entries,
+        };
+        let state_path = write_cleanup_state(&state, tmp.path().to_str().unwrap()).unwrap();
+
+        let status = RunStatus {
+            run_id: RunId::new("run-failed".to_owned()).unwrap(),
+            nickname: Nickname::new("host".to_owned()).unwrap(),
+            state: RunState::Done,
+            entries: vec![EntryStatusEntry {
+                kind: ManifestEntryKind::Directory,
+                local_path: dir.to_str().unwrap().to_owned(),
+                relative_path: "photos".to_owned(),
+                status: FileStatus::Failed,
+                final_paths: vec![],
+                postprocess: None,
+                error: Some("something went wrong".to_owned()),
+            }],
+            error: None,
+        };
+
+        confirm_imports_from_status(&state_path, &status).unwrap();
+
+        let content = fs::read_to_string(state_path.as_std_path()).unwrap();
+        let state: DurableCleanupState = toml::from_str(&content).unwrap();
+
+        assert!(
+            state.entries.iter().all(|e| !e.import_confirmed),
+            "no entries should be confirmed when the covering directory failed"
+        );
+    }
+
+    #[test]
+    fn cleanup_does_not_confirm_covered_descendants_when_covering_dir_not_in_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("photos");
+        fs::create_dir(&dir).unwrap();
+        let file = dir.join("photo1.jpg");
+        fs::write(&file, "image data").unwrap();
+
+        let entries = vec![
+            CleanupEntry {
+                relative_path: "photos/photo1.jpg".to_owned(),
+                local_path: file.to_str().unwrap().to_owned(),
+                kind: ManifestEntryKind::RegularFile,
+                size: fs::metadata(&file).unwrap().len(),
+                mtime_ns: 0,
+                sha256: None,
+                link_target: None,
+                import_confirmed: false,
+                cleaned: false,
+            },
+            CleanupEntry {
+                relative_path: "photos".to_owned(),
+                local_path: dir.to_str().unwrap().to_owned(),
+                kind: ManifestEntryKind::Directory,
+                size: 0,
+                mtime_ns: 0,
+                sha256: None,
+                link_target: None,
+                import_confirmed: false,
+                cleaned: false,
+            },
+        ];
+
+        let state = DurableCleanupState {
+            nickname: "host".to_owned(),
+            operation_id: "run-missing".to_owned(),
+            entries,
+        };
+        let state_path = write_cleanup_state(&state, tmp.path().to_str().unwrap()).unwrap();
+
+        // Status has no entry for the covering directory.
+        let status = RunStatus {
+            run_id: RunId::new("run-missing".to_owned()).unwrap(),
+            nickname: Nickname::new("host".to_owned()).unwrap(),
+            state: RunState::Done,
+            entries: vec![EntryStatusEntry {
+                kind: ManifestEntryKind::RegularFile,
+                local_path: "/unrelated".to_owned(),
+                relative_path: "unrelated.txt".to_owned(),
+                status: FileStatus::Imported,
+                final_paths: vec!["/dest/unrelated.txt".to_owned()],
+                postprocess: None,
+                error: None,
+            }],
+            error: None,
+        };
+
+        confirm_imports_from_status(&state_path, &status).unwrap();
+
+        let content = fs::read_to_string(state_path.as_std_path()).unwrap();
+        let state: DurableCleanupState = toml::from_str(&content).unwrap();
+
+        assert!(
+            state.entries.iter().all(|e| !e.import_confirmed),
+            "no entries should be confirmed when the covering directory is absent from status"
+        );
     }
 }

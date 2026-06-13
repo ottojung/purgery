@@ -51,6 +51,50 @@ fn passthrough_without_cleanup_runs_rsync_without_server_run() {
 }
 
 #[test]
+fn passthrough_relative_destination_uses_rsync_directly_no_server_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let log = tmp.path().join("commands.log");
+    write_executable(
+        &bin.join("rsync"),
+        "#!/bin/sh\nprintf 'rsync:%s\\n' \"$*\" >> \"$COMMAND_LOG\"\n",
+    );
+    write_executable(
+        &bin.join("ssh"),
+        "#!/bin/sh\nprintf 'ssh:%s\\n' \"$*\" >> \"$COMMAND_LOG\"\nexit 99\n",
+    );
+    let source = tmp.path().join("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("a.txt"), "hello").unwrap();
+
+    let status = Command::new(env!("CARGO_BIN_EXE_purgery-client"))
+        .args([
+            "sync",
+            "--",
+            source.to_str().unwrap(),
+            "user@host:relative/dest",
+        ])
+        .env("PATH", &bin)
+        .env("COMMAND_LOG", &log)
+        .env("XDG_STATE_HOME", tmp.path().join("state"))
+        .status()
+        .unwrap();
+
+    assert!(status.success());
+    let commands = fs::read_to_string(log).unwrap();
+    assert!(commands.contains("rsync:"), "passthrough must run rsync");
+    assert!(
+        commands.contains("relative/dest/"),
+        "rsync must receive relative destination"
+    );
+    assert!(
+        !commands.contains("ssh:"),
+        "passthrough with relative destination must not create a server run"
+    );
+}
+
+#[test]
 fn passthrough_cleanup_deletes_only_an_unchanged_original() {
     let tmp = tempfile::tempdir().unwrap();
     let bin = tmp.path().join("bin");
