@@ -898,6 +898,11 @@ pub(crate) fn run_sync_with_run_id(
 }
 
 /// Handle --split mode.
+///
+/// Pure passthrough split runs one rsync with constant filter rules derived
+/// from the pattern — no pre-discovery, no server run, no cleanup state.
+/// Cleanup/postprocess split uses Purgery discovery with ancestor pruning
+/// and serialized non-split operations.
 fn run_split(
     runner: &RemoteRunner,
     args: &SyncArgs,
@@ -906,14 +911,8 @@ fn run_split(
     source_spec: &classify::SourceSpec,
 ) -> Result<()> {
     let has_postprocess = !args.postprocess.is_empty();
-    let entry_roots =
-        split::discover_split_entries(&source_spec.operation_path, args.split.as_deref().unwrap())
-            .map_err(|e| anyhow::anyhow!("split discovery failed: {e}"))?;
-    if entry_roots.is_empty() {
-        info!("split pattern matched nothing");
-        return Ok(());
-    }
     let target = parse_destination(&args.destination)?;
+
     if !has_postprocess && !args.delete_after_import {
         return run_passthrough_split(
             runner,
@@ -922,6 +921,14 @@ fn run_split(
             &target.host,
             target.path.as_str(),
         );
+    }
+
+    let entry_roots =
+        split::discover_split_entries(&source_spec.operation_path, args.split.as_deref().unwrap())
+            .map_err(|e| anyhow::anyhow!("split discovery failed: {e}"))?;
+    if entry_roots.is_empty() {
+        info!("split pattern matched nothing");
+        return Ok(());
     }
     let base_dest = &args.destination;
     for root in &entry_roots {

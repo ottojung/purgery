@@ -561,7 +561,11 @@ mod tests {
                 "/src",
                 "host",
                 "/dest",
-                &["*/".to_string(), "*.mp4/***".to_string(), "*.mp4".to_string()],
+                &[
+                    "*/".to_string(),
+                    "*.mp4/***".to_string(),
+                    "*.mp4".to_string(),
+                ],
                 "*",
             )
             .unwrap();
