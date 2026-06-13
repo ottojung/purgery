@@ -34,26 +34,6 @@ pub(crate) fn write_cleanup_state(
     Ok(final_path)
 }
 
-pub(crate) fn mark_cleaned(state_path: &Utf8Path, local_path: &str) -> Result<()> {
-    let content = fs::read_to_string(state_path.as_std_path())
-        .with_context(|| format!("failed to read cleanup state: {state_path}"))?;
-    let mut state: DurableCleanupState = toml::from_str(&content)
-        .map_err(|e| anyhow::anyhow!("failed to parse cleanup state: {e}"))?;
-    for entry in &mut state.entries {
-        if entry.local_path == local_path {
-            entry.cleaned = true;
-        }
-    }
-    let tmp_path = state_path.with_extension("toml.tmp");
-    let new_content = toml::to_string(&state)
-        .map_err(|e| anyhow::anyhow!("failed to serialize cleanup state: {e}"))?;
-    fs::write(&tmp_path, &new_content)
-        .with_context(|| format!("failed to write cleanup state: {tmp_path}"))?;
-    fs::rename(&tmp_path, state_path)
-        .with_context(|| format!("failed to atomically update cleanup state: {state_path}"))?;
-    Ok(())
-}
-
 pub(crate) fn confirm_all_imports(state_path: &Utf8Path) -> Result<()> {
     let content = fs::read_to_string(state_path.as_std_path())
         .with_context(|| format!("failed to read cleanup state: {state_path}"))?;
@@ -255,119 +235,170 @@ pub(crate) fn compute_sha256(path: &Path) -> Result<String> {
 pub(crate) fn process_cleanup_state_file(state_path: &Utf8Path) -> Result<()> {
     let content = fs::read_to_string(state_path.as_std_path())
         .with_context(|| format!("failed to read cleanup state: {state_path}"))?;
-    let state: DurableCleanupState = toml::from_str(&content)
+    let mut state: DurableCleanupState = toml::from_str(&content)
         .map_err(|e| anyhow::anyhow!("failed to parse cleanup state: {e}"))?;
 
-    for entry in &state.entries {
-        if !entry.import_confirmed || entry.cleaned {
+    // Phase 1: clean non-directory entries (files and symlinks).
+    // Keep the in-memory state mutable so directory checks in phase 2
+    // see the updated cleaned flags.
+    for i in 0..state.entries.len() {
+        if !state.entries[i].import_confirmed || state.entries[i].cleaned {
             continue;
         }
-        let local_path = Path::new(&entry.local_path);
-        let symmeta = match fs::symlink_metadata(local_path) {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let _ = mark_cleaned(state_path, &entry.local_path);
-                continue;
-            }
-            Err(_) => continue,
-        };
-
-        match entry.kind {
-            ManifestEntryKind::Directory => {
-                if !symmeta.file_type().is_dir() {
-                    continue;
-                }
-                let has_unexpected = match fs::read_dir(local_path) {
-                    Ok(reader) => {
-                        let mut unexpected = false;
-                        for child in reader {
-                            let child = match child {
-                                Ok(c) => c,
-                                Err(_) => {
-                                    unexpected = true;
-                                    break;
-                                }
-                            };
-                            let child_path = child.path();
-                            if child_path == local_path {
-                                continue;
-                            }
-                            if state.entries.iter().any(|e| {
-                                let e_path = Path::new(&e.local_path);
-                                e_path == child_path && (e.cleaned || !e.import_confirmed)
-                            }) {
-                                continue;
-                            }
-                            unexpected = true;
-                        }
-                        unexpected
-                    }
-                    Err(_) => true,
-                };
-                if has_unexpected {
-                    continue;
-                }
-                if let Err(e) = fs::remove_dir(local_path) {
-                    warn!(path = %entry.local_path, error = %e, "failed to remove directory");
-                } else {
-                    let _ = mark_cleaned(state_path, &entry.local_path);
-                }
-            }
-            ManifestEntryKind::Symlink => {
-                if !symmeta.file_type().is_symlink() {
-                    continue;
-                }
-                let Some(ref expected_target) = entry.link_target else {
-                    continue;
-                };
-                let Ok(current_target) = fs::read_link(local_path) else {
-                    continue;
-                };
-                if current_target.to_string_lossy().as_ref() != expected_target.as_str() {
-                    continue;
-                }
-                if let Err(e) = fs::remove_file(local_path) {
-                    warn!(path = %entry.local_path, error = %e, "failed to unlink symlink");
-                } else {
-                    let _ = mark_cleaned(state_path, &entry.local_path);
-                }
-            }
-            ManifestEntryKind::RegularFile => {
-                if !symmeta.file_type().is_file() || symmeta.file_type().is_symlink() {
-                    continue;
-                }
-                let Ok(meta) = fs::metadata(local_path) else {
-                    continue;
-                };
-                if meta.len() != entry.size {
-                    continue;
-                }
-                let current_mtime = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_nanos() as i64)
-                    .unwrap_or(0);
-                if current_mtime != entry.mtime_ns {
-                    continue;
-                }
-                let Some(ref expected_sha) = entry.sha256 else {
-                    continue;
-                };
-                let Ok(actual_sha) = compute_sha256(local_path) else {
-                    continue;
-                };
-                if actual_sha != *expected_sha {
-                    continue;
-                }
-                if let Err(e) = fs::remove_file(local_path) {
-                    warn!(path = %entry.local_path, error = %e, "failed to delete");
-                } else {
-                    let _ = mark_cleaned(state_path, &entry.local_path);
-                }
-            }
+        if state.entries[i].kind == ManifestEntryKind::Directory {
+            continue;
+        }
+        let cleaned = try_clean_entry(&state.entries, i);
+        if cleaned {
+            state.entries[i].cleaned = true;
+            write_cleanup_state_atomic(state_path, &state)?;
         }
     }
+
+    // Phase 2: clean directories bottom-up. The entries are already
+    // sorted by depth (directories first in manifest order), but we
+    // iterate in reverse so leaf directories are processed first.
+    for i in (0..state.entries.len()).rev() {
+        if !state.entries[i].import_confirmed || state.entries[i].cleaned {
+            continue;
+        }
+        if state.entries[i].kind != ManifestEntryKind::Directory {
+            continue;
+        }
+        if !can_remove_directory(&state.entries, i) {
+            continue;
+        }
+        let local_path = Path::new(&state.entries[i].local_path);
+        if let Err(e) = fs::remove_dir(local_path) {
+            warn!(path = %state.entries[i].local_path, error = %e, "failed to remove directory");
+        } else {
+            info!(path = %state.entries[i].local_path, "removed empty directory");
+            state.entries[i].cleaned = true;
+            write_cleanup_state_atomic(state_path, &state)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Returns true if the entry at index i was successfully cleaned.
+fn try_clean_entry(entries: &[CleanupEntry], i: usize) -> bool {
+    let entry = &entries[i];
+    let local_path = Path::new(&entry.local_path);
+    let symmeta = match fs::symlink_metadata(local_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+    };
+
+    match entry.kind {
+        ManifestEntryKind::Directory => false,
+        ManifestEntryKind::Symlink => {
+            if !symmeta.file_type().is_symlink() {
+                return false;
+            }
+            let Some(ref expected_target) = entry.link_target else {
+                return false;
+            };
+            let Ok(current_target) = fs::read_link(local_path) else {
+                return false;
+            };
+            if current_target.to_string_lossy().as_ref() != expected_target.as_str() {
+                return false;
+            }
+            if let Err(e) = fs::remove_file(local_path) {
+                warn!(path = %entry.local_path, error = %e, "failed to unlink symlink");
+                return false;
+            }
+            true
+        }
+        ManifestEntryKind::RegularFile => {
+            if !symmeta.file_type().is_file() || symmeta.file_type().is_symlink() {
+                return false;
+            }
+            let Ok(meta) = fs::metadata(local_path) else {
+                return false;
+            };
+            if meta.len() != entry.size {
+                return false;
+            }
+            let current_mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(0);
+            if current_mtime != entry.mtime_ns {
+                return false;
+            }
+            let Some(ref expected_sha) = entry.sha256 else {
+                return false;
+            };
+            let Ok(actual_sha) = compute_sha256(local_path) else {
+                return false;
+            };
+            if actual_sha != *expected_sha {
+                return false;
+            }
+            if let Err(e) = fs::remove_file(local_path) {
+                warn!(path = %entry.local_path, error = %e, "failed to delete");
+                return false;
+            }
+            true
+        }
+    }
+}
+
+/// Check whether a directory can be safely removed: all children in the
+/// cleanup state must be cleaned or unconfirmed, and there must be no
+/// unexpected files on disk.
+fn can_remove_directory(entries: &[CleanupEntry], dir_idx: usize) -> bool {
+    let dir_entry = &entries[dir_idx];
+    let local_path = Path::new(&dir_entry.local_path);
+
+    let reader = match fs::read_dir(local_path) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+
+    for child in reader {
+        let child = match child {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        let child_path = child.path();
+        // Is this child tracked in the cleanup state?
+        let tracked = entries.iter().any(|e| {
+            let e_path = Path::new(&e.local_path);
+            e_path == child_path
+        });
+        if !tracked {
+            // Untracked entry on disk — directory is not empty of
+            // unknown content; refuse to remove.
+            return false;
+        }
+        // If tracked, it must already be cleaned (removed) or
+        // unconfirmed (never imported).
+        let child_clear = entries.iter().any(|e| {
+            let e_path = Path::new(&e.local_path);
+            e_path == child_path && (e.cleaned || !e.import_confirmed)
+        });
+        if !child_clear {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn write_cleanup_state_atomic(state_path: &Utf8Path, state: &DurableCleanupState) -> Result<()> {
+    let tmp_path = state_path.with_extension("toml.tmp");
+    let new_content = toml::to_string(state)
+        .map_err(|e| anyhow::anyhow!("failed to serialize cleanup state: {e}"))?;
+    fs::write(&tmp_path, &new_content)
+        .with_context(|| format!("failed to write cleanup state: {tmp_path}"))?;
+    fs::rename(&tmp_path, state_path)
+        .with_context(|| format!("failed to atomically update cleanup state: {state_path}"))?;
     Ok(())
 }
 
@@ -436,6 +467,130 @@ mod tests {
         confirm_imports_from_status(&state_path, &status_for(&file, FileStatus::Imported)).unwrap();
         process_cleanup_state_file(&state_path).unwrap();
         assert!(!file.exists());
+    }
+
+    #[test]
+    fn cleanup_removes_file_then_parent_directory_in_one_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("subdir");
+        fs::create_dir(&dir).unwrap();
+        let file = dir.join("a.txt");
+        fs::write(&file, "hello").unwrap();
+
+        let file_sha = compute_sha256(&file).unwrap();
+        let mut entries = vec![dir_entry(&dir), file_entry(&file, &file_sha)];
+        for e in &mut entries {
+            e.import_confirmed = true;
+        }
+
+        let state = DurableCleanupState {
+            nickname: "host".to_owned(),
+            operation_id: "run-dir".to_owned(),
+            entries,
+        };
+        let state_path = write_cleanup_state(&state, tmp.path().to_str().unwrap()).unwrap();
+
+        process_cleanup_state_file(&state_path).unwrap();
+
+        assert!(!file.exists(), "file should be removed");
+        assert!(!dir.exists(), "empty directory should be removed");
+
+        // Re-running should be idempotent
+        process_cleanup_state_file(&state_path).unwrap();
+    }
+
+    #[test]
+    fn cleanup_preserves_directory_with_untracked_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("subdir");
+        fs::create_dir(&dir).unwrap();
+        let file = dir.join("a.txt");
+        fs::write(&file, "hello").unwrap();
+        let extra = dir.join("extra.txt");
+        fs::write(&extra, "untracked").unwrap();
+
+        let file_sha = compute_sha256(&file).unwrap();
+        let mut entries = vec![dir_entry(&dir), file_entry(&file, &file_sha)];
+        for e in &mut entries {
+            e.import_confirmed = true;
+        }
+
+        let state = DurableCleanupState {
+            nickname: "host".to_owned(),
+            operation_id: "run-extra".to_owned(),
+            entries,
+        };
+        let state_path = write_cleanup_state(&state, tmp.path().to_str().unwrap()).unwrap();
+
+        process_cleanup_state_file(&state_path).unwrap();
+
+        assert!(!file.exists(), "tracked file should be removed");
+        assert!(dir.exists(), "directory with untracked file must remain");
+        assert!(extra.exists(), "untracked file must remain");
+    }
+
+    #[test]
+    fn cleanup_preserves_directory_with_changed_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("subdir");
+        fs::create_dir(&dir).unwrap();
+        let file = dir.join("a.txt");
+        fs::write(&file, "hello").unwrap();
+
+        let file_sha = compute_sha256(&file).unwrap();
+        let mut entries = vec![dir_entry(&dir), file_entry(&file, &file_sha)];
+        for e in &mut entries {
+            e.import_confirmed = true;
+        }
+        // Change the file after capturing identity
+        fs::write(&file, "modified").unwrap();
+
+        let state = DurableCleanupState {
+            nickname: "host".to_owned(),
+            operation_id: "run-changed".to_owned(),
+            entries,
+        };
+        let state_path = write_cleanup_state(&state, tmp.path().to_str().unwrap()).unwrap();
+
+        process_cleanup_state_file(&state_path).unwrap();
+
+        assert!(file.exists(), "changed file must remain");
+        assert!(dir.exists(), "directory with changed file must remain");
+    }
+
+    fn dir_entry(path: &Path) -> CleanupEntry {
+        CleanupEntry {
+            relative_path: path.file_name().unwrap().to_str().unwrap().to_owned(),
+            local_path: path.to_str().unwrap().to_owned(),
+            kind: ManifestEntryKind::Directory,
+            size: 0,
+            mtime_ns: 0,
+            sha256: None,
+            link_target: None,
+            import_confirmed: false,
+            cleaned: false,
+        }
+    }
+
+    fn file_entry(path: &Path, sha: &str) -> CleanupEntry {
+        let metadata = fs::metadata(path).unwrap();
+        let mtime_ns = metadata
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        CleanupEntry {
+            relative_path: path.file_name().unwrap().to_str().unwrap().to_owned(),
+            local_path: path.to_str().unwrap().to_owned(),
+            kind: ManifestEntryKind::RegularFile,
+            size: metadata.len(),
+            mtime_ns,
+            sha256: Some(sha.to_owned()),
+            link_target: None,
+            import_confirmed: false,
+            cleaned: false,
+        }
     }
 
     #[test]
