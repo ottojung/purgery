@@ -76,6 +76,8 @@ The source entry name is used consistently for the manifest `relative_path`, sta
 
 The `--split <PATTERN>` flag selects source entries to process individually. The pattern is an rsync-style single positive selector, not an ordered include/exclude rule list.
 
+Split operates in one of two modes depending on the presence of `--delete-after-import` or `--postprocess`.
+
 ### Pattern syntax
 
 - Patterns with `/` match against relative paths.
@@ -86,19 +88,37 @@ The `--split <PATTERN>` flag selects source entries to process individually. The
 - Leading `/` anchors to the transfer root (`<SOURCE>`).
 - `?` matches any single character except `/`.
 
-### Pattern matching behavior
+### Pure passthrough split
 
-- `--split` is a positive selector, not an ordered include/exclude filter list.
+Without `--delete-after-import` or `--postprocess`, the client performs one rsync filter transfer with constant include/exclude rules derived from the pattern. No Purgery-side candidate discovery, ancestor pruning, or root ordering is performed. The contract is final destination effect under the generated rsync filter rules.
+
+Rsync filter rules:
+
+```
+--include='*/'
+--include='<P-as-directory-payload>'
+--include='<P-as-entry>'
+--exclude='*'
+```
+
+`<P-as-entry>` is the pattern verbatim. `<P-as-directory-payload>` appends `/***` to the pattern (stripping a trailing `/` if present), ensuring that when the pattern matches a directory, its full payload is transferred.
+
+The source operand in filter mode intentionally has a trailing slash (`<SOURCE>/`) so selected entries land directly under `<TARGET>` rather than under `<TARGET>/<SOURCE-NAME>`. Nested entries preserve their relative parent paths under `<TARGET>`.
+
+`--split "."` is special: it uses ordinary source-entry rsync (no trailing slash on source, no filter rules) and imports `<SOURCE>` as `<TARGET>/<SOURCE-NAME>`.
+
+Pure passthrough split uses `--prune-empty-dirs` to remove traversal-only directory scaffolding created by the `*/` rule. Empty directories selected only by the filter may not be created at the destination. Cleanup and postprocess split do not use this optimization.
+
+No server run, manifest, or client state is created. No destination collision preflight is performed. Rsync always runs; when nothing matches the filter, rsync simply transfers nothing.
+
+### Serialized split for cleanup and postprocess
+
+With `--delete-after-import` or `--postprocess`, the client discovers matching entries using Purgery's own pattern matcher. Match determination uses these rules:
+
 - `<SOURCE>` itself is candidate `.` (matched by its relative sentinel, not by basename).
 - Every descendant is a candidate, represented by its normalized relative path from `<SOURCE>`.
 - Candidates are tested against the single pattern. If a matched entry has a matched ancestor, only the ancestor is kept (ancestor pruning).
 - The result is a deterministic non-overlapping set of roots in normalized path order.
-
-### No-match behavior
-
-If `--split <PATTERN>` matches nothing, an info-level message is logged, no transfer is performed, no server run is created, and the client exits successfully with status code 0.
-
-### Target suffix
 
 Each matched root gets a target suffix that preserves its relative layout under `<TARGET>`:
 
@@ -108,17 +128,9 @@ Each matched root gets a target suffix that preserves its relative layout under 
 | Top-level child of `<SOURCE>` | `/` | `user@host:/archive/` |
 | Nested child | `/parent` | `user@host:/archive/parent` |
 
-### Pure passthrough split
+Each root is processed as a serialized non-split sync operation. The next operation starts only after the previous one is completely done: transfer finished, server run reached terminal (if postprocess), status read, cleanup confirmed, local deletion completed.
 
-Without `--delete-after-import` or `--postprocess`, the split performs one rsync filter transfer of the selected roots and their payloads. No Purgery-side discovery is performed — the pattern is translated into constant rsync include/exclude rules. Nested entries preserve their relative parent paths under `<TARGET>`. No server run, manifest, or client state is created. No destination collision preflight is added.
-
-`--split "."` uses ordinary source-entry rsync.
-
-Pure passthrough split uses `--prune-empty-dirs` to remove traversal-only directory scaffolding. Empty directories selected only by the filter may not be created at the destination. Cleanup and postprocess split do not use this optimization.
-
-### Serialized split for cleanup and postprocess
-
-With `--delete-after-import` or `--postprocess`, the client discovers matching entries using Purgery's own pattern matcher. Matched roots are ancestor-pruned and sorted deterministically. Each root is processed as a serialized non-split sync operation. The next operation starts only after the previous one is completely done: transfer finished, server run reached terminal (if postprocess), status read, cleanup confirmed, local deletion completed.
+If the pattern matches nothing, an info-level message is logged, no transfer is performed, no server run is created, and the client exits successfully with status code 0.
 
 ## Heartbeat and leases
 
