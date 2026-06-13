@@ -96,7 +96,7 @@ Each matched root gets a target suffix that preserves its relative layout under 
 |---------------|--------|-------|
 | `<SOURCE>` exactly | empty | `user@host:/archive` |
 | Top-level child of `<SOURCE>` | `/` | `user@host:/archive/` |
-| Nested child | `/parent/` | `user@host:/archive/parent/` |
+| Nested child | `/parent` | `user@host:/archive/parent` |
 
 ### Pure passthrough optimization
 

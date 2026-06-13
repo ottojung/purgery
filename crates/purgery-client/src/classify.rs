@@ -16,7 +16,7 @@ pub(crate) fn build_manifest(
     postprocess_steps: &[String],
 ) -> Result<Manifest> {
     let source_path = Path::new(source);
-    if !source_path.exists() {
+    if std::fs::symlink_metadata(source_path).is_err() {
         anyhow::bail!("source path does not exist: {source}");
     }
 
@@ -118,7 +118,7 @@ pub(crate) fn capture_cleanup_identity(source: &str) -> Result<Vec<CleanupEntry>
     use walkdir::WalkDir;
 
     let source_path = Path::new(source);
-    if !source_path.exists() {
+    if std::fs::symlink_metadata(source_path).is_err() {
         return Ok(Vec::new());
     }
 

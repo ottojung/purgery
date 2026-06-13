@@ -16,7 +16,7 @@ pub(crate) fn discover_split_entries(
     pattern: &str,
 ) -> Result<Vec<SplitCandidate>, String> {
     let source_path = Path::new(source);
-    if !source_path.exists() {
+    if std::fs::symlink_metadata(source_path).is_err() {
         return Ok(Vec::new());
     }
 
@@ -100,6 +100,10 @@ pub(crate) fn discover_split_entries(
 }
 
 /// Compute the target suffix for a matched root relative to source.
+///
+/// - source itself → empty (root already matches target)
+/// - top-level child → "/" (rsync destination parent)
+/// - nested child → "/parent" (no trailing slash — run_rsync adds it)
 pub(crate) fn split_target_suffix(source: &str, root: &str) -> String {
     if root == source {
         return String::new();
@@ -113,7 +117,7 @@ pub(crate) fn split_target_suffix(source: &str, root: &str) -> String {
         if parent.as_os_str().is_empty() {
             "/".to_string()
         } else {
-            format!("/{}/", parent.to_string_lossy())
+            format!("/{}", parent.to_string_lossy())
         }
     } else {
         String::new()
@@ -436,7 +440,7 @@ mod tests {
     #[test]
     fn nested_child_has_parent_suffix() {
         let suffix = split_target_suffix("/src", "/src/2024/a.mp4");
-        assert_eq!(suffix, "/2024/");
+        assert_eq!(suffix, "/2024");
     }
 
     #[test]

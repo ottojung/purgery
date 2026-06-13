@@ -126,6 +126,10 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
     let run_config = purgery_core::RunConfig::from_toml(&run_config_content)
         .with_context(|| "failed to parse run config")?;
 
+    if !run_config.delete_after_import {
+        anyhow::bail!("postprocess runs require delete_after_import = true");
+    }
+
     let manifest_path = incoming_path.join("manifest.toml");
     let manifest_content =
         fs::read_to_string(&manifest_path).with_context(|| "failed to read manifest")?;

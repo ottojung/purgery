@@ -34,6 +34,7 @@ pub(crate) struct FakeState {
     rsync_errors: Mutex<Vec<(String, String)>>,
     log: Mutex<Vec<String>>,
     written_files: Mutex<HashMap<String, String>>,
+    file_list: Mutex<Vec<Vec<String>>>,
     finish_run_hook: Mutex<Option<Box<dyn Fn() + Send>>>,
     rsync_hook: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
@@ -47,6 +48,7 @@ impl std::fmt::Debug for FakeState {
             .field("rsync_errors", &self.rsync_errors)
             .field("log", &self.log)
             .field("written_files", &self.written_files)
+            .field("file_list", &self.file_list)
             .finish()
     }
 }
@@ -66,6 +68,7 @@ impl RemoteRunner {
                 rsync_errors: Mutex::new(Vec::new()),
                 log: Mutex::new(Vec::new()),
                 written_files: Mutex::new(HashMap::new()),
+                file_list: Mutex::new(Vec::new()),
                 finish_run_hook: Mutex::new(None),
                 rsync_hook: Mutex::new(None),
             }),
@@ -160,7 +163,16 @@ impl RemoteRunner {
     pub(crate) fn written_files(&self) -> HashMap<String, String> {
         match self {
             RemoteRunner::Fake { inner } => inner.written_files.lock().unwrap().clone(),
-            _ => unreachable!(),
+            RemoteRunner::Real => HashMap::new(),
+        }
+    }
+
+    /// Return the list of file lists passed to run_rsync_with_file_list.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn file_lists(&self) -> Vec<Vec<String>> {
+        match self {
+            RemoteRunner::Fake { inner } => inner.file_list.lock().unwrap().clone(),
+            RemoteRunner::Real => Vec::new(),
         }
     }
 
@@ -375,6 +387,7 @@ impl RemoteRunner {
                     }
                 }
                 inner.log.lock().unwrap().push(args.join(" "));
+                inner.file_list.lock().unwrap().push(file_list.to_vec());
                 Ok(())
             }
         }
@@ -533,5 +546,17 @@ mod tests {
         let log = runner.command_log();
         assert_eq!(log.len(), 1, "pure passthrough split must use one rsync");
         assert!(!log[0].contains("ssh"), "must be an rsync command, not ssh");
+    }
+
+    #[test]
+    fn file_list_rsync_records_selected_files() {
+        let runner = RemoteRunner::fake();
+        let files = vec!["a.mp4".to_string(), "b.mp4".to_string()];
+        runner
+            .run_rsync_with_file_list("/src", "host", "/dest", &files)
+            .unwrap();
+        let lists = runner.file_lists();
+        assert_eq!(lists.len(), 1, "must record exactly one file list");
+        assert_eq!(lists[0], files, "recorded file list must match input");
     }
 }

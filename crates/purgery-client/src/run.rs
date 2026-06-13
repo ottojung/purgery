@@ -566,7 +566,7 @@ fn resolve_state_dir(args: &SyncArgs) -> String {
 
 fn validate_source_exists(source: &str) -> Result<()> {
     let path = Path::new(source);
-    if !path.exists() {
+    if std::fs::symlink_metadata(path).is_err() {
         anyhow::bail!("source path does not exist: {source}");
     }
     Ok(())
