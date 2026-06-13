@@ -30,40 +30,43 @@ jobs:
 
       - name: Select model
         id: select-model
+        shell: bash
         env:
           COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
-          first_token="$(printf '%s\n' "$COMMENT_BODY" | awk 'NF { print $1; exit }')"
+          first_line="$(
+            printf '%s\n' "$COMMENT_BODY" \
+              | tr -d '\r' \
+              | grep -m 1 -E '[^[:space:]]' \
+              || true
+          )"
 
-          case "$first_token" in
+          read -r command _ <<< "$first_line"
+
+          case "$command" in
             /opencode-pro-zen)
-              echo 'run=true' >> "$GITHUB_OUTPUT"
               echo 'model=opencode/deepseek-v4-pro' >> "$GITHUB_OUTPUT"
               ;;
 
             plsocz)
-              echo 'run=true' >> "$GITHUB_OUTPUT"
               echo 'model=opencode/deepseek-v4-flash' >> "$GITHUB_OUTPUT"
               ;;
 
             /opencode-pro)
-              echo 'run=true' >> "$GITHUB_OUTPUT"
               echo 'model=opencode-go/deepseek-v4-pro' >> "$GITHUB_OUTPUT"
               ;;
 
             /opencode|plsoc)
-              echo 'run=true' >> "$GITHUB_OUTPUT"
               echo 'model=opencode-go/deepseek-v4-flash' >> "$GITHUB_OUTPUT"
               ;;
 
             *)
-              echo 'run=false' >> "$GITHUB_OUTPUT"
-              echo "Ignoring non-opencode command: $first_token"
+              echo "Unsupported opencode command: $command" >&2
+              exit 1
               ;;
           esac
 
       - name: Run opencode
-        if: steps.select-model.outputs.run == 'true'
         uses: anomalyco/opencode/github@latest
         env:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
