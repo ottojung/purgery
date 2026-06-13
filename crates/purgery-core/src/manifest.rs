@@ -52,8 +52,6 @@ pub struct ManifestEntry {
     pub mode: ManifestEntryMode,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub postprocess_steps: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub covered_by: Option<String>,
 }
 
 impl ManifestEntry {

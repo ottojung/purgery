@@ -149,42 +149,6 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
             })?;
     }
 
-    // Validate covered_by consistency.
-    for entry in &manifest.entries {
-        let is_covered = entry.mode == purgery_core::ManifestEntryMode::Covered;
-        if is_covered {
-            let Some(ref covered_by) = entry.covered_by else {
-                anyhow::bail!(
-                    "covered entry '{}' is missing covered_by",
-                    entry.relative_path.as_str()
-                );
-            };
-            if !entry.postprocess_steps.is_empty() {
-                anyhow::bail!(
-                    "covered entry '{}' must not have postprocess steps",
-                    entry.relative_path.as_str()
-                );
-            }
-            let covering_exists = manifest.entries.iter().any(|other| {
-                other.relative_path.as_str() == covered_by
-                    && other.kind == purgery_core::ManifestEntryKind::Directory
-                    && other.mode == purgery_core::ManifestEntryMode::Postprocess
-            });
-            if !covering_exists {
-                anyhow::bail!(
-                    "covered entry '{}' has covered_by '{}' which is not a postprocessed directory entry",
-                    entry.relative_path.as_str(),
-                    covered_by
-                );
-            }
-        } else if entry.covered_by.is_some() {
-            anyhow::bail!(
-                "non-covered entry '{}' must not have covered_by",
-                entry.relative_path.as_str()
-            );
-        }
-    }
-
     // Resolve relative destination against server cwd.
     let resolved_destination = if !run_config.destination.is_absolute() {
         let cwd =
@@ -802,7 +766,6 @@ delete_after_import = true
                 link_target: None,
                 mode: Default::default(),
                 postprocess_steps: Vec::new(),
-                covered_by: None,
             }],
         };
         fs::write(
@@ -926,7 +889,6 @@ delete_after_import = true
                 link_target: None,
                 mode: Default::default(),
                 postprocess_steps: Vec::new(),
-                covered_by: None,
             }],
         };
         fs::write(
@@ -1021,7 +983,6 @@ delete_after_import = true
                 link_target: None,
                 mode: Default::default(),
                 postprocess_steps: Vec::new(),
-                covered_by: None,
             }],
         };
         fs::write(
@@ -1101,7 +1062,6 @@ delete_after_import = true
                 link_target: None,
                 mode: Default::default(),
                 postprocess_steps: Vec::new(),
-                covered_by: None,
             }],
         };
         fs::write(
@@ -1230,7 +1190,6 @@ delete_after_import = true
                 link_target: None,
                 mode: purgery_core::ManifestEntryMode::Postprocess,
                 postprocess_steps: vec!["compress-video".into()],
-                covered_by: None,
             }],
         };
         fs::write(
@@ -1551,7 +1510,6 @@ delete_after_import = true
                 link_target: None,
                 mode: Default::default(),
                 postprocess_steps: Vec::new(),
-                covered_by: None,
             }],
         };
         fs::write(
@@ -1605,7 +1563,6 @@ delete_after_import = true
                 link_target: None,
                 mode: purgery_core::ManifestEntryMode::Postprocess,
                 postprocess_steps: vec!["compress-video".into()],
-                covered_by: None,
             }],
         };
         fs::write(
@@ -1685,7 +1642,6 @@ delete_after_import = true
                 link_target: None,
                 mode: Default::default(),
                 postprocess_steps: Vec::new(),
-                covered_by: None,
             }],
         };
         fs::write(
@@ -1788,7 +1744,6 @@ delete_after_import = true
                 link_target: None,
                 mode: Default::default(),
                 postprocess_steps: vec!["compress-video".into()],
-                covered_by: None,
             }],
         };
         fs::write(
@@ -1876,7 +1831,6 @@ delete_after_import = true
                 link_target: None,
                 mode: Default::default(),
                 postprocess_steps: vec!["compress-video".into()],
-                covered_by: None,
             }],
         };
         fs::write(
@@ -1966,7 +1920,6 @@ delete_after_import = true
                 link_target: None,
                 mode: Default::default(),
                 postprocess_steps: vec!["compress-video".into()],
-                covered_by: None,
             }],
         };
         fs::write(
@@ -2765,7 +2718,6 @@ delete_after_import = true
             link_target: target.map(Utf8PathBuf::from),
             mode: Default::default(),
             postprocess_steps: Vec::new(),
-            covered_by: None,
         };
         let manifest = Manifest {
             run_id: run_id.clone(),
@@ -2964,7 +2916,6 @@ delete_after_import = true
                 link_target: None,
                 mode: purgery_core::ManifestEntryMode::Passthrough,
                 postprocess_steps: Vec::new(),
-                covered_by: None,
             }],
         };
         fs::write(incoming.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
@@ -3033,7 +2984,6 @@ delete_after_import = true
                 link_target: None,
                 mode: purgery_core::ManifestEntryMode::Passthrough,
                 postprocess_steps: Vec::new(),
-                covered_by: None,
             }],
         };
         fs::write(incoming.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
@@ -3102,7 +3052,6 @@ delete_after_import = true
                 link_target: None,
                 mode: purgery_core::ManifestEntryMode::Passthrough,
                 postprocess_steps: Vec::new(),
-                covered_by: None,
             }],
         };
         fs::write(ready.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
@@ -3269,7 +3218,6 @@ delete_after_import = true
                 link_target: None,
                 mode: Default::default(),
                 postprocess_steps: Vec::new(),
-                covered_by: None,
             }],
         };
         fs::write(
@@ -4299,7 +4247,6 @@ delete_after_import = true
                 link_target: None,
                 mode: Default::default(),
                 postprocess_steps: Vec::new(),
-                covered_by: None,
             }],
         };
         fs::write(
@@ -4372,7 +4319,6 @@ delete_after_import = true
                     link_target: None,
                     mode: ManifestEntryMode::Postprocess,
                     postprocess_steps: vec!["always-fail".into()],
-                    covered_by: None,
                 },
                 ManifestEntry {
                     local_path: ClientLocalPath::new("/home/user/b.mp4".into()).unwrap(),
@@ -4385,7 +4331,6 @@ delete_after_import = true
                     link_target: None,
                     mode: ManifestEntryMode::Postprocess,
                     postprocess_steps: vec!["always-fail".into()],
-                    covered_by: None,
                 },
             ],
         };
@@ -4475,7 +4420,6 @@ delete_after_import = true
                 link_target: None,
                 mode: ManifestEntryMode::Postprocess,
                 postprocess_steps: vec!["echo-args".into()],
-                covered_by: None,
             }],
         };
         fs::write(
@@ -4815,7 +4759,6 @@ delete_after_import = true
                 link_target: None,
                 mode: ManifestEntryMode::Postprocess,
                 postprocess_steps: vec!["make-symlink".into()],
-                covered_by: None,
             }],
         };
         fs::write(
@@ -5099,7 +5042,6 @@ delete_after_import = true
                 link_target: None,
                 mode: ManifestEntryMode::Postprocess,
                 postprocess_steps: vec!["make-tree".into()],
-                covered_by: None,
             }],
         };
         fs::write(
@@ -5203,7 +5145,6 @@ delete_after_import = true
             link_target: None,
             mode: Default::default(),
             postprocess_steps: Vec::new(),
-            covered_by: None,
         });
         fs::write(
             ready_path.join("manifest.toml"),
@@ -5323,7 +5264,6 @@ delete_after_import = true
                     link_target: Some(Utf8PathBuf::from("/usr/share/data")),
                     mode: Default::default(),
                     postprocess_steps: Vec::new(),
-                    covered_by: None,
                 },
                 // Second entry fails (missing staged file).
                 ManifestEntry {
@@ -5337,7 +5277,6 @@ delete_after_import = true
                     link_target: None,
                     mode: Default::default(),
                     postprocess_steps: Vec::new(),
-                    covered_by: None,
                 },
             ],
         };
@@ -5640,7 +5579,6 @@ delete_after_import = true
                 link_target: Some(Utf8PathBuf::from("/etc/config")),
                 mode: Default::default(),
                 postprocess_steps: Vec::new(),
-                covered_by: None,
             }],
         };
         fs::write(
@@ -5773,7 +5711,6 @@ delete_after_import = true
                 link_target: None,
                 mode: ManifestEntryMode::Postprocess,
                 postprocess_steps: vec!["copy-cmd".into()],
-                covered_by: None,
             }],
         };
         fs::write(
@@ -5903,7 +5840,6 @@ delete_after_import = true
                 link_target: None,
                 mode: ManifestEntryMode::Postprocess,
                 postprocess_steps: vec!["copy-cmd".into()],
-                covered_by: None,
             }],
         };
         fs::write(
@@ -5997,7 +5933,6 @@ delete_after_import = true
                 link_target: None,
                 mode: ManifestEntryMode::Postprocess,
                 postprocess_steps: vec!["typo".to_owned()],
-                covered_by: None,
             }],
         };
         fs::write(incoming.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
@@ -6009,271 +5944,6 @@ delete_after_import = true
             .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Ready)
             .exists());
-    }
-
-    #[test]
-    fn prepare_run_rejects_covered_entry_with_missing_covered_by() {
-        let tmp = tempfile::tempdir().unwrap();
-        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let config = test_server_config(&work_dir);
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_id = RunId::new("covered-missing-covered-by".into()).unwrap();
-        let incoming = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Incoming);
-        fs::create_dir_all(&incoming).unwrap();
-
-        write_run_toml_with_destination(&incoming, &nickname, "data");
-
-        let manifest = Manifest {
-            run_id: run_id.clone(),
-            nickname: nickname.clone(),
-            entries: vec![ManifestEntry {
-                local_path: ClientLocalPath::new("/source/file.txt".into()).unwrap(),
-                staged_path: NormalizedRelativePath::new("files/file.txt".into()).unwrap(),
-                relative_path: NormalizedRelativePath::new("file.txt".into()).unwrap(),
-                kind: ManifestEntryKind::RegularFile,
-                size: 13,
-                mtime_ns: 0,
-                sha256: None,
-                link_target: None,
-                mode: purgery_core::ManifestEntryMode::Covered,
-                postprocess_steps: Vec::new(),
-                covered_by: None,
-            }],
-        };
-        fs::write(incoming.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
-
-        let error = prepare_run(&config, &nickname, &run_id).unwrap_err();
-        assert!(error.to_string().contains("is missing covered_by"));
-    }
-
-    #[test]
-    fn prepare_run_rejects_covered_entry_with_wrong_covered_by() {
-        let tmp = tempfile::tempdir().unwrap();
-        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let config = test_server_config(&work_dir);
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_id = RunId::new("covered-wrong-covered-by".into()).unwrap();
-        let incoming = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Incoming);
-        fs::create_dir_all(&incoming).unwrap();
-
-        write_run_toml_with_destination(&incoming, &nickname, "data");
-
-        let manifest = Manifest {
-            run_id: run_id.clone(),
-            nickname: nickname.clone(),
-            entries: vec![ManifestEntry {
-                local_path: ClientLocalPath::new("/source/file.txt".into()).unwrap(),
-                staged_path: NormalizedRelativePath::new("files/file.txt".into()).unwrap(),
-                relative_path: NormalizedRelativePath::new("file.txt".into()).unwrap(),
-                kind: ManifestEntryKind::RegularFile,
-                size: 13,
-                mtime_ns: 0,
-                sha256: None,
-                link_target: None,
-                mode: purgery_core::ManifestEntryMode::Covered,
-                postprocess_steps: Vec::new(),
-                covered_by: Some("nonexistent".into()),
-            }],
-        };
-        fs::write(incoming.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
-
-        let error = prepare_run(&config, &nickname, &run_id).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("not a postprocessed directory entry"));
-    }
-
-    #[test]
-    fn prepare_run_rejects_covered_entry_with_postprocess_steps() {
-        let tmp = tempfile::tempdir().unwrap();
-        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let config = test_server_config(&work_dir);
-        let config = ServerConfig {
-            postprocess: PostprocessConfig {
-                steps: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        "test-step".to_owned(),
-                        PostprocessStepDefinition {
-                            kind: PostprocessKind::Subprocess,
-                            program: "true".into(),
-                            args: vec![],
-                            expected_outputs: vec![],
-                            keep_original: true,
-                        },
-                    );
-                    m
-                },
-            },
-            ..config
-        };
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_id = RunId::new("covered-postprocess-steps".into()).unwrap();
-        let incoming = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Incoming);
-        fs::create_dir_all(&incoming).unwrap();
-
-        write_run_toml_with_destination(&incoming, &nickname, "data");
-
-        let manifest = Manifest {
-            run_id: run_id.clone(),
-            nickname: nickname.clone(),
-            entries: vec![ManifestEntry {
-                local_path: ClientLocalPath::new("/source/file.txt".into()).unwrap(),
-                staged_path: NormalizedRelativePath::new("files/file.txt".into()).unwrap(),
-                relative_path: NormalizedRelativePath::new("file.txt".into()).unwrap(),
-                kind: ManifestEntryKind::RegularFile,
-                size: 13,
-                mtime_ns: 0,
-                sha256: None,
-                link_target: None,
-                mode: purgery_core::ManifestEntryMode::Covered,
-                postprocess_steps: vec!["test-step".into()],
-                covered_by: Some("photos".into()),
-            }],
-        };
-        fs::write(incoming.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
-
-        let error = prepare_run(&config, &nickname, &run_id).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("must not have postprocess steps"));
-    }
-
-    #[test]
-    fn prepare_run_rejects_covered_entry_pointing_to_non_directory() {
-        let tmp = tempfile::tempdir().unwrap();
-        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let config = test_server_config(&work_dir);
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_id = RunId::new("covered-non-dir".into()).unwrap();
-        let incoming = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Incoming);
-        fs::create_dir_all(&incoming).unwrap();
-
-        write_run_toml_with_destination(&incoming, &nickname, "data");
-
-        let manifest = Manifest {
-            run_id: run_id.clone(),
-            nickname: nickname.clone(),
-            entries: vec![
-                ManifestEntry {
-                    local_path: ClientLocalPath::new("/source/photos.txt".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/photos.txt".into()).unwrap(),
-                    relative_path: NormalizedRelativePath::new("photos.txt".into()).unwrap(),
-                    kind: ManifestEntryKind::RegularFile,
-                    size: 13,
-                    mtime_ns: 0,
-                    sha256: None,
-                    link_target: None,
-                    mode: purgery_core::ManifestEntryMode::Postprocess,
-                    postprocess_steps: Vec::new(),
-                    covered_by: None,
-                },
-                ManifestEntry {
-                    local_path: ClientLocalPath::new("/source/photos.txt/file.txt".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/photos.txt/file.txt".into())
-                        .unwrap(),
-                    relative_path: NormalizedRelativePath::new("photos.txt/file.txt".into())
-                        .unwrap(),
-                    kind: ManifestEntryKind::RegularFile,
-                    size: 13,
-                    mtime_ns: 0,
-                    sha256: None,
-                    link_target: None,
-                    mode: purgery_core::ManifestEntryMode::Covered,
-                    postprocess_steps: Vec::new(),
-                    covered_by: Some("photos.txt".into()),
-                },
-            ],
-        };
-        fs::write(incoming.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
-
-        let error = prepare_run(&config, &nickname, &run_id).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("not a postprocessed directory entry"));
-    }
-
-    #[test]
-    fn prepare_run_accepts_covered_entry_with_valid_covering_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let config = test_server_config(&work_dir);
-        let config = ServerConfig {
-            postprocess: PostprocessConfig {
-                steps: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        "test-step".to_owned(),
-                        PostprocessStepDefinition {
-                            kind: PostprocessKind::Subprocess,
-                            program: "true".into(),
-                            args: vec![],
-                            expected_outputs: vec![],
-                            keep_original: true,
-                        },
-                    );
-                    m
-                },
-            },
-            ..config
-        };
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_id = RunId::new("covered-valid".into()).unwrap();
-        let incoming = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Incoming);
-        fs::create_dir_all(&incoming).unwrap();
-
-        write_run_toml_with_destination(&incoming, &nickname, "data");
-
-        let manifest = Manifest {
-            run_id: run_id.clone(),
-            nickname: nickname.clone(),
-            entries: vec![
-                ManifestEntry {
-                    local_path: ClientLocalPath::new("/source/photos".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/photos".into()).unwrap(),
-                    relative_path: NormalizedRelativePath::new("photos".into()).unwrap(),
-                    kind: ManifestEntryKind::Directory,
-                    size: 0,
-                    mtime_ns: 0,
-                    sha256: None,
-                    link_target: None,
-                    mode: purgery_core::ManifestEntryMode::Postprocess,
-                    postprocess_steps: vec!["test-step".into()],
-                    covered_by: None,
-                },
-                ManifestEntry {
-                    local_path: ClientLocalPath::new("/source/photos/photo1.jpg".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/photos/photo1.jpg".into())
-                        .unwrap(),
-                    relative_path: NormalizedRelativePath::new("photos/photo1.jpg".into()).unwrap(),
-                    kind: ManifestEntryKind::RegularFile,
-                    size: 13,
-                    mtime_ns: 0,
-                    sha256: None,
-                    link_target: None,
-                    mode: purgery_core::ManifestEntryMode::Covered,
-                    postprocess_steps: Vec::new(),
-                    covered_by: Some("photos".into()),
-                },
-            ],
-        };
-        fs::write(incoming.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
-
-        let result = prepare_run(&config, &nickname, &run_id);
-        assert!(
-            result.is_ok(),
-            "prepare_run must succeed for valid covered entry"
-        );
     }
 
     #[test]
@@ -6328,7 +5998,6 @@ delete_after_import = true
                 link_target: Some("/some/target".into()),
                 mode: ManifestEntryMode::Postprocess,
                 postprocess_steps: vec!["test-step".into()],
-                covered_by: None,
             }],
         };
         fs::write(
@@ -6409,7 +6078,6 @@ delete_after_import = true
                 link_target: None,
                 mode: ManifestEntryMode::Postprocess,
                 postprocess_steps: vec!["test-step".into()],
-                covered_by: None,
             }],
         };
         fs::write(
@@ -6435,224 +6103,5 @@ delete_after_import = true
         let final_dir = test_storage_root(config.work_dir.as_path()).join("univ/data/photos");
         assert!(final_dir.as_std_path().is_dir());
         assert!(final_dir.join("photo1.jpg").as_std_path().exists());
-    }
-
-    #[test]
-    fn process_covered_entries_mirror_covering_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_id = RunId::new("test-covered-success".into()).unwrap();
-
-        let config = ServerConfig {
-            work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
-            gc: Default::default(),
-            postprocess: PostprocessConfig {
-                steps: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        "test-step".to_owned(),
-                        PostprocessStepDefinition {
-                            kind: PostprocessKind::Subprocess,
-                            program: "true".to_owned(),
-                            args: vec![],
-                            expected_outputs: vec![],
-                            keep_original: true,
-                        },
-                    );
-                    m
-                },
-            },
-            logging: Default::default(),
-        };
-
-        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
-        fs::create_dir_all(ready_path.join("files")).unwrap();
-
-        let staged_dir = ready_path.join("files/photos");
-        fs::create_dir(&staged_dir).unwrap();
-        fs::write(staged_dir.join("photo1.jpg"), b"photo data").unwrap();
-
-        write_run_toml_with_destination(&ready_path, &nickname, "univ/data");
-
-        let manifest = Manifest {
-            run_id: run_id.clone(),
-            nickname: nickname.clone(),
-            entries: vec![
-                ManifestEntry {
-                    local_path: ClientLocalPath::new("/home/user/photos".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/photos".into()).unwrap(),
-                    relative_path: NormalizedRelativePath::new("photos".into()).unwrap(),
-                    kind: ManifestEntryKind::Directory,
-                    size: 0,
-                    mtime_ns: 0,
-                    sha256: None,
-                    link_target: None,
-                    mode: ManifestEntryMode::Postprocess,
-                    postprocess_steps: vec!["test-step".into()],
-                    covered_by: None,
-                },
-                ManifestEntry {
-                    local_path: ClientLocalPath::new("/home/user/photos/photo1.jpg".into())
-                        .unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/photos/photo1.jpg".into())
-                        .unwrap(),
-                    relative_path: NormalizedRelativePath::new("photos/photo1.jpg".into()).unwrap(),
-                    kind: ManifestEntryKind::RegularFile,
-                    size: 11,
-                    mtime_ns: 1000000,
-                    sha256: None,
-                    link_target: None,
-                    mode: ManifestEntryMode::Covered,
-                    postprocess_steps: Vec::new(),
-                    covered_by: Some("photos".into()),
-                },
-            ],
-        };
-        fs::write(
-            ready_path.join("manifest.toml"),
-            manifest.to_toml().unwrap(),
-        )
-        .unwrap();
-
-        let result = process_run(&config, &nickname, &run_id);
-        assert!(
-            result.is_ok(),
-            "covered entries run should succeed: {result:?}"
-        );
-
-        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
-        assert!(done_path.exists());
-
-        let status_content = fs::read_to_string(done_path.join("status.toml")).unwrap();
-        let status = RunStatus::from_toml(&status_content).unwrap();
-        assert_eq!(status.entries.len(), 2);
-
-        let dir_entry = status
-            .entries
-            .iter()
-            .find(|e| e.relative_path == "photos")
-            .unwrap();
-        assert_eq!(dir_entry.status, FileStatus::Imported);
-        let file_entry = status
-            .entries
-            .iter()
-            .find(|e| e.relative_path == "photos/photo1.jpg")
-            .unwrap();
-        assert_eq!(file_entry.status, FileStatus::Imported);
-    }
-
-    #[test]
-    fn process_covered_entry_fails_when_covering_directory_fails() {
-        let tmp = tempfile::tempdir().unwrap();
-        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_id = RunId::new("test-covered-fail".into()).unwrap();
-
-        let config = ServerConfig {
-            work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
-            gc: Default::default(),
-            postprocess: PostprocessConfig {
-                steps: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        "always-fail".to_owned(),
-                        PostprocessStepDefinition {
-                            kind: PostprocessKind::Subprocess,
-                            program: "false".to_owned(),
-                            args: vec![],
-                            expected_outputs: vec![],
-                            keep_original: true,
-                        },
-                    );
-                    m
-                },
-            },
-            logging: Default::default(),
-        };
-
-        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
-        fs::create_dir_all(ready_path.join("files")).unwrap();
-
-        let staged_dir = ready_path.join("files/photos");
-        fs::create_dir(&staged_dir).unwrap();
-        fs::write(staged_dir.join("photo1.jpg"), b"photo data").unwrap();
-
-        write_run_toml_with_destination(&ready_path, &nickname, "univ/data");
-
-        let manifest = Manifest {
-            run_id: run_id.clone(),
-            nickname: nickname.clone(),
-            entries: vec![
-                ManifestEntry {
-                    local_path: ClientLocalPath::new("/home/user/photos".into()).unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/photos".into()).unwrap(),
-                    relative_path: NormalizedRelativePath::new("photos".into()).unwrap(),
-                    kind: ManifestEntryKind::Directory,
-                    size: 0,
-                    mtime_ns: 0,
-                    sha256: None,
-                    link_target: None,
-                    mode: ManifestEntryMode::Postprocess,
-                    postprocess_steps: vec!["always-fail".into()],
-                    covered_by: None,
-                },
-                ManifestEntry {
-                    local_path: ClientLocalPath::new("/home/user/photos/photo1.jpg".into())
-                        .unwrap(),
-                    staged_path: NormalizedRelativePath::new("files/photos/photo1.jpg".into())
-                        .unwrap(),
-                    relative_path: NormalizedRelativePath::new("photos/photo1.jpg".into()).unwrap(),
-                    kind: ManifestEntryKind::RegularFile,
-                    size: 11,
-                    mtime_ns: 1000000,
-                    sha256: None,
-                    link_target: None,
-                    mode: ManifestEntryMode::Covered,
-                    postprocess_steps: Vec::new(),
-                    covered_by: Some("photos".into()),
-                },
-            ],
-        };
-        fs::write(
-            ready_path.join("manifest.toml"),
-            manifest.to_toml().unwrap(),
-        )
-        .unwrap();
-
-        let result = process_run(&config, &nickname, &run_id);
-        assert!(
-            result.is_ok(),
-            "process_run should succeed even when covering dir fails"
-        );
-
-        let failed_path = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Failed);
-        assert!(failed_path.exists());
-
-        let status_content = fs::read_to_string(failed_path.join("status.toml")).unwrap();
-        let status = RunStatus::from_toml(&status_content).unwrap();
-        assert_eq!(status.entries.len(), 2);
-
-        let dir_entry = status
-            .entries
-            .iter()
-            .find(|e| e.relative_path == "photos")
-            .unwrap();
-        assert_eq!(dir_entry.status, FileStatus::Failed);
-        let file_entry = status
-            .entries
-            .iter()
-            .find(|e| e.relative_path == "photos/photo1.jpg")
-            .unwrap();
-        assert_eq!(file_entry.status, FileStatus::Failed);
-        assert!(file_entry
-            .error
-            .as_deref()
-            .unwrap()
-            .contains("covering directory failed"));
     }
 }

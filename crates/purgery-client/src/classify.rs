@@ -100,7 +100,6 @@ pub(crate) fn build_manifest(
         link_target,
         mode,
         postprocess_steps: postprocess_steps.to_vec(),
-        covered_by: None,
     };
 
     Ok(Manifest {
