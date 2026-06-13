@@ -128,34 +128,19 @@ pub(crate) fn resume_pending_cleanups(state_dir: &str) -> Result<()> {
 }
 
 pub(crate) fn build_cleanup_entries(
-    source: &str,
     manifest: &Manifest,
 ) -> Result<Vec<CleanupEntry>> {
-    let source_path = Path::new(source);
-    let is_file_source = source_path.is_file();
-    let walk_root = if is_file_source {
-        source_path.parent().unwrap_or(source_path)
-    } else {
-        source_path
-    };
-
     let mut entries: Vec<CleanupEntry> = Vec::new();
     let mut dirs: Vec<(String, String)> = Vec::new();
 
     for entry in manifest.entries.iter() {
         let local_path = entry.local_path.as_str();
-        let path = Path::new(local_path);
 
         if entry.mode == ManifestEntryMode::Covered {
             continue;
         }
 
-        let relative_from_root = path
-            .strip_prefix(walk_root)
-            .ok()
-            .and_then(|r| r.to_str())
-            .unwrap_or(entry.relative_path.as_str())
-            .to_owned();
+        let relative_from_root = entry.relative_path.as_str().to_owned();
 
         match entry.kind {
             ManifestEntryKind::Directory => {
@@ -255,10 +240,10 @@ pub(crate) fn process_cleanup_state_file(state_path: &Utf8Path) -> Result<()> {
         }
     }
 
-    // Phase 2: clean directories bottom-up. The entries are already
-    // sorted by depth (directories first in manifest order), but we
-    // iterate in reverse so leaf directories are processed first.
-    for i in (0..state.entries.len()).rev() {
+    // Phase 2: clean directories bottom-up. Entries are already sorted
+    // deepest-first, so iterating forward processes leaf directories
+    // before their parents.
+    for i in 0..state.entries.len() {
         if !state.entries[i].import_confirmed || state.entries[i].cleaned {
             continue;
         }
@@ -591,6 +576,61 @@ mod tests {
             import_confirmed: false,
             cleaned: false,
         }
+    }
+
+    #[test]
+    fn cleanup_nested_directories_removed_in_one_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a_dir = tmp.path().join("a");
+        let b_dir = a_dir.join("b");
+        fs::create_dir_all(&b_dir).unwrap();
+        let file = b_dir.join("file.txt");
+        fs::write(&file, "content").unwrap();
+
+        let file_sha = compute_sha256(&file).unwrap();
+        let mut entries: Vec<CleanupEntry> = Vec::new();
+        entries.push(file_entry(&file, &file_sha));
+        entries.push(CleanupEntry {
+            relative_path: "a/b".to_owned(),
+            local_path: b_dir.to_str().unwrap().to_owned(),
+            kind: ManifestEntryKind::Directory,
+            size: 0,
+            mtime_ns: 0,
+            sha256: None,
+            link_target: None,
+            import_confirmed: false,
+            cleaned: false,
+        });
+        entries.push(CleanupEntry {
+            relative_path: "a".to_owned(),
+            local_path: a_dir.to_str().unwrap().to_owned(),
+            kind: ManifestEntryKind::Directory,
+            size: 0,
+            mtime_ns: 0,
+            sha256: None,
+            link_target: None,
+            import_confirmed: false,
+            cleaned: false,
+        });
+        for e in &mut entries {
+            e.import_confirmed = true;
+        }
+
+        let state = DurableCleanupState {
+            nickname: "host".to_owned(),
+            operation_id: "run-nested".to_owned(),
+            entries,
+        };
+        let state_path = write_cleanup_state(&state, tmp.path().to_str().unwrap()).unwrap();
+
+        process_cleanup_state_file(&state_path).unwrap();
+
+        assert!(!file.exists(), "file should be removed");
+        assert!(!b_dir.exists(), "b dir should be removed");
+        assert!(!a_dir.exists(), "a dir should be removed");
+
+        // Idempotent
+        process_cleanup_state_file(&state_path).unwrap();
     }
 
     #[test]

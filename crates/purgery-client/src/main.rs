@@ -9,8 +9,6 @@ mod classify;
 mod cleanup;
 mod run;
 mod runner;
-mod ssh;
-mod transfer;
 
 #[derive(Parser)]
 #[command(

@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use anyhow::{Context, Result};
 use purgery_core::{shell_escape, BeginRunResponse, PrepareRunResponse, RunStateResponse};
 use std::collections::HashMap;
@@ -21,18 +19,33 @@ struct ScriptedResponse {
 /// underlying state via Arc so all clones see the same scripted responses
 /// and log.
 #[derive(Clone)]
-#[allow(dead_code)]
 pub(crate) enum RemoteRunner {
     Real,
+    #[allow(dead_code)]
     Fake { inner: Arc<FakeState> },
 }
 
-#[derive(Debug)]
 pub(crate) struct FakeState {
     responses: Mutex<Vec<ScriptedResponse>>,
     errors: Mutex<Vec<(String, String)>>,
+    write_errors: Mutex<Vec<(String, String)>>,
+    rsync_errors: Mutex<Vec<(String, String)>>,
     log: Mutex<Vec<String>>,
     written_files: Mutex<HashMap<String, String>>,
+    finish_run_hook: Mutex<Option<Box<dyn Fn() + Send>>>,
+}
+
+impl std::fmt::Debug for FakeState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FakeState")
+            .field("responses", &self.responses)
+            .field("errors", &self.errors)
+            .field("write_errors", &self.write_errors)
+            .field("rsync_errors", &self.rsync_errors)
+            .field("log", &self.log)
+            .field("written_files", &self.written_files)
+            .finish()
+    }
 }
 
 impl RemoteRunner {
@@ -46,12 +59,16 @@ impl RemoteRunner {
             inner: Arc::new(FakeState {
                 responses: Mutex::new(Vec::new()),
                 errors: Mutex::new(Vec::new()),
+                write_errors: Mutex::new(Vec::new()),
+                rsync_errors: Mutex::new(Vec::new()),
                 log: Mutex::new(Vec::new()),
                 written_files: Mutex::new(HashMap::new()),
+                finish_run_hook: Mutex::new(None),
             }),
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn add_response(&self, cmd_contains: &str, stdout: &str) {
         match self {
             RemoteRunner::Fake { inner } => {
@@ -64,6 +81,7 @@ impl RemoteRunner {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn add_error(&self, cmd_contains: &str, error_msg: &str) {
         match self {
             RemoteRunner::Fake { inner } => {
@@ -77,6 +95,46 @@ impl RemoteRunner {
         }
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn add_write_error(&self, path_contains: &str, error_msg: &str) {
+        match self {
+            RemoteRunner::Fake { inner } => {
+                inner
+                    .write_errors
+                    .lock()
+                    .unwrap()
+                    .push((path_contains.to_owned(), error_msg.to_owned()));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[allow(dead_code)]
+    #[allow(dead_code)]
+    pub(crate) fn set_finish_run_hook(&self, hook: Box<dyn Fn() + Send>) {
+        match self {
+            RemoteRunner::Fake { inner } => {
+                inner.finish_run_hook.lock().unwrap().replace(hook);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn add_rsync_error(&self, cmd_contains: &str, error_msg: &str) {
+        match self {
+            RemoteRunner::Fake { inner } => {
+                inner
+                    .rsync_errors
+                    .lock()
+                    .unwrap()
+                    .push((cmd_contains.to_owned(), error_msg.to_owned()));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn command_log(&self) -> Vec<String> {
         match self {
             RemoteRunner::Fake { inner } => inner.log.lock().unwrap().clone(),
@@ -84,6 +142,7 @@ impl RemoteRunner {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn written_files(&self) -> HashMap<String, String> {
         match self {
             RemoteRunner::Fake { inner } => inner.written_files.lock().unwrap().clone(),
@@ -123,6 +182,11 @@ impl RemoteRunner {
                 for (ec, err) in inner.errors.lock().unwrap().iter() {
                     if ssh_cmd.contains(ec.as_str()) {
                         anyhow::bail!("{err}");
+                    }
+                }
+                if ssh_cmd.contains("finish-run") {
+                    if let Some(hook) = inner.finish_run_hook.lock().unwrap().take() {
+                        hook();
                     }
                 }
                 for resp in inner.responses.lock().unwrap().iter().rev() {
@@ -173,6 +237,11 @@ impl RemoteRunner {
                     .lock()
                     .unwrap()
                     .push(format!("write {host}:{path}"));
+                for (pc, err) in inner.write_errors.lock().unwrap().iter() {
+                    if path.contains(pc.as_str()) {
+                        anyhow::bail!("{err}");
+                    }
+                }
                 inner
                     .written_files
                     .lock()
@@ -205,6 +274,11 @@ impl RemoteRunner {
                 Ok(())
             }
             RemoteRunner::Fake { inner } => {
+                for (rc, err) in inner.rsync_errors.lock().unwrap().iter() {
+                    if rsync_cmd.contains(rc.as_str()) {
+                        anyhow::bail!("{err}");
+                    }
+                }
                 inner.log.lock().unwrap().push(rsync_cmd);
                 Ok(())
             }
@@ -276,5 +350,50 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("simulated failure"));
+    }
+
+    #[test]
+    fn fake_runner_write_error_stops_write() {
+        let runner = RemoteRunner::fake();
+        runner.add_write_error("manifest.toml", "write failed");
+        let result = runner.write_remote_file("host", "/remote/manifest.toml", "content");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("write failed"));
+    }
+
+    #[test]
+    fn fake_runner_write_error_does_not_write_file() {
+        let runner = RemoteRunner::fake();
+        runner.add_write_error("manifest.toml", "write failed");
+        let _ = runner.write_remote_file("host", "/remote/manifest.toml", "content");
+        let files = runner.written_files();
+        assert!(!files.contains_key("/remote/manifest.toml"));
+    }
+
+    #[test]
+    fn fake_runner_write_succeeds_when_no_error_matches() {
+        let runner = RemoteRunner::fake();
+        runner.add_write_error("other.toml", "write failed");
+        let result = runner.write_remote_file("host", "/remote/manifest.toml", "content");
+        assert!(result.is_ok());
+        let files = runner.written_files();
+        assert_eq!(files.get("/remote/manifest.toml").unwrap(), "content");
+    }
+
+    #[test]
+    fn fake_runner_rsync_error_stops_transfer() {
+        let runner = RemoteRunner::fake();
+        runner.add_rsync_error("host", "rsync failed");
+        let result = runner.run_rsync("/src", "host", "/dest");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("rsync failed"));
+    }
+
+    #[test]
+    fn fake_runner_rsync_succeeds_when_no_error_matches() {
+        let runner = RemoteRunner::fake();
+        runner.add_rsync_error("other-host", "rsync failed");
+        let result = runner.run_rsync("/src", "host", "/dest");
+        assert!(result.is_ok());
     }
 }

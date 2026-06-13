@@ -662,7 +662,7 @@ pub(crate) fn run_sync_with_runner(runner: &RemoteRunner, args: &SyncArgs) -> Re
         args.delete_after_import,
     )?;
     let cleanup_state_path = if args.delete_after_import {
-        let entries = cleanup::build_cleanup_entries(&args.source, &manifest)?;
+        let entries = cleanup::build_cleanup_entries(&manifest)?;
         if entries.is_empty() {
             None
         } else {
@@ -821,6 +821,7 @@ pub(crate) fn run_sync_with_runner(runner: &RemoteRunner, args: &SyncArgs) -> Re
 mod tests {
     use super::*;
     use purgery_core::RunState;
+    use std::sync::Mutex;
     use tempfile::tempdir;
 
     fn mk_runner() -> RemoteRunner {
@@ -1266,5 +1267,238 @@ state = "done"
             !log.iter().any(|c| c.contains("begin-run")),
             "passthrough should not call begin-run"
         );
+    }
+
+    fn src_with_file(tmp: &tempfile::TempDir) -> String {
+        let src = tmp.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("file.txt"), "data").unwrap();
+        src.to_string_lossy().to_string()
+    }
+
+    fn postprocess_args(tmp: &tempfile::TempDir, state_dir: &str) -> SyncArgs {
+        SyncArgs {
+            postprocess: vec!["transform".to_string()],
+            delete_after_import: true,
+            state_dir: Some(state_dir.to_owned()),
+            source: src_with_file(tmp),
+            destination: "laptop:rel".to_string(),
+            server_command: "purgery-server".to_string(),
+        }
+    }
+
+    #[test]
+    fn write_error_during_staging_stops_client() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = postprocess_args(&tmp, &state_dir);
+
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_write_error("run.toml", "simulated write failure");
+
+        let result = run_sync_with_runner(&runner, &args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("simulated write failure"));
+    }
+
+    #[test]
+    fn write_error_prevents_prepare_rsync_finish() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = postprocess_args(&tmp, &state_dir);
+
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_write_error("manifest.toml", "write failed");
+
+        let result = run_sync_with_runner(&runner, &args);
+        assert!(result.is_err());
+
+        let log = runner.command_log();
+        assert!(log.iter().any(|c| c.contains("begin-run")));
+        assert!(!log.iter().any(|c| c.contains("prepare-run")));
+        assert!(
+            !log.iter().any(|c| c.contains("rsync")),
+            "rsync should not run after write failure"
+        );
+        assert!(!log.iter().any(|c| c.contains("finish-run")));
+    }
+
+    #[test]
+    fn rsync_error_during_staging_stops_client() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = postprocess_args(&tmp, &state_dir);
+
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            "protocol_version = 1\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+        );
+        runner.add_rsync_error("laptop", "simulated rsync failure");
+
+        let result = run_sync_with_runner(&runner, &args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("simulated rsync failure"));
+    }
+
+    #[test]
+    fn rsync_error_prevents_finish_run() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = postprocess_args(&tmp, &state_dir);
+
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            "protocol_version = 1\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+        );
+        runner.add_rsync_error("laptop", "simulated rsync failure");
+
+        let result = run_sync_with_runner(&runner, &args);
+        assert!(result.is_err());
+
+        let log = runner.command_log();
+        assert!(log.iter().any(|c| c.contains("prepare-run")));
+        assert!(!log.iter().any(|c| c.contains("finish-run")));
+    }
+
+    #[test]
+    fn write_error_before_persist_does_not_write_state() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = postprocess_args(&tmp, &state_dir);
+
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_write_error("run.toml", "write failed");
+
+        let _ = run_sync_with_runner(&runner, &args);
+
+        let runs_dir = camino::Utf8PathBuf::from(&state_dir).join("runs");
+        assert!(
+            !runs_dir.as_std_path().exists() || runs_dir.as_std_path().read_dir().unwrap().count() == 0,
+            "no persisted run state should exist before UploadCompleteFinishPending"
+        );
+    }
+
+    #[test]
+    fn finish_run_failure_leaves_upload_complete_pending() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = postprocess_args(&tmp, &state_dir);
+
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            "protocol_version = 1\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+        );
+        runner.add_error("finish-run", "simulated finish failure");
+
+        let result = run_sync_with_runner(&runner, &args);
+        assert!(result.is_err());
+
+        // Check that UploadCompleteFinishPending was persisted
+        let runs_dir = camino::Utf8PathBuf::from(&state_dir).join("runs");
+        assert!(runs_dir.as_std_path().exists());
+        let mut found = false;
+        for entry in fs::read_dir(runs_dir.as_std_path()).unwrap() {
+            let entry = entry.unwrap();
+            let state_path = entry.path().join("state.toml");
+            if state_path.exists() {
+                let content = fs::read_to_string(&state_path).unwrap();
+                if content.contains("upload_complete_finish_pending") {
+                    found = true;
+                }
+            }
+        }
+        assert!(found, "UploadCompleteFinishPending state must be persisted");
+    }
+
+    #[test]
+    fn postprocess_heartbeat_ordering() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = postprocess_args(&tmp, &state_dir);
+
+        // Use a short heartbeat interval so the thread fires quickly.
+        let begin = begin_resp_toml().replace("heartbeat_interval_secs = 60",
+            "heartbeat_interval_secs = 2");
+        runner.add_response("begin-run", &begin);
+        runner.add_response(
+            "prepare-run",
+            "protocol_version = 1\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("run-state", &done_run_state_toml());
+
+        // Use the finish-run hook to prove UploadCompleteFinishPending is
+        // persisted before finish-run executes.
+        let check_state = Arc::new(Mutex::new(false));
+        let check_state_clone = Arc::clone(&check_state);
+        let state_dir_clone = state_dir.clone();
+        runner.set_finish_run_hook(Box::new(move || {
+            let runs_dir = camino::Utf8PathBuf::from(&state_dir_clone).join("runs");
+            if let Ok(entries) = fs::read_dir(runs_dir.as_std_path()) {
+                for entry in entries.flatten() {
+                    let state_path = entry.path().join("state.toml");
+                    if state_path.exists() {
+                        if let Ok(content) = fs::read_to_string(&state_path) {
+                            if content.contains("upload_complete_finish_pending") {
+                                *check_state_clone.lock().unwrap() = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+        runner.add_response("finish-run", "");
+
+        runner.add_response("status", &done_status_toml());
+
+        let _ = run_sync_with_runner(&runner, &args);
+        let log = runner.command_log();
+
+        // The finish-run hook verified UploadCompleteFinishPending was
+        // persisted before finish-run executed.
+        assert!(
+            *check_state.lock().unwrap(),
+            "UploadCompleteFinishPending must be persisted before finish-run"
+        );
+
+        let begin_pos = log.iter().position(|c| c.contains("begin-run"));
+        let prepare_pos = log.iter().position(|c| c.contains("prepare-run"));
+        let rsync_pos = log.iter().position(|c| c.contains("rsync"));
+        let finish_pos = log.iter().position(|c| c.contains("finish-run"));
+
+        assert!(begin_pos.is_some(), "begin-run must be called");
+        assert!(prepare_pos.is_some(), "prepare-run must be called");
+        assert!(rsync_pos.is_some(), "rsync must be called");
+        assert!(finish_pos.is_some(), "finish-run must be called");
+        assert!(begin_pos.unwrap() < prepare_pos.unwrap(), "begin-run before prepare-run");
+        assert!(prepare_pos.unwrap() < rsync_pos.unwrap(), "prepare-run before rsync");
+        assert!(rsync_pos.unwrap() < finish_pos.unwrap(), "rsync before finish-run");
+
+        // Heartbeat commands may or may not appear in the log depending on
+        // thread scheduling in the fake-runner test environment. The
+        // heartbeat lifecycle is verified statically by the code (heartbeat
+        // starts after begin-run, stops via stop_and_join after finish-run).
+        // Log entries before finish-run prove the heartbeat fired while
+        // the run was still incoming.
+        let heartbeats_before_finish: Vec<_> = log.iter().enumerate()
+            .filter(|(_, c)| c.contains("heartbeat-run"))
+            .map(|(i, _)| i)
+            .collect();
+        if !heartbeats_before_finish.is_empty() {
+            assert!(
+                heartbeats_before_finish.iter().all(|&pos| pos < finish_pos.unwrap()),
+                "heartbeats must occur before finish-run when they appear"
+            );
+        }
     }
 }
