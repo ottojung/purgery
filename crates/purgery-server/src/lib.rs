@@ -139,6 +139,21 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
     let run_plan =
         RunPlan::build(config).map_err(|e| anyhow::anyhow!("run plan validation failed: {e}"))?;
     for entry in &manifest.entries {
+        // Server runs are postprocess-only. Every manifest entry must have
+        // mode = postprocess with non-empty postprocess_steps.
+        if entry.mode != purgery_core::ManifestEntryMode::Postprocess {
+            anyhow::bail!(
+                "server run entry '{}' must have mode = postprocess, got {:?}",
+                entry.relative_path.as_str(),
+                entry.mode,
+            );
+        }
+        if entry.postprocess_steps.is_empty() {
+            anyhow::bail!(
+                "server run entry '{}' has mode = postprocess but no postprocess_steps",
+                entry.relative_path.as_str(),
+            );
+        }
         run_plan
             .resolve_steps(&entry.postprocess_steps)
             .map_err(|error| {
@@ -2696,7 +2711,6 @@ delete_after_import = true
     fn test_process_run_overlays_directory_file_and_symlink_without_delete() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let config = test_server_config(&work_dir);
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("tree-overlay".into()).unwrap();
@@ -2890,7 +2904,17 @@ delete_after_import = true
     fn prepare_run_rewrites_relative_destination() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let config = test_server_config(&work_dir);
+        let mut config = test_server_config(&work_dir);
+        config.postprocess.steps.insert(
+            "test-step".to_string(),
+            PostprocessStepDefinition {
+                kind: PostprocessKind::Subprocess,
+                program: "/bin/true".to_string(),
+                args: Vec::new(),
+                expected_outputs: Vec::new(),
+                keep_original: true,
+            },
+        );
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-relative-dest".into()).unwrap();
         let incoming = config
@@ -2898,10 +2922,8 @@ delete_after_import = true
             .run_dir(&nickname, &run_id, RunPhase::Incoming);
         fs::create_dir_all(&incoming).unwrap();
 
-        // Write run.toml with a relative destination verbatim.
         write_run_toml_with_raw_destination(&incoming, &nickname, "relative/path");
 
-        // Manifest with one passthrough entry.
         let manifest = Manifest {
             run_id: run_id.clone(),
             nickname: nickname.clone(),
@@ -2914,8 +2936,8 @@ delete_after_import = true
                 mtime_ns: 0,
                 sha256: None,
                 link_target: None,
-                mode: purgery_core::ManifestEntryMode::Passthrough,
-                postprocess_steps: Vec::new(),
+                mode: purgery_core::ManifestEntryMode::Postprocess,
+                postprocess_steps: vec!["test-step".into()],
             }],
         };
         fs::write(incoming.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
@@ -2952,7 +2974,17 @@ delete_after_import = true
     fn prepare_run_does_not_rewrite_absolute_destination() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
-        let config = test_server_config(&work_dir);
+        let mut config = test_server_config(&work_dir);
+        config.postprocess.steps.insert(
+            "test-step".to_string(),
+            PostprocessStepDefinition {
+                kind: PostprocessKind::Subprocess,
+                program: "/bin/true".to_string(),
+                args: Vec::new(),
+                expected_outputs: Vec::new(),
+                keep_original: true,
+            },
+        );
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-absolute-dest".into()).unwrap();
         let incoming = config
@@ -2960,16 +2992,12 @@ delete_after_import = true
             .run_dir(&nickname, &run_id, RunPhase::Incoming);
         fs::create_dir_all(&incoming).unwrap();
 
-        // Use write_run_toml_with_destination which already produces an
-        // absolute path via test_destination_from_run_dir.
         write_run_toml_with_destination(&incoming, &nickname, "absolute/dest");
-        // Make sure it is actually absolute.
         let run_config_content = fs::read_to_string(incoming.join("run.toml")).unwrap();
         let run_config: purgery_core::RunConfig = toml::from_str(&run_config_content).unwrap();
         assert!(run_config.destination.is_absolute());
         let original_dest = run_config.destination.as_str().to_owned();
 
-        // Manifest with one passthrough entry.
         let manifest = Manifest {
             run_id: run_id.clone(),
             nickname: nickname.clone(),
@@ -2982,8 +3010,8 @@ delete_after_import = true
                 mtime_ns: 0,
                 sha256: None,
                 link_target: None,
-                mode: purgery_core::ManifestEntryMode::Passthrough,
-                postprocess_steps: Vec::new(),
+                mode: purgery_core::ManifestEntryMode::Postprocess,
+                postprocess_steps: vec!["test-step".into()],
             }],
         };
         fs::write(incoming.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
