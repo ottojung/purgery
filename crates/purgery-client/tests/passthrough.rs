@@ -334,8 +334,5 @@ fn passthrough_trailing_slash_does_not_change_source_entry_semantics() {
         trailing_slash_operand
     );
     // Should import as source entry, not contents
-    assert!(
-        commands.contains("--recursive"),
-        "must use ordinary rsync"
-    );
+    assert!(commands.contains("--recursive"), "must use ordinary rsync");
 }
