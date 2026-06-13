@@ -309,6 +309,7 @@ pub enum ClientRunPhase {
 /// Client-persisted state for a postprocess run, used to resume
 /// waiting and cleanup after a crash.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientRunState {
     pub protocol_version: u32,
     pub nickname: String,

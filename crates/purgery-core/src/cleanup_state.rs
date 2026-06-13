@@ -5,6 +5,7 @@ use crate::ManifestEntryKind;
 // ── Durable Cleanup State ────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DurableCleanupState {
     pub nickname: String,
     pub operation_id: String,
@@ -12,6 +13,7 @@ pub struct DurableCleanupState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CleanupEntry {
     pub relative_path: String,
     pub local_path: String,

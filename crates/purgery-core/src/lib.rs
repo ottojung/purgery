@@ -652,6 +652,74 @@ nickname = "laptop"
         assert!(result.is_err());
     }
 
+    #[test]
+    fn manifest_rejects_unknown_top_level_field() {
+        let toml = r#"
+run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+nickname = "laptop"
+unknown_field = "value"
+
+[[entries]]
+local_path = "/tmp/test.mp4"
+staged_path = "files/test.mp4"
+relative_path = "test.mp4"
+kind = "regular_file"
+"#;
+        let result = Manifest::from_toml(toml);
+        assert!(result.is_err(), "unknown top-level field must be rejected");
+    }
+
+    #[test]
+    fn manifest_entry_rejects_unknown_field() {
+        let toml = r#"
+run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+nickname = "laptop"
+
+[[entries]]
+local_path = "/tmp/test.mp4"
+staged_path = "files/test.mp4"
+relative_path = "test.mp4"
+kind = "regular_file"
+unknown_entry_field = "value"
+"#;
+        let result = Manifest::from_toml(toml);
+        assert!(result.is_err(), "unknown entry field must be rejected");
+    }
+
+    #[test]
+    fn manifest_rejects_mode_field() {
+        let toml = r#"
+run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+nickname = "laptop"
+
+[[entries]]
+local_path = "/tmp/test.mp4"
+staged_path = "files/test.mp4"
+relative_path = "test.mp4"
+kind = "regular_file"
+mode = "covered"
+"#;
+        let result = Manifest::from_toml(toml);
+        assert!(result.is_err(), "mode field must be rejected");
+    }
+
+    #[test]
+    fn manifest_rejects_covered_by_field() {
+        let toml = r#"
+run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+nickname = "laptop"
+
+[[entries]]
+local_path = "/tmp/test.mp4"
+staged_path = "files/test.mp4"
+relative_path = "test.mp4"
+kind = "regular_file"
+covered_by = "Videos"
+"#;
+        let result = Manifest::from_toml(toml);
+        assert!(result.is_err(), "covered_by field must be rejected");
+    }
+
     // ── Status tests ──
 
     #[test]
@@ -661,7 +729,6 @@ run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 state = "failed"
 error = "failed to parse manifest.toml"
-files = []
 "#;
         let status = RunStatus::from_toml(toml).unwrap();
         assert_eq!(status.state, RunState::Failed);
@@ -670,6 +737,71 @@ files = []
             Some("failed to parse manifest.toml")
         );
         assert!(status.entries.is_empty());
+    }
+
+    #[test]
+    fn status_rejects_unknown_top_level_field() {
+        let toml = r#"
+run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+nickname = "laptop"
+state = "done"
+unknown_field = "value"
+"#;
+        let result = RunStatus::from_toml(toml);
+        assert!(result.is_err(), "unknown status field must be rejected");
+    }
+
+    #[test]
+    fn status_entry_rejects_unknown_field() {
+        let toml = r#"
+run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+nickname = "laptop"
+state = "done"
+
+[[entries]]
+local_path = "/tmp/test.mp4"
+relative_path = "test.mp4"
+status = "imported"
+covered_by = "parent"
+"#;
+        let result = RunStatus::from_toml(toml);
+        assert!(result.is_err(), "unknown entry status field must be rejected");
+    }
+
+    #[test]
+    fn cleanup_state_rejects_unknown_fields() {
+        let toml = r#"
+nickname = "laptop"
+operation_id = "test-id"
+mode = "covered"
+
+[[entries]]
+relative_path = "file.mp4"
+local_path = "/tmp/file.mp4"
+kind = "regular_file"
+size = 0
+mtime_ns = 0
+cleaned = false
+"#;
+        let result: Result<DurableCleanupState, _> = toml::from_str(toml);
+        assert!(result.is_err(), "unknown cleanup state field must be rejected");
+    }
+
+    #[test]
+    fn client_run_state_rejects_unknown_fields() {
+        let toml = r#"
+protocol_version = 1
+nickname = "laptop"
+run_id = "test-run"
+host = "host"
+server_command = "ps"
+manifest = "[[entries]]"
+run_config = "[delete_after_import]"
+phase = "cleanup_complete"
+unknown_field = "value"
+"#;
+        let result: Result<ClientRunState, _> = toml::from_str(toml);
+        assert!(result.is_err(), "unknown client run state field must be rejected");
     }
 
     // ── Identity tests ──

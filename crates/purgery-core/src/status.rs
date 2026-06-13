@@ -91,6 +91,7 @@ impl<'de> Deserialize<'de> for RunState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RunStatus {
     pub run_id: RunId,
     pub nickname: Nickname,
@@ -102,6 +103,7 @@ pub struct RunStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EntryStatusEntry {
     #[serde(default)]
     pub kind: ManifestEntryKind,

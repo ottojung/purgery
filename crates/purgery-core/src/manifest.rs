@@ -26,6 +26,7 @@ pub(crate) fn is_zero_i64(value: &i64) -> bool {
 // ── Manifest Types ───────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub run_id: RunId,
     pub nickname: Nickname,
@@ -34,6 +35,7 @@ pub struct Manifest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ManifestEntry {
     pub local_path: ClientLocalPath,
     pub staged_path: NormalizedRelativePath,
