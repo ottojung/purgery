@@ -49,14 +49,19 @@ pub(crate) struct SourceSpec {
 /// - Symlink sources remain symlink sources.
 pub(crate) fn normalize_source(source: &str) -> Result<SourceSpec> {
     let raw_input = source.to_owned();
-    let path = Path::new(source);
 
-    if path == Path::new("/") {
+    if source == "/" {
         anyhow::bail!("cannot use root path as source entry: /");
     }
 
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("source path does not exist: {source}"))?;
+    // Normalize the operand first — strip trailing slashes and resolve
+    // `.`/`..` — so the normalized path is used for filesystem-kind
+    // inspection. This ensures symlink sources remain symlink sources
+    // even when the original CLI operand included a trailing slash.
+    let (operation_path, source_entry_name) = normalize_operand(source)?;
+
+    let metadata = fs::symlink_metadata(&operation_path)
+        .with_context(|| format!("source path does not exist: {operation_path}"))?;
     let file_type = metadata.file_type();
 
     let kind = if file_type.is_dir() && !file_type.is_symlink() {
@@ -69,7 +74,19 @@ pub(crate) fn normalize_source(source: &str) -> Result<SourceSpec> {
         anyhow::bail!("unsupported source kind: {source}");
     };
 
-    let (operation_path, source_entry_name) = if source == "." || source == ".." {
+    Ok(SourceSpec {
+        raw_input,
+        operation_path,
+        source_entry_name,
+        kind,
+    })
+}
+
+/// Strip trailing slashes and resolve `.`/`..` without accessing the
+/// filesystem for metadata. Returns the normalized path and the source
+/// entry name.
+fn normalize_operand(source: &str) -> Result<(String, String)> {
+    if source == "." || source == ".." {
         let cwd = std::env::current_dir()
             .map_err(|e| anyhow::anyhow!("failed to resolve current directory: {e}"))?;
         let target = if source == ".." {
@@ -87,10 +104,11 @@ pub(crate) fn normalize_source(source: &str) -> Result<SourceSpec> {
                 "cannot determine source entry name for '{source}': resolved path has no name"
             );
         }
-        (target.to_string_lossy().to_string(), name)
+        Ok((target.to_string_lossy().to_string(), name))
     } else {
-        let trimmed = path.to_string_lossy().to_string();
-        let stripped = trimmed.trim_end_matches('/');
+        let path = Path::new(source);
+        let path_str = path.to_string_lossy().to_string();
+        let stripped = path_str.trim_end_matches('/');
         let name = Path::new(stripped)
             .file_name()
             .ok_or_else(|| {
@@ -101,15 +119,8 @@ pub(crate) fn normalize_source(source: &str) -> Result<SourceSpec> {
         if name.is_empty() {
             anyhow::bail!("cannot determine source entry name from path: {source}");
         }
-        (stripped.to_owned(), name)
-    };
-
-    Ok(SourceSpec {
-        raw_input,
-        operation_path,
-        source_entry_name,
-        kind,
-    })
+        Ok((stripped.to_owned(), name))
+    }
 }
 
 /// Build a manifest with one logical source entry.
@@ -652,5 +663,51 @@ mod tests {
         let s = normalize_source(&source_with_slash).unwrap();
         let cleanup = capture_cleanup_identity(&s).unwrap();
         assert!(cleanup.iter().any(|e| e.relative_path == "Videos"));
+    }
+
+    #[test]
+    fn symlink_to_directory_with_trailing_slash_remains_symlink_kind() {
+        let tmp = tempdir().unwrap();
+        let real_dir = tmp.path().join("realdir");
+        fs::create_dir(&real_dir).unwrap();
+        let link = tmp.path().join("linkdir");
+        unix::fs::symlink(&real_dir, &link).unwrap();
+        let source_with_slash = format!("{}/", link.to_str().unwrap());
+        let s = normalize_source(&source_with_slash).unwrap();
+        assert_eq!(s.source_entry_name, "linkdir");
+        assert_eq!(s.kind, SourceKind::Symlink);
+        assert!(!s.operation_path.ends_with('/'));
+    }
+
+    #[test]
+    fn symlink_to_file_with_trailing_slash_remains_symlink_kind() {
+        let tmp = tempdir().unwrap();
+        let real_file = tmp.path().join("real.txt");
+        fs::write(&real_file, "data").unwrap();
+        let link = tmp.path().join("linkfile");
+        unix::fs::symlink(&real_file, &link).unwrap();
+        let source_with_slash = format!("{}/", link.to_str().unwrap());
+        let s = normalize_source(&source_with_slash).unwrap();
+        assert_eq!(s.source_entry_name, "linkfile");
+        assert_eq!(s.kind, SourceKind::Symlink);
+        assert!(!s.operation_path.ends_with('/'));
+    }
+
+    #[test]
+    fn symlink_source_without_trailing_slash_is_symlink_kind() {
+        let tmp = tempdir().unwrap();
+        let real_file = tmp.path().join("real.txt");
+        fs::write(&real_file, "data").unwrap();
+        let link = tmp.path().join("mylink");
+        unix::fs::symlink(&real_file, &link).unwrap();
+        let s = normalize_source(link.to_str().unwrap()).unwrap();
+        assert_eq!(s.source_entry_name, "mylink");
+        assert_eq!(s.kind, SourceKind::Symlink);
+    }
+
+    #[test]
+    fn normalize_source_rejects_root_in_all_forms() {
+        assert!(normalize_source("/").is_err());
+        assert!(normalize_source("//").is_err(), "double-slash root should also be invalid");
     }
 }
