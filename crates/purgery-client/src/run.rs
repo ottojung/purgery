@@ -686,6 +686,10 @@ pub(crate) fn run_sync_with_run_id(
 
     // Phase 2: validate the new operation
     validate_source_exists(&args.source)?;
+    // Reject root path — it has no source entry name.
+    if std::path::Path::new(&args.source) == std::path::Path::new("/") {
+        anyhow::bail!("cannot use root path as source entry: /");
+    }
 
     let has_postprocess = !args.postprocess.is_empty();
     if has_postprocess && !args.delete_after_import {

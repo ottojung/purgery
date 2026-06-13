@@ -35,7 +35,7 @@ client: persist local state as cleanup_complete
 
 ### Path C: Split (with --split)
 
-Each split entry is processed as a separate server run when --postprocess or --delete-after-import is present. Pure passthrough split performs one transfer of the selected roots only.
+Each split entry is processed as a separate operation. With `--postprocess`, each operation creates a server run. With `--delete-after-import` only, each operation uses direct rsync plus cleanup. Pure passthrough split performs one transfer of the selected roots only.
 
 ```
 client: validate args

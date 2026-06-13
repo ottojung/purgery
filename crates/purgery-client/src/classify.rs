@@ -77,10 +77,7 @@ pub(crate) fn build_manifest(
         .with_context(|| format!("failed to read metadata: {source}"))?;
     let file_type = metadata.file_type();
 
-    let source_name = source_path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| source.to_owned());
+    let source_name = source_entry_name(source)?;
 
     let relative_path = NormalizedRelativePath::new(Utf8PathBuf::from(source_name.clone()))
         .with_context(|| format!("invalid source name: {source_name}"))?;
@@ -201,8 +198,8 @@ pub(crate) fn capture_cleanup_identity(source: &str) -> Result<Vec<CleanupEntry>
 
     if file_type.is_symlink() {
         let target = fs::read_link(source_path)
-            .ok()
-            .map(|t| t.to_string_lossy().to_string());
+            .map(|t| t.to_string_lossy().to_string())
+            .with_context(|| format!("failed to read symlink target: {source}"))?;
         return Ok(vec![CleanupEntry {
             relative_path: source_name,
             local_path: source.to_owned(),
@@ -210,7 +207,7 @@ pub(crate) fn capture_cleanup_identity(source: &str) -> Result<Vec<CleanupEntry>
             size: 0,
             mtime_ns: 0,
             sha256: None,
-            link_target: target,
+            link_target: Some(target),
             import_confirmed: false,
             cleaned: false,
         }]);
@@ -276,8 +273,8 @@ pub(crate) fn capture_cleanup_identity(source: &str) -> Result<Vec<CleanupEntry>
             });
         } else if ft.is_symlink() {
             let target = fs::read_link(path)
-                .ok()
-                .map(|t| t.to_string_lossy().to_string());
+                .map(|t| t.to_string_lossy().to_string())
+                .with_context(|| format!("failed to read symlink target: {}", path.display()))?;
             entries.push(CleanupEntry {
                 relative_path: relative_str,
                 local_path: local_str,
@@ -285,7 +282,7 @@ pub(crate) fn capture_cleanup_identity(source: &str) -> Result<Vec<CleanupEntry>
                 size: 0,
                 mtime_ns: 0,
                 sha256: None,
-                link_target: target,
+                link_target: Some(target),
                 import_confirmed: false,
                 cleaned: false,
             });

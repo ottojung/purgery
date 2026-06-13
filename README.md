@@ -54,7 +54,7 @@ purgery-client sync \
   -- ~/Videos user@server:/archive
 ```
 
-Each matched entry is processed as its own server run. Pure passthrough splits use a single filtered rsync transfer; cleanup and postprocess splits run serially.
+Each matched entry is processed as a separate operation. Postprocess operations each create a server run; passthrough cleanup operations use direct rsync plus cleanup; pure passthrough uses one transfer of the selected roots.
 
 ## Configuration
 

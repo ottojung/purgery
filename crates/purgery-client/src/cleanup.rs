@@ -67,24 +67,30 @@ pub(crate) fn confirm_imports_from_status(state_path: &Utf8Path, status: &RunSta
         });
     }
 
-    // Second pass: propagate imported directory confirmation to all
-    // descendants in the cleanup state. When a directory was imported,
-    // every file or directory nested under it is assured to have been
-    // postprocessed and can be cleaned regardless of whether the status
-    // contains an individual entry for each descendant.
+    // Second pass: propagate imported directory confirmation to
+    // descendants.  Only propagate from an imported directory when the
+    // cleanup state itself has a directory entry that was confirmed in the
+    // first pass — this ensures the status entry matches an actual cleanup
+    // directory entry by kind, local path, and relative path.
+    let confirmed_dirs: Vec<String> = state
+        .entries
+        .iter()
+        .filter(|e| e.import_confirmed && e.kind == ManifestEntryKind::Directory)
+        .map(|e| e.relative_path.clone())
+        .collect();
+
     for cleanup_entry in &mut state.entries {
         if cleanup_entry.import_confirmed {
             continue;
         }
-        let parent_imported = status.entries.iter().any(|s| {
-            s.status == FileStatus::Imported
-                && s.kind == ManifestEntryKind::Directory
-                && cleanup_entry
-                    .relative_path
-                    .starts_with(&format!("{}/", s.relative_path))
-        });
-        if parent_imported {
-            cleanup_entry.import_confirmed = true;
+        for dir_rel_path in &confirmed_dirs {
+            if cleanup_entry
+                .relative_path
+                .starts_with(&format!("{}/", dir_rel_path))
+            {
+                cleanup_entry.import_confirmed = true;
+                break;
+            }
         }
     }
 
