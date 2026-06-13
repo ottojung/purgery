@@ -304,6 +304,65 @@ impl RemoteRunner {
         }
     }
 
+    /// Run rsync with --files-from for selected-file-only transfer.
+    pub(crate) fn run_rsync_with_file_list(
+        &self,
+        source: &str,
+        host: &str,
+        remote_dir: &str,
+        file_list: &[String],
+    ) -> Result<()> {
+        let rsync_dest = format!("{host}:{remote_dir}/");
+
+        match self {
+            RemoteRunner::Real => {
+                // Write the file list to a temp file in the system temp dir.
+                let tmp_dir = std::env::temp_dir();
+                let list_path = tmp_dir.join(format!("purgery-rsync-{}.list", std::process::id()));
+                std::fs::write(&list_path, file_list.join("\n"))
+                    .with_context(|| "failed to write rsync file list")?;
+                let result = (|| -> Result<()> {
+                    let mut args = purgery_core::build_rsync_args(source, &rsync_dest);
+                    args.pop();
+                    args.pop();
+                    args.push(format!("--files-from={}", list_path.display()));
+                    args.push("--relative".to_string());
+                    args.push(format!("{}/", source));
+                    args.push(rsync_dest);
+                    let status = Command::new("rsync")
+                        .args(&args)
+                        .status()
+                        .with_context(|| {
+                            format!("failed to execute rsync: {source} -> {host}:{remote_dir}")
+                        })?;
+                    if !status.success() {
+                        anyhow::bail!("rsync failed: {source} -> {host}:{remote_dir}");
+                    }
+                    Ok(())
+                })();
+                let _ = std::fs::remove_file(&list_path);
+                result
+            }
+            RemoteRunner::Fake { inner } => {
+                if let Some(hook) = inner.rsync_hook.lock().unwrap().take() {
+                    hook();
+                }
+                for (rc, err) in inner.rsync_errors.lock().unwrap().iter() {
+                    let cmd = format!(
+                        "rsync --files-from <file-list> --relative -- {source}/ {rsync_dest}"
+                    );
+                    if cmd.contains(rc.as_str()) {
+                        anyhow::bail!("{err}");
+                    }
+                }
+                inner.log.lock().unwrap().push(format!(
+                    "rsync --files-from <file-list> --relative -- {source}/ {rsync_dest}"
+                ));
+                Ok(())
+            }
+        }
+    }
+
     /// Parse a BeginRunResponse from the given TOML string. Convenience for tests.
     pub(crate) fn parse_begin_response(toml: &str) -> Result<BeginRunResponse> {
         let resp: BeginRunResponse =
