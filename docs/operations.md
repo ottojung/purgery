@@ -98,7 +98,7 @@ Each matched root gets a target suffix that preserves its relative layout under 
 | Top-level child of `<SOURCE>` | `/` | `user@host:/archive/` |
 | Nested child | `/parent` | `user@host:/archive/parent` |
 
-### Pure passthrough optimization
+### Pure passthrough split
 
 Without `--delete-after-import` or `--postprocess`, the split is implemented as a single rsync transfer that copies only the selected roots and their payloads. Nested entries preserve their relative parent paths under `<TARGET>`. No server run or client state is created. No destination collision preflight is added.
 

@@ -102,7 +102,7 @@ The `destination` field is the target parent directory. It may be absolute or re
 
 ## Manifest (manifest.toml)
 
-A normal non-split run describes one logical source entry.
+A server-run manifest describes exactly one logical source entry and is uploaded only for postprocess runs. Direct passthrough never uploads a manifest.
 
 ```toml
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
@@ -113,7 +113,6 @@ local_path = "/home/user/video.mp4"
 staged_path = "files/video.mp4"
 relative_path = "video.mp4"
 kind = "regular_file"
-mode = "postprocess"
 size = 1048576
 mtime_ns = 1700000000000000000
 sha256 = "abc123..."
@@ -128,14 +127,12 @@ local_path = "/home/user/Videos"
 staged_path = "files/Videos"
 relative_path = "Videos"
 kind = "directory"
-mode = "postprocess"
 postprocess_steps = ["compress-video"]
 ```
 
-- `mode` is `passthrough` or `postprocess`.
-- `relative_path` is the source entry name.
 - `staged_path` uses the format `files/<source-name>`.
-- The manifest contains one entry for a non-split run.
+- Non-empty `postprocess_steps` is required.
+- The manifest contains exactly one entry for a non-split run.
 
 ## Status (status.toml)
 

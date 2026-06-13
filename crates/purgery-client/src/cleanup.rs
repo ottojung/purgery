@@ -599,7 +599,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_confirms_covered_descendants_when_covering_dir_imported() {
+    fn cleanup_confirms_directory_descendants_when_imported() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("photos");
         fs::create_dir(&dir).unwrap();
@@ -642,14 +642,14 @@ mod tests {
 
         let state = DurableCleanupState {
             nickname: "host".to_owned(),
-            operation_id: "run-covered".to_owned(),
+            operation_id: "run-dir".to_owned(),
             entries,
         };
         let state_path = write_cleanup_state(&state, tmp.path().to_str().unwrap()).unwrap();
 
         // Status only mentions the directory as imported — no individual descendant entry.
         let status = RunStatus {
-            run_id: RunId::new("run-covered".to_owned()).unwrap(),
+            run_id: RunId::new("run-dir".to_owned()).unwrap(),
             nickname: Nickname::new("host".to_owned()).unwrap(),
             state: RunState::Done,
             entries: vec![EntryStatusEntry {
@@ -678,15 +678,15 @@ mod tests {
             .iter()
             .any(|e| e.kind == ManifestEntryKind::RegularFile && e.import_confirmed);
 
-        assert!(dir_confirmed, "covering directory must be confirmed");
+        assert!(dir_confirmed, "parent directory must be confirmed");
         assert!(
             file_confirmed,
-            "covered descendant must be confirmed via covering directory"
+            "directory descendant must be confirmed via parent directory"
         );
     }
 
     #[test]
-    fn cleanup_does_not_confirm_covered_descendants_when_covering_dir_failed() {
+    fn cleanup_does_not_confirm_directory_descendants_when_failed() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("photos");
         fs::create_dir(&dir).unwrap();
@@ -748,12 +748,12 @@ mod tests {
 
         assert!(
             state.entries.iter().all(|e| !e.import_confirmed),
-            "no entries should be confirmed when the covering directory failed"
+            "no entries should be confirmed when the parent directory failed"
         );
     }
 
     #[test]
-    fn cleanup_does_not_confirm_covered_descendants_when_covering_dir_not_in_status() {
+    fn cleanup_does_not_confirm_directory_descendants_when_absent() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("photos");
         fs::create_dir(&dir).unwrap();
@@ -792,7 +792,7 @@ mod tests {
         };
         let state_path = write_cleanup_state(&state, tmp.path().to_str().unwrap()).unwrap();
 
-        // Status has no entry for the covering directory.
+        // Status has no entry for the parent directory.
         let status = RunStatus {
             run_id: RunId::new("run-missing".to_owned()).unwrap(),
             nickname: Nickname::new("host".to_owned()).unwrap(),
@@ -816,7 +816,7 @@ mod tests {
 
         assert!(
             state.entries.iter().all(|e| !e.import_confirmed),
-            "no entries should be confirmed when the covering directory is absent from status"
+            "no entries should be confirmed when the parent directory is absent from status"
         );
     }
 }

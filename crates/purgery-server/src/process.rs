@@ -449,7 +449,7 @@ pub fn process_processing_run(
     );
 
     let mut outcomes: Vec<EntryOutcome> = Vec::new();
-    // Map: covering dir relative_path -> its outcome index.
+    // Map: directory entry relative_path -> its outcome index.
     let mut dir_outcomes: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
 
