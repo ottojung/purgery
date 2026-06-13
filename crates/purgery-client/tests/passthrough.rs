@@ -403,6 +403,8 @@ fn passthrough_split_non_dot_on_regular_file_does_not_call_rsync() {
     let file = source.join("a.mp4");
     fs::write(&file, "data").unwrap();
 
+    fs::write(&log, "").unwrap();
+
     let status = Command::new(env!("CARGO_BIN_EXE_purgery-client"))
         .args([
             "sync",
@@ -491,6 +493,8 @@ fn passthrough_split_non_dot_on_symlink_does_not_call_rsync() {
     fs::write(&target_file, "data").unwrap();
     let link = source.join("link.mp4");
     std::os::unix::fs::symlink(&target_file, &link).unwrap();
+
+    fs::write(&log, "").unwrap();
 
     let status = Command::new(env!("CARGO_BIN_EXE_purgery-client"))
         .args([

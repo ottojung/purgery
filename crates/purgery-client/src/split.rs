@@ -925,17 +925,59 @@ mod tests {
         cmd.status().map(|s| s.success()).unwrap_or(false)
     }
 
-    /// Collect relative file paths under a directory, sorted.
-    fn list_files(dir: &std::path::Path) -> Vec<String> {
-        let mut files = Vec::new();
-        for entry in walkdir::WalkDir::new(dir).sort_by_file_name().min_depth(1) {
-            let entry = entry.unwrap();
-            if entry.file_type().is_file() || entry.file_type().is_symlink() {
-                let relative = entry.path().strip_prefix(dir).unwrap();
-                files.push(relative.to_string_lossy().to_string());
+    /// Collect relative paths under a directory, recording files, directories,
+    /// and symlinks. Subdirectory entries use a trailing `/` suffix so
+    /// directory-pruning assertions can observe directory presence.
+    fn list_entries(dir: &std::path::Path) -> Vec<String> {
+        let mut entries = Vec::new();
+        for walk_entry in walkdir::WalkDir::new(dir).sort_by_file_name().min_depth(1) {
+            let walk_entry = walk_entry.unwrap();
+            let relative = walk_entry.path().strip_prefix(dir).unwrap();
+            if walk_entry.file_type().is_dir() {
+                entries.push(format!("{}/", relative.to_string_lossy()));
+            } else {
+                entries.push(relative.to_string_lossy().to_string());
             }
         }
-        files
+        entries
+    }
+
+    #[test]
+    fn rsync_filter_prunes_traversal_only_directories() {
+        if !rsync_available() {
+            return;
+        }
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("deep/nested")).unwrap();
+        fs::write(src.join("a.mp4"), "data").unwrap();
+        fs::write(src.join("deep/nested/deepest.txt"), "text").unwrap();
+
+        let dest = tmp.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let f = build_split_filters("*.mp4").unwrap();
+        assert!(run_local_filter_rsync(
+            &src,
+            &dest,
+            &f.include_rules,
+            &f.exclude_rule
+        ));
+
+        let entries = list_entries(&dest);
+        assert!(entries.contains(&"a.mp4".to_string()));
+        assert!(
+            !entries.contains(&"deep/".to_string()),
+            "traversal-only directory deep must be pruned by --prune-empty-dirs"
+        );
+        assert!(
+            !entries.contains(&"deep/nested/".to_string()),
+            "traversal-only directory deep/nested must be pruned"
+        );
+        assert!(
+            !entries.contains(&"deep/nested/deepest.txt".to_string()),
+            "non-matching file must not be copied"
+        );
     }
 
     #[test]
@@ -962,26 +1004,26 @@ mod tests {
             &f.exclude_rule
         ));
 
-        let files = list_files(&dest);
+        let entries = list_entries(&dest);
         assert!(
-            files.contains(&"a.mp4".to_string()),
+            entries.contains(&"a.mp4".to_string()),
             "must copy top-level a.mp4"
         );
         assert!(
-            files.contains(&"sub/c.mp4".to_string()),
+            entries.contains(&"sub/c.mp4".to_string()),
             "must copy nested c.mp4"
         );
         assert!(
-            !files.contains(&"b.txt".to_string()),
+            !entries.contains(&"b.txt".to_string()),
             "must NOT copy unrelated b.txt"
         );
         assert!(
-            !files.contains(&"sub/d.txt".to_string()),
+            !entries.contains(&"sub/d.txt".to_string()),
             "must NOT copy nested unrelated d.txt"
         );
         assert!(
-            !files.contains(&"sub".to_string()),
-            "traversal-only directory sub must be pruned"
+            entries.contains(&"sub/".to_string()),
+            "sub directory must exist (it contains transferred c.mp4)"
         );
     }
 
@@ -1009,11 +1051,19 @@ mod tests {
             &f.exclude_rule
         ));
 
-        let files = list_files(&dest);
-        assert!(files.contains(&"top.mp4".to_string()));
-        assert!(files.contains(&"a/deep.mp4".to_string()));
-        assert!(files.contains(&"a/b/c/deepest.mp4".to_string()));
-        assert!(!files.contains(&"skip.txt".to_string()));
+        let entries = list_entries(&dest);
+        assert!(entries.contains(&"top.mp4".to_string()));
+        assert!(entries.contains(&"a/deep.mp4".to_string()));
+        assert!(entries.contains(&"a/b/c/deepest.mp4".to_string()));
+        assert!(!entries.contains(&"skip.txt".to_string()));
+        assert!(
+            entries.contains(&"a/".to_string()),
+            "parent dir a must exist (contains transferred files)"
+        );
+        assert!(
+            entries.contains(&"a/b/".to_string()),
+            "parent dir a/b must exist (contains c/ with deepest.mp4)"
+        );
     }
 
     #[test]
@@ -1040,16 +1090,108 @@ mod tests {
             &f.exclude_rule
         ));
 
-        let files = list_files(&dest);
-        assert!(files.contains(&"Photos/a.jpg".to_string()));
-        assert!(files.contains(&"Photos/b.jpg".to_string()));
+        let entries = list_entries(&dest);
         assert!(
-            files.contains(&"Photos/notes.txt".to_string()),
+            entries.contains(&"Photos/".to_string()),
+            "Photos directory must be created"
+        );
+        assert!(entries.contains(&"Photos/a.jpg".to_string()));
+        assert!(entries.contains(&"Photos/b.jpg".to_string()));
+        assert!(
+            entries.contains(&"Photos/notes.txt".to_string()),
             "directory payload includes non-matching children inside selected directory"
         );
         assert!(
-            !files.contains(&"other.mp4".to_string()),
+            !entries.contains(&"other.mp4".to_string()),
             "must NOT copy unrelated other.mp4 outside Photos"
+        );
+    }
+
+    #[test]
+    fn rsync_filter_nested_photos_dir_copies_both_payloads() {
+        if !rsync_available() {
+            return;
+        }
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("Photos")).unwrap();
+        fs::create_dir_all(src.join("somewhere/Photos")).unwrap();
+        fs::write(src.join("Photos/a.jpg"), "top-photo").unwrap();
+        fs::write(src.join("somewhere/Photos/b.jpg"), "nested-photo").unwrap();
+        fs::write(src.join("other.txt"), "text").unwrap();
+
+        let dest = tmp.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let f = build_split_filters("Photos/").unwrap();
+        assert!(run_local_filter_rsync(
+            &src,
+            &dest,
+            &f.include_rules,
+            &f.exclude_rule
+        ));
+
+        let entries = list_entries(&dest);
+        assert!(
+            entries.contains(&"Photos/".to_string()),
+            "top-level Photos directory must be created"
+        );
+        assert!(entries.contains(&"Photos/a.jpg".to_string()));
+        assert!(
+            entries.contains(&"somewhere/Photos/".to_string()),
+            "nested somewhere/Photos directory must be created"
+        );
+        assert!(entries.contains(&"somewhere/Photos/b.jpg".to_string()));
+        assert!(
+            !entries.contains(&"other.txt".to_string()),
+            "unrelated other.txt must not be copied"
+        );
+    }
+
+    #[test]
+    fn rsync_filter_directory_named_mp4_transfers_full_payload() {
+        if !rsync_available() {
+            return;
+        }
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("video.mp4")).unwrap();
+        fs::write(src.join("video.mp4/a.txt"), "payload").unwrap();
+        fs::write(src.join("video.mp4/b.dat"), "payload").unwrap();
+        fs::write(src.join("other.mp4"), "video").unwrap();
+        fs::write(src.join("skip.txt"), "text").unwrap();
+
+        let dest = tmp.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let f = build_split_filters("*.mp4").unwrap();
+        assert!(run_local_filter_rsync(
+            &src,
+            &dest,
+            &f.include_rules,
+            &f.exclude_rule
+        ));
+
+        let entries = list_entries(&dest);
+        assert!(
+            entries.contains(&"other.mp4".to_string()),
+            "matching regular file *.mp4 must be copied"
+        );
+        assert!(
+            entries.contains(&"video.mp4/".to_string()),
+            "directory whose name matches *.mp4 must be created"
+        );
+        assert!(
+            entries.contains(&"video.mp4/a.txt".to_string()),
+            "payload of directory whose name matches *.mp4 must be transferred"
+        );
+        assert!(
+            entries.contains(&"video.mp4/b.dat".to_string()),
+            "payload of directory whose name matches *.mp4 must be fully transferred"
+        );
+        assert!(
+            !entries.contains(&"skip.txt".to_string()),
+            "unrelated file must not be copied"
         );
     }
 
@@ -1076,10 +1218,10 @@ mod tests {
             &f.exclude_rule
         ));
 
-        let files = list_files(&dest);
-        assert!(files.contains(&"real.mp4".to_string()));
-        assert!(files.contains(&"link.mp4".to_string()));
-        assert!(!files.contains(&"skip.txt".to_string()));
+        let entries = list_entries(&dest);
+        assert!(entries.contains(&"real.mp4".to_string()));
+        assert!(entries.contains(&"link.mp4".to_string()));
+        assert!(!entries.contains(&"skip.txt".to_string()));
 
         let link_dest = dest.join("link.mp4");
         let target = fs::read_link(&link_dest).unwrap();
@@ -1149,6 +1291,6 @@ mod tests {
             &f.include_rules,
             &f.exclude_rule
         ));
-        assert!(list_files(&dest).contains(&"a.mp4".to_string()));
+        assert!(list_entries(&dest).contains(&"a.mp4".to_string()));
     }
 }
