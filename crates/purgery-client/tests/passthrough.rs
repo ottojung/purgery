@@ -336,3 +336,183 @@ fn passthrough_trailing_slash_does_not_change_source_entry_semantics() {
     // Should import as source entry, not contents
     assert!(commands.contains("--recursive"), "must use ordinary rsync");
 }
+
+#[test]
+fn passthrough_split_dot_on_regular_file_runs_ordinary_rsync() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let log = tmp.path().join("commands.log");
+    write_executable(
+        &bin.join("rsync"),
+        "#!/bin/sh\nprintf 'rsync:%s\\n' \"$*\" >> \"$COMMAND_LOG\"\n",
+    );
+    write_executable(
+        &bin.join("ssh"),
+        "#!/bin/sh\nprintf 'ssh:%s\\n' \"$*\" >> \"$COMMAND_LOG\"\nexit 99\n",
+    );
+    let source = tmp.path().join("source");
+    fs::create_dir(&source).unwrap();
+    let file = source.join("a.mp4");
+    fs::write(&file, "data").unwrap();
+
+    let status = Command::new(env!("CARGO_BIN_EXE_purgery-client"))
+        .args([
+            "sync",
+            "--split",
+            ".",
+            "--state-dir",
+            tmp.path().join("state").to_str().unwrap(),
+            "--",
+            file.to_str().unwrap(),
+            "user@host:/dest",
+        ])
+        .env("PATH", &bin)
+        .env("COMMAND_LOG", &log)
+        .status()
+        .unwrap();
+
+    assert!(status.success());
+    let commands = fs::read_to_string(log).unwrap();
+    assert!(commands.contains("rsync:"));
+    assert!(!commands.contains("ssh:"));
+    assert!(!commands.contains("--include"));
+    assert!(!commands.contains("--exclude"));
+    assert!(
+        !commands.contains("--prune-empty-dirs"),
+        "ordinary rsync must not use --prune-empty-dirs"
+    );
+}
+
+#[test]
+fn passthrough_split_non_dot_on_regular_file_does_not_call_rsync() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let log = tmp.path().join("commands.log");
+    write_executable(
+        &bin.join("rsync"),
+        "#!/bin/sh\nprintf 'rsync:%s\\n' \"$*\" >> \"$COMMAND_LOG\"\n",
+    );
+    write_executable(
+        &bin.join("ssh"),
+        "#!/bin/sh\nprintf 'ssh:%s\\n' \"$*\" >> \"$COMMAND_LOG\"\nexit 99\n",
+    );
+    let source = tmp.path().join("source");
+    fs::create_dir(&source).unwrap();
+    let file = source.join("a.mp4");
+    fs::write(&file, "data").unwrap();
+
+    let status = Command::new(env!("CARGO_BIN_EXE_purgery-client"))
+        .args([
+            "sync",
+            "--split",
+            "*.mp4",
+            "--state-dir",
+            tmp.path().join("state").to_str().unwrap(),
+            "--",
+            file.to_str().unwrap(),
+            "user@host:/dest",
+        ])
+        .env("PATH", &bin)
+        .env("COMMAND_LOG", &log)
+        .status()
+        .unwrap();
+
+    assert!(status.success());
+    let commands = fs::read_to_string(log).unwrap();
+    assert!(
+        !commands.contains("rsync:"),
+        "non-directory source with non-dot split must not invoke rsync"
+    );
+    assert!(!commands.contains("ssh:"));
+}
+
+#[test]
+fn passthrough_split_dot_on_symlink_runs_ordinary_rsync() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let log = tmp.path().join("commands.log");
+    write_executable(
+        &bin.join("rsync"),
+        "#!/bin/sh\nprintf 'rsync:%s\\n' \"$*\" >> \"$COMMAND_LOG\"\n",
+    );
+    write_executable(
+        &bin.join("ssh"),
+        "#!/bin/sh\nprintf 'ssh:%s\\n' \"$*\" >> \"$COMMAND_LOG\"\nexit 99\n",
+    );
+    let source = tmp.path().join("source");
+    fs::create_dir(&source).unwrap();
+    let target_file = source.join("real.mp4");
+    fs::write(&target_file, "data").unwrap();
+    let link = source.join("link.mp4");
+    std::os::unix::fs::symlink(&target_file, &link).unwrap();
+
+    let status = Command::new(env!("CARGO_BIN_EXE_purgery-client"))
+        .args([
+            "sync",
+            "--split",
+            ".",
+            "--state-dir",
+            tmp.path().join("state").to_str().unwrap(),
+            "--",
+            link.to_str().unwrap(),
+            "user@host:/dest",
+        ])
+        .env("PATH", &bin)
+        .env("COMMAND_LOG", &log)
+        .status()
+        .unwrap();
+
+    assert!(status.success());
+    let commands = fs::read_to_string(log).unwrap();
+    assert!(commands.contains("rsync:"));
+    assert!(!commands.contains("ssh:"));
+}
+
+#[test]
+fn passthrough_split_non_dot_on_symlink_does_not_call_rsync() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let log = tmp.path().join("commands.log");
+    write_executable(
+        &bin.join("rsync"),
+        "#!/bin/sh\nprintf 'rsync:%s\\n' \"$*\" >> \"$COMMAND_LOG\"\n",
+    );
+    write_executable(
+        &bin.join("ssh"),
+        "#!/bin/sh\nprintf 'ssh:%s\\n' \"$*\" >> \"$COMMAND_LOG\"\nexit 99\n",
+    );
+    let source = tmp.path().join("source");
+    fs::create_dir(&source).unwrap();
+    let target_file = source.join("real.mp4");
+    fs::write(&target_file, "data").unwrap();
+    let link = source.join("link.mp4");
+    std::os::unix::fs::symlink(&target_file, &link).unwrap();
+
+    let status = Command::new(env!("CARGO_BIN_EXE_purgery-client"))
+        .args([
+            "sync",
+            "--split",
+            "*.mp4",
+            "--state-dir",
+            tmp.path().join("state").to_str().unwrap(),
+            "--",
+            link.to_str().unwrap(),
+            "user@host:/dest",
+        ])
+        .env("PATH", &bin)
+        .env("COMMAND_LOG", &log)
+        .status()
+        .unwrap();
+
+    assert!(status.success());
+    let commands = fs::read_to_string(log).unwrap();
+    assert!(
+        !commands.contains("rsync:"),
+        "symlink source with non-dot split must not invoke rsync"
+    );
+    assert!(!commands.contains("ssh:"));
+}

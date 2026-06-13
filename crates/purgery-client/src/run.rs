@@ -917,6 +917,7 @@ fn run_split(
         return run_passthrough_split(
             runner,
             &source_spec.operation_path,
+            source_spec.kind,
             args.split.as_deref().unwrap(),
             &target.host,
             target.path.as_str(),
@@ -953,6 +954,7 @@ fn run_split(
 fn run_passthrough_split(
     runner: &RemoteRunner,
     source: &str,
+    kind: crate::classify::SourceKind,
     pattern: &str,
     host: &str,
     remote_dir: &str,
@@ -965,6 +967,13 @@ fn run_passthrough_split(
             runner.run_rsync(source, host, remote_dir)?;
         }
         Some(f) => {
+            if kind != crate::classify::SourceKind::Directory {
+                info!(
+                    "passthrough split with pattern \"{pattern}\" on non-directory source: \
+                     no matches possible, exiting"
+                );
+                return Ok(());
+            }
             info!(
                 "passthrough split: transferring with filter rules: includes={:?} exclude={}",
                 f.include_rules, f.exclude_rule
