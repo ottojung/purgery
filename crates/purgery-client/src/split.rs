@@ -289,7 +289,6 @@ fn first_match_len(pattern: &str, path: &str, start: usize) -> Option<usize> {
             b'*' => {
                 pi += 1;
                 if pi == pat.len() {
-                    // Match rest of path up to /
                     let end = path[si..].find('/').unwrap_or(path.len() - si);
                     return Some(si + end);
                 }
@@ -310,6 +309,47 @@ fn first_match_len(pattern: &str, path: &str, start: usize) -> Option<usize> {
                 pi += 1;
                 si += 1;
             }
+            b'[' => {
+                pi += 1;
+                if pi >= pat.len() {
+                    return None;
+                }
+                let negated = pat[pi] == b'!';
+                if negated {
+                    pi += 1;
+                }
+                if pi >= pat.len() || si >= pth.len() || pth[si] == b'/' {
+                    return None;
+                }
+                let mut matched = false;
+                while pi < pat.len() && pat[pi] != b']' {
+                    if pi + 2 < pat.len() && pat[pi + 1] == b'-' && pat[pi + 2] != b']' {
+                        let lo = pat[pi];
+                        let hi = pat[pi + 2];
+                        let ch = pth[si];
+                        if ch >= lo && ch <= hi {
+                            matched = true;
+                        }
+                        pi += 3;
+                    } else {
+                        if pat[pi] == pth[si] {
+                            matched = true;
+                        }
+                        pi += 1;
+                    }
+                }
+                if pi >= pat.len() || pat[pi] != b']' {
+                    return None;
+                }
+                pi += 1;
+                if negated {
+                    matched = !matched;
+                }
+                if !matched {
+                    return None;
+                }
+                si += 1;
+            }
             c => {
                 if si >= pth.len() || pth[si] != c {
                     return None;
@@ -326,7 +366,7 @@ fn simple_glob(pattern: &str, path: &str) -> bool {
     if pattern == path {
         return true;
     }
-    if !pattern.contains('*') && !pattern.contains('?') {
+    if !pattern.contains('*') && !pattern.contains('?') && !pattern.contains('[') {
         return pattern == path;
     }
 
@@ -338,12 +378,10 @@ fn simple_glob(pattern: &str, path: &str) -> bool {
     while pi < pat_bytes.len() {
         match pat_bytes[pi] {
             b'*' => {
-                // * matches any chars except /
                 pi += 1;
                 if pi == pat_bytes.len() {
                     return !path[si..].contains('/');
                 }
-                // Try to match the rest at each position (including at a / boundary)
                 while si < path_bytes.len() {
                     if simple_glob(&pattern[pi..], &path[si..]) {
                         return true;
@@ -360,6 +398,55 @@ fn simple_glob(pattern: &str, path: &str) -> bool {
                     return false;
                 }
                 pi += 1;
+                si += 1;
+            }
+            b'[' => {
+                // Bracket expression [...].
+                pi += 1;
+                if pi >= pat_bytes.len() {
+                    return false;
+                }
+                let negated = pat_bytes[pi] == b'!';
+                if negated {
+                    pi += 1;
+                }
+                if pi >= pat_bytes.len() {
+                    return false;
+                }
+                if si >= path_bytes.len() || path_bytes[si] == b'/' {
+                    return false;
+                }
+                let mut matched = false;
+                while pi < pat_bytes.len() && pat_bytes[pi] != b']' {
+                    if pi + 2 < pat_bytes.len()
+                        && pat_bytes[pi + 1] == b'-'
+                        && pat_bytes[pi + 2] != b']'
+                    {
+                        // Range like a-z
+                        let lo = pat_bytes[pi];
+                        let hi = pat_bytes[pi + 2];
+                        let ch = path_bytes[si];
+                        if ch >= lo && ch <= hi {
+                            matched = true;
+                        }
+                        pi += 3;
+                    } else {
+                        if pat_bytes[pi] == path_bytes[si] {
+                            matched = true;
+                        }
+                        pi += 1;
+                    }
+                }
+                if pi >= pat_bytes.len() || pat_bytes[pi] != b']' {
+                    return false;
+                }
+                pi += 1;
+                if negated {
+                    matched = !matched;
+                }
+                if !matched {
+                    return false;
+                }
                 si += 1;
             }
             c => {
@@ -597,6 +684,30 @@ mod tests {
         let m = PatternMatcher::new("a?c.mp4");
         assert!(m.is_match("abc.mp4", false));
         assert!(!m.is_match("abbc.mp4", false));
+    }
+
+    #[test]
+    fn bracket_expression_matches_character_class() {
+        let m = PatternMatcher::new("[ab].txt");
+        assert!(m.is_match("a.txt", false));
+        assert!(m.is_match("b.txt", false));
+        assert!(!m.is_match("c.txt", false));
+    }
+
+    #[test]
+    fn bracket_expression_range_matches() {
+        let m = PatternMatcher::new("[a-c].txt");
+        assert!(m.is_match("a.txt", false));
+        assert!(m.is_match("b.txt", false));
+        assert!(m.is_match("c.txt", false));
+        assert!(!m.is_match("d.txt", false));
+    }
+
+    #[test]
+    fn bracket_expression_negation() {
+        let m = PatternMatcher::new("[!a].txt");
+        assert!(!m.is_match("a.txt", false));
+        assert!(m.is_match("b.txt", false));
     }
 
     #[test]
