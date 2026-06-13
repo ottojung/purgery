@@ -64,7 +64,7 @@ purgery-server gc --config server.toml
 
 ## Split
 
-The `--split <PATTERN>` flag selects source entries to process individually. The pattern uses rsync include/exclude syntax.
+The `--split <PATTERN>` flag selects source entries to process individually. The pattern uses rsync-style single-pattern matching as a positive selector. It supports the documented rsync include/exclude pattern forms without implementing a full ordered rule list.
 
 ### Pattern syntax
 
@@ -74,14 +74,15 @@ The `--split <PATTERN>` flag selects source entries to process individually. The
 - `**` matches across directory boundaries.
 - Trailing `/` restricts to directories only.
 - Leading `/` anchors to the transfer root (`<SOURCE>`).
+- `?` matches any single character except `/`.
 
-### Candidate discovery
+### Pattern matching behavior
 
-Candidates include `<SOURCE>` itself (represented as `.`) and every descendant, represented by its normalized relative path from `<SOURCE>`.
-
-### Ancestor pruning
-
-If a matched entry has a matched ancestor, only the ancestor is kept. The result is a non-overlapping set of roots in deterministic normalized path order.
+- `--split` is a positive selector, not an ordered include/exclude filter list.
+- The source entry itself is candidate `.`.
+- Every descendant is a candidate, represented by its normalized relative path from `<SOURCE>`.
+- Candidates are tested against the single pattern. If a matched entry has a matched ancestor, only the ancestor is kept (ancestor pruning).
+- The result is a deterministic non-overlapping set of roots in normalized path order.
 
 ### No-match behavior
 
@@ -99,7 +100,7 @@ Each matched root gets a target suffix that preserves its relative layout under 
 
 ### Pure passthrough optimization
 
-Without `--delete-after-import` or `--postprocess`, the split is implemented as a single rsync transfer with equivalent include/exclude filters. No server run or client state is created.
+Without `--delete-after-import` or `--postprocess`, the split is implemented as a single rsync transfer using `--files-from` with the selected roots and their descendants. The file list is NUL-delimited (safe for filenames containing newlines) and transferred with `--relative` so nested entries preserve their parent path under `<TARGET>`. No server run or client state is created.
 
 ### Serialized split for cleanup and postprocess
 

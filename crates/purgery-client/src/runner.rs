@@ -491,4 +491,50 @@ mod tests {
         let result = runner.run_rsync("/src", "host", "/dest");
         assert!(result.is_ok());
     }
+
+    #[test]
+    fn file_list_rsync_argv_puts_options_before_separator() {
+        let runner = RemoteRunner::fake();
+        let files = vec!["a.mp4".to_string(), "b.mp4".to_string()];
+        runner
+            .run_rsync_with_file_list("/src", "host", "/dest", &files)
+            .unwrap();
+        let log = runner.command_log();
+        assert_eq!(log.len(), 1, "must be exactly one rsync process");
+        let cmd = &log[0];
+        // Verify all options appear before -- and operands after.
+        let before_sep = cmd.split(" -- ").next().unwrap();
+        assert!(
+            before_sep.contains("--files-from"),
+            "--files-from must be before --"
+        );
+        assert!(
+            before_sep.contains("--relative"),
+            "--relative must be before --"
+        );
+        assert!(before_sep.contains("--from0"), "--from0 must be before --");
+        assert!(
+            cmd.contains("/src/"),
+            "source dir with trailing / must be after --"
+        );
+        assert!(
+            cmd.contains("host:/dest/"),
+            "dest with trailing / must be after --"
+        );
+    }
+
+    #[test]
+    fn pure_passthrough_split_uses_one_rsync_no_ssh() {
+        let runner = RemoteRunner::fake();
+        let files = vec!["a.mp4".to_string()];
+        runner
+            .run_rsync_with_file_list("/src", "host", "/dest", &files)
+            .unwrap();
+        let log = runner.command_log();
+        assert_eq!(log.len(), 1, "pure passthrough split must use one rsync");
+        assert!(
+            !log[0].contains("ssh"),
+            "must be an rsync command, not ssh"
+        );
+    }
 }

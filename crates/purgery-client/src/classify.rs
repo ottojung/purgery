@@ -280,6 +280,7 @@ mod tests {
     use purgery_core::{ManifestEntryKind, ManifestEntryMode};
     use std::fs;
     use std::os::unix;
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
     #[test]
@@ -399,5 +400,44 @@ mod tests {
             .position(|e| e.relative_path == "Videos/a.mp4")
             .unwrap();
         assert!(file_idx < dir_idx, "files should appear before parent dir");
+    }
+
+    #[test]
+    fn cleanup_sha_failure_fatal_for_directory_descendant() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("Videos");
+        fs::create_dir(dir.join("sub")).unwrap_or_else(|_| fs::create_dir_all(&dir).unwrap());
+        fs::write(dir.join("ok.txt"), "data").unwrap();
+        // Create an unreadable regular file so SHA computation fails.
+        let bad_file = dir.join("secret.txt");
+        fs::write(&bad_file, "hidden").unwrap();
+        // Make it unreadable
+        let mut perms = fs::metadata(&bad_file).unwrap().permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&bad_file, perms).unwrap();
+        let result = capture_cleanup_identity(dir.to_str().unwrap());
+        assert!(
+            result.is_err(),
+            "SHA failure must be fatal for directory descendant"
+        );
+        // Reset permissions so cleanup can remove temp dir
+        let mut perms = fs::metadata(&bad_file).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&bad_file, perms).unwrap();
+    }
+
+    #[test]
+    fn cleanup_sha_failure_fatal_for_file_source() {
+        let tmp = tempdir().unwrap();
+        let file = tmp.path().join("secret.txt");
+        fs::write(&file, "hidden").unwrap();
+        let mut perms = fs::metadata(&file).unwrap().permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&file, perms).unwrap();
+        let result = capture_cleanup_identity(file.to_str().unwrap());
+        assert!(result.is_err(), "SHA failure must be fatal for file source");
+        let mut perms = fs::metadata(&file).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&file, perms).unwrap();
     }
 }
