@@ -4,15 +4,10 @@ use std::process::Command;
 
 fn write_config(temp: &tempfile::TempDir) -> std::path::PathBuf {
     let config_path = temp.path().join("server.toml");
-    let root = temp.path().join("storage");
     let work_dir = temp.path().join("purgery");
     fs::write(
         &config_path,
-        format!(
-            "work_dir = {:?}\n\n[[root]]\nname = \"univ\"\npath = {:?}\n",
-            work_dir.to_string_lossy(),
-            root.to_string_lossy()
-        ),
+        format!("work_dir = {:?}\n", work_dir.to_string_lossy()),
     )
     .unwrap();
     config_path

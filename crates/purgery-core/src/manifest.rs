@@ -26,6 +26,7 @@ pub(crate) fn is_zero_i64(value: &i64) -> bool {
 // ── Manifest Types ───────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub run_id: RunId,
     pub nickname: Nickname,
@@ -34,8 +35,8 @@ pub struct Manifest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ManifestEntry {
-    pub sync_name: SyncName,
     pub local_path: ClientLocalPath,
     pub staged_path: NormalizedRelativePath,
     pub relative_path: NormalizedRelativePath,
@@ -49,12 +50,8 @@ pub struct ManifestEntry {
     pub sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link_target: Option<Utf8PathBuf>,
-    #[serde(default)]
-    pub mode: ManifestEntryMode,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub postprocess_steps: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub covered_by: Option<String>,
 }
 
 impl ManifestEntry {
@@ -131,34 +128,6 @@ impl Manifest {
     pub fn to_toml(&self) -> Result<String, ManifestError> {
         toml::to_string(self).map_err(|e| ManifestError::TomlSerialize(e.to_string()))
     }
-
-    pub fn build_server_manifest(&self) -> Manifest {
-        let entries: Vec<ManifestEntry> = self
-            .entries
-            .iter()
-            .filter(|e| e.mode != ManifestEntryMode::Passthrough)
-            .cloned()
-            .collect();
-        Manifest {
-            run_id: self.run_id.clone(),
-            nickname: self.nickname.clone(),
-            entries,
-        }
-    }
-
-    pub fn to_transfer_plan(&self) -> Vec<TransferPlanEntry> {
-        self.entries
-            .iter()
-            .map(|e| TransferPlanEntry {
-                sync_name: e.sync_name.clone(),
-                relative_path: e.relative_path.clone(),
-                kind: e.kind,
-                mode: e.mode,
-                covered_by: e.covered_by.clone(),
-                postprocess_steps: e.postprocess_steps.clone(),
-            })
-            .collect()
-    }
 }
 
 pub fn compute_sha256(path: &Utf8Path) -> Result<String, std::io::Error> {
@@ -175,63 +144,4 @@ pub fn compute_sha256(path: &Utf8Path) -> Result<String, std::io::Error> {
         hasher.update(&buffer[..bytes_read]);
     }
     Ok(format!("{:x}", hasher.finalize()))
-}
-
-// ── Transfer types ────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TransferRoot {
-    Exact(String),
-    Subtree(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TransferPlanEntry {
-    pub sync_name: SyncName,
-    pub relative_path: NormalizedRelativePath,
-    pub kind: ManifestEntryKind,
-    pub mode: ManifestEntryMode,
-    pub covered_by: Option<String>,
-    pub postprocess_steps: Vec<String>,
-}
-
-pub fn transfer_set_filter(roots: &[TransferRoot]) -> String {
-    let mut lines: Vec<String> = Vec::new();
-    let mut dirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-
-    for root in roots {
-        let path = match root {
-            TransferRoot::Exact(p) | TransferRoot::Subtree(p) => p,
-        };
-        if let Some(parent) = std::path::Path::new(path).parent() {
-            let mut ancestor = String::new();
-            for component in parent.components() {
-                use std::path::Component;
-                if let Component::Normal(c) = component {
-                    if !ancestor.is_empty() {
-                        ancestor.push('/');
-                    }
-                    ancestor.push_str(&c.to_string_lossy());
-                    dirs.insert(ancestor.clone() + "/");
-                }
-            }
-        }
-    }
-
-    for dir in &dirs {
-        lines.push(format!("+ {dir}"));
-    }
-    for root in roots {
-        match root {
-            TransferRoot::Exact(path) => {
-                lines.push(format!("+ {path}"));
-            }
-            TransferRoot::Subtree(path) => {
-                lines.push(format!("+ {path}/"));
-                lines.push(format!("+ {path}/**"));
-            }
-        }
-    }
-    lines.push("- *".to_string());
-    lines.join("\n")
 }

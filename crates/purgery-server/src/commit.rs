@@ -29,7 +29,33 @@ pub(crate) fn prepare_destination_for_file_or_symlink(
     }
 }
 
+fn ensure_destination_root(root: &Utf8Path) -> Result<(), String> {
+    match fs::symlink_metadata(root.as_std_path()) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
+        Ok(_) => Err(format!(
+            "destination root is not a directory: {}",
+            root.as_str()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(root.as_std_path())
+                .map_err(|error| format!("failed to create destination root: {error}"))?;
+            let metadata = fs::symlink_metadata(root.as_std_path())
+                .map_err(|error| format!("failed to inspect destination root: {error}"))?;
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "destination root is not a directory: {}",
+                    root.as_str()
+                ))
+            }
+        }
+        Err(error) => Err(format!("failed to inspect destination root: {error}")),
+    }
+}
+
 fn ensure_final_parent(final_path: &Utf8Path, root: &Utf8Path) -> Result<(), String> {
+    ensure_destination_root(root)?;
     let parent = final_path
         .parent()
         .ok_or_else(|| format!("final path has no parent: {}", final_path.as_str()))?;
@@ -121,12 +147,12 @@ pub(crate) fn commit_symlink_entry(
 pub(crate) fn commit_directory_tree(
     source_root: &Utf8Path,
     final_root: &Utf8Path,
-    server_root: &Utf8Path,
+    destination_root: &Utf8Path,
     run_id: &purgery_core::RunId,
 ) -> Result<CommitDisposition, String> {
     use walkdir::WalkDir;
 
-    let root_disp = commit_directory_entry(final_root, server_root)?;
+    let root_disp = commit_directory_entry(final_root, destination_root)?;
 
     let mut entries: Vec<(Utf8PathBuf, Utf8PathBuf)> = Vec::new();
     for entry in WalkDir::new(source_root.as_std_path())
@@ -152,11 +178,11 @@ pub(crate) fn commit_directory_tree(
         let meta = fs::symlink_metadata(source_entry.as_std_path())
             .map_err(|e| format!("failed to read output entry metadata: {e}"))?;
         if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
-            commit_directory_entry(final_entry, server_root)?;
+            commit_directory_entry(final_entry, destination_root)?;
         } else if meta.file_type().is_file() {
-            commit_regular_file_entry(source_entry, final_entry, server_root, run_id)?;
+            commit_regular_file_entry(source_entry, final_entry, destination_root, run_id)?;
         } else if meta.file_type().is_symlink() {
-            commit_symlink_entry(source_entry, final_entry, server_root, run_id)?;
+            commit_symlink_entry(source_entry, final_entry, destination_root, run_id)?;
         } else {
             return Err(format!(
                 "unsupported output entry type: {}",
@@ -183,17 +209,17 @@ pub(crate) fn commit_directory_tree(
 pub(crate) fn commit_output_entry(
     source: &Utf8Path,
     final_path: &Utf8Path,
-    server_root: &Utf8Path,
+    destination_root: &Utf8Path,
     run_id: &purgery_core::RunId,
 ) -> Result<CommitDisposition, String> {
     let meta = fs::symlink_metadata(source.as_std_path())
         .map_err(|e| format!("failed to inspect output entry: {e}"))?;
     if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
-        commit_directory_tree(source, final_path, server_root, run_id)
+        commit_directory_tree(source, final_path, destination_root, run_id)
     } else if meta.file_type().is_file() {
-        commit_regular_file_entry(source, final_path, server_root, run_id)
+        commit_regular_file_entry(source, final_path, destination_root, run_id)
     } else if meta.file_type().is_symlink() {
-        commit_symlink_entry(source, final_path, server_root, run_id)
+        commit_symlink_entry(source, final_path, destination_root, run_id)
     } else {
         Err(format!(
             "unsupported output entry type: {}",

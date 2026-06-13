@@ -5,6 +5,7 @@ use crate::ManifestEntryKind;
 // ── Durable Cleanup State ────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DurableCleanupState {
     pub nickname: String,
     pub operation_id: String,
@@ -12,8 +13,8 @@ pub struct DurableCleanupState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CleanupEntry {
-    pub sync_name: String,
     pub relative_path: String,
     pub local_path: String,
     #[serde(default)]
@@ -24,6 +25,7 @@ pub struct CleanupEntry {
     pub sha256: Option<String>,
     #[serde(default)]
     pub link_target: Option<String>,
-    pub rsync_succeeded: bool,
+    #[serde(default)]
+    pub import_confirmed: bool,
     pub cleaned: bool,
 }

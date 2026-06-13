@@ -29,49 +29,123 @@ Both binaries support global flags that override config file and environment:
 
 Precedence: CLI flags > config file > default. The `RUST_LOG` environment variable is not consulted; logging is controlled entirely through the config file and CLI flags.
 
-## Setup
+## Server setup
 
 ```sh
-# Create archive root and work_dir directories
-purgery-server bootstrap --config server.toml
-
-# Verify configuration and dependencies
 purgery-server check --config server.toml
 ```
 
-`bootstrap` creates each named root directory and `work_dir` if missing. It does not process runs or run GC.
+Server checks: parse config, verify `work_dir` exists (but does not create it), resolve every postprocess `program`, validate step invariants.
 
-## Boot-time checks
-
-Both binaries support a `check` subcommand that is local and side-effect-free — no SSH, no directory creation, no mutations.
-
-```sh
-purgery-client check --config client.toml
-purgery-server check --config server.toml
-```
-
-Client checks: parse config, resolve `ssh` and `rsync` executables, validate config fields.
-
-Server checks: parse config, verify each named root and `work_dir` exist (but do not create them), resolve every postprocess `program`, validate step invariants.
-
-If server directories do not exist, `check` reports an error and suggests running `bootstrap` first.
+If server directories do not exist, `check` reports an error.
 
 ## Normal operation
 
 ```sh
-# Server: recover processing runs and process ready runs
 purgery-server process-once --config server.toml
 
-# Client: sync files and clean up confirmed imports
-purgery-client sync-and-cleanup --config client.toml
+purgery-client sync -- ~/video.mp4 user@server:/archive
 
-# Server: run garbage collection manually
-purgery-server gc --config server.toml
+purgery-client sync \
+  --postprocess compress-video \
+  --delete-after-import \
+  -- ~/Videos/trip user@server:/archive
+
+purgery-client sync \
+  --postprocess compress-video \
+  --delete-after-import \
+  --split "**/*.mp4" \
+  -- ~/Videos user@server:/archive
 ```
 
 `process-once` runs side-effect-free server validation first, then GC opportunistically, then recovers processing runs and processes ready runs.
 
-`sync-and-cleanup` runs local checks first, then uploads, waits for processing, and cleans up confirmed local entries.
+### Source entry model
+
+The `SOURCE` operand may be a regular file, directory, or symlink. The target is a destination parent. The source entry is imported under the target using the source entry name.
+
+- Trailing slashes on source operands do not change source-entry semantics. `~/Videos` and `~/Videos/` both import the directory named `Videos`.
+- `.` imports the current directory as a source entry named after that directory. `.` is resolved to a concrete directory path before rsync.
+- `..` imports the parent directory as a source entry named after that directory. `..` is resolved to a concrete directory path before rsync.
+- `/` is invalid in every mode — it has no source entry name.
+- Symlink sources remain symlink sources. Source paths are not canonicalized through symlinks.
+
+The source entry name is used consistently for the manifest `relative_path`, staged path, cleanup root, server expected staged path, and server base final path (`<destination>/<source_entry_name>`).
+
+## Split
+
+The `--split <PATTERN>` flag selects source entries to process individually. The pattern is an rsync-style single positive selector, not an ordered include/exclude rule list.
+
+Split operates in one of two modes depending on the presence of `--delete-after-import` or `--postprocess`.
+
+### Pattern syntax
+
+- Patterns with `/` match against relative paths.
+- Patterns without `/` may match any path component.
+- `*` matches within a single directory level (does not cross `/`).
+- `**` matches across directory boundaries.
+- Trailing `/` restricts to directories only.
+- Leading `/` anchors to the transfer root (`<SOURCE>`).
+- `?` matches any single character except `/`.
+
+### Pure passthrough split
+
+Without `--delete-after-import` or `--postprocess`, the client performs one rsync filter transfer with constant include/exclude rules derived from the pattern. No Purgery-side candidate discovery, ancestor pruning, or root ordering is performed. The contract is final destination effect under the generated rsync filter rules.
+
+Rsync filter rules (actual argv, not shell-quoted):
+
+```
+--include=*/
+--include=<P-as-directory-payload>
+--include=<P-as-nested-directory-payload>   (patterns without "/" only)
+--include=<P-as-entry>
+--exclude=*
+```
+
+When shown as shell examples, filter arguments are quoted so the shell does not expand wildcards. The actual process argv values must not contain those quote characters.
+
+```
+rsync -a -m \
+  --include='*/' \
+  --include='<P-as-directory-payload>' \
+  --include='<P-as-nested-directory-payload>' \
+  --include='<P-as-entry>' \
+  --exclude='*' \
+  -- <SOURCE>/ <HOST>:<TARGET>/
+```
+
+`<P-as-entry>` is the pattern verbatim. `<P-as-directory-payload>` appends `/***` to the pattern (stripping a trailing `/` if present), ensuring that top-level matched directories transfer their full payload. `<P-as-nested-directory-payload>` is the same but prefixed with `**/`, ensuring that directories whose names match a component-only pattern at any nesting depth transfer their full payload. This rule is only emitted for patterns without `/`.
+
+The source operand in filter mode intentionally has a trailing slash (`<SOURCE>/`) so selected entries land directly under `<TARGET>` rather than under `<TARGET>/<SOURCE-NAME>`. Nested entries preserve their relative parent paths under `<TARGET>`.
+
+`--split "."` is special: it uses ordinary source-entry rsync (no trailing slash on source, no filter rules) and imports `<SOURCE>` as `<TARGET>/<SOURCE-NAME>`.
+
+Pure passthrough split uses `--prune-empty-dirs` to remove traversal-only directory scaffolding created by the `*/` rule. Empty directories selected only by the filter may not be created at the destination. Cleanup and postprocess split do not use this optimization.
+
+No server run, manifest, or client state is created. No destination collision preflight is performed.
+
+For directory sources, rsync always runs for non-dot patterns; when nothing matches the filter, rsync transfers nothing. For non-directory sources (regular files, symlinks), only `--split "."` can match; other patterns are no-op and exit successfully without invoking rsync.
+
+### Serialized split for cleanup and postprocess
+
+With `--delete-after-import` or `--postprocess`, the client discovers matching entries using Purgery's own pattern matcher. Match determination uses these rules:
+
+- `<SOURCE>` itself is candidate `.` (matched by its relative sentinel, not by basename).
+- Every descendant is a candidate, represented by its normalized relative path from `<SOURCE>`.
+- Candidates are tested against the single pattern. If a matched entry has a matched ancestor, only the ancestor is kept (ancestor pruning).
+- The result is a deterministic non-overlapping set of roots in normalized path order.
+
+Each matched root gets a target suffix that preserves its relative layout under `<TARGET>`:
+
+| Matched entry | Suffix | Example target |
+|---------------|--------|-------|
+| `<SOURCE>` exactly | empty | `user@host:/archive` |
+| Top-level child of `<SOURCE>` | `/` | `user@host:/archive/` |
+| Nested child | `/parent` | `user@host:/archive/parent` |
+
+Each root is processed as a serialized non-split sync operation. The next operation starts only after the previous one is completely done: transfer finished, server run reached terminal (if postprocess), status read, cleanup confirmed, local deletion completed.
+
+If the pattern matches nothing, an info-level message is logged, no transfer is performed, no server run is created, and the client exits successfully with status code 0.
 
 ## Heartbeat and leases
 
@@ -86,7 +160,7 @@ last_heartbeat_unix_secs = 1234567890
 expires_at_unix_secs = 1234569690
 ```
 
-During `sync-and-cleanup`, the client spawns a background thread that calls `heartbeat-run` at the configured interval, covering the entire upload phase including long single rsync transfers. If the heartbeat thread fails, the client aborts before `finish-run`.
+The client keeps the incoming lease fresh by calling `heartbeat-run` at the configured interval from `begin-run` through `finish-run`. If the lease expires before the server accepts the run (`finish-run` completes), the server may GC the incoming run. If a heartbeat call fails and `finish-run` has not yet succeeded, the client aborts the operation. Once `finish-run` succeeds the run has left `incoming` and heartbeat failure is no longer fatal.
 
 The heartbeat updates `last_heartbeat_unix_secs` and extends `expires_at_unix_secs` by `incoming_lease_secs`.
 
@@ -120,9 +194,9 @@ If `failed/<run_id>` already exists, the abandoned run is moved to a GC quaranti
 
 GC is run opportunistically at the start of `process-once` and `begin-run`. It is never run from `check`. Expose separately for cron/systemd timers.
 
-## `server.command` trust model
+## `--server-command` trust model
 
-The client's `[server].command` value is a trusted shell command prefix executed on the remote host via SSH. Purgery appends shell-escaped arguments. This is not intended to accept untrusted input.
+The client's `--server-command` value is a trusted command name executed on the remote host via SSH. Purgery appends shell-escaped arguments. This is not intended to accept untrusted input.
 
 ## Executable resolution
 
@@ -140,8 +214,8 @@ This is used for client `ssh`, `rsync`, and server postprocess `program` values.
 
 ## Final-storage overlay
 
-Each run overlays its uploaded tree onto final storage with recursive archive-mode rsync semantics and no delete option. Existing directories are merged, regular files and symlinks replace compatible destination entries, and extra final descendants remain. A regular file or symlink does not replace a non-empty destination directory. Source directory entries can replace conflicting file or symlink parents before descendants are imported.
+Each run overlays its uploaded source onto the destination with recursive archive-mode rsync semantics and no delete option. The source entry base final path is `<destination>/<source_entry_name>`. If `keep_original = true`, the original work entry commits to that base final path. Each expected postprocess output commits under the same parent, using the output file name. Existing directories are merged, regular files and symlinks replace compatible destination entries.
 
-Symlink targets are stored and recreated literally. Neither staged symlinks nor final-storage symlinks are traversed as directories. Postprocessing applies to regular files, directories, and symlinks. Client cleanup removes only confirmed unchanged local originals, respecting entry-kind identity checks.
+Symlink targets are stored and recreated literally. Neither staged symlinks nor destination symlinks are traversed as directories. Postprocessing applies to the source entry, regardless of kind.
 
 A crash can expose a prefix of the entry overlay. This is expected: the run remains in `processing/` without a terminal status and `process-once` replays it until the final tree converges. The operation is not an all-or-nothing filesystem transaction.

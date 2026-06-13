@@ -1,0 +1,1440 @@
+/// Rsync-style pattern matching for --split.
+use std::path::Path;
+use walkdir::WalkDir;
+
+/// Rsync filter rules for pure passthrough split transfers.
+///
+/// Each rule is an include/exclude pattern as passed to rsync's
+/// `--include` or `--exclude` option, in positional order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SplitFilters {
+    pub include_rules: Vec<String>,
+    pub exclude_rule: String,
+}
+
+/// Build rsync include/exclude filter rules for a split pattern.
+///
+/// Generates a constant number of rules:
+///
+/// - `--include='*/'` keeps parent directories traversable.
+/// - `--include='<P-as-directory-payload>'` transfers matched directory
+///   payloads at the top level.
+/// - `--include='<P-as-nested-directory-payload>'` transfers matched
+///   directory payloads at any nesting depth (only for patterns without
+///   `/`). Without this additional rule, a directory whose name matches
+///   a component-only pattern at a nested level would match as an entry
+///   but would not transfer its payload.
+/// - `--include='<P-as-entry>'` selects matching files, symlinks, and
+///   directory entries.
+/// - `--exclude='*'` prevents unrelated entries from being copied.
+///
+/// `<P-as-entry>` is the pattern unchanged.
+///
+/// `<P-as-directory-payload>` is the pattern with a trailing `***`
+/// element appended (after stripping any existing trailing `/`), so
+/// rsync knows to recurse into matched directories.
+///
+/// `<P-as-nested-directory-payload>` is the same but prefixed with
+/// `**/` so directories whose names match a component-only pattern
+/// at any nesting depth transfer their full payload.
+///
+/// Returns `None` for the `"."` sentinel pattern which means the
+/// source entry itself matched — that case uses ordinary rsync.
+pub(crate) fn build_split_filters(pattern: &str) -> Option<SplitFilters> {
+    if pattern == "." {
+        return None;
+    }
+
+    let dir_payload = build_dir_payload(pattern);
+
+    let has_slash = pattern.contains('/');
+    let mut include_rules = vec!["*/".to_string(), dir_payload];
+    if !has_slash {
+        include_rules.push(build_nested_dir_payload(pattern));
+    }
+    include_rules.push(pattern.to_string());
+
+    Some(SplitFilters {
+        include_rules,
+        exclude_rule: "*".to_string(),
+    })
+}
+
+/// Build the directory-payload include pattern.
+///
+/// If the pattern ends with `/`, strip it and append `/***`.
+/// Otherwise, append `/***`.
+///
+/// Examples:
+///
+/// - `"*.mp4"` → `"*.mp4/***"`
+/// - `"Photos/"` → `"Photos/***"`
+/// - `"**/*.mp4"` → `"**/*.mp4/***"`
+fn build_dir_payload(pattern: &str) -> String {
+    let stripped = pattern.trim_end_matches('/');
+    format!("{}/***", stripped)
+}
+
+/// Build the nested directory-payload include pattern for patterns
+/// without `/`. This ensures directories whose name matches a
+/// component-only pattern at any nesting depth transfer their full
+/// payload.
+///
+/// Example: for `"*.mp4"`, produces `"**/*.mp4/***"`.
+fn build_nested_dir_payload(pattern: &str) -> String {
+    let stripped = pattern.trim_end_matches('/');
+    format!("**/{}/***", stripped)
+}
+
+/// Validate a split pattern, returning an error for patterns that are
+/// empty, consist only of `/` separators, or would otherwise produce
+/// dangerous filter rules when translated for pure passthrough split.
+///
+/// Rejected patterns:
+///
+/// - `""` (empty)
+/// - `"/"` and `"///"` (root-anchored-slash-only — stripped to empty,
+///   causing `build_dir_payload` to produce `"***"` with no qualifying
+///   prefix, which matches everything)
+pub(crate) fn validate_split_pattern(pattern: &str) -> Result<(), String> {
+    if pattern.is_empty() {
+        return Err("split pattern must not be empty".to_string());
+    }
+
+    let mut stripped = pattern.trim_end_matches('/');
+    if stripped.starts_with('/') {
+        stripped = &stripped[1..];
+    }
+
+    if stripped.is_empty() {
+        return Err(format!(
+            "split pattern \"{pattern}\" consists only of path separators"
+        ));
+    }
+
+    Ok(())
+}
+
+pub(crate) struct SplitCandidate {
+    pub path: String,
+    pub is_dir: bool,
+}
+
+/// Discover split entries under `source` that match `pattern`.
+///
+/// Returns a deterministic non-overlapping set of root paths in
+/// normalized path order, with ancestor pruning applied.
+pub(crate) fn discover_split_entries(
+    source: &str,
+    pattern: &str,
+) -> Result<Vec<SplitCandidate>, String> {
+    let source_path = Path::new(source);
+    if std::fs::symlink_metadata(source_path).is_err() {
+        return Ok(Vec::new());
+    }
+
+    let matcher = PatternMatcher::new(pattern);
+
+    // Collect all candidates (including source itself).
+    let mut candidates: Vec<SplitCandidate> = Vec::new();
+
+    // SOURCE itself is candidate ".".
+    candidates.push(SplitCandidate {
+        path: source.to_owned(),
+        is_dir: std::fs::symlink_metadata(source_path)
+            .map(|m| m.file_type().is_dir() && !m.file_type().is_symlink())
+            .unwrap_or(false),
+    });
+
+    // Walk descendants.
+    for walk_entry in WalkDir::new(source_path).follow_links(false).min_depth(1) {
+        let walk_entry = match walk_entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let path = walk_entry.path();
+        let relative = match path.strip_prefix(source_path) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let candidate = source_path.join(relative);
+        candidates.push(SplitCandidate {
+            path: candidate.to_string_lossy().to_string(),
+            is_dir: walk_entry.file_type().is_dir() && !walk_entry.file_type().is_symlink(),
+        });
+    }
+
+    // Filter by pattern.
+    let matched: Vec<SplitCandidate> = candidates
+        .into_iter()
+        .filter(|c| {
+            let relative_str = if c.path == source {
+                ".".to_string()
+            } else {
+                let path = Path::new(&c.path);
+                path.strip_prefix(source_path)
+                    .unwrap_or(std::path::Path::new(""))
+                    .to_string_lossy()
+                    .to_string()
+            };
+            matcher.is_match(&relative_str, c.is_dir)
+        })
+        .collect();
+
+    // Prune descendants of matched ancestors.
+    let mut pruned: Vec<SplitCandidate> = Vec::new();
+    for candidate in &matched {
+        if candidate.path == source {
+            // SOURCE matches — all descendants are pruned.
+            return Ok(vec![SplitCandidate {
+                path: source.to_owned(),
+                is_dir: true,
+            }]);
+        }
+        // Check if any ancestor is also matched.
+        let has_ancestor = matched.iter().any(|other| {
+            if other.path == candidate.path {
+                return false;
+            }
+            let candidate_path = Path::new(&candidate.path);
+            let other_path = Path::new(&other.path);
+            candidate_path.starts_with(other_path)
+        });
+        if !has_ancestor {
+            pruned.push(SplitCandidate {
+                path: candidate.path.clone(),
+                is_dir: candidate.is_dir,
+            });
+        }
+    }
+
+    // Deterministic sort.
+    pruned.sort_by(|a, b| a.path.cmp(&b.path));
+
+    Ok(pruned)
+}
+
+/// Compute the target suffix for a matched root relative to source.
+///
+/// - source itself → empty (root already matches target)
+/// - top-level child → "/" (rsync destination parent)
+/// - nested child → "/parent" (no trailing slash — run_rsync adds it)
+pub(crate) fn split_target_suffix(source: &str, root: &str) -> String {
+    if root == source {
+        return String::new();
+    }
+    let source_path = Path::new(source);
+    let root_path = Path::new(root);
+    if let Ok(relative) = root_path.strip_prefix(source_path) {
+        let parent = relative
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new(""));
+        if parent.as_os_str().is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", parent.to_string_lossy())
+        }
+    } else {
+        String::new()
+    }
+}
+
+struct PatternMatcher {
+    pattern: String,
+    anchored: bool,
+    dir_only: bool,
+}
+
+impl PatternMatcher {
+    fn new(pattern: &str) -> Self {
+        let mut p = pattern;
+        let anchored = p.starts_with('/');
+        if anchored {
+            p = &p[1..];
+        }
+        let dir_only = p.ends_with('/');
+        if dir_only {
+            p = &p[..p.len() - 1];
+        }
+        PatternMatcher {
+            pattern: p.to_owned(),
+            anchored,
+            dir_only,
+        }
+    }
+
+    fn is_match(&self, path: &str, is_dir: bool) -> bool {
+        if self.dir_only && !is_dir {
+            return false;
+        }
+        // The root sentinel "." is not a regular path component and
+        // should not match dir-only patterns like "*/".
+        if self.dir_only && path == "." {
+            return false;
+        }
+
+        // For rsync patterns without /, match against any component.
+        let has_slash = self.pattern.contains('/') || self.anchored;
+
+        if has_slash || self.anchored {
+            glob_match(&self.pattern, path)
+        } else {
+            // Unanchored pattern without /: match against any component.
+            let components: Vec<&str> = path.split('/').collect();
+            components.iter().any(|c| glob_match(&self.pattern, c))
+        }
+    }
+}
+
+/// Simple glob matching supporting * and **.
+/// - * matches anything except /
+/// - ** matches anything including /
+fn glob_match(pattern: &str, path: &str) -> bool {
+    if pattern == "**" {
+        return true;
+    }
+
+    if !pattern.contains("**") {
+        return simple_glob(pattern, path);
+    }
+
+    // Split by **. Each part is itself a simple glob pattern.
+    let parts: Vec<&str> = pattern.split("**").collect();
+
+    // Strip leading / from parts after **, since ** matches any depth.
+    let segments: Vec<&str> = parts
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            if p.is_empty() {
+                p
+            } else if i > 0 && p.starts_with('/') {
+                &p[1..]
+            } else {
+                p
+            }
+        })
+        .collect();
+
+    let parts_with_positions: Vec<usize> = segments
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| !s.is_empty())
+        .map(|(i, _)| i)
+        .collect();
+
+    if parts_with_positions.is_empty() {
+        return true; // just **
+    }
+
+    let _first_idx = parts_with_positions[0];
+    let _last_idx = parts_with_positions[parts_with_positions.len() - 1];
+
+    let mut search_start = 0usize;
+
+    for (i, &seg_idx) in parts_with_positions.iter().enumerate() {
+        let segment = segments[seg_idx];
+        if i == 0 && seg_idx == 0 {
+            // First part matches at start.
+            if let Some(len) = first_match_len(segment, path, 0) {
+                search_start = len;
+            } else {
+                return false;
+            }
+        } else if i == parts_with_positions.len() - 1 && seg_idx == segments.len() - 1 {
+            // Last part after ** matches a suffix of the path anchored at end.
+            // Try each suffix starting after a / boundary, from shortest to longest.
+            let mut suffix_start = match path[search_start..].rfind('/') {
+                Some(pos) => search_start + pos + 1,
+                None => search_start,
+            };
+            let mut found_suffix = false;
+            loop {
+                let suffix = &path[suffix_start..];
+                if simple_glob(segment, suffix) {
+                    found_suffix = true;
+                    break;
+                }
+                if suffix_start <= search_start {
+                    break;
+                }
+                // Move to previous / boundary
+                match path[..suffix_start - 1].rfind('/') {
+                    Some(pos) => suffix_start = pos + 1,
+                    None => {
+                        suffix_start = search_start;
+                    }
+                }
+            }
+            if !found_suffix {
+                return false;
+            }
+        } else {
+            // Middle part matches somewhere after search_start.
+            let mut found = false;
+            let mut pos = search_start;
+            while pos <= path.len() {
+                if simple_glob(segment, &path[pos..]) {
+                    if let Some(len) = first_match_len(segment, &path[pos..], 0) {
+                        search_start = pos + len;
+                        found = true;
+                        break;
+                    }
+                }
+                pos += 1;
+            }
+            if !found {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn first_match_len(pattern: &str, path: &str, start: usize) -> Option<usize> {
+    let mut pi = 0;
+    let mut si = start;
+    let pat = pattern.as_bytes();
+    let pth = path.as_bytes();
+
+    while pi < pat.len() {
+        match pat[pi] {
+            b'*' => {
+                pi += 1;
+                if pi == pat.len() {
+                    let end = path[si..].find('/').unwrap_or(path.len() - si);
+                    return Some(si + end);
+                }
+                let mut matched = None;
+                while si < pth.len() && pth[si] != b'/' {
+                    if let Some(len) = first_match_len(&pattern[pi..], path, si) {
+                        matched = Some(len);
+                        break;
+                    }
+                    si += 1;
+                }
+                return matched;
+            }
+            b'?' => {
+                if si >= pth.len() || pth[si] == b'/' {
+                    return None;
+                }
+                pi += 1;
+                si += 1;
+            }
+            b'[' => {
+                pi += 1;
+                if pi >= pat.len() {
+                    return None;
+                }
+                let negated = pat[pi] == b'!';
+                if negated {
+                    pi += 1;
+                }
+                if pi >= pat.len() || si >= pth.len() || pth[si] == b'/' {
+                    return None;
+                }
+                let mut matched = false;
+                while pi < pat.len() && pat[pi] != b']' {
+                    if pi + 2 < pat.len() && pat[pi + 1] == b'-' && pat[pi + 2] != b']' {
+                        let lo = pat[pi];
+                        let hi = pat[pi + 2];
+                        let ch = pth[si];
+                        if ch >= lo && ch <= hi {
+                            matched = true;
+                        }
+                        pi += 3;
+                    } else {
+                        if pat[pi] == pth[si] {
+                            matched = true;
+                        }
+                        pi += 1;
+                    }
+                }
+                if pi >= pat.len() || pat[pi] != b']' {
+                    return None;
+                }
+                pi += 1;
+                if negated {
+                    matched = !matched;
+                }
+                if !matched {
+                    return None;
+                }
+                si += 1;
+            }
+            c => {
+                if si >= pth.len() || pth[si] != c {
+                    return None;
+                }
+                pi += 1;
+                si += 1;
+            }
+        }
+    }
+    Some(si)
+}
+
+fn simple_glob(pattern: &str, path: &str) -> bool {
+    if pattern == path {
+        return true;
+    }
+    if !pattern.contains('*') && !pattern.contains('?') && !pattern.contains('[') {
+        return pattern == path;
+    }
+
+    let pat_bytes = pattern.as_bytes();
+    let path_bytes = path.as_bytes();
+    let mut pi = 0;
+    let mut si = 0;
+
+    while pi < pat_bytes.len() {
+        match pat_bytes[pi] {
+            b'*' => {
+                pi += 1;
+                if pi == pat_bytes.len() {
+                    return !path[si..].contains('/');
+                }
+                while si < path_bytes.len() {
+                    if simple_glob(&pattern[pi..], &path[si..]) {
+                        return true;
+                    }
+                    if path_bytes[si] == b'/' {
+                        break;
+                    }
+                    si += 1;
+                }
+                return false;
+            }
+            b'?' => {
+                if si >= path_bytes.len() || path_bytes[si] == b'/' {
+                    return false;
+                }
+                pi += 1;
+                si += 1;
+            }
+            b'[' => {
+                // Bracket expression [...].
+                pi += 1;
+                if pi >= pat_bytes.len() {
+                    return false;
+                }
+                let negated = pat_bytes[pi] == b'!';
+                if negated {
+                    pi += 1;
+                }
+                if pi >= pat_bytes.len() {
+                    return false;
+                }
+                if si >= path_bytes.len() || path_bytes[si] == b'/' {
+                    return false;
+                }
+                let mut matched = false;
+                while pi < pat_bytes.len() && pat_bytes[pi] != b']' {
+                    if pi + 2 < pat_bytes.len()
+                        && pat_bytes[pi + 1] == b'-'
+                        && pat_bytes[pi + 2] != b']'
+                    {
+                        // Range like a-z
+                        let lo = pat_bytes[pi];
+                        let hi = pat_bytes[pi + 2];
+                        let ch = path_bytes[si];
+                        if ch >= lo && ch <= hi {
+                            matched = true;
+                        }
+                        pi += 3;
+                    } else {
+                        if pat_bytes[pi] == path_bytes[si] {
+                            matched = true;
+                        }
+                        pi += 1;
+                    }
+                }
+                if pi >= pat_bytes.len() || pat_bytes[pi] != b']' {
+                    return false;
+                }
+                pi += 1;
+                if negated {
+                    matched = !matched;
+                }
+                if !matched {
+                    return false;
+                }
+                si += 1;
+            }
+            c => {
+                if si >= path_bytes.len() || path_bytes[si] != c {
+                    return false;
+                }
+                pi += 1;
+                si += 1;
+            }
+        }
+    }
+
+    si == path_bytes.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix;
+    use tempfile::tempdir;
+
+    #[test]
+    fn pattern_star_matches_single_component() {
+        let m = PatternMatcher::new("*.txt");
+        assert!(m.is_match("file.txt", false));
+        assert!(m.is_match("sub/file.txt", false));
+    }
+
+    #[test]
+    fn pattern_star_does_not_cross_slash() {
+        let m = PatternMatcher::new("*/*.txt");
+        assert!(m.is_match("sub/file.txt", false));
+        assert!(!m.is_match("file.txt", false));
+    }
+
+    #[test]
+    fn pattern_doublestar_matches_across_dirs() {
+        let m = PatternMatcher::new("**/*.txt");
+        assert!(m.is_match("file.txt", false));
+        assert!(m.is_match("sub/file.txt", false));
+        assert!(m.is_match("a/b/c/file.txt", false));
+    }
+
+    #[test]
+    fn pattern_anchored_matches_from_root() {
+        let m = PatternMatcher::new("/file.txt");
+        assert!(m.is_match("file.txt", false));
+        assert!(!m.is_match("sub/file.txt", false));
+    }
+
+    #[test]
+    fn discover_includes_source_itself() {
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("a.txt"), "").unwrap();
+        let entries = discover_split_entries(tmp.path().to_str().unwrap(), ".").unwrap();
+        assert!(!entries.is_empty());
+        // Should include the source directory itself when "." matches
+    }
+
+    #[test]
+    fn ancestor_pruning_removes_descendants() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("photos");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("a.jpg"), "").unwrap();
+        let entries = discover_split_entries(tmp.path().to_str().unwrap(), "**").unwrap();
+        // ** matches everything, so only source itself should remain
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn top_level_child_has_slash_suffix() {
+        let suffix = split_target_suffix("/src", "/src/a.mp4");
+        assert_eq!(suffix, "/");
+    }
+
+    #[test]
+    fn nested_child_has_parent_suffix() {
+        let suffix = split_target_suffix("/src", "/src/2024/a.mp4");
+        assert_eq!(suffix, "/2024");
+    }
+
+    #[test]
+    fn source_itself_has_empty_suffix() {
+        let suffix = split_target_suffix("/src", "/src");
+        assert_eq!(suffix, "");
+    }
+
+    #[test]
+    fn no_match_returns_empty() {
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("a.txt"), "").unwrap();
+        let entries = discover_split_entries(tmp.path().to_str().unwrap(), "*.mp4").unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn split_dir_pattern_selects_directories() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("photos");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("a.jpg"), "").unwrap();
+        fs::write(tmp.path().join("readme.txt"), "").unwrap();
+        let entries = discover_split_entries(tmp.path().to_str().unwrap(), "*/").unwrap();
+        assert_eq!(entries.len(), 1);
+        let path = std::path::Path::new(&entries[0].path);
+        assert_eq!(path.file_name().unwrap().to_str().unwrap(), "photos");
+    }
+
+    #[test]
+    fn split_dot_selects_source_itself() {
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("a.txt"), "").unwrap();
+        let entries = discover_split_entries(tmp.path().to_str().unwrap(), ".").unwrap();
+        // Source itself should be the only entry.
+        assert!(!entries.is_empty());
+        let sources: Vec<&str> = entries
+            .iter()
+            .map(|c| {
+                std::path::Path::new(&c.path)
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+            })
+            .collect();
+        assert!(sources
+            .iter()
+            .any(|s| *s == tmp.path().file_name().unwrap().to_str().unwrap()));
+    }
+
+    #[test]
+    fn split_mp4_matches_top_level_and_nested() {
+        let tmp = tempdir().unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        fs::write(tmp.path().join("a.mp4"), "").unwrap();
+        fs::write(tmp.path().join("b.txt"), "").unwrap();
+        fs::write(tmp.path().join("sub/c.mp4"), "").unwrap();
+        let entries = discover_split_entries(tmp.path().to_str().unwrap(), "*.mp4").unwrap();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn split_anchored_matches_only_root_level() {
+        let tmp = tempdir().unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        fs::write(tmp.path().join("a.mp4"), "").unwrap();
+        fs::write(tmp.path().join("sub/a.mp4"), "").unwrap();
+        let entries = discover_split_entries(tmp.path().to_str().unwrap(), "/a.mp4").unwrap();
+        // Only the root-level a.mp4 should match.
+        assert_eq!(entries.len(), 1);
+        let path = std::path::Path::new(&entries[0].path);
+        assert_eq!(path.file_name().unwrap(), "a.mp4");
+        assert!(path.parent().unwrap() == tmp.path());
+    }
+
+    #[test]
+    fn split_doublestar_mp4_matches_any_depth() {
+        let tmp = tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("a/b")).unwrap();
+        fs::write(tmp.path().join("a.mp4"), "").unwrap();
+        fs::write(tmp.path().join("a/b/c.mp4"), "").unwrap();
+        let entries = discover_split_entries(tmp.path().to_str().unwrap(), "**/*.mp4").unwrap();
+        assert!(!entries.is_empty());
+    }
+
+    #[test]
+    fn split_pattern_with_slash_limits_depth() {
+        let tmp = tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("2024/sub")).unwrap();
+        fs::write(tmp.path().join("2024/a.mp4"), "").unwrap();
+        fs::write(tmp.path().join("2024/sub/b.mp4"), "").unwrap();
+        // Pattern "2024/*.mp4" should match a.mp4 but not sub/b.mp4
+        let entries = discover_split_entries(tmp.path().to_str().unwrap(), "2024/*.mp4").unwrap();
+        assert_eq!(entries.len(), 1);
+        let name = std::path::Path::new(&entries[0].path)
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(name, "a.mp4");
+    }
+
+    #[test]
+    fn split_doublestar_under_dir_matches_nested() {
+        let tmp = tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("2024/sub")).unwrap();
+        fs::write(tmp.path().join("2024/a.mp4"), "").unwrap();
+        fs::write(tmp.path().join("2024/sub/b.mp4"), "").unwrap();
+        // Pattern "2024/**/*.mp4" should match both
+        let entries =
+            discover_split_entries(tmp.path().to_str().unwrap(), "2024/**/*.mp4").unwrap();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn split_ancestor_pruning_removes_descendants() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("photos");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("a.jpg"), "").unwrap();
+        let entries = discover_split_entries(tmp.path().to_str().unwrap(), "**").unwrap();
+        // ** matches everything, so only source itself should remain
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn split_deterministic_ordering() {
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("c.txt"), "").unwrap();
+        fs::write(tmp.path().join("a.txt"), "").unwrap();
+        fs::write(tmp.path().join("b.txt"), "").unwrap();
+        let entries = discover_split_entries(tmp.path().to_str().unwrap(), "*.txt").unwrap();
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|e| {
+                std::path::Path::new(&e.path)
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["a.txt", "b.txt", "c.txt"],
+            "must be alphabetically sorted"
+        );
+    }
+
+    #[test]
+    fn split_question_matches_single_char() {
+        let m = PatternMatcher::new("a?c.mp4");
+        assert!(m.is_match("abc.mp4", false));
+        assert!(!m.is_match("abbc.mp4", false));
+    }
+
+    #[test]
+    fn bracket_expression_matches_character_class() {
+        let m = PatternMatcher::new("[ab].txt");
+        assert!(m.is_match("a.txt", false));
+        assert!(m.is_match("b.txt", false));
+        assert!(!m.is_match("c.txt", false));
+    }
+
+    #[test]
+    fn bracket_expression_range_matches() {
+        let m = PatternMatcher::new("[a-c].txt");
+        assert!(m.is_match("a.txt", false));
+        assert!(m.is_match("b.txt", false));
+        assert!(m.is_match("c.txt", false));
+        assert!(!m.is_match("d.txt", false));
+    }
+
+    #[test]
+    fn bracket_expression_negation() {
+        let m = PatternMatcher::new("[!a].txt");
+        assert!(!m.is_match("a.txt", false));
+        assert!(m.is_match("b.txt", false));
+    }
+
+    #[test]
+    fn split_dir_pattern_does_not_match_symlink_to_directory() {
+        let tmp = tempdir().unwrap();
+        let real_dir = tmp.path().join("realdir");
+        fs::create_dir(&real_dir).unwrap();
+        let link = tmp.path().join("linkdir");
+        unix::fs::symlink(&real_dir, &link).unwrap();
+        fs::write(tmp.path().join("f.txt"), "").unwrap();
+        // Pattern "*/" should match realdir but not linkdir (symlink) or f.txt (file)
+        let entries = discover_split_entries(tmp.path().to_str().unwrap(), "*/").unwrap();
+        let matched: Vec<&str> = entries
+            .iter()
+            .map(|e| {
+                std::path::Path::new(&e.path)
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            matched,
+            vec!["realdir"],
+            "only real directory should match */"
+        );
+    }
+
+    #[test]
+    fn split_dot_returns_exactly_source_itself() {
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("a.txt"), "").unwrap();
+        let entries = discover_split_entries(tmp.path().to_str().unwrap(), ".").unwrap();
+        assert_eq!(entries.len(), 1, "dot pattern must match exactly one entry");
+        let path = std::path::Path::new(&entries[0].path);
+        assert_eq!(path, tmp.path(), "must match the source directory itself");
+        assert!(entries[0].is_dir, "source is a directory");
+    }
+
+    #[test]
+    fn split_mp4_matches_exact_files() {
+        let tmp = tempdir().unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        fs::write(tmp.path().join("a.mp4"), "").unwrap();
+        fs::write(tmp.path().join("b.txt"), "").unwrap();
+        fs::write(tmp.path().join("sub/c.mp4"), "").unwrap();
+        let entries = discover_split_entries(tmp.path().to_str().unwrap(), "*.mp4").unwrap();
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|e| {
+                std::path::Path::new(&e.path)
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"a.mp4"));
+        assert!(names.contains(&"c.mp4"));
+        assert!(
+            !names.contains(&"b.txt"),
+            "unrelated .txt files must not be included"
+        );
+    }
+
+    // ── Filter generation tests ──
+
+    #[test]
+    fn build_split_filters_dot_returns_none() {
+        assert!(build_split_filters(".").is_none());
+    }
+
+    // ── Pattern validation tests ──
+
+    #[test]
+    fn validate_split_pattern_rejects_empty() {
+        let err = validate_split_pattern("").unwrap_err();
+        assert!(err.contains("must not be empty"));
+    }
+
+    #[test]
+    fn validate_split_pattern_rejects_root_slash() {
+        let err = validate_split_pattern("/").unwrap_err();
+        assert!(err.contains("path separators"));
+    }
+
+    #[test]
+    fn validate_split_pattern_rejects_multislash() {
+        let err = validate_split_pattern("///").unwrap_err();
+        assert!(err.contains("path separators"));
+    }
+
+    #[test]
+    fn validate_split_pattern_accepts_dot() {
+        assert!(validate_split_pattern(".").is_ok());
+    }
+
+    #[test]
+    fn validate_split_pattern_accepts_star_mp4() {
+        assert!(validate_split_pattern("*.mp4").is_ok());
+    }
+
+    #[test]
+    fn validate_split_pattern_accepts_doublestar() {
+        assert!(validate_split_pattern("**/*.mp4").is_ok());
+    }
+
+    #[test]
+    fn validate_split_pattern_accepts_dir_trailing_slash() {
+        assert!(validate_split_pattern("Photos/").is_ok());
+    }
+
+    #[test]
+    fn build_split_filters_star_mp4() {
+        let f = build_split_filters("*.mp4").unwrap();
+        assert_eq!(
+            f.include_rules,
+            vec![
+                "*/".to_string(),
+                "*.mp4/***".to_string(),
+                "**/*.mp4/***".to_string(),
+                "*.mp4".to_string()
+            ]
+        );
+        assert_eq!(f.exclude_rule, "*".to_string());
+    }
+
+    #[test]
+    fn build_split_filters_doublestar_mp4() {
+        let f = build_split_filters("**/*.mp4").unwrap();
+        assert_eq!(
+            f.include_rules,
+            vec![
+                "*/".to_string(),
+                "**/*.mp4/***".to_string(),
+                "**/*.mp4".to_string()
+            ]
+        );
+        assert_eq!(f.exclude_rule, "*".to_string());
+    }
+
+    #[test]
+    fn build_split_filters_photos_slash() {
+        let f = build_split_filters("Photos/").unwrap();
+        assert_eq!(
+            f.include_rules,
+            vec![
+                "*/".to_string(),
+                "Photos/***".to_string(),
+                "Photos/".to_string()
+            ]
+        );
+        assert_eq!(f.exclude_rule, "*".to_string());
+    }
+
+    #[test]
+    fn build_split_filters_always_has_exclude_wildcard() {
+        let f = build_split_filters("*.mp4").unwrap();
+        assert_eq!(f.exclude_rule, "*".to_string());
+    }
+
+    #[test]
+    fn build_split_filters_always_has_dir_traversal() {
+        let f = build_split_filters("pattern").unwrap();
+        assert_eq!(f.include_rules[0], "*/".to_string());
+    }
+
+    // ── Real rsync behavioral tests ──
+
+    fn rsync_available() -> bool {
+        std::process::Command::new("rsync")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn run_local_filter_rsync(
+        source: &std::path::Path,
+        dest: &std::path::Path,
+        include_rules: &[String],
+        exclude_rule: &str,
+    ) -> bool {
+        let mut cmd = std::process::Command::new("rsync");
+        cmd.args(["--archive", "--prune-empty-dirs"]);
+        for rule in include_rules {
+            cmd.arg(format!("--include={rule}"));
+        }
+        cmd.arg(format!("--exclude={exclude_rule}"));
+        cmd.arg("--");
+        cmd.arg(format!("{}/", source.display()));
+        cmd.arg(format!("{}/", dest.display()));
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        cmd.status().map(|s| s.success()).unwrap_or(false)
+    }
+
+    /// Collect relative paths under a directory, recording files, directories,
+    /// and symlinks. Subdirectory entries use a trailing `/` suffix so
+    /// directory-pruning assertions can observe directory presence.
+    fn list_entries(dir: &std::path::Path) -> Vec<String> {
+        let mut entries = Vec::new();
+        for walk_entry in walkdir::WalkDir::new(dir).sort_by_file_name().min_depth(1) {
+            let walk_entry = walk_entry.unwrap();
+            let relative = walk_entry.path().strip_prefix(dir).unwrap();
+            if walk_entry.file_type().is_dir() {
+                entries.push(format!("{}/", relative.to_string_lossy()));
+            } else {
+                entries.push(relative.to_string_lossy().to_string());
+            }
+        }
+        entries
+    }
+
+    #[test]
+    fn rsync_filter_prunes_traversal_only_directories() {
+        if !rsync_available() {
+            return;
+        }
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("deep/nested")).unwrap();
+        fs::write(src.join("a.mp4"), "data").unwrap();
+        fs::write(src.join("deep/nested/deepest.txt"), "text").unwrap();
+
+        let dest = tmp.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let f = build_split_filters("*.mp4").unwrap();
+        assert!(run_local_filter_rsync(
+            &src,
+            &dest,
+            &f.include_rules,
+            &f.exclude_rule
+        ));
+
+        let entries = list_entries(&dest);
+        assert!(entries.contains(&"a.mp4".to_string()));
+        assert!(
+            !entries.contains(&"deep/".to_string()),
+            "traversal-only directory deep must be pruned by --prune-empty-dirs"
+        );
+        assert!(
+            !entries.contains(&"deep/nested/".to_string()),
+            "traversal-only directory deep/nested must be pruned"
+        );
+        assert!(
+            !entries.contains(&"deep/nested/deepest.txt".to_string()),
+            "non-matching file must not be copied"
+        );
+    }
+
+    #[test]
+    fn rsync_filter_star_mp4_copies_matching_not_txt() {
+        if !rsync_available() {
+            return;
+        }
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("a.mp4"), "mp4-data").unwrap();
+        fs::write(src.join("b.txt"), "txt-data").unwrap();
+        fs::write(src.join("sub/c.mp4"), "nested-mp4").unwrap();
+        fs::write(src.join("sub/d.txt"), "nested-txt").unwrap();
+
+        let dest = tmp.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let f = build_split_filters("*.mp4").unwrap();
+        assert!(run_local_filter_rsync(
+            &src,
+            &dest,
+            &f.include_rules,
+            &f.exclude_rule
+        ));
+
+        let entries = list_entries(&dest);
+        assert!(
+            entries.contains(&"a.mp4".to_string()),
+            "must copy top-level a.mp4"
+        );
+        assert!(
+            entries.contains(&"sub/c.mp4".to_string()),
+            "must copy nested c.mp4"
+        );
+        assert!(
+            !entries.contains(&"b.txt".to_string()),
+            "must NOT copy unrelated b.txt"
+        );
+        assert!(
+            !entries.contains(&"sub/d.txt".to_string()),
+            "must NOT copy nested unrelated d.txt"
+        );
+        assert!(
+            entries.contains(&"sub/".to_string()),
+            "sub directory must exist (it contains transferred c.mp4)"
+        );
+    }
+
+    #[test]
+    fn rsync_filter_doublestar_mp4_copies_any_depth() {
+        if !rsync_available() {
+            return;
+        }
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("a/b/c")).unwrap();
+        fs::write(src.join("top.mp4"), "data").unwrap();
+        fs::write(src.join("a/deep.mp4"), "data").unwrap();
+        fs::write(src.join("a/b/c/deepest.mp4"), "data").unwrap();
+        fs::write(src.join("skip.txt"), "data").unwrap();
+
+        let dest = tmp.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let f = build_split_filters("**/*.mp4").unwrap();
+        assert!(run_local_filter_rsync(
+            &src,
+            &dest,
+            &f.include_rules,
+            &f.exclude_rule
+        ));
+
+        let entries = list_entries(&dest);
+        assert!(entries.contains(&"top.mp4".to_string()));
+        assert!(entries.contains(&"a/deep.mp4".to_string()));
+        assert!(entries.contains(&"a/b/c/deepest.mp4".to_string()));
+        assert!(!entries.contains(&"skip.txt".to_string()));
+        assert!(
+            entries.contains(&"a/".to_string()),
+            "parent dir a must exist (contains transferred files)"
+        );
+        assert!(
+            entries.contains(&"a/b/".to_string()),
+            "parent dir a/b must exist (contains c/ with deepest.mp4)"
+        );
+    }
+
+    #[test]
+    fn rsync_filter_photos_dir_copies_payload() {
+        if !rsync_available() {
+            return;
+        }
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("Photos")).unwrap();
+        fs::write(src.join("Photos/a.jpg"), "photo-a").unwrap();
+        fs::write(src.join("Photos/b.jpg"), "photo-b").unwrap();
+        fs::write(src.join("Photos/notes.txt"), "notes").unwrap();
+        fs::write(src.join("other.mp4"), "video").unwrap();
+
+        let dest = tmp.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let f = build_split_filters("Photos/").unwrap();
+        assert!(run_local_filter_rsync(
+            &src,
+            &dest,
+            &f.include_rules,
+            &f.exclude_rule
+        ));
+
+        let entries = list_entries(&dest);
+        assert!(
+            entries.contains(&"Photos/".to_string()),
+            "Photos directory must be created"
+        );
+        assert!(entries.contains(&"Photos/a.jpg".to_string()));
+        assert!(entries.contains(&"Photos/b.jpg".to_string()));
+        assert!(
+            entries.contains(&"Photos/notes.txt".to_string()),
+            "directory payload includes non-matching children inside selected directory"
+        );
+        assert!(
+            !entries.contains(&"other.mp4".to_string()),
+            "must NOT copy unrelated other.mp4 outside Photos"
+        );
+    }
+
+    #[test]
+    fn rsync_filter_nested_photos_dir_copies_both_payloads() {
+        if !rsync_available() {
+            return;
+        }
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("Photos")).unwrap();
+        fs::create_dir_all(src.join("somewhere/Photos")).unwrap();
+        fs::write(src.join("Photos/a.jpg"), "top-photo").unwrap();
+        fs::write(src.join("somewhere/Photos/b.jpg"), "nested-photo").unwrap();
+        fs::write(src.join("other.txt"), "text").unwrap();
+
+        let dest = tmp.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let f = build_split_filters("Photos/").unwrap();
+        assert!(run_local_filter_rsync(
+            &src,
+            &dest,
+            &f.include_rules,
+            &f.exclude_rule
+        ));
+
+        let entries = list_entries(&dest);
+        assert!(
+            entries.contains(&"Photos/".to_string()),
+            "top-level Photos directory must be created"
+        );
+        assert!(entries.contains(&"Photos/a.jpg".to_string()));
+        assert!(
+            entries.contains(&"somewhere/Photos/".to_string()),
+            "nested somewhere/Photos directory must be created"
+        );
+        assert!(entries.contains(&"somewhere/Photos/b.jpg".to_string()));
+        assert!(
+            !entries.contains(&"other.txt".to_string()),
+            "unrelated other.txt must not be copied"
+        );
+    }
+
+    #[test]
+    fn rsync_filter_directory_named_mp4_transfers_full_payload() {
+        if !rsync_available() {
+            return;
+        }
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("video.mp4")).unwrap();
+        fs::write(src.join("video.mp4/a.txt"), "payload").unwrap();
+        fs::write(src.join("video.mp4/b.dat"), "payload").unwrap();
+        fs::write(src.join("other.mp4"), "video").unwrap();
+        fs::write(src.join("skip.txt"), "text").unwrap();
+
+        let dest = tmp.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let f = build_split_filters("*.mp4").unwrap();
+        assert!(run_local_filter_rsync(
+            &src,
+            &dest,
+            &f.include_rules,
+            &f.exclude_rule
+        ));
+
+        let entries = list_entries(&dest);
+        assert!(
+            entries.contains(&"other.mp4".to_string()),
+            "matching regular file *.mp4 must be copied"
+        );
+        assert!(
+            entries.contains(&"video.mp4/".to_string()),
+            "directory whose name matches *.mp4 must be created"
+        );
+        assert!(
+            entries.contains(&"video.mp4/a.txt".to_string()),
+            "payload of directory whose name matches *.mp4 must be transferred"
+        );
+        assert!(
+            entries.contains(&"video.mp4/b.dat".to_string()),
+            "payload of directory whose name matches *.mp4 must be fully transferred"
+        );
+        assert!(
+            !entries.contains(&"skip.txt".to_string()),
+            "unrelated file must not be copied"
+        );
+    }
+
+    #[test]
+    fn rsync_filter_star_mp4_copies_nested_matching_directory_payload() {
+        if !rsync_available() {
+            return;
+        }
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("video.mp4")).unwrap();
+        fs::create_dir_all(src.join("sub/video.mp4")).unwrap();
+        fs::write(src.join("video.mp4/top.txt"), "payload").unwrap();
+        fs::write(src.join("sub/video.mp4/nested.txt"), "payload").unwrap();
+        fs::write(src.join("skip.txt"), "text").unwrap();
+
+        let dest = tmp.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let f = build_split_filters("*.mp4").unwrap();
+        assert!(run_local_filter_rsync(
+            &src,
+            &dest,
+            &f.include_rules,
+            &f.exclude_rule
+        ));
+
+        let entries = list_entries(&dest);
+        assert!(
+            entries.contains(&"video.mp4/".to_string()),
+            "top-level video.mp4 directory must be created"
+        );
+        assert!(
+            entries.contains(&"video.mp4/top.txt".to_string()),
+            "top-level video.mp4 payload must be transferred"
+        );
+        assert!(
+            entries.contains(&"sub/video.mp4/".to_string()),
+            "nested sub/video.mp4 directory must be created"
+        );
+        assert!(
+            entries.contains(&"sub/video.mp4/nested.txt".to_string()),
+            "nested sub/video.mp4 payload must be transferred"
+        );
+        assert!(
+            !entries.contains(&"skip.txt".to_string()),
+            "unrelated skip.txt must not be copied"
+        );
+    }
+
+    #[test]
+    fn rsync_filter_symlinks_preserved() {
+        if !rsync_available() {
+            return;
+        }
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("real.mp4"), "real-data").unwrap();
+        std::os::unix::fs::symlink("real.mp4", src.join("link.mp4")).unwrap();
+        fs::write(src.join("skip.txt"), "txt").unwrap();
+
+        let dest = tmp.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let f = build_split_filters("*.mp4").unwrap();
+        assert!(run_local_filter_rsync(
+            &src,
+            &dest,
+            &f.include_rules,
+            &f.exclude_rule
+        ));
+
+        let entries = list_entries(&dest);
+        assert!(entries.contains(&"real.mp4".to_string()));
+        assert!(entries.contains(&"link.mp4".to_string()));
+        assert!(!entries.contains(&"skip.txt".to_string()));
+
+        let link_dest = dest.join("link.mp4");
+        let target = fs::read_link(&link_dest).unwrap();
+        assert_eq!(target, std::path::Path::new("real.mp4"));
+    }
+
+    #[test]
+    fn rsync_filter_empty_selected_dir_is_pruned() {
+        if !rsync_available() {
+            return;
+        }
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("empty_dir")).unwrap();
+        fs::write(src.join("a.mp4"), "data").unwrap();
+
+        let dest = tmp.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let f = build_split_filters("*/").unwrap();
+        assert!(run_local_filter_rsync(
+            &src,
+            &dest,
+            &f.include_rules,
+            &f.exclude_rule
+        ));
+
+        assert!(
+            !dest.join("empty_dir").exists(),
+            "selected empty directory is pruned by --prune-empty-dirs"
+        );
+        assert!(
+            !dest.join("a.mp4").exists(),
+            "non-directory entry a.mp4 is not selected by pattern '*/'"
+        );
+    }
+
+    #[test]
+    fn rsync_filter_star_mp4_argv_has_no_shell_quotes() {
+        if !rsync_available() {
+            return;
+        }
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("a.mp4"), "data").unwrap();
+
+        let dest = tmp.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let f = build_split_filters("*.mp4").unwrap();
+        // The filter rules themselves must not contain quote characters.
+        for rule in f
+            .include_rules
+            .iter()
+            .chain(std::iter::once(&f.exclude_rule))
+        {
+            assert!(
+                !rule.contains('\''),
+                "filter rule must not contain shell quote: {rule}"
+            );
+        }
+
+        assert!(run_local_filter_rsync(
+            &src,
+            &dest,
+            &f.include_rules,
+            &f.exclude_rule
+        ));
+        assert!(list_entries(&dest).contains(&"a.mp4".to_string()));
+    }
+}

@@ -1,65 +1,60 @@
 # Purgery
 
-Purgery imports generated filesystem entries from devices into a central archive, optionally transforms them, and only removes local originals when doing so is explicitly configured and safe.
-
-You have photos, videos, recordings, or other generated files on a laptop, camera SD card, or similar device. They fill up local storage. You want to move them into a central archive — and maybe compress or convert them on the way — without risking data loss.
-
-Purgery is the import pipeline for that.
-
-## Non-goals
-
-Purgery is not bidirectional sync, not a Dropbox/Syncthing replacement, not a network daemon, not a multi-user authorization system, not a remote shell execution framework, and not an automatic conflict-resolution system. It is intentionally a one-way import pipeline.
+Purgery imports a filesystem entry from a device into a destination, optionally transforms it on the server, and only removes the local original when doing so is explicitly configured and safe.
 
 ## Quick start
 
 ### Server
 
 ```sh
-# Create archive root directories
-purgery-server bootstrap --config /etc/purgery/server.toml
-
-# Verify configuration and dependencies
 purgery-server check --config /etc/purgery/server.toml
-
-# Run one batch of imports
-purgery-server process-once
+purgery-server process-once --config /etc/purgery/server.toml
 ```
 If `--config` is omitted, the server looks for config at `$PURGERY_SERVER_CONFIG_PATH`, `$XDG_CONFIG_HOME/purgery/server.toml`, `~/.config/purgery/server.toml`, or `/etc/purgery/server.toml`.
 
 ### Client (source device)
 
-```sh
-# Verify local executables and configuration (no SSH)
-purgery-client check --config ~/.config/purgery/client.toml
+Import a single file, directory, or symlink:
 
-# Run a full import cycle: transfer, transform, clean up confirmed originals
-purgery-client sync-and-cleanup
+```sh
+purgery-client sync -- ~/video.mp4 user@server:/archive
+purgery-client sync -- ~/Videos user@server:/archive
+
+purgery-client sync \
+  --postprocess compress-video \
+  --delete-after-import \
+  -- ~/Videos/trip user@server:/archive
 ```
-If `--config` is omitted, the client looks for config at `$PURGERY_CLIENT_CONFIG_PATH`, `$XDG_CONFIG_HOME/purgery/client.toml`, or `~/.config/purgery/client.toml`.
+
+SOURCE may be a regular file, directory, or symlink. The destination is rsync-style: `USER@HOST:/absolute/path` or `USER@HOST:relative/path`. Both absolute and relative destinations are accepted. For postprocess runs, a relative destination is resolved against the server's working directory during `prepare-run` and the resolved absolute path persists in the run.
 
 ## How it works
 
-### Terminology
+Each `sync` invocation operates on exactly one source entry. The source entry is imported under `<TARGET>` using its own name:
 
-| Term | Meaning |
-|------|---------|
-| **Source tree** | A local directory whose contents you want to import (e.g., `/home/user/Videos`) |
-| **Archive** | The central storage location where imported files accumulate (a server directory) |
-| **Named root** | A server-side archive root with a name visible to clients (e.g., `univ = /universe/synced`, `system = /etc/system`) |
-| **Import** | The act of copying or transforming an entry from a source tree into the archive |
-| **Transform** | An optional server-side postprocessing step (e.g., compress, convert, rename) applied during import |
-| **Passthrough import** | Copying an entry directly into the archive without transformation |
-| **Transformed import** | Copying an entry into the archive through a server-side transformation step |
-| **Cleanup** | Removing a confirmed local original entry after import is complete and verified |
+```
+purgery-client sync -- ./video.mp4 user@server:/archive
+  → /archive/video.mp4
 
----
+purgery-client sync -- ./Photos user@server:/archive
+  → /archive/Photos
+```
 
-1. You configure one or more **source trees** on a device and point each to a destination inside a named archive root.
-2. The client walks each source tree (never following symlinks) and classifies every entry as either **passthrough** (direct copy to archive) or **transformed** (server-side processing required).
-3. If any source tree has transformed entries, the client creates a server run: it uploads a manifest of only the entries needing transformation, validates the plan on the server, and transfers them to a staging area (not the final archive destination).
-4. The server processes transformed entries in the staging area: it prepares work areas from staged files, runs subprocesses there, and only after processing succeeds commits outputs to the final archive destination. If a transformed entry fails before materialization, that entry produces no final outputs. A run can be partial; entries already committed by the same run are not rolled back.
-5. For source trees that are pure passthrough (no transformation), the client skips server bookkeeping entirely and copies entries directly to the archive.
-6. Local cleanup of originals depends on how cleanup was configured for each source tree. Passthrough entries use locally recorded transfer state as authority. Transformed entries are cleaned only after server status confirms the import.
+1. Without `--postprocess`, the client transfers directly to the destination with rsync; no server run or manifest exists.
+2. With passthrough cleanup, the client records local identity before rsync and removes only unchanged originals after rsync succeeds.
+3. With `--postprocess`, the client creates a server run for the source entry, waits for processing, and retires only unchanged originals that server status marks imported.
+
+For multiple source entries under a common root, use `--split <PATTERN>`:
+
+```sh
+purgery-client sync \
+  --postprocess compress-video \
+  --delete-after-import \
+  --split "**/*.mp4" \
+  -- ~/Videos user@server:/archive
+```
+
+Each matched entry is processed as a separate operation. Postprocess operations each create a server run; passthrough cleanup operations use direct rsync plus cleanup; pure passthrough uses one transfer of the selected roots.
 
 ## Configuration
 
@@ -67,45 +62,15 @@ Minimal server config (`server.toml`):
 
 ```toml
 work_dir = "/var/lib/purgery/work"
-
-[[root]]
-name = "univ"
-path = "/universe/synced"
-
-[[root]]
-name = "system"
-path = "/etc/system"
 ```
 
-Minimal client config (`client.toml`):
-
-```toml
-nickname = "laptop"
-state_dir = "/var/lib/purgery"
-
-[server]
-host = "example.com"
-
-[[sync]]
-name = "videos"
-from = "/home/user/Videos"
-to = "univ/videos"
-
-[[sync]]
-name = "server-configs"
-from = "/home/user/my/server-configs"
-to = "system/server-configs"
-```
-
-The client sync `to` field references a named root: `to = "univ/videos"` means "place files under the root named `univ`, inside the `videos` subdirectory."
-
-The final archive path for `/home/user/Videos/trips/a.mp4` would be `/universe/synced/videos/trips/a.mp4`. The client nickname is operational metadata and does not appear in final archive paths.
+Server config contains only server-owned concerns: work directory, postprocess step definitions, GC settings, and logging.
 
 Full config reference: [docs/config.md](docs/config.md)
 
 ## Transforms (postprocessing)
 
-Transformations are defined on the server. Clients request named steps by rule; they do not upload arbitrary commands.
+Transformations are defined on the server. Clients request named steps via the `--postprocess` flag. Postprocessing applies to the source entry itself, regardless of kind. A directory source is passed as a single work path; its contents are available to the subprocess but the operation is one logical entry.
 
 ```toml
 # server.toml
@@ -117,18 +82,11 @@ expected_outputs = ["{file_stem}.compressed.webm"]
 keep_original = true
 ```
 
-```toml
-# client.toml
-[[postprocess.rules]]
-match = "*.mp4"
-steps = ["compress-video"]
-```
-
 ## Transform and cleanup coupling
 
-Because transformed outputs are not the original source files, Purgery cannot use the final archive alone to know that an unchanged local original has already been processed in a previous run. The server does not retain indefinite source-file metadata or an ever-growing receipt ledger.
+Because transformed outputs are not the original source files, Purgery cannot use the final archive alone to know that an unchanged local original has already been processed in a previous run.
 
-For this reason, a source tree with transforms **must** also enable cleanup (`delete_after_import = true`). The transformed import is an import-and-retire operation:
+For this reason, `--postprocess` requires `--delete-after-import`. The transformed import is an import-and-retire operation:
 
 1. the source entry is uploaded into a server run;
 2. the server transforms and commits outputs;
@@ -137,27 +95,23 @@ For this reason, a source tree with transforms **must** also enable cleanup (`de
 
 This prevents repeated reprocessing of the same original on subsequent runs.
 
-A source tree without transforms may still use `delete_after_import = false` — passthrough imports preserve the original content in the archive, so repeated runs converge naturally.
+A passthrough import may still use `--delete-after-import` — passthrough imports preserve the original content, so cleanup is optional.
 
 ## Safety model
 
 Purgery targets Unix/POSIX filesystem semantics and is conservative about data loss:
 
-- For **passthrough imports**, cleanup is opt-in per source tree (`delete_after_import = true`). A passthrough source tree with `delete_after_import = false` does not clean up local originals.
-- For **transformed imports**, cleanup is required by the conformance model. Because the server does not retain indefinite source-file metadata and transformed outputs are not the original files, the source original must be retired locally after successful import (import-and-retire). See [Transform and cleanup coupling](#transform-and-cleanup-coupling).
-- **Transformed imports**: cleanup is server-confirmed. The client removes local originals only after the server confirms the import in a valid status record whose nickname and run ID match the original upload.
-- **Passthrough imports with delete-after-import**: cleanup is transfer-confirmed. A durable local state file is atomically recorded after successful transfer to the archive. The client verifies the local entry still matches its uploaded identity before removal.
-- **Passthrough imports without delete-after-import**: no cleanup occurs. The local entry remains after transfer.
+- **Passthrough imports**: cleanup is opt-in. With `--delete-after-import`, a durable local state file records the transfer; the client verifies the local entry still matches its uploaded identity before removal.
+- **Transformed imports**: cleanup is required (`--delete-after-import`). The client removes local originals only after the server confirms the import in a valid status record.
 - Before any removal, the client verifies the local entry still matches its uploaded identity (size, mtime, optional SHA-256 for regular files; link target for symlinks; subtree identity for directories).
-- The server performs a recursive merge into the archive: directories merge, regular files replace existing ones, symlinks remain symlinks, and absent source entries never delete archive entries.
-- Symlink targets are literal data. The server never follows staged or archive symlinks as directories.
-- Tree imports provide replayable convergence through crash-safe per-entry commits, not an all-or-nothing transaction.
-- Transforms and cleanup apply to all entry kinds: regular files, directories, and symlinks. Client cleanup remains conservative and removes only confirmed unchanged local originals, respecting entry-kind identity checks (symlinks are unlinked without following the target; directories are removed bottom-up only when safe).
+- The server performs a recursive merge into the destination: directories merge, regular files replace existing ones, symlinks remain symlinks.
+- Symlink targets are literal data. The server never follows staged or destination symlinks as directories.
+- When a directory source is imported, its local descendants are captured for safe deletion but the manifest and status describe one logical entry.
 
 ## More documentation
 
-- [Config reference](docs/config.md) — archive, client, transform, and run configuration
+- [Config reference](docs/config.md) — server config, transform definitions, run configuration
 - [Protocol](docs/protocol.md) — lifecycle, subcommands, run states, status format
-- [Operations](docs/operations.md) — bootstrap, check, GC, heartbeat, leases
-- [Import semantics](docs/design/import-semantics.md) — tree-overlay model, work areas, and per-entry safety rules
+- [Operations](docs/operations.md) — check, GC, heartbeat, leases, split
+- [Import semantics](docs/design/import-semantics.md) — one-source-entry model, work areas, and per-entry safety rules
 - [Crash safety and idempotence](docs/design/crash-safety-and-idempotence.md) — durable phases, replay recovery, atomic replacement, and deletion authority
