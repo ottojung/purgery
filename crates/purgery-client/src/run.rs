@@ -2151,10 +2151,10 @@ state = "done"
             "source operand must have trailing slash in filter mode"
         );
         assert!(
-            cmd.contains("--include='*/'"),
+            cmd.contains("--include=*/"),
             "must include directory traversal rule"
         );
-        assert!(cmd.contains("--exclude='*'"), "must include exclude rule");
+        assert!(cmd.contains("--exclude=*"), "must include exclude rule");
         assert!(
             cmd.contains("--prune-empty-dirs"),
             "must include -m to prune traversal scaffolding"
@@ -2186,7 +2186,7 @@ state = "done"
         let log = runner.command_log();
         assert_eq!(log.len(), 1);
         let cmd = &log[0];
-        assert!(cmd.contains("--include='*.mp4'"));
-        assert!(cmd.contains("--exclude='*'"));
+        assert!(cmd.contains("--include=*.mp4"));
+        assert!(cmd.contains("--exclude=*"));
     }
 }

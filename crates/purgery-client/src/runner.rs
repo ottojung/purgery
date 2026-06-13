@@ -353,9 +353,9 @@ impl RemoteRunner {
             "--prune-empty-dirs".to_string(),
         ];
         for rule in include_rules {
-            args.push(format!("--include='{rule}'"));
+            args.push(format!("--include={rule}"));
         }
-        args.push(format!("--exclude='{exclude_rule}'"));
+        args.push(format!("--exclude={exclude_rule}"));
         args.push("--".to_string());
         args.push(source_with_slash);
         args.push(rsync_dest);
@@ -526,23 +526,22 @@ mod tests {
         let log = runner.command_log();
         assert_eq!(log.len(), 1, "must be exactly one rsync process");
         let cmd = &log[0];
-        // Verify all options appear before -- and operands after.
         let before_sep = cmd.split(" -- ").next().unwrap();
         assert!(
-            before_sep.contains("--include='*/'"),
-            "--include='*/' must be before --"
+            before_sep.contains("--include=*/"),
+            "--include=*/ must be before --"
         );
         assert!(
-            before_sep.contains("--include='*.mp4/***'"),
-            "--include='*.mp4/***' must be before --"
+            before_sep.contains("--include=*.mp4/***"),
+            "--include=*.mp4/*** must be before --"
         );
         assert!(
-            before_sep.contains("--exclude='*'"),
-            "--exclude='*' must be before --"
+            before_sep.contains("--exclude=*"),
+            "--exclude=* must be before --"
         );
         assert!(
             before_sep.contains("--prune-empty-dirs"),
-            "-m must be before --"
+            "--prune-empty-dirs must be before --"
         );
         assert!(
             cmd.contains("/src/"),
@@ -552,6 +551,29 @@ mod tests {
             cmd.contains("host:/dest/"),
             "dest with trailing / must be after --"
         );
+    }
+
+    #[test]
+    fn filter_include_exclude_argv_has_no_shell_quotes() {
+        let runner = RemoteRunner::fake();
+        runner
+            .run_rsync_filter_transfer(
+                "/src",
+                "host",
+                "/dest",
+                &["*/".to_string(), "*.mp4/***".to_string(), "*.mp4".to_string()],
+                "*",
+            )
+            .unwrap();
+        let rule_sets = runner.filter_rule_sets();
+        assert_eq!(rule_sets.len(), 1);
+        let (includes, exclude) = &rule_sets[0];
+        for rule in includes.iter().chain(std::iter::once(exclude)) {
+            assert!(
+                !rule.contains('\''),
+                "include/exclude rules must not contain shell quote characters, got: {rule}"
+            );
+        }
     }
 
     #[test]
