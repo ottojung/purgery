@@ -564,6 +564,7 @@ fn resolve_state_dir(args: &SyncArgs) -> String {
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn validate_source_exists(source: &str) -> Result<()> {
     let path = Path::new(source);
     if std::fs::symlink_metadata(path).is_err() {
@@ -684,21 +685,18 @@ pub(crate) fn run_sync_with_run_id(
     cleanup::resume_pending_cleanups(&state_dir)?;
     resume_runs(runner, &state_dir)?;
 
-    // Phase 2: validate the new operation
-    validate_source_exists(&args.source)?;
-    // Reject root path — it has no source entry name.
-    if std::path::Path::new(&args.source) == std::path::Path::new("/") {
-        anyhow::bail!("cannot use root path as source entry: /");
-    }
+    // Phase 2: normalize the source. This validates existence, rejects "/",
+    // resolves "."/"..", and strips trailing slashes so every downstream
+    // path uses the same normalized operation_path and source_entry_name.
+    let source_spec = classify::normalize_source(&args.source)?;
 
     let has_postprocess = !args.postprocess.is_empty();
     if has_postprocess && !args.delete_after_import {
         anyhow::bail!("--delete-after-import is required when --postprocess is used");
     }
 
-    // Dispatch to split or single-entry handler.
     if let Some(ref _pattern) = args.split {
-        return run_split(runner, args, run_id, &state_dir);
+        return run_split(runner, args, run_id, &state_dir, &source_spec);
     }
 
     let remote = parse_destination(&args.destination)?;
@@ -716,14 +714,14 @@ pub(crate) fn run_sync_with_run_id(
     // Passthrough, no cleanup: direct rsync only
     if !has_postprocess && !args.delete_after_import {
         info!("starting direct rsync");
-        runner.run_rsync(&args.source, &remote.host, remote.path.as_str())?;
+        runner.run_rsync(&source_spec.operation_path, &remote.host, remote.path.as_str())?;
         info!("sync complete");
         return Ok(());
     }
 
-    let manifest = classify::build_manifest(&args.source, run_id, &nickname, &args.postprocess)?;
+    let manifest = classify::build_manifest(&source_spec, run_id, &nickname, &args.postprocess)?;
     let cleanup_state_path = if args.delete_after_import {
-        let entries = classify::capture_cleanup_identity(&args.source)?;
+        let entries = classify::capture_cleanup_identity(&source_spec)?;
         if entries.is_empty() {
             None
         } else {
@@ -741,7 +739,7 @@ pub(crate) fn run_sync_with_run_id(
     // Passthrough with cleanup: direct rsync + durable cleanup
     if !has_postprocess {
         info!("starting direct rsync with durable cleanup");
-        runner.run_rsync(&args.source, &remote.host, remote.path.as_str())?;
+        runner.run_rsync(&source_spec.operation_path, &remote.host, remote.path.as_str())?;
         if let Some(ref state_path) = cleanup_state_path {
             cleanup::confirm_all_imports(state_path)?;
             cleanup::process_cleanup_state_file(state_path)?;
@@ -785,8 +783,6 @@ pub(crate) fn run_sync_with_run_id(
         info!("validating server run plan");
         let prepare_resp = prepare_run(runner, &remote.host, server_cmd, &nickname, run_id)?;
 
-        // If the server resolved a relative destination, update our local
-        // copy so that persisted state contains the resolved (absolute) path.
         if let Some(ref dest) = prepare_resp.destination {
             run_config = RunConfig {
                 nickname: nickname.clone(),
@@ -797,7 +793,7 @@ pub(crate) fn run_sync_with_run_id(
         }
 
         info!("transferring files to server staging");
-        runner.run_rsync(&args.source, &remote.host, &begin_resp.files_dir)?;
+        runner.run_rsync(&source_spec.operation_path, &remote.host, &begin_resp.files_dir)?;
 
         Ok(())
     })();
@@ -914,10 +910,12 @@ fn run_split(
     args: &SyncArgs,
     _run_id: &RunId,
     state_dir: &str,
+    source_spec: &classify::SourceSpec,
 ) -> Result<()> {
     let has_postprocess = !args.postprocess.is_empty();
-    let entry_roots = split::discover_split_entries(&args.source, args.split.as_deref().unwrap())
-        .map_err(|e| anyhow::anyhow!("split discovery failed: {e}"))?;
+    let entry_roots =
+        split::discover_split_entries(&source_spec.operation_path, args.split.as_deref().unwrap())
+            .map_err(|e| anyhow::anyhow!("split discovery failed: {e}"))?;
     if entry_roots.is_empty() {
         info!("split pattern matched nothing");
         return Ok(());
@@ -926,7 +924,7 @@ fn run_split(
     if !has_postprocess && !args.delete_after_import {
         return run_passthrough_split(
             runner,
-            &args.source,
+            &source_spec.operation_path,
             &entry_roots,
             &target.host,
             target.path.as_str(),
@@ -934,7 +932,7 @@ fn run_split(
     }
     let base_dest = &args.destination;
     for root in &entry_roots {
-        let suffix = split::split_target_suffix(&args.source, &root.path);
+        let suffix = split::split_target_suffix(&source_spec.operation_path, &root.path);
         let split_dest = format!("{}{}", base_dest, suffix);
         info!(source = %root.path, destination = %split_dest, "processing split entry");
         let split_args = SyncArgs {

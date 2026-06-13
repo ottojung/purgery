@@ -8,106 +8,145 @@ use std::fs;
 use std::path::Path;
 use std::time::SystemTime;
 
-/// Compute the source entry name from a source path.
+/// The kind of a source filesystem entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceKind {
+    RegularFile,
+    Directory,
+    Symlink,
+}
+
+/// Normalized source specification used by all client paths.
 ///
-/// - Ordinary paths use the final path component.
-/// - Trailing slashes are ignored.
-/// - Symlinks use the symlink path's own name, not the target's.
-/// - `.` uses the current directory's name.
-/// - `..` uses the parent directory's name.
-/// - `/` is rejected (no valid source entry name).
-pub(crate) fn source_entry_name(source: &str) -> Result<String> {
+/// Established by `normalize_source()` before dispatch to passthrough,
+/// split, cleanup, or postprocess. All modes use `operation_path` for
+/// rsync and `source_entry_name` for manifest, staging, and cleanup.
+#[derive(Debug, Clone)]
+pub(crate) struct SourceSpec {
+    /// The exact CLI argument, for diagnostics only.
+    #[allow(dead_code)]
+    pub raw_input: String,
+    /// The local path operand for rsync, normalized to preserve
+    /// source-entry semantics (trailing slash stripped, `.`/`..`
+    /// resolved to a concrete named path).
+    pub operation_path: String,
+    /// The name used for manifest `relative_path`, staged path, cleanup
+    /// root `relative_path`, and the final source-entry name.
+    pub source_entry_name: String,
+    /// The filesystem kind, determined without following symlink sources.
+    pub kind: SourceKind,
+}
+
+/// Normalize a source path before dispatch.
+///
+/// # Rules
+///
+/// - `/` is rejected in every mode.
+/// - Trailing slashes are ignored for source-entry semantics.
+/// - `.` is resolved to the current directory's concrete path.
+/// - `..` is resolved to the parent directory's concrete path.
+/// - Ordinary paths are used as-is; canonicalization is not performed.
+/// - Symlink sources remain symlink sources.
+pub(crate) fn normalize_source(source: &str) -> Result<SourceSpec> {
+    let raw_input = source.to_owned();
     let path = Path::new(source);
 
-    // Reject root path which has no entry name.
     if path == Path::new("/") {
         anyhow::bail!("cannot use root path as source entry: /");
     }
 
-    // For . and .., resolve to the actual directory name.
-    if source == "." || source.ends_with("/.") {
-        let cwd = std::env::current_dir()
-            .map_err(|e| anyhow::anyhow!("failed to resolve current directory: {e}"))?;
-        return cwd
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .ok_or_else(|| {
-                anyhow::anyhow!("cannot determine source entry name for current directory")
-            });
-    }
-    if source == ".." || source.ends_with("/..") {
-        let cwd = std::env::current_dir()
-            .map_err(|e| anyhow::anyhow!("failed to resolve current directory: {e}"))?;
-        let parent = cwd.parent().map(|p| p.to_owned()).unwrap_or(cwd);
-        return parent
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .ok_or_else(|| {
-                anyhow::anyhow!("cannot determine source entry name for parent directory")
-            });
-    }
-
-    // Strip trailing slashes.
-    let cleaned = path;
-    let name = cleaned
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .ok_or_else(|| anyhow::anyhow!("cannot determine source entry name from path: {source}"))?;
-
-    if name.is_empty() {
-        anyhow::bail!("cannot determine source entry name from path: {source}");
-    }
-
-    Ok(name)
-}
-
-/// Build a manifest with one logical source entry.
-pub(crate) fn build_manifest(
-    source: &str,
-    run_id: &RunId,
-    nickname: &Nickname,
-    postprocess_steps: &[String],
-) -> Result<Manifest> {
-    let source_path = Path::new(source);
-    if std::fs::symlink_metadata(source_path).is_err() {
-        anyhow::bail!("source path does not exist: {source}");
-    }
-
-    let metadata = fs::symlink_metadata(source_path)
-        .with_context(|| format!("failed to read metadata: {source}"))?;
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("source path does not exist: {source}"))?;
     let file_type = metadata.file_type();
 
-    let source_name = source_entry_name(source)?;
-
-    let relative_path = NormalizedRelativePath::new(Utf8PathBuf::from(source_name.clone()))
-        .with_context(|| format!("invalid source name: {source_name}"))?;
-
-    let staged_path = NormalizedRelativePath::new(Utf8PathBuf::from("files").join(&source_name))
-        .with_context(|| "invalid staged path".to_string())?;
-
-    let local_path_str = source_path.to_string_lossy().to_string();
-    let local_path = ClientLocalPath::new(local_path_str)
-        .with_context(|| format!("invalid local path: {source}"))?;
-
-    let is_regular_file = file_type.is_file();
-    let is_dir = file_type.is_dir();
-    let is_symlink = file_type.is_symlink();
-
-    let has_postprocess = !postprocess_steps.is_empty();
-
-    let kind = if is_dir {
-        ManifestEntryKind::Directory
-    } else if is_regular_file {
-        ManifestEntryKind::RegularFile
-    } else if is_symlink {
-        ManifestEntryKind::Symlink
+    let kind = if file_type.is_dir() && !file_type.is_symlink() {
+        SourceKind::Directory
+    } else if file_type.is_file() {
+        SourceKind::RegularFile
+    } else if file_type.is_symlink() {
+        SourceKind::Symlink
     } else {
         anyhow::bail!("unsupported source kind: {source}");
     };
 
-    let size = if is_regular_file { metadata.len() } else { 0 };
+    let (operation_path, source_entry_name) = if source == "." || source == ".." {
+        let cwd = std::env::current_dir()
+            .map_err(|e| anyhow::anyhow!("failed to resolve current directory: {e}"))?;
+        let target = if source == ".." {
+            cwd.parent().map(|p| p.to_owned()).unwrap_or(cwd)
+        } else {
+            cwd
+        };
+        let name = target
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("cannot determine source entry name for '{source}'"))?
+            .to_string_lossy()
+            .to_string();
+        if name.is_empty() {
+            anyhow::bail!(
+                "cannot determine source entry name for '{source}': resolved path has no name"
+            );
+        }
+        (target.to_string_lossy().to_string(), name)
+    } else {
+        let trimmed = path.to_string_lossy().to_string();
+        let stripped = trimmed.trim_end_matches('/');
+        let name = Path::new(stripped)
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("cannot determine source entry name from path: {source}"))?
+            .to_string_lossy()
+            .to_string();
+        if name.is_empty() {
+            anyhow::bail!("cannot determine source entry name from path: {source}");
+        }
+        (stripped.to_owned(), name)
+    };
 
-    let (mtime_ns, sha256) = if is_regular_file && has_postprocess {
+    Ok(SourceSpec {
+        raw_input,
+        operation_path,
+        source_entry_name,
+        kind,
+    })
+}
+
+/// Build a manifest with one logical source entry.
+pub(crate) fn build_manifest(
+    spec: &SourceSpec,
+    run_id: &RunId,
+    nickname: &Nickname,
+    postprocess_steps: &[String],
+) -> Result<Manifest> {
+    let source_path = Path::new(&spec.operation_path);
+
+    let metadata = fs::symlink_metadata(source_path)
+        .with_context(|| format!("failed to read metadata: {}", spec.operation_path))?;
+    let file_type = metadata.file_type();
+
+    let relative_path = NormalizedRelativePath::new(Utf8PathBuf::from(
+        spec.source_entry_name.clone(),
+    ))
+    .with_context(|| format!("invalid source name: {}", spec.source_entry_name))?;
+
+    let staged_path =
+        NormalizedRelativePath::new(Utf8PathBuf::from("files").join(&spec.source_entry_name))
+            .with_context(|| "invalid staged path".to_string())?;
+
+    let local_path =
+        ClientLocalPath::new(spec.operation_path.clone())
+            .with_context(|| format!("invalid local path: {}", spec.operation_path))?;
+
+    let has_postprocess = !postprocess_steps.is_empty();
+
+    let kind = match spec.kind {
+        SourceKind::Directory => ManifestEntryKind::Directory,
+        SourceKind::RegularFile => ManifestEntryKind::RegularFile,
+        SourceKind::Symlink => ManifestEntryKind::Symlink,
+    };
+
+    let size = if file_type.is_file() { metadata.len() } else { 0 };
+
+    let (mtime_ns, sha256) = if file_type.is_file() && has_postprocess {
         let mtime = metadata
             .modified()
             .ok()
@@ -115,17 +154,20 @@ pub(crate) fn build_manifest(
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
         let utf8_path = Utf8Path::from_path(source_path)
-            .ok_or_else(|| anyhow::anyhow!("non-UTF-8 path: {source}"))?;
-        let sha =
-            Some(compute_sha256(utf8_path).with_context(|| format!("SHA-256 failed: {source}"))?);
+            .ok_or_else(|| anyhow::anyhow!("non-UTF-8 path: {}", spec.operation_path))?;
+        let sha = Some(
+            compute_sha256(utf8_path)
+                .with_context(|| format!("SHA-256 failed: {}", spec.operation_path))?,
+        );
         (mtime, sha)
     } else {
         (0, None)
     };
 
-    let link_target = if is_symlink {
-        let target = fs::read_link(source_path)
-            .with_context(|| format!("failed to read symlink: {source}"))?;
+    let link_target = if file_type.is_symlink() {
+        let target = fs::read_link(source_path).with_context(|| {
+            format!("failed to read symlink: {}", spec.operation_path)
+        })?;
         let target = Utf8PathBuf::from_path_buf(target)
             .map_err(|p| anyhow::anyhow!("non-UTF-8 symlink target: {}", p.display()))?;
         Some(target)
@@ -157,18 +199,13 @@ pub(crate) fn build_manifest(
 /// so the client can safely delete the entire imported tree after
 /// server-confirmed import. These identities are used only for
 /// deletion safety — the manifest/status still describe one logical entry.
-pub(crate) fn capture_cleanup_identity(source: &str) -> Result<Vec<CleanupEntry>> {
+pub(crate) fn capture_cleanup_identity(spec: &SourceSpec) -> Result<Vec<CleanupEntry>> {
     use walkdir::WalkDir;
 
-    let source_path = Path::new(source);
-    if std::fs::symlink_metadata(source_path).is_err() {
-        anyhow::bail!("source path does not exist: {source}");
-    }
-
-    let source_name = source_entry_name(source)?;
+    let source_path = Path::new(&spec.operation_path);
 
     let metadata = fs::symlink_metadata(source_path)
-        .with_context(|| format!("failed to read metadata: {source}"))?;
+        .with_context(|| format!("failed to read metadata: {}", spec.operation_path))?;
     let file_type = metadata.file_type();
 
     if file_type.is_file() {
@@ -179,13 +216,16 @@ pub(crate) fn capture_cleanup_identity(source: &str) -> Result<Vec<CleanupEntry>
             .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
-        let utf8_path = Utf8Path::from_path(source_path)
-            .ok_or_else(|| anyhow::anyhow!("non-UTF-8 path: {source}"))?;
-        let sha =
-            Some(compute_sha256(utf8_path).with_context(|| format!("SHA-256 failed: {source}"))?);
+        let utf8_path = Utf8Path::from_path(source_path).ok_or_else(|| {
+            anyhow::anyhow!("non-UTF-8 path: {}", spec.operation_path)
+        })?;
+        let sha = Some(
+            compute_sha256(utf8_path)
+                .with_context(|| format!("SHA-256 failed: {}", spec.operation_path))?,
+        );
         return Ok(vec![CleanupEntry {
-            relative_path: source_name,
-            local_path: source.to_owned(),
+            relative_path: spec.source_entry_name.clone(),
+            local_path: spec.operation_path.clone(),
             kind: ManifestEntryKind::RegularFile,
             size,
             mtime_ns: mtime,
@@ -199,10 +239,10 @@ pub(crate) fn capture_cleanup_identity(source: &str) -> Result<Vec<CleanupEntry>
     if file_type.is_symlink() {
         let target = fs::read_link(source_path)
             .map(|t| t.to_string_lossy().to_string())
-            .with_context(|| format!("failed to read symlink target: {source}"))?;
+            .with_context(|| format!("failed to read symlink target: {}", spec.operation_path))?;
         return Ok(vec![CleanupEntry {
-            relative_path: source_name,
-            local_path: source.to_owned(),
+            relative_path: spec.source_entry_name.clone(),
+            local_path: spec.operation_path.clone(),
             kind: ManifestEntryKind::Symlink,
             size: 0,
             mtime_ns: 0,
@@ -219,7 +259,10 @@ pub(crate) fn capture_cleanup_identity(source: &str) -> Result<Vec<CleanupEntry>
     let mut dirs: Vec<(String, String)> = Vec::new();
 
     // Top-level directory entry.
-    dirs.push((source_name.clone(), source.to_owned()));
+    dirs.push((
+        spec.source_entry_name.clone(),
+        spec.operation_path.clone(),
+    ));
 
     for walk_entry in WalkDir::new(source_path).follow_links(false).min_depth(1) {
         let walk_entry = match walk_entry {
@@ -238,7 +281,7 @@ pub(crate) fn capture_cleanup_identity(source: &str) -> Result<Vec<CleanupEntry>
         };
         // Prefix with source name so relative paths are rooted at the
         // source entry (e.g. "Videos/a.mp4").
-        let relative_str = format!("{}/{}", source_name, relative.to_string_lossy());
+        let relative_str = format!("{}/{}", spec.source_entry_name, relative.to_string_lossy());
         let local_str = path.to_string_lossy().to_string();
 
         if ft.is_dir() {
@@ -323,13 +366,18 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
+    fn spec(path: &str) -> SourceSpec {
+        normalize_source(path).unwrap()
+    }
+
     #[test]
     fn normal_sync_creates_one_source_entry() {
         let tmp = tempdir().unwrap();
         let file = tmp.path().join("test.txt");
         fs::write(&file, "content").unwrap();
+        let s = spec(file.to_str().unwrap());
         let manifest = build_manifest(
-            file.to_str().unwrap(),
+            &s,
             &RunId::new("test".into()).unwrap(),
             &Nickname::new("host".into()).unwrap(),
             &[],
@@ -344,8 +392,9 @@ mod tests {
         let tmp = tempdir().unwrap();
         let file = tmp.path().join("video.mp4");
         fs::write(&file, "data").unwrap();
+        let s = spec(file.to_str().unwrap());
         let manifest = build_manifest(
-            file.to_str().unwrap(),
+            &s,
             &RunId::new("test".into()).unwrap(),
             &Nickname::new("host".into()).unwrap(),
             &["compress".into()],
@@ -361,8 +410,9 @@ mod tests {
         let tmp = tempdir().unwrap();
         let dir = tmp.path().join("Videos");
         fs::create_dir(&dir).unwrap();
+        let s = spec(dir.to_str().unwrap());
         let manifest = build_manifest(
-            dir.to_str().unwrap(),
+            &s,
             &RunId::new("test".into()).unwrap(),
             &Nickname::new("host".into()).unwrap(),
             &["compress".into()],
@@ -379,8 +429,9 @@ mod tests {
         fs::write(&target, "data").unwrap();
         let link = tmp.path().join("link");
         unix::fs::symlink(&target, &link).unwrap();
+        let s = spec(link.to_str().unwrap());
         let manifest = build_manifest(
-            link.to_str().unwrap(),
+            &s,
             &RunId::new("test".into()).unwrap(),
             &Nickname::new("host".into()).unwrap(),
             &["compress".into()],
@@ -398,14 +449,14 @@ mod tests {
         fs::create_dir(&dir).unwrap();
         fs::write(dir.join("a.mp4"), "data").unwrap();
         fs::write(dir.join("b.mp4"), "data").unwrap();
+        let s = spec(dir.to_str().unwrap());
         let manifest = build_manifest(
-            dir.to_str().unwrap(),
+            &s,
             &RunId::new("test".into()).unwrap(),
             &Nickname::new("host".into()).unwrap(),
             &["compress".into()],
         )
         .unwrap();
-        // One logical entry for the source directory, not three.
         assert_eq!(manifest.entries.len(), 1);
         assert_eq!(manifest.entries[0].kind, ManifestEntryKind::Directory);
     }
@@ -417,16 +468,14 @@ mod tests {
         fs::create_dir_all(dir.join("sub")).unwrap();
         fs::write(dir.join("a.mp4"), "data").unwrap();
         fs::write(dir.join("sub/b.mp4"), "data").unwrap();
-        let entries = capture_cleanup_identity(dir.to_str().unwrap()).unwrap();
-        // Should include the top-level directory and descendants with
-        // relative paths rooted at the source entry name.
+        let s = spec(dir.to_str().unwrap());
+        let entries = capture_cleanup_identity(&s).unwrap();
         assert!(entries.iter().any(|e| e.relative_path == "Videos"));
         assert!(entries.iter().any(|e| e.relative_path == "Videos/a.mp4"));
         assert!(entries
             .iter()
             .any(|e| e.relative_path == "Videos/sub/b.mp4"));
         assert!(entries.iter().any(|e| e.relative_path == "Videos/sub"));
-        // Top-level dir should sort after descendants (deeper first).
         let dir_idx = entries
             .iter()
             .position(|e| e.relative_path == "Videos")
@@ -444,19 +493,17 @@ mod tests {
         let dir = tmp.path().join("Videos");
         fs::create_dir(dir.join("sub")).unwrap_or_else(|_| fs::create_dir_all(&dir).unwrap());
         fs::write(dir.join("ok.txt"), "data").unwrap();
-        // Create an unreadable regular file so SHA computation fails.
         let bad_file = dir.join("secret.txt");
         fs::write(&bad_file, "hidden").unwrap();
-        // Make it unreadable
         let mut perms = fs::metadata(&bad_file).unwrap().permissions();
         perms.set_mode(0o000);
         fs::set_permissions(&bad_file, perms).unwrap();
-        let result = capture_cleanup_identity(dir.to_str().unwrap());
+        let s = spec(dir.to_str().unwrap());
+        let result = capture_cleanup_identity(&s);
         assert!(
             result.is_err(),
             "SHA failure must be fatal for directory descendant"
         );
-        // Reset permissions so cleanup can remove temp dir
         let mut perms = fs::metadata(&bad_file).unwrap().permissions();
         perms.set_mode(0o644);
         fs::set_permissions(&bad_file, perms).unwrap();
@@ -470,7 +517,8 @@ mod tests {
         let mut perms = fs::metadata(&file).unwrap().permissions();
         perms.set_mode(0o000);
         fs::set_permissions(&file, perms).unwrap();
-        let result = capture_cleanup_identity(file.to_str().unwrap());
+        let s = spec(file.to_str().unwrap());
+        let result = capture_cleanup_identity(&s);
         assert!(result.is_err(), "SHA failure must be fatal for file source");
         let mut perms = fs::metadata(&file).unwrap().permissions();
         perms.set_mode(0o644);
@@ -478,37 +526,62 @@ mod tests {
     }
 
     #[test]
-    fn source_entry_name_for_regular_file() {
-        let name = source_entry_name("/home/user/video.mp4").unwrap();
-        assert_eq!(name, "video.mp4");
+    fn normalize_source_for_regular_file() {
+        let tmp = tempdir().unwrap();
+        let file = tmp.path().join("video.mp4");
+        fs::write(&file, "data").unwrap();
+        let s = normalize_source(file.to_str().unwrap()).unwrap();
+        assert_eq!(s.source_entry_name, "video.mp4");
+        assert_eq!(s.kind, SourceKind::RegularFile);
+        assert!(!s.operation_path.ends_with('/'));
     }
 
     #[test]
-    fn source_entry_name_for_directory() {
-        let name = source_entry_name("/home/user/Videos").unwrap();
-        assert_eq!(name, "Videos");
+    fn normalize_source_for_directory() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("Videos");
+        fs::create_dir(&dir).unwrap();
+        let s = normalize_source(dir.to_str().unwrap()).unwrap();
+        assert_eq!(s.source_entry_name, "Videos");
+        assert_eq!(s.kind, SourceKind::Directory);
     }
 
     #[test]
-    fn source_entry_name_with_trailing_slash() {
-        let name = source_entry_name("/home/user/Videos/").unwrap();
-        assert_eq!(name, "Videos");
+    fn normalize_source_with_trailing_slash() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("Videos");
+        fs::create_dir(&dir).unwrap();
+        let source_path = format!("{}/", dir.to_str().unwrap());
+        let s = normalize_source(&source_path).unwrap();
+        assert_eq!(s.source_entry_name, "Videos");
+        assert_eq!(s.kind, SourceKind::Directory);
+        // operation_path must not have trailing slash
+        assert!(!s.operation_path.ends_with('/'));
+        // raw_input preserves the trailing slash
+        assert!(s.raw_input.ends_with('/'));
     }
 
     #[test]
-    fn source_entry_name_for_symlink_uses_symlink_name() {
+    fn normalize_source_for_symlink_uses_symlink_name() {
         let tmp = tempdir().unwrap();
         let target = tmp.path().join("target");
         fs::write(&target, "data").unwrap();
         let link = tmp.path().join("mylink");
         unix::fs::symlink(&target, &link).unwrap();
-        let name = source_entry_name(link.to_str().unwrap()).unwrap();
-        assert_eq!(name, "mylink");
+        let s = normalize_source(link.to_str().unwrap()).unwrap();
+        assert_eq!(s.source_entry_name, "mylink");
+        assert_eq!(s.kind, SourceKind::Symlink);
     }
 
     #[test]
-    fn source_entry_name_rejects_root() {
-        let result = source_entry_name("/");
+    fn normalize_source_rejects_root() {
+        let result = normalize_source("/");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn normalize_source_rejects_nonexistent() {
+        let result = normalize_source("/nonexistent/path");
         assert!(result.is_err());
     }
 
@@ -518,16 +591,70 @@ mod tests {
         let dir = tmp.path().join("Videos");
         fs::create_dir(&dir).unwrap();
         fs::write(dir.join("a.mp4"), "data").unwrap();
+        let s = spec(dir.to_str().unwrap());
         let manifest = build_manifest(
-            dir.to_str().unwrap(),
+            &s,
             &RunId::new("test".into()).unwrap(),
             &Nickname::new("host".into()).unwrap(),
             &[],
         )
         .unwrap();
-        let cleanup = capture_cleanup_identity(dir.to_str().unwrap()).unwrap();
-        // Both must use the same source entry name.
+        let cleanup = capture_cleanup_identity(&s).unwrap();
         assert_eq!(manifest.entries[0].relative_path.as_str(), "Videos");
+        assert!(cleanup.iter().any(|e| e.relative_path == "Videos"));
+    }
+
+    #[test]
+    fn normalize_source_dot_resolves_to_current_dir_name() {
+        let cwd = std::env::current_dir().unwrap();
+        let expected_name = cwd.file_name().unwrap().to_string_lossy().to_string();
+        let s = normalize_source(".").unwrap();
+        assert_eq!(s.source_entry_name, expected_name);
+        assert!(!s.operation_path.ends_with('/'));
+        assert_ne!(s.operation_path, ".");
+        assert!(!s.operation_path.ends_with("/."));
+    }
+
+    #[test]
+    fn normalize_source_dotdot_resolves_to_parent_dir_name() {
+        let cwd = std::env::current_dir().unwrap();
+        let parent = cwd.parent().unwrap_or(&cwd).to_owned();
+        let expected_name = parent.file_name().unwrap().to_string_lossy().to_string();
+        let s = normalize_source("..").unwrap();
+        assert_eq!(s.source_entry_name, expected_name);
+        assert!(!s.operation_path.ends_with('/'));
+        assert_ne!(s.operation_path, "..");
+    }
+
+    #[test]
+    fn trailing_slash_dir_preserves_source_entry_semantics_in_manifest() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("Videos");
+        fs::create_dir(&dir).unwrap();
+        let source_with_slash = format!("{}/", dir.to_str().unwrap());
+        let s = normalize_source(&source_with_slash).unwrap();
+        let manifest = build_manifest(
+            &s,
+            &RunId::new("test".into()).unwrap(),
+            &Nickname::new("host".into()).unwrap(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(manifest.entries[0].relative_path.as_str(), "Videos");
+        assert_eq!(
+            manifest.entries[0].staged_path.as_str(),
+            "files/Videos"
+        );
+    }
+
+    #[test]
+    fn trailing_slash_dir_preserves_source_entry_semantics_in_cleanup() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("Videos");
+        fs::create_dir(&dir).unwrap();
+        let source_with_slash = format!("{}/", dir.to_str().unwrap());
+        let s = normalize_source(&source_with_slash).unwrap();
+        let cleanup = capture_cleanup_identity(&s).unwrap();
         assert!(cleanup.iter().any(|e| e.relative_path == "Videos"));
     }
 }
