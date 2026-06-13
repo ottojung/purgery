@@ -33,6 +33,11 @@ pub(crate) enum EntryOutcome {
         relative_path: String,
         error: String,
     },
+    Skipped {
+        kind: ManifestEntryKind,
+        local_path: String,
+        relative_path: String,
+    },
 }
 
 impl EntryOutcome {
@@ -66,6 +71,19 @@ impl EntryOutcome {
                 final_paths: vec![],
                 postprocess: None,
                 error: Some(error),
+            },
+            EntryOutcome::Skipped {
+                kind,
+                local_path,
+                relative_path,
+            } => EntryStatusEntry {
+                kind,
+                local_path,
+                relative_path,
+                status: FileStatus::Skipped,
+                final_paths: vec![],
+                postprocess: None,
+                error: None,
             },
         }
     }
@@ -467,6 +485,9 @@ pub fn process_processing_run(
     );
 
     let mut outcomes: Vec<EntryOutcome> = Vec::new();
+    // Map: covering dir relative_path -> its outcome index.
+    let mut dir_outcomes: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
 
     for (entry_idx, entry) in manifest.entries.iter().enumerate() {
         write_progress_best_effort(
@@ -480,6 +501,18 @@ pub fn process_processing_run(
             "",
         );
 
+        if entry.mode == purgery_core::ManifestEntryMode::Covered {
+            // Covered entries are not processed independently — they are
+            // part of a postprocessed directory tree. A synthetic outcome
+            // is added after processing based on the covering directory.
+            outcomes.push(EntryOutcome::Skipped {
+                kind: entry.kind,
+                local_path: entry.local_path.as_str().to_owned(),
+                relative_path: entry.relative_path.as_str().to_owned(),
+            });
+            continue;
+        }
+
         outcomes.push(process_manifest_entry(
             &run_plan,
             entry,
@@ -491,6 +524,43 @@ pub fn process_processing_run(
             manifest.entries.len(),
             &run_config.destination,
         ));
+
+        if entry.kind == ManifestEntryKind::Directory {
+            dir_outcomes.insert(entry.relative_path.as_str().to_owned(), outcomes.len() - 1);
+        }
+    }
+
+    // Resolve covered entry outcomes to mirror their covering directory.
+    for (i, entry) in manifest.entries.iter().enumerate() {
+        if entry.mode != purgery_core::ManifestEntryMode::Covered {
+            continue;
+        }
+        let Some(ref covered_by) = entry.covered_by else {
+            continue;
+        };
+        let Some(&dir_idx) = dir_outcomes.get(covered_by) else {
+            continue;
+        };
+        match &outcomes[dir_idx] {
+            EntryOutcome::Success { .. } => {
+                outcomes[i] = EntryOutcome::Success {
+                    kind: entry.kind,
+                    local_path: entry.local_path.as_str().to_owned(),
+                    relative_path: entry.relative_path.as_str().to_owned(),
+                    final_paths: vec![],
+                    postprocess: None,
+                };
+            }
+            EntryOutcome::Failure { error, .. } => {
+                outcomes[i] = EntryOutcome::Failure {
+                    kind: entry.kind,
+                    local_path: entry.local_path.as_str().to_owned(),
+                    relative_path: entry.relative_path.as_str().to_owned(),
+                    error: format!("covering directory failed: {error}"),
+                };
+            }
+            EntryOutcome::Skipped { .. } => {}
+        }
     }
 
     let all_imported = outcomes

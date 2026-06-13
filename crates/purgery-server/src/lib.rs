@@ -149,6 +149,42 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
             })?;
     }
 
+    // Validate covered_by consistency.
+    for entry in &manifest.entries {
+        let is_covered = entry.mode == purgery_core::ManifestEntryMode::Covered;
+        if is_covered {
+            let Some(ref covered_by) = entry.covered_by else {
+                anyhow::bail!(
+                    "covered entry '{}' is missing covered_by",
+                    entry.relative_path.as_str()
+                );
+            };
+            if !entry.postprocess_steps.is_empty() {
+                anyhow::bail!(
+                    "covered entry '{}' must not have postprocess steps",
+                    entry.relative_path.as_str()
+                );
+            }
+            let covering_exists = manifest.entries.iter().any(|other| {
+                other.relative_path.as_str() == covered_by
+                    && other.kind == purgery_core::ManifestEntryKind::Directory
+                    && other.mode == purgery_core::ManifestEntryMode::Postprocess
+            });
+            if !covering_exists {
+                anyhow::bail!(
+                    "covered entry '{}' has covered_by '{}' which is not a postprocessed directory entry",
+                    entry.relative_path.as_str(),
+                    covered_by
+                );
+            }
+        } else if entry.covered_by.is_some() {
+            anyhow::bail!(
+                "non-covered entry '{}' must not have covered_by",
+                entry.relative_path.as_str()
+            );
+        }
+    }
+
     // Resolve relative destination against server cwd.
     let resolved_destination = if !run_config.destination.is_absolute() {
         let cwd =

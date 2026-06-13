@@ -4,6 +4,7 @@ use purgery_core::{
     compute_sha256, ClientLocalPath, Manifest, ManifestEntry, ManifestEntryKind, ManifestEntryMode,
     Nickname, NormalizedRelativePath, RunId,
 };
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::time::SystemTime;
@@ -24,6 +25,10 @@ pub(crate) fn build_manifest(
     let has_postprocess = !postprocess_steps.is_empty();
     let walk_root = source_path.to_path_buf();
     let mut entries: Vec<ManifestEntry> = Vec::new();
+
+    // Track which directories are postprocess roots so their descendants
+    // can be marked as covered.
+    let mut covering_dirs: HashSet<String> = HashSet::new();
 
     for walk_entry in WalkDir::new(&walk_root).follow_links(false).min_depth(1) {
         let walk_entry = walk_entry.with_context(|| format!("error walking {source}"))?;
@@ -49,22 +54,38 @@ pub(crate) fn build_manifest(
         let local_path = ClientLocalPath::new(local_path_str)
             .with_context(|| format!("invalid local path: {}", path.display()))?;
 
-        if file_type.is_dir() {
-            entries.push(ManifestEntry {
-                local_path,
-                staged_path: staged_path_norm,
-                relative_path: relative_path_norm,
-                kind: ManifestEntryKind::Directory,
-                size: 0,
-                mtime_ns: 0,
-                sha256: None,
-                link_target: None,
-                mode: ManifestEntryMode::Passthrough,
-                postprocess_steps: Vec::new(),
-            });
-        } else if file_type.is_file() {
-            let size = metadata.len();
-            let (mtime_ns, sha256) = if has_postprocess || capture_cleanup_identity || size > 0 {
+        // Determine if this entry is covered by a postprocessed parent directory.
+        let parent_dir = relative_path.parent().map(|p| p.as_str().to_owned());
+        let is_covered = parent_dir
+            .as_ref()
+            .is_some_and(|p| covering_dirs.contains(p));
+
+        // Determine mode and steps for this entry.
+        let is_top_level = relative_path.parent().is_none_or(|p| p.as_str().is_empty());
+
+        let (mode, steps) = if has_postprocess && is_top_level {
+            // Top-level entries in postprocess runs get postprocess mode.
+            (ManifestEntryMode::Postprocess, postprocess_steps.to_vec())
+        } else if has_postprocess && is_covered {
+            // Descendants of postprocess directory roots are covered.
+            (ManifestEntryMode::Covered, Vec::new())
+        } else {
+            (ManifestEntryMode::Passthrough, Vec::new())
+        };
+
+        // Track postprocess directory roots so their descendants are covered.
+        if file_type.is_dir() && mode == ManifestEntryMode::Postprocess {
+            covering_dirs.insert(relative_path.as_str().to_owned());
+        }
+
+        // Compute identity fields.
+        let is_regular_file = file_type.is_file();
+        let is_symlink = file_type.is_symlink();
+        let is_dir = file_type.is_dir();
+
+        let size = if is_regular_file { metadata.len() } else { 0 };
+        let (mtime_ns, sha256) =
+            if is_regular_file && (has_postprocess || capture_cleanup_identity || size > 0) {
                 let mtime = metadata
                     .modified()
                     .ok()
@@ -86,51 +107,41 @@ pub(crate) fn build_manifest(
                 (0, None)
             };
 
-            let mode = if has_postprocess {
-                ManifestEntryMode::Postprocess
-            } else {
-                ManifestEntryMode::Passthrough
-            };
+        let kind = if is_dir {
+            ManifestEntryKind::Directory
+        } else if is_regular_file {
+            ManifestEntryKind::RegularFile
+        } else if is_symlink {
+            ManifestEntryKind::Symlink
+        } else {
+            anyhow::bail!("unsupported filesystem entry: {}", path.display());
+        };
 
-            entries.push(ManifestEntry {
-                local_path,
-                staged_path: staged_path_norm,
-                relative_path: relative_path_norm,
-                kind: ManifestEntryKind::RegularFile,
-                size,
-                mtime_ns,
-                sha256: if has_postprocess || capture_cleanup_identity {
-                    sha256
-                } else {
-                    None
-                },
-                link_target: None,
-                mode,
-                postprocess_steps: if has_postprocess {
-                    postprocess_steps.to_vec()
-                } else {
-                    Vec::new()
-                },
-            });
-        } else if file_type.is_symlink() {
+        let link_target = if is_symlink {
             let target = fs::read_link(path)
                 .with_context(|| format!("failed to read symlink: {}", path.display()))?;
             let target = Utf8PathBuf::from_path_buf(target)
                 .map_err(|p| anyhow::anyhow!("non-UTF-8 symlink target: {}", p.display()))?;
+            Some(target)
+        } else {
+            None
+        };
 
-            entries.push(ManifestEntry {
-                local_path,
-                staged_path: staged_path_norm,
-                relative_path: relative_path_norm,
-                kind: ManifestEntryKind::Symlink,
-                size: 0,
-                mtime_ns: 0,
-                sha256: None,
-                link_target: Some(target),
-                mode: ManifestEntryMode::Passthrough,
-                postprocess_steps: Vec::new(),
-            });
-        }
+        let covered_by = if is_covered { parent_dir } else { None };
+
+        entries.push(ManifestEntry {
+            local_path,
+            staged_path: staged_path_norm,
+            relative_path: relative_path_norm,
+            kind,
+            size,
+            mtime_ns,
+            sha256,
+            link_target,
+            mode,
+            postprocess_steps: steps,
+            covered_by,
+        });
     }
 
     entries.sort_by(|a, b| {
