@@ -127,9 +127,7 @@ pub(crate) fn resume_pending_cleanups(state_dir: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn build_cleanup_entries(
-    manifest: &Manifest,
-) -> Result<Vec<CleanupEntry>> {
+pub(crate) fn build_cleanup_entries(manifest: &Manifest) -> Result<Vec<CleanupEntry>> {
     let mut entries: Vec<CleanupEntry> = Vec::new();
     let mut dirs: Vec<(String, String)> = Vec::new();
 

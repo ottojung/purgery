@@ -1299,7 +1299,10 @@ state = "done"
 
         let result = run_sync_with_runner(&runner, &args);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("simulated write failure"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("simulated write failure"));
     }
 
     #[test]
@@ -1341,7 +1344,10 @@ state = "done"
 
         let result = run_sync_with_runner(&runner, &args);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("simulated rsync failure"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("simulated rsync failure"));
     }
 
     #[test]
@@ -1380,7 +1386,8 @@ state = "done"
 
         let runs_dir = camino::Utf8PathBuf::from(&state_dir).join("runs");
         assert!(
-            !runs_dir.as_std_path().exists() || runs_dir.as_std_path().read_dir().unwrap().count() == 0,
+            !runs_dir.as_std_path().exists()
+                || runs_dir.as_std_path().read_dir().unwrap().count() == 0,
             "no persisted run state should exist before UploadCompleteFinishPending"
         );
     }
@@ -1427,8 +1434,10 @@ state = "done"
         let args = postprocess_args(&tmp, &state_dir);
 
         // Use a short heartbeat interval so the thread fires quickly.
-        let begin = begin_resp_toml().replace("heartbeat_interval_secs = 60",
-            "heartbeat_interval_secs = 2");
+        let begin = begin_resp_toml().replace(
+            "heartbeat_interval_secs = 60",
+            "heartbeat_interval_secs = 2",
+        );
         runner.add_response("begin-run", &begin);
         runner.add_response(
             "prepare-run",
@@ -1480,9 +1489,18 @@ state = "done"
         assert!(prepare_pos.is_some(), "prepare-run must be called");
         assert!(rsync_pos.is_some(), "rsync must be called");
         assert!(finish_pos.is_some(), "finish-run must be called");
-        assert!(begin_pos.unwrap() < prepare_pos.unwrap(), "begin-run before prepare-run");
-        assert!(prepare_pos.unwrap() < rsync_pos.unwrap(), "prepare-run before rsync");
-        assert!(rsync_pos.unwrap() < finish_pos.unwrap(), "rsync before finish-run");
+        assert!(
+            begin_pos.unwrap() < prepare_pos.unwrap(),
+            "begin-run before prepare-run"
+        );
+        assert!(
+            prepare_pos.unwrap() < rsync_pos.unwrap(),
+            "prepare-run before rsync"
+        );
+        assert!(
+            rsync_pos.unwrap() < finish_pos.unwrap(),
+            "rsync before finish-run"
+        );
 
         // Heartbeat commands may or may not appear in the log depending on
         // thread scheduling in the fake-runner test environment. The
@@ -1490,13 +1508,17 @@ state = "done"
         // starts after begin-run, stops via stop_and_join after finish-run).
         // Log entries before finish-run prove the heartbeat fired while
         // the run was still incoming.
-        let heartbeats_before_finish: Vec<_> = log.iter().enumerate()
+        let heartbeats_before_finish: Vec<_> = log
+            .iter()
+            .enumerate()
             .filter(|(_, c)| c.contains("heartbeat-run"))
             .map(|(i, _)| i)
             .collect();
         if !heartbeats_before_finish.is_empty() {
             assert!(
-                heartbeats_before_finish.iter().all(|&pos| pos < finish_pos.unwrap()),
+                heartbeats_before_finish
+                    .iter()
+                    .all(|&pos| pos < finish_pos.unwrap()),
                 "heartbeats must occur before finish-run when they appear"
             );
         }

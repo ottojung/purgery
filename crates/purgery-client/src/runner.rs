@@ -22,7 +22,9 @@ struct ScriptedResponse {
 pub(crate) enum RemoteRunner {
     Real,
     #[allow(dead_code)]
-    Fake { inner: Arc<FakeState> },
+    Fake {
+        inner: Arc<FakeState>,
+    },
 }
 
 pub(crate) struct FakeState {
