@@ -29,7 +29,7 @@ After processing, the client waits for a terminal state and reads a valid status
 
 ## Split
 
-With `--split <PATTERN>`, the client discovers matching source entries under `<SOURCE>` and processes each as a separate operation. Pure passthrough splits use a single filtered rsync transfer. Cleanup and postprocess splits run serially.
+With `--split <PATTERN>`, the client discovers matching source entries under `<SOURCE>` and processes each as a separate operation. Pure passthrough split performs one transfer of the selected roots. Cleanup and postprocess splits run serially.
 
 ## Destination overlay
 
