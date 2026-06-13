@@ -14,14 +14,12 @@ If `--config` is omitted, the server looks for config at `$PURGERY_SERVER_CONFIG
 
 ### Client (source device)
 
-```sh
-# Import a single file
-purgery-client sync -- ~/video.mp4 user@server:/archive
+Import a single file, directory, or symlink:
 
-# Import a single directory
+```sh
+purgery-client sync -- ~/video.mp4 user@server:/archive
 purgery-client sync -- ~/Videos user@server:/archive
 
-# Import with server-side transformation
 purgery-client sync \
   --postprocess compress-video \
   --delete-after-import \
