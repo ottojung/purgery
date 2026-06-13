@@ -1087,7 +1087,7 @@ mod tests {
     }
 
     #[test]
-    fn rsync_filter_empty_selected_dir_may_be_pruned() {
+    fn rsync_filter_empty_selected_dir_is_pruned() {
         if !rsync_available() {
             return;
         }
@@ -1099,8 +1099,6 @@ mod tests {
         let dest = tmp.path().join("dest");
         fs::create_dir(&dest).unwrap();
 
-        // Pattern "*/" selects directories but --prune-empty-dirs removes
-        // traversal-only empty directories even when selected.
         let f = build_split_filters("*/").unwrap();
         assert!(run_local_filter_rsync(
             &src,
@@ -1109,11 +1107,14 @@ mod tests {
             &f.exclude_rule
         ));
 
-        // Because empty_dir has no contents, --prune-empty-dirs may remove it.
-        // *.mp4 files are not matched by "*/" so they should not appear.
-        // The key assertion: empty_dir may or may not exist depending on rsync behavior.
-        // We explicitly document that it may be pruned.
-        let _files = list_files(&dest);
+        assert!(
+            !dest.join("empty_dir").exists(),
+            "selected empty directory is pruned by --prune-empty-dirs"
+        );
+        assert!(
+            !dest.join("a.mp4").exists(),
+            "non-directory entry a.mp4 is not selected by pattern '*/'"
+        );
     }
 
     #[test]
