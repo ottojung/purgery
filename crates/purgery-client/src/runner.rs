@@ -167,11 +167,22 @@ impl RemoteRunner {
         }
     }
 
-    /// Return the list of file lists passed to run_rsync_with_file_list.
+    /// Return the lists of filter rules passed to run_rsync_filter_transfer.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn file_lists(&self) -> Vec<Vec<String>> {
+    pub(crate) fn filter_rule_sets(&self) -> Vec<(Vec<String>, String)> {
         match self {
-            RemoteRunner::Fake { inner } => inner.file_list.lock().unwrap().clone(),
+            RemoteRunner::Fake { inner } => {
+                let lists = inner.file_list.lock().unwrap();
+                lists
+                    .iter()
+                    .map(|f| {
+                        let includes: Vec<_> =
+                            f.iter().take(f.len().saturating_sub(1)).cloned().collect();
+                        let exclude = f.last().cloned().unwrap_or_default();
+                        (includes, exclude)
+                    })
+                    .collect()
+            }
             RemoteRunner::Real => Vec::new(),
         }
     }
@@ -316,86 +327,71 @@ impl RemoteRunner {
         }
     }
 
-    /// Run rsync with --files-from for selected-file-only transfer.
-    pub(crate) fn run_rsync_with_file_list(
+    /// Run rsync with include/exclude filter rules for pure passthrough split.
+    ///
+    /// Uses one rsync invocation with a constant number of include/exclude
+    /// rules derived from the split pattern. The source operand in filter
+    /// mode has a trailing slash so selected entries land under `<TARGET>`
+    /// rather than under `<TARGET>/<SOURCE-NAME>`.
+    pub(crate) fn run_rsync_filter_transfer(
         &self,
         source: &str,
         host: &str,
         remote_dir: &str,
-        file_list: &[String],
+        include_rules: &[String],
+        exclude_rule: &str,
     ) -> Result<()> {
         let rsync_dest = format!("{host}:{remote_dir}/");
+        let source_with_slash = format!("{source}/");
 
-        // All options before --.  Source/dest operands after --.
-        let args: Vec<String> = vec![
-            "--recursive".to_string(),
+        let mut args: Vec<String> = vec![
+            "--archive".to_string(),
             "--partial".to_string(),
             "--inplace".to_string(),
             "--mkpath".to_string(),
-            "--archive".to_string(),
             "--protect-args".to_string(),
-            "--files-from={FILES}".to_string(),
-            "--relative".to_string(),
-            "--from0".to_string(),
-            "--".to_string(),
-            format!("{}/", source),
-            rsync_dest.clone(),
+            "--prune-empty-dirs".to_string(),
         ];
+        for rule in include_rules {
+            args.push(format!("--include='{rule}'"));
+        }
+        args.push(format!("--exclude='{exclude_rule}'"));
+        args.push("--".to_string());
+        args.push(source_with_slash);
+        args.push(rsync_dest);
+
+        let rsync_cmd = args.join(" ");
 
         match self {
             RemoteRunner::Real => {
-                let tmp_dir = std::env::temp_dir();
-                let unique = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos();
-                let list_path = tmp_dir.join(format!(
-                    "purgery-rsync-{}-{}.list",
-                    std::process::id(),
-                    unique
-                ));
-                let list_content = file_list.join("\0");
-                let files_arg = format!("--files-from={}", list_path.display());
-
-                std::fs::write(&list_path, &list_content)
-                    .with_context(|| "failed to write rsync file list")?;
-                let result = (|| -> Result<()> {
-                    let real_args: Vec<String> = args
-                        .iter()
-                        .map(|a| {
-                            if a == "--files-from={FILES}" {
-                                files_arg.clone()
-                            } else {
-                                a.clone()
-                            }
-                        })
-                        .collect();
-                    let status = Command::new("rsync")
-                        .args(&real_args)
-                        .status()
-                        .with_context(|| {
-                            format!("failed to execute rsync: {source} -> {host}:{remote_dir}")
-                        })?;
-                    if !status.success() {
-                        anyhow::bail!("rsync failed: {source} -> {host}:{remote_dir}");
-                    }
-                    Ok(())
-                })();
-                let _ = std::fs::remove_file(&list_path);
-                result
+                let status = Command::new("rsync")
+                    .args(&args)
+                    .status()
+                    .with_context(|| {
+                        format!(
+                            "failed to execute rsync filter transfer: {source} -> {host}:{remote_dir}"
+                        )
+                    })?;
+                if !status.success() {
+                    anyhow::bail!(
+                        "rsync filter transfer failed: {source} -> {host}:{remote_dir}"
+                    );
+                }
+                Ok(())
             }
             RemoteRunner::Fake { inner } => {
                 if let Some(hook) = inner.rsync_hook.lock().unwrap().take() {
                     hook();
                 }
                 for (rc, err) in inner.rsync_errors.lock().unwrap().iter() {
-                    let cmd = args.join(" ");
-                    if cmd.contains(rc.as_str()) {
+                    if rsync_cmd.contains(rc.as_str()) {
                         anyhow::bail!("{err}");
                     }
                 }
-                inner.log.lock().unwrap().push(args.join(" "));
-                inner.file_list.lock().unwrap().push(file_list.to_vec());
+                inner.log.lock().unwrap().push(rsync_cmd);
+                let mut all_rules: Vec<String> = include_rules.to_vec();
+                all_rules.push(exclude_rule.to_string());
+                inner.file_list.lock().unwrap().push(all_rules);
                 Ok(())
             }
         }
@@ -514,11 +510,16 @@ mod tests {
     }
 
     #[test]
-    fn file_list_rsync_argv_puts_options_before_separator() {
+    fn filter_rsync_argv_puts_options_before_separator() {
         let runner = RemoteRunner::fake();
-        let files = vec!["a.mp4".to_string(), "b.mp4".to_string()];
         runner
-            .run_rsync_with_file_list("/src", "host", "/dest", &files)
+            .run_rsync_filter_transfer(
+                "/src",
+                "host",
+                "/dest",
+                &["*/".to_string(), "*.mp4/***".to_string(), "*.mp4".to_string()],
+                "*",
+            )
             .unwrap();
         let log = runner.command_log();
         assert_eq!(log.len(), 1, "must be exactly one rsync process");
@@ -526,14 +527,18 @@ mod tests {
         // Verify all options appear before -- and operands after.
         let before_sep = cmd.split(" -- ").next().unwrap();
         assert!(
-            before_sep.contains("--files-from"),
-            "--files-from must be before --"
+            before_sep.contains("--include='*/'"),
+            "--include='*/' must be before --"
         );
         assert!(
-            before_sep.contains("--relative"),
-            "--relative must be before --"
+            before_sep.contains("--include='*.mp4/***'"),
+            "--include='*.mp4/***' must be before --"
         );
-        assert!(before_sep.contains("--from0"), "--from0 must be before --");
+        assert!(
+            before_sep.contains("--exclude='*'"),
+            "--exclude='*' must be before --"
+        );
+        assert!(before_sep.contains("--prune-empty-dirs"), "-m must be before --");
         assert!(
             cmd.contains("/src/"),
             "source dir with trailing / must be after --"
@@ -547,9 +552,14 @@ mod tests {
     #[test]
     fn pure_passthrough_split_uses_one_rsync_no_ssh() {
         let runner = RemoteRunner::fake();
-        let files = vec!["a.mp4".to_string()];
         runner
-            .run_rsync_with_file_list("/src", "host", "/dest", &files)
+            .run_rsync_filter_transfer(
+                "/src",
+                "host",
+                "/dest",
+                &["*/".to_string(), "*.mp4/***".to_string(), "*.mp4".to_string()],
+                "*",
+            )
             .unwrap();
         let log = runner.command_log();
         assert_eq!(log.len(), 1, "pure passthrough split must use one rsync");
@@ -557,14 +567,16 @@ mod tests {
     }
 
     #[test]
-    fn file_list_rsync_records_selected_files() {
+    fn filter_transfer_records_rules() {
         let runner = RemoteRunner::fake();
-        let files = vec!["a.mp4".to_string(), "b.mp4".to_string()];
+        let includes = vec!["*/".to_string(), "*.mp4/***".to_string(), "*.mp4".to_string()];
         runner
-            .run_rsync_with_file_list("/src", "host", "/dest", &files)
+            .run_rsync_filter_transfer("/src", "host", "/dest", &includes, "*")
             .unwrap();
-        let lists = runner.file_lists();
-        assert_eq!(lists.len(), 1, "must record exactly one file list");
-        assert_eq!(lists[0], files, "recorded file list must match input");
+        let rule_sets = runner.filter_rule_sets();
+        assert_eq!(rule_sets.len(), 1, "must record exactly one rule set");
+        let (recorded_includes, recorded_exclude) = &rule_sets[0];
+        assert_eq!(*recorded_includes, includes);
+        assert_eq!(*recorded_exclude, "*".to_string());
     }
 }

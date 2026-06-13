@@ -897,25 +897,6 @@ pub(crate) fn run_sync_with_run_id(
     Ok(())
 }
 
-/// Collect all descendant paths of a directory relative to source_root.
-fn collect_descendant_paths(
-    dir: &std::path::Path,
-    source_root: &std::path::Path,
-    paths: &mut Vec<String>,
-) {
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Ok(rel) = path.strip_prefix(source_root) {
-                paths.push(rel.to_string_lossy().to_string());
-            }
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                collect_descendant_paths(&path, source_root, paths);
-            }
-        }
-    }
-}
-
 /// Handle --split mode.
 fn run_split(
     runner: &RemoteRunner,
@@ -937,7 +918,7 @@ fn run_split(
         return run_passthrough_split(
             runner,
             &source_spec.operation_path,
-            &entry_roots,
+            args.split.as_deref().unwrap(),
             &target.host,
             target.path.as_str(),
         );
@@ -965,56 +946,32 @@ fn run_split(
 fn run_passthrough_split(
     runner: &RemoteRunner,
     source: &str,
-    roots: &[split::SplitCandidate],
+    pattern: &str,
     host: &str,
     remote_dir: &str,
 ) -> Result<()> {
-    // If only the source itself is selected, do a normal rsync.
-    if roots.len() == 1 && roots[0].path == source {
-        info!("passthrough split: transferring whole source");
-        runner.run_rsync(source, host, remote_dir)?;
-        return Ok(());
-    }
-
-    info!(
-        "passthrough split: transferring {} selected roots",
-        roots.len()
-    );
-
-    // Build a file list: for selected roots, include the root and all
-    // its descendants. Paths are relative to source.
-    let mut file_list: Vec<String> = Vec::new();
-    let source_path = std::path::Path::new(source);
-    for root in roots {
-        let root_path = std::path::Path::new(&root.path);
-        let relative = root_path.strip_prefix(source_path).unwrap_or(root_path);
-        let relative_str = relative.to_string_lossy().to_string();
-
-        if root.is_dir {
-            // Include the directory entry and all descendants.
-            // Walk is needed because rsync --files-from doesn't recurse
-            // into directories by itself.
-            file_list.push(relative_str.clone());
-            // Walk descendants for directories.
-            collect_descendant_paths(
-                std::path::Path::new(&root.path),
-                source_path,
-                &mut file_list,
+    let filters = split::build_split_filters(pattern);
+    match filters {
+        None => {
+            // --split "." : source entry itself matched, use ordinary rsync.
+            info!("passthrough split: transferring source entry");
+            runner.run_rsync(source, host, remote_dir)?;
+        }
+        Some(f) => {
+            info!(
+                "passthrough split: transferring with filter rules: includes={:?} exclude={}",
+                f.include_rules, f.exclude_rule
             );
-        } else {
-            file_list.push(relative_str);
+            runner.run_rsync_filter_transfer(
+                source,
+                host,
+                remote_dir,
+                &f.include_rules,
+                &f.exclude_rule,
+            )?;
         }
     }
-
-    // Deduplicate and sort.
-    file_list.sort();
-    file_list.dedup();
-
-    if file_list.is_empty() {
-        return Ok(());
-    }
-
-    runner.run_rsync_with_file_list(source, host, remote_dir, &file_list)
+    Ok(())
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -2072,18 +2029,22 @@ state = "done"
             "pure passthrough split must not use ssh"
         );
 
-        let file_lists = runner.file_lists();
-        assert_eq!(file_lists.len(), 1, "must record one file list");
-        let files = &file_lists[0];
-        assert!(files.iter().any(|f| f == "a.mp4"), "must include a.mp4");
+        let rule_sets = runner.filter_rule_sets();
+        assert_eq!(rule_sets.len(), 1, "must record one rule set");
+        let (includes, exclude) = &rule_sets[0];
         assert!(
-            files.iter().any(|f| f.contains("c.mp4")),
-            "must include sub/c.mp4"
+            includes.contains(&"*/".to_string()),
+            "must include '*/' for directory traversal"
         );
         assert!(
-            !files.iter().any(|f| f == "b.txt" || f.contains("b.txt")),
-            "must not include b.txt"
+            includes.contains(&"*.mp4/***".to_string()),
+            "must include '*.mp4/***' for directory payload"
         );
+        assert!(
+            includes.contains(&"*.mp4".to_string()),
+            "must include '*.mp4' for entry selection"
+        );
+        assert_eq!(exclude, "*", "must exclude '*'");
     }
 
     #[test]

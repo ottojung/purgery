@@ -2,6 +2,63 @@
 use std::path::Path;
 use walkdir::WalkDir;
 
+/// Rsync filter rules for pure passthrough split transfers.
+///
+/// Each rule is an include/exclude pattern as passed to rsync's
+/// `--include` or `--exclude` option, in positional order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SplitFilters {
+    pub include_rules: Vec<String>,
+    pub exclude_rule: String,
+}
+
+/// Build rsync include/exclude filter rules for a split pattern.
+///
+/// Generates a constant number of rules:
+///
+/// - `--include='*/'` keeps parent directories traversable.
+/// - `--include='<P-as-directory-payload>'` transfers matched directory
+///   payloads.
+/// - `--include='<P-as-entry>'` selects matching files, symlinks, and
+///   directory entries.
+/// - `--exclude='*'` prevents unrelated entries from being copied.
+///
+/// `<P-as-entry>` is the pattern unchanged.
+///
+/// `<P-as-directory-payload>` is the pattern with a trailing `***`
+/// element appended (after stripping any existing trailing `/`), so
+/// rsync knows to recurse into matched directories.
+///
+/// Returns `None` for the `"."` sentinel pattern which means the
+/// source entry itself matched — that case uses ordinary rsync.
+pub(crate) fn build_split_filters(pattern: &str) -> Option<SplitFilters> {
+    if pattern == "." {
+        return None;
+    }
+
+    let dir_payload = build_dir_payload(pattern);
+
+    Some(SplitFilters {
+        include_rules: vec!["*/".to_string(), dir_payload, pattern.to_string()],
+        exclude_rule: "*".to_string(),
+    })
+}
+
+/// Build the directory-payload include pattern.
+///
+/// If the pattern ends with `/`, strip it and append `/***`.
+/// Otherwise, append `/***`.
+///
+/// Examples:
+///
+/// - `"*.mp4"` → `"*.mp4/***"`
+/// - `"Photos/"` → `"Photos/***"`
+/// - `"**/*.mp4"` → `"**/*.mp4/***"`
+fn build_dir_payload(pattern: &str) -> String {
+    let stripped = pattern.trim_end_matches('/');
+    format!("{}/***", stripped)
+}
+
 pub(crate) struct SplitCandidate {
     pub path: String,
     pub is_dir: bool,
