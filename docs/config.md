@@ -121,25 +121,32 @@ All config structs reject unknown fields. Misspelled fields produce clear errors
 
 ## Cleanup identity requirements
 
-Regular files that can authorize local deletion must have SHA-256 identity.
+Cleanup captures identity for safe local deletion. For a single source entry, identity is captured as follows:
 
-| Entry kind | Identity fields | SHA required? |
-|------------|----------------|---------------|
-| Regular file | size, mtime, SHA-256 | yes, for delete-authorizing entries |
-| Symlink | literal link target | no |
-| Directory | bottom-up subtree identity | no |
+| Source kind | Identity fields |
+|-------------|----------------|
+| Regular file | size, mtime, SHA-256 |
+| Symlink | literal link target |
+| Directory | recursive descendant identities (see below) |
 
-Cleanup behaviour by kind:
+### Directory source identity
 
-- **Regular file with SHA**: deletion is authorised when size, mtime, and SHA-256 all match captured identity. If SHA recomputation fails during verification, deletion is refused.
+When the source is a directory, the client recursively captures identity for every descendant at cleanup snapshot time. This does not create manifest entries for descendants — the manifest describes one logical source entry. The descendant identities are used only for safe local deletion after server-confirmed import.
+
+Each descendant's identity follows the same rules: regular files capture size, mtime, and SHA-256; symlinks capture the literal link target; descendant directories are removed bottom-up after their children are gone.
+
+### Identity verification
+
+- **Regular file with SHA**: deletion is authorised when size, mtime, and SHA-256 all match captured identity.
 - **Regular file without SHA**: deletion is never authorised. The entry is excluded from cleanup ledgers.
 - **Symlink**: deletion is authorised when the literal link target matches. The symlink is unlinked without following the target.
-- **Directory**: tracked descendants must still match their captured identities.
+- **Descendant directory**: tracked children must still match their captured identities before the parent can be removed.
+- **Untracked content**: an on-disk descendant not captured in the cleanup snapshot prevents its containing directory from being removed.
 
-### SHA computation failure during classification
+### SHA computation failure
 
-- Postprocess regular files: SHA failure is fatal during manifest building.
-- Passthrough regular files with `--delete-after-import`: SHA failure is fatal during manifest building when the entry may authorise cleanup.
+- Postprocess source files: SHA failure is fatal during manifest building.
+- Passthrough files with `--delete-after-import`: SHA failure is fatal during cleanup identity capture.
 - Pure passthrough pre-rsync cleanup ledger capture: a regular file whose SHA cannot be computed is skipped (not added to the ledger).
 
 ## Trust boundary assumptions

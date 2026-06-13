@@ -44,17 +44,66 @@ If server directories do not exist, `check` reports an error.
 ```sh
 purgery-server process-once --config server.toml
 
-purgery-client sync -- ~/Videos user@server:/universe/synced/videos
+purgery-client sync -- ~/video.mp4 user@server:/archive
 
 purgery-client sync \
   --postprocess compress-video \
   --delete-after-import \
-  -- ~/Videos user@server:/universe/synced/videos
+  -- ~/Videos/trip user@server:/archive
+
+purgery-client sync \
+  --postprocess compress-video \
+  --delete-after-import \
+  --split "**/*.mp4" \
+  -- ~/Videos user@server:/archive
 
 purgery-server gc --config server.toml
 ```
 
 `process-once` runs side-effect-free server validation first, then GC opportunistically, then recovers processing runs and processes ready runs.
+
+## Split
+
+The `--split <PATTERN>` flag selects source entries to process individually. The pattern uses rsync include/exclude syntax.
+
+### Pattern syntax
+
+- Patterns with `/` match against relative paths.
+- Patterns without `/` may match any path component.
+- `*` matches within a single directory level (does not cross `/`).
+- `**` matches across directory boundaries.
+- Trailing `/` restricts to directories only.
+- Leading `/` anchors to the transfer root (`<SOURCE>`).
+
+### Candidate discovery
+
+Candidates include `<SOURCE>` itself (represented as `.`) and every descendant, represented by its normalized relative path from `<SOURCE>`.
+
+### Ancestor pruning
+
+If a matched entry has a matched ancestor, only the ancestor is kept. The result is a non-overlapping set of roots in deterministic normalized path order.
+
+### No-match behavior
+
+If `--split <PATTERN>` matches nothing, an info-level message is logged, no transfer is performed, no server run is created, and the client exits successfully with status code 0.
+
+### Target suffix
+
+Each matched root gets a target suffix that preserves its relative layout under `<TARGET>`:
+
+| Matched entry | Suffix | Example target |
+|---------------|--------|-------|
+| `<SOURCE>` exactly | empty | `user@host:/archive` |
+| Top-level child of `<SOURCE>` | `/` | `user@host:/archive/` |
+| Nested child | `/parent/` | `user@host:/archive/parent/` |
+
+### Pure passthrough optimization
+
+Without `--delete-after-import` or `--postprocess`, the split is implemented as a single rsync transfer with equivalent include/exclude filters. No server run or client state is created.
+
+### Serialized split for cleanup and postprocess
+
+With `--delete-after-import` or `--postprocess`, each matched entry is processed as a serialized non-split sync operation. The next operation starts only after the previous one is completely done: transfer finished, server run reached terminal (if postprocess), status read, cleanup confirmed, local deletion completed.
 
 ## Heartbeat and leases
 
@@ -123,8 +172,8 @@ This is used for client `ssh`, `rsync`, and server postprocess `program` values.
 
 ## Final-storage overlay
 
-Each run overlays its uploaded tree onto the destination with recursive archive-mode rsync semantics and no delete option. Existing directories are merged, regular files and symlinks replace compatible destination entries, and extra final descendants remain. A regular file or symlink does not replace a non-empty destination directory. Source directory entries can replace conflicting file or symlink parents before descendants are imported.
+Each run overlays its uploaded source onto the destination with recursive archive-mode rsync semantics and no delete option. The source entry name is appended to the destination to form the final path. Existing directories are merged, regular files and symlinks replace compatible destination entries.
 
-Symlink targets are stored and recreated literally. Neither staged symlinks nor destination symlinks are traversed as directories. Postprocessing applies to regular files, directories, and symlinks. A postprocessed directory covers its descendants, which are committed as part of the directory's output tree rather than processed independently.
+Symlink targets are stored and recreated literally. Neither staged symlinks nor destination symlinks are traversed as directories. Postprocessing applies to the source entry, regardless of kind.
 
 A crash can expose a prefix of the entry overlay. This is expected: the run remains in `processing/` without a terminal status and `process-once` replays it until the final tree converges. The operation is not an all-or-nothing filesystem transaction.

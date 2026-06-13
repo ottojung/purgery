@@ -4,11 +4,11 @@
 
 The client stores durable cleanup records under `--state-dir`, defaulting to `$XDG_STATE_HOME/purgery` or `~/.local/state/purgery`. Pending cleanup records are replayed at the start of every invocation.
 
-Each cleanup entry records the local path, relative path, entry kind, and identity. Cleanup is idempotent: missing entries are marked complete, unchanged authorized entries are removed, and changed entries remain untouched.
+Each cleanup entry records the local path, relative path, entry kind, and identity. For a directory source, descendant identities are also recorded for safe recursive deletion, but the manifest and server run describe one logical entry. Cleanup is idempotent: missing entries are marked complete, unchanged authorized entries are removed, and changed entries remain untouched.
 
 Authority depends on the mode:
 
-- direct passthrough: successful rsync confirms every recorded transfer entry;
+- direct passthrough: successful rsync confirms the transfer;
 - postprocess: a valid terminal server status confirms only entries marked `imported`.
 
 A successful upload to postprocess staging never authorizes cleanup.

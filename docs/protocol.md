@@ -7,7 +7,8 @@
 ```
 client: validate args
 client: if --delete-after-import, capture durable local cleanup identity
-client: direct rsync to USER@HOST:DESTINATION/
+client: source entry is transferred via rsync as-is (no trailing / appended)
+client: direct rsync to USER@HOST:DESTINATION
 client: if --delete-after-import, mark the transfer successful and remove only unchanged originals
 (no server run, manifest, status polling, or finish-run)
 ```
@@ -16,19 +17,37 @@ client: if --delete-after-import, mark the transfer successful and remove only u
 
 ```
 client: validate args (--postprocess requires --delete-after-import)
-client: walk source tree, build manifest with entry classification
 client: generate run ID
 client: begin-run over SSH -> server creates incoming directory, returns paths
 client: write run.toml + manifest.toml to server incoming dir
 client: prepare-run over SSH -> server validates the destination, envelope, and requested steps
-client: rsync to server staging area (files/)
+client: rsync source entry to server staging area (files/<source-name>)
 client: persist local run state as upload_complete_finish_pending
 client: finish-run over SSH -> server moves incoming -> ready
 client: persist local state as waiting_for_terminal_state
 client: wait using run-state; retry only on ready/processing
 client: on terminal: read status
-client: remove confirmed local originals (server-confirmed cleanup)
+client: remove confirmed local original (server-confirmed cleanup)
 client: persist local state as cleanup_complete
+```
+
+### Path C: Split (with --split)
+
+Each split entry is processed as a separate server run when --postprocess or --delete-after-import is present. Pure passthrough splits use a single filtered rsync transfer.
+
+```
+client: validate args
+client: discover split candidates under SOURCE
+client: apply rsync-style pattern to select non-overlapping roots
+if no match:
+  log info, exit 0
+if pure passthrough:
+  construct single rsync command with include/exclude filters
+  run rsync, exit
+if cleanup or postprocess:
+  for each matched root (in deterministic order):
+    run non-split sync with root as source and target suffix
+    wait for completion before next root
 ```
 
 ## Server subcommands
@@ -73,49 +92,48 @@ heartbeat_interval_secs = 60
 
 ```toml
 nickname = "laptop"
-destination = "/universe/synced/videos"
+destination = "/archive"
 delete_after_import = true
 ```
 
-The `destination` field is the client-supplied destination path. It may be absolute or relative. For postprocess runs, a relative destination is resolved against the server's working directory during `prepare-run` and the `run.toml` is atomically rewritten with the absolute path. Final paths are computed as `{destination}/{relative_entry_path}`; `work_dir` is never prepended.
+The `destination` field is the target parent directory. It may be absolute or relative. For postprocess runs, a relative destination is resolved against the server's working directory during `prepare-run` and the `run.toml` is atomically rewritten with the absolute path. The server computes the final path as `{destination}/{source_entry_name}`; `work_dir` is never prepended.
 
 ## Manifest (manifest.toml)
+
+A normal non-split run describes one logical source entry.
 
 ```toml
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 
 [[entries]]
-local_path = "/home/user/Videos/test.mp4"
-staged_path = "files/test.mp4"
-relative_path = "test.mp4"
+local_path = "/home/user/video.mp4"
+staged_path = "files/video.mp4"
+relative_path = "video.mp4"
 kind = "regular_file"
 mode = "postprocess"
 size = 1048576
 mtime_ns = 1700000000000000000
 sha256 = "abc123..."
 postprocess_steps = ["compress-video"]
+```
 
+For a directory source:
+
+```toml
 [[entries]]
-local_path = "/home/user/Videos/photos"
-staged_path = "files/photos"
-relative_path = "photos"
+local_path = "/home/user/Videos"
+staged_path = "files/Videos"
+relative_path = "Videos"
 kind = "directory"
 mode = "postprocess"
 postprocess_steps = ["compress-video"]
-
-[[entries]]
-local_path = "/home/user/Videos/photos/photo1.jpg"
-staged_path = "files/photos/photo1.jpg"
-relative_path = "photos/photo1.jpg"
-kind = "regular_file"
-mode = "covered"
-covered_by = "photos"
 ```
 
-- `mode` is one of `passthrough`, `postprocess`, or `covered`.
-- `covered` entries have no `postprocess_steps`; they are covered by a postprocessed directory ancestor named in `covered_by`.
-- Staged paths use the format `files/<relative-path>`.
+- `mode` is `passthrough` or `postprocess`.
+- `relative_path` is the source entry name.
+- `staged_path` uses the format `files/<source-name>`.
+- The manifest contains one entry for a non-split run.
 
 ## Status (status.toml)
 
@@ -125,14 +143,14 @@ nickname = "laptop"
 state = "done"
 
 [[entries]]
-local_path = "/home/user/Videos/test.mp4"
-relative_path = "test.mp4"
+local_path = "/home/user/video.mp4"
+relative_path = "video.mp4"
 status = "imported"
-final_paths = ["/universe/synced/videos/test.mp4"]
+final_paths = ["/archive/video.mp4"]
 postprocess = ["compress-video"]
 ```
 
-`final_paths` entries are `<destination>/<relative_path>`. The nickname is operational metadata and does not appear in final_paths.
+`final_paths` entries are `<destination>/<source-entry-name>`. The nickname is operational metadata and does not appear in final_paths.
 
 ## RunStateResponse
 
@@ -142,7 +160,7 @@ nickname = "laptop"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 phase = "processing"
 terminal = false
-message = "processing entry 3/10"
+message = "processing entry 1/1"
 updated_at_unix_secs = 1234567890
 observed_at_unix_secs = 1234567891
 ```

@@ -1,6 +1,6 @@
 # Purgery
 
-Purgery imports filesystem entries from devices into a destination, optionally transforms them on the server, and only removes local originals when doing so is explicitly configured and safe.
+Purgery imports a filesystem entry from a device into a destination, optionally transforms it on the server, and only removes the local original when doing so is explicitly configured and safe.
 
 ## Quick start
 
@@ -15,22 +15,48 @@ If `--config` is omitted, the server looks for config at `$PURGERY_SERVER_CONFIG
 ### Client (source device)
 
 ```sh
-purgery-client sync -- ~/Videos user@server:/universe/synced/videos
+# Import a single file
+purgery-client sync -- ~/video.mp4 user@server:/archive
 
+# Import a single directory
+purgery-client sync -- ~/Videos user@server:/archive
+
+# Import with server-side transformation
 purgery-client sync \
   --postprocess compress-video \
   --delete-after-import \
-  -- ~/Videos user@server:/universe/synced/videos
+  -- ~/Videos/trip user@server:/archive
 ```
 
-SOURCE must be a local directory. The destination is rsync-style: `USER@HOST:/absolute/path` or `USER@HOST:relative/path`. Both absolute and relative destinations are accepted. For postprocess runs, a relative destination is resolved against the server's working directory during `prepare-run` and the resolved absolute path persists in the run.
+SOURCE may be a regular file, directory, or symlink. The destination is rsync-style: `USER@HOST:/absolute/path` or `USER@HOST:relative/path`. Both absolute and relative destinations are accepted. For postprocess runs, a relative destination is resolved against the server's working directory during `prepare-run` and the resolved absolute path persists in the run.
 
 ## How it works
 
-1. You invoke `purgery-client sync` with a local source tree and a remote destination.
-2. Without `--postprocess`, the client transfers directly to the destination with rsync; no server run or manifest exists.
-3. With passthrough cleanup, the client records local identity before rsync and removes only unchanged originals after rsync succeeds.
-4. With `--postprocess`, the client validates a server run plan before staging files, waits for processing, and retires only unchanged originals that server status marks imported.
+Each `sync` invocation operates on exactly one source entry. The source entry is imported under `<TARGET>` using its own name:
+
+```
+purgery-client sync -- ./video.mp4 user@server:/archive
+  → /archive/video.mp4
+
+purgery-client sync -- ./Photos user@server:/archive
+  → /archive/Photos
+```
+
+1. Without `--postprocess`, the client transfers directly to the destination with rsync; no server run or manifest exists.
+2. With passthrough cleanup, the client records local identity before rsync and removes only unchanged originals after rsync succeeds.
+3. With `--postprocess`, the client creates a server run for the source entry, waits for processing, and retires only unchanged originals that server status marks imported.
+
+For multiple source entries under a common root, use `--split <PATTERN>`:
+
+```sh
+purgery-client sync \
+  --postprocess compress-video \
+  --delete-after-import \
+  --split "**/*.mp4" \
+  -- ~/Videos user@server:/archive
+```
+
+Each matched entry is processed as its own server run. Pure passthrough splits use a single filtered rsync transfer; cleanup and postprocess splits run serially.
 
 ## Configuration
 
@@ -46,7 +72,7 @@ Full config reference: [docs/config.md](docs/config.md)
 
 ## Transforms (postprocessing)
 
-Transformations are defined on the server. Clients request named steps via the `--postprocess` flag. Postprocessing applies to regular files, directories, and symlinks. A postprocessed directory covers its descendants, which are committed as part of the directory's output tree rather than processed independently.
+Transformations are defined on the server. Clients request named steps via the `--postprocess` flag. Postprocessing applies to the source entry itself, regardless of kind. A directory source is passed as a single work path; its contents are available to the subprocess but the operation is one logical entry.
 
 ```toml
 # server.toml
@@ -80,14 +106,14 @@ Purgery targets Unix/POSIX filesystem semantics and is conservative about data l
 - **Passthrough imports**: cleanup is opt-in. With `--delete-after-import`, a durable local state file records the transfer; the client verifies the local entry still matches its uploaded identity before removal.
 - **Transformed imports**: cleanup is required (`--delete-after-import`). The client removes local originals only after the server confirms the import in a valid status record.
 - Before any removal, the client verifies the local entry still matches its uploaded identity (size, mtime, optional SHA-256 for regular files; link target for symlinks; subtree identity for directories).
-- The server performs a recursive merge into the destination: directories merge, regular files replace existing ones, symlinks remain symlinks, and absent source entries never delete destination entries.
+- The server performs a recursive merge into the destination: directories merge, regular files replace existing ones, symlinks remain symlinks.
 - Symlink targets are literal data. The server never follows staged or destination symlinks as directories.
-- Tree imports provide replayable convergence through crash-safe per-entry commits, not an all-or-nothing transaction.
+- When a directory source is imported, its local descendants are captured for safe deletion but the manifest and status describe one logical entry.
 
 ## More documentation
 
 - [Config reference](docs/config.md) — server config, transform definitions, run configuration
 - [Protocol](docs/protocol.md) — lifecycle, subcommands, run states, status format
-- [Operations](docs/operations.md) — check, GC, heartbeat, leases
-- [Import semantics](docs/design/import-semantics.md) — tree-overlay model, work areas, and per-entry safety rules
+- [Operations](docs/operations.md) — check, GC, heartbeat, leases, split
+- [Import semantics](docs/design/import-semantics.md) — one-source-entry model, work areas, and per-entry safety rules
 - [Crash safety and idempotence](docs/design/crash-safety-and-idempotence.md) — durable phases, replay recovery, atomic replacement, and deletion authority
