@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use purgery_core::{
-    compute_sha256, ClientLocalPath, Manifest, ManifestEntry, ManifestEntryKind, ManifestEntryMode,
-    Nickname, NormalizedRelativePath, RunId,
+    compute_sha256, CleanupEntry, ClientLocalPath, Manifest, ManifestEntry, ManifestEntryKind,
+    ManifestEntryMode, Nickname, NormalizedRelativePath, RunId,
 };
 use std::fs;
 use std::path::Path;
@@ -108,22 +108,24 @@ pub(crate) fn build_manifest(
         entries: vec![entry],
     })
 }
-
 /// Capture cleanup identity for a source entry.
 ///
 /// For a directory source, recursively captures descendant identities
 /// so the client can safely delete the entire imported tree after
 /// server-confirmed import. These identities are used only for
 /// deletion safety — the manifest/status still describe one logical entry.
-pub(crate) fn capture_cleanup_identity(source: &str) -> Result<Vec<purgery_core::CleanupEntry>> {
-    use purgery_core::CleanupEntry;
-    use std::path::Path;
+pub(crate) fn capture_cleanup_identity(source: &str) -> Result<Vec<CleanupEntry>> {
     use walkdir::WalkDir;
 
     let source_path = Path::new(source);
     if !source_path.exists() {
         return Ok(Vec::new());
     }
+
+    let source_name = source_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| source.to_owned());
 
     let metadata = fs::symlink_metadata(source_path)
         .with_context(|| format!("failed to read metadata: {source}"))?;
@@ -141,12 +143,8 @@ pub(crate) fn capture_cleanup_identity(source: &str) -> Result<Vec<purgery_core:
             .ok_or_else(|| anyhow::anyhow!("non-UTF-8 path: {source}"))?;
         let sha =
             Some(compute_sha256(utf8_path).with_context(|| format!("SHA-256 failed: {source}"))?);
-        let name = source_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| source.to_owned());
         return Ok(vec![CleanupEntry {
-            relative_path: name,
+            relative_path: source_name,
             local_path: source.to_owned(),
             kind: ManifestEntryKind::RegularFile,
             size,
@@ -162,12 +160,8 @@ pub(crate) fn capture_cleanup_identity(source: &str) -> Result<Vec<purgery_core:
         let target = fs::read_link(source_path)
             .ok()
             .map(|t| t.to_string_lossy().to_string());
-        let name = source_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| source.to_owned());
         return Ok(vec![CleanupEntry {
-            relative_path: name,
+            relative_path: source_name,
             local_path: source.to_owned(),
             kind: ManifestEntryKind::Symlink,
             size: 0,
@@ -179,9 +173,13 @@ pub(crate) fn capture_cleanup_identity(source: &str) -> Result<Vec<purgery_core:
         }]);
     }
 
-    // Directory source: walk all descendants to capture identities.
+    // Directory source: include the top-level directory itself plus all
+    // descendants. Relative paths are rooted at the source entry name.
     let mut entries: Vec<CleanupEntry> = Vec::new();
     let mut dirs: Vec<(String, String)> = Vec::new();
+
+    // Top-level directory entry.
+    dirs.push((source_name.clone(), source.to_owned()));
 
     for walk_entry in WalkDir::new(source_path).follow_links(false).min_depth(1) {
         let walk_entry = match walk_entry {
@@ -198,8 +196,9 @@ pub(crate) fn capture_cleanup_identity(source: &str) -> Result<Vec<purgery_core:
             Ok(r) => r,
             Err(_) => continue,
         };
-        let relative_str = relative.to_string_lossy().to_string();
-
+        // Prefix with source name so relative paths are rooted at the
+        // source entry (e.g. "Videos/a.mp4").
+        let relative_str = format!("{}/{}", source_name, relative.to_string_lossy());
         let local_str = path.to_string_lossy().to_string();
 
         if ft.is_dir() {
@@ -245,7 +244,7 @@ pub(crate) fn capture_cleanup_identity(source: &str) -> Result<Vec<purgery_core:
         }
     }
 
-    // Add directories bottom-up (deepest first).
+    // Add directories bottom-up (deepest first) so children are deleted before parents.
     for (relative_str, local_path_str) in dirs.into_iter().rev() {
         entries.push(CleanupEntry {
             relative_path: relative_str,
@@ -260,6 +259,7 @@ pub(crate) fn capture_cleanup_identity(source: &str) -> Result<Vec<purgery_core:
         });
     }
 
+    // Sort deepest-first for bottom-up deletion.
     entries.sort_by(|a, b| {
         let a_depth = a.local_path.matches('/').count();
         let b_depth = b.local_path.matches('/').count();
@@ -376,10 +376,23 @@ mod tests {
         fs::write(dir.join("a.mp4"), "data").unwrap();
         fs::write(dir.join("sub/b.mp4"), "data").unwrap();
         let entries = capture_cleanup_identity(dir.to_str().unwrap()).unwrap();
-        // Should include both files and the subdirectory (not the top-level dir)
-        assert!(!entries.is_empty());
-        assert!(entries.iter().any(|e| e.relative_path == "a.mp4"));
-        assert!(entries.iter().any(|e| e.relative_path == "sub/b.mp4"));
-        assert!(entries.iter().any(|e| e.relative_path == "sub"));
+        // Should include the top-level directory and descendants with
+        // relative paths rooted at the source entry name.
+        assert!(entries.iter().any(|e| e.relative_path == "Videos"));
+        assert!(entries.iter().any(|e| e.relative_path == "Videos/a.mp4"));
+        assert!(entries
+            .iter()
+            .any(|e| e.relative_path == "Videos/sub/b.mp4"));
+        assert!(entries.iter().any(|e| e.relative_path == "Videos/sub"));
+        // Top-level dir should sort after descendants (deeper first).
+        let dir_idx = entries
+            .iter()
+            .position(|e| e.relative_path == "Videos")
+            .unwrap();
+        let file_idx = entries
+            .iter()
+            .position(|e| e.relative_path == "Videos/a.mp4")
+            .unwrap();
+        assert!(file_idx < dir_idx, "files should appear before parent dir");
     }
 }
