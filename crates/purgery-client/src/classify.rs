@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use purgery_core::{
     compute_sha256, CleanupEntry, ClientLocalPath, Manifest, ManifestEntry, ManifestEntryKind,
-    ManifestEntryMode, Nickname, NormalizedRelativePath, RunId,
+    Nickname, NormalizedRelativePath, RunId,
 };
 use std::fs;
 use std::path::Path;
@@ -83,12 +83,6 @@ pub(crate) fn build_manifest(
         None
     };
 
-    let mode = if has_postprocess {
-        ManifestEntryMode::Postprocess
-    } else {
-        ManifestEntryMode::Passthrough
-    };
-
     let entry = ManifestEntry {
         local_path,
         staged_path,
@@ -98,7 +92,6 @@ pub(crate) fn build_manifest(
         mtime_ns,
         sha256,
         link_target,
-        mode,
         postprocess_steps: postprocess_steps.to_vec(),
     };
 
@@ -277,7 +270,7 @@ pub(crate) fn capture_cleanup_identity(source: &str) -> Result<Vec<CleanupEntry>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use purgery_core::{ManifestEntryKind, ManifestEntryMode};
+    use purgery_core::ManifestEntryKind;
     use std::fs;
     use std::os::unix;
     use std::os::unix::fs::PermissionsExt;
@@ -297,7 +290,6 @@ mod tests {
         .unwrap();
         assert_eq!(manifest.entries.len(), 1);
         assert_eq!(manifest.entries[0].kind, ManifestEntryKind::RegularFile);
-        assert_eq!(manifest.entries[0].mode, ManifestEntryMode::Passthrough);
     }
 
     #[test]
@@ -314,7 +306,6 @@ mod tests {
         .unwrap();
         assert_eq!(manifest.entries.len(), 1);
         assert_eq!(manifest.entries[0].kind, ManifestEntryKind::RegularFile);
-        assert_eq!(manifest.entries[0].mode, ManifestEntryMode::Postprocess);
         assert_eq!(manifest.entries[0].postprocess_steps, vec!["compress"]);
     }
 
@@ -332,7 +323,6 @@ mod tests {
         .unwrap();
         assert_eq!(manifest.entries.len(), 1);
         assert_eq!(manifest.entries[0].kind, ManifestEntryKind::Directory);
-        assert_eq!(manifest.entries[0].mode, ManifestEntryMode::Postprocess);
     }
 
     #[test]
@@ -351,7 +341,6 @@ mod tests {
         .unwrap();
         assert_eq!(manifest.entries.len(), 1);
         assert_eq!(manifest.entries[0].kind, ManifestEntryKind::Symlink);
-        assert_eq!(manifest.entries[0].mode, ManifestEntryMode::Postprocess);
         assert!(manifest.entries[0].link_target.is_some());
     }
 

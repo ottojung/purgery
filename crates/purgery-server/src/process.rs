@@ -8,9 +8,7 @@ use purgery_core::{
 use std::fs;
 use tracing::{info, span, warn, Level};
 
-use crate::commit::{
-    commit_directory_entry, commit_output_entry, commit_regular_file_entry, commit_symlink_entry,
-};
+use crate::commit::commit_output_entry;
 use crate::gc::run_gc;
 use crate::phases::{
     finalize_processing_run, move_to_failed, write_progress_best_effort, write_run_failure,
@@ -239,112 +237,96 @@ fn process_manifest_entry(
             format!("final path escapes destination: {}", final_path.as_str()),
         );
     }
-    let final_destination = final_path.as_str().to_owned();
-
-    let has_postprocess = !entry.postprocess_steps.is_empty();
-
-    let result = if !has_postprocess {
-        match entry.kind {
-            ManifestEntryKind::Directory => commit_directory_entry(&final_path, destination_root)
-                .map(|_| (vec![final_destination], None)),
-            ManifestEntryKind::Symlink => {
-                let work_path = match prepare_work_entry(entry, &source_path, work_area) {
-                    Ok(p) => p,
-                    Err(error) => return failed_entry(entry, error.to_string()),
-                };
-                commit_symlink_entry(&work_path, &final_path, destination_root, run_id)
-                    .map(|_| (vec![final_destination], None))
-            }
-            ManifestEntryKind::RegularFile => {
-                let work_path = match prepare_work_entry(entry, &source_path, work_area) {
-                    Ok(p) => p,
-                    Err(error) => return failed_entry(entry, error.to_string()),
-                };
-                commit_regular_file_entry(&work_path, &final_path, destination_root, run_id)
-                    .map(|_| (vec![final_destination], None))
-            }
-        }
-    } else {
-        let work_path = match prepare_work_entry(entry, &source_path, work_area) {
-            Ok(p) => p,
-            Err(error) => return failed_entry(entry, error.to_string()),
-        };
-        let mut pp_helper = |update: &purgery_core::ProgressUpdate| {
-            write_progress_best_effort(
-                processing_path,
-                nickname,
-                run_id,
-                update.state,
-                update.entry_index,
-                update.entry_total,
-                update.current_entry,
-                update.current_step,
-            );
-        };
-        let resolved_steps = match run_plan.resolve_steps(&entry.postprocess_steps) {
-            Ok(s) => s,
-            Err(error) => return failed_entry(entry, error),
-        };
-        match apply_postprocessing(
-            &resolved_steps,
-            &work_path,
-            &mut pp_helper,
-            entry_index,
-            entry_total,
-            entry.relative_path.as_str(),
-        ) {
-            Ok(outputs) => {
-                let mut final_paths = Vec::new();
-                for output in outputs {
-                    let output_final = if output == work_path {
-                        final_path.clone()
-                    } else {
-                        let filename = output.file_name().unwrap_or("");
-                        final_path.parent().map_or_else(
-                            || Utf8PathBuf::from(filename),
-                            |parent| parent.join(filename),
-                        )
-                    };
-                    if !path_is_within_root(&output_final, destination_root) {
-                        return failed_entry(entry, "output escapes root");
-                    }
-                    if let Err(error) =
-                        commit_output_entry(&output, &output_final, destination_root, run_id)
-                    {
-                        return failed_entry(entry, format!("commit failed: {error}"));
-                    }
-                    let output_relative = if output == work_path {
-                        entry.relative_path.clone()
-                    } else {
-                        let filename = output.file_name().unwrap_or("");
-                        let relative = entry.relative_path.as_path().parent().map_or_else(
-                            || Utf8PathBuf::from(filename),
-                            |parent| parent.join(filename),
-                        );
-                        match NormalizedRelativePath::new(relative) {
-                            Ok(path) => path,
-                            Err(error) => {
-                                return failed_entry(entry, format!("invalid output path: {error}"))
-                            }
-                        }
-                    };
-                    final_paths.push(destination.join(&output_relative).as_str().to_owned());
-                }
-                let steps: Vec<String> = entry.postprocess_steps.clone();
-                Ok((final_paths, (!steps.is_empty()).then_some(steps)))
-            }
-            Err(error) => Err(error),
-        }
+    let work_path = match prepare_work_entry(entry, &source_path, work_area) {
+        Ok(p) => p,
+        Err(error) => return failed_entry(entry, error.to_string()),
     };
 
-    match result {
-        Ok((final_paths, postprocess)) => EntryOutcome::Success {
-            kind: entry.kind,
-            local_path: entry.local_path.as_str().to_owned(),
-            relative_path: entry.relative_path.as_str().to_owned(),
-            final_paths,
-            postprocess,
-        },
+    // No steps → commit the original work path directly (identity transform).
+    if entry.postprocess_steps.is_empty() {
+        let final_destination = final_path.as_str().to_owned();
+        return match commit_output_entry(&work_path, &final_path, destination_root, run_id) {
+            Ok(_) => EntryOutcome::Success {
+                kind: entry.kind,
+                local_path: entry.local_path.as_str().to_owned(),
+                relative_path: entry.relative_path.as_str().to_owned(),
+                final_paths: vec![final_destination],
+                postprocess: None,
+            },
+            Err(error) => failed_entry(entry, error),
+        };
+    }
+
+    let mut pp_helper = |update: &purgery_core::ProgressUpdate| {
+        write_progress_best_effort(
+            processing_path,
+            nickname,
+            run_id,
+            update.state,
+            update.entry_index,
+            update.entry_total,
+            update.current_entry,
+            update.current_step,
+        );
+    };
+    let resolved_steps = match run_plan.resolve_steps(&entry.postprocess_steps) {
+        Ok(s) => s,
+        Err(error) => return failed_entry(entry, error),
+    };
+    match apply_postprocessing(
+        &resolved_steps,
+        &work_path,
+        &mut pp_helper,
+        entry_index,
+        entry_total,
+        entry.relative_path.as_str(),
+    ) {
+        Ok(outputs) => {
+            let mut final_paths = Vec::new();
+            for output in outputs {
+                let output_final = if output == work_path {
+                    final_path.clone()
+                } else {
+                    let filename = output.file_name().unwrap_or("");
+                    final_path.parent().map_or_else(
+                        || Utf8PathBuf::from(filename),
+                        |parent| parent.join(filename),
+                    )
+                };
+                if !path_is_within_root(&output_final, destination_root) {
+                    return failed_entry(entry, "output escapes root");
+                }
+                if let Err(error) =
+                    commit_output_entry(&output, &output_final, destination_root, run_id)
+                {
+                    return failed_entry(entry, format!("commit failed: {error}"));
+                }
+                let output_relative = if output == work_path {
+                    entry.relative_path.clone()
+                } else {
+                    let filename = output.file_name().unwrap_or("");
+                    let relative = entry.relative_path.as_path().parent().map_or_else(
+                        || Utf8PathBuf::from(filename),
+                        |parent| parent.join(filename),
+                    );
+                    match NormalizedRelativePath::new(relative) {
+                        Ok(path) => path,
+                        Err(error) => {
+                            return failed_entry(entry, format!("invalid output path: {error}"))
+                        }
+                    }
+                };
+                final_paths.push(destination.join(&output_relative).as_str().to_owned());
+            }
+            let steps: Vec<String> = entry.postprocess_steps.clone();
+            EntryOutcome::Success {
+                kind: entry.kind,
+                local_path: entry.local_path.as_str().to_owned(),
+                relative_path: entry.relative_path.as_str().to_owned(),
+                final_paths,
+                postprocess: (!steps.is_empty()).then_some(steps),
+            }
+        }
         Err(error) => failed_entry(entry, error),
     }
 }

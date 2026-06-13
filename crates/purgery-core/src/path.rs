@@ -394,14 +394,6 @@ pub enum ManifestEntryKind {
     Symlink,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ManifestEntryMode {
-    Passthrough,
-    #[default]
-    Postprocess,
-}
-
 // ── Path Safety ──────────────────────────────────────────────────────
 
 pub fn path_is_within_root(resolved: &Utf8Path, root: &Utf8Path) -> bool {

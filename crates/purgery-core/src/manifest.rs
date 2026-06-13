@@ -48,8 +48,6 @@ pub struct ManifestEntry {
     pub sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link_target: Option<Utf8PathBuf>,
-    #[serde(default)]
-    pub mode: ManifestEntryMode,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub postprocess_steps: Vec<String>,
 }

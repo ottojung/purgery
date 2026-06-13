@@ -142,19 +142,18 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
 
     let run_plan =
         RunPlan::build(config).map_err(|e| anyhow::anyhow!("run plan validation failed: {e}"))?;
+
+    if manifest.entries.len() != 1 {
+        anyhow::bail!(
+            "server run manifest must contain exactly one entry, got {}",
+            manifest.entries.len(),
+        );
+    }
+
     for entry in &manifest.entries {
-        // Server runs are postprocess-only. Every manifest entry must have
-        // mode = postprocess with non-empty postprocess_steps.
-        if entry.mode != purgery_core::ManifestEntryMode::Postprocess {
-            anyhow::bail!(
-                "server run entry '{}' must have mode = postprocess, got {:?}",
-                entry.relative_path.as_str(),
-                entry.mode,
-            );
-        }
         if entry.postprocess_steps.is_empty() {
             anyhow::bail!(
-                "server run entry '{}' has mode = postprocess but no postprocess_steps",
+                "server run entry '{}' has no postprocess_steps",
                 entry.relative_path.as_str(),
             );
         }
@@ -651,8 +650,8 @@ mod tests {
     use crate::commit::commit_directory_tree;
     use camino::Utf8PathBuf;
     use purgery_core::{
-        ClientLocalPath, ManifestEntry, ManifestEntryMode, NormalizedRelativePath,
-        PostprocessConfig, PostprocessKind, PostprocessStepDefinition,
+        ClientLocalPath, ManifestEntry, NormalizedRelativePath, PostprocessConfig, PostprocessKind,
+        PostprocessStepDefinition,
     };
 
     /// Call apply_postprocessing with a no-op progress callback for testing.
@@ -783,7 +782,7 @@ delete_after_import = true
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
-                mode: Default::default(),
+
                 postprocess_steps: Vec::new(),
             }],
         };
@@ -906,7 +905,7 @@ delete_after_import = true
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
-                mode: Default::default(),
+
                 postprocess_steps: Vec::new(),
             }],
         };
@@ -1000,7 +999,7 @@ delete_after_import = true
                 mtime_ns: 100,
                 sha256: None,
                 link_target: None,
-                mode: Default::default(),
+
                 postprocess_steps: Vec::new(),
             }],
         };
@@ -1079,7 +1078,7 @@ delete_after_import = true
                 mtime_ns: 100,
                 sha256: None,
                 link_target: None,
-                mode: Default::default(),
+
                 postprocess_steps: Vec::new(),
             }],
         };
@@ -1207,7 +1206,7 @@ delete_after_import = true
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
-                mode: purgery_core::ManifestEntryMode::Postprocess,
+
                 postprocess_steps: vec!["compress-video".into()],
             }],
         };
@@ -1527,7 +1526,7 @@ delete_after_import = true
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
-                mode: Default::default(),
+
                 postprocess_steps: Vec::new(),
             }],
         };
@@ -1580,7 +1579,7 @@ delete_after_import = true
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
-                mode: purgery_core::ManifestEntryMode::Postprocess,
+
                 postprocess_steps: vec!["compress-video".into()],
             }],
         };
@@ -1659,7 +1658,7 @@ delete_after_import = true
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
-                mode: Default::default(),
+
                 postprocess_steps: Vec::new(),
             }],
         };
@@ -1761,7 +1760,7 @@ delete_after_import = true
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
-                mode: Default::default(),
+
                 postprocess_steps: vec!["compress-video".into()],
             }],
         };
@@ -1848,7 +1847,7 @@ delete_after_import = true
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
-                mode: Default::default(),
+
                 postprocess_steps: vec!["compress-video".into()],
             }],
         };
@@ -1937,7 +1936,7 @@ delete_after_import = true
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
-                mode: Default::default(),
+
                 postprocess_steps: vec!["compress-video".into()],
             }],
         };
@@ -2734,7 +2733,6 @@ delete_after_import = true
             mtime_ns: 0,
             sha256: None,
             link_target: target.map(Utf8PathBuf::from),
-            mode: Default::default(),
             postprocess_steps: Vec::new(),
         };
         let manifest = Manifest {
@@ -2940,7 +2938,7 @@ delete_after_import = true
                 mtime_ns: 0,
                 sha256: None,
                 link_target: None,
-                mode: purgery_core::ManifestEntryMode::Postprocess,
+
                 postprocess_steps: vec!["test-step".into()],
             }],
         };
@@ -3014,7 +3012,7 @@ delete_after_import = true
                 mtime_ns: 0,
                 sha256: None,
                 link_target: None,
-                mode: purgery_core::ManifestEntryMode::Postprocess,
+
                 postprocess_steps: vec!["test-step".into()],
             }],
         };
@@ -3082,7 +3080,7 @@ delete_after_import = true
                 mtime_ns: 100,
                 sha256: None,
                 link_target: None,
-                mode: purgery_core::ManifestEntryMode::Passthrough,
+
                 postprocess_steps: Vec::new(),
             }],
         };
@@ -3248,7 +3246,7 @@ delete_after_import = true
                 mtime_ns: 100,
                 sha256: None,
                 link_target: None,
-                mode: Default::default(),
+
                 postprocess_steps: Vec::new(),
             }],
         };
@@ -4277,7 +4275,7 @@ delete_after_import = true
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
-                mode: Default::default(),
+
                 postprocess_steps: Vec::new(),
             }],
         };
@@ -4349,7 +4347,7 @@ delete_after_import = true
                     mtime_ns: 1000000,
                     sha256: None,
                     link_target: None,
-                    mode: ManifestEntryMode::Postprocess,
+
                     postprocess_steps: vec!["always-fail".into()],
                 },
                 ManifestEntry {
@@ -4361,7 +4359,7 @@ delete_after_import = true
                     mtime_ns: 2000000,
                     sha256: None,
                     link_target: None,
-                    mode: ManifestEntryMode::Postprocess,
+
                     postprocess_steps: vec!["always-fail".into()],
                 },
             ],
@@ -4450,7 +4448,7 @@ delete_after_import = true
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
-                mode: ManifestEntryMode::Postprocess,
+
                 postprocess_steps: vec!["echo-args".into()],
             }],
         };
@@ -4789,7 +4787,7 @@ delete_after_import = true
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
-                mode: ManifestEntryMode::Postprocess,
+
                 postprocess_steps: vec!["make-symlink".into()],
             }],
         };
@@ -5072,7 +5070,7 @@ delete_after_import = true
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
-                mode: ManifestEntryMode::Postprocess,
+
                 postprocess_steps: vec!["make-tree".into()],
             }],
         };
@@ -5175,7 +5173,6 @@ delete_after_import = true
             mtime_ns: 2000000,
             sha256: None,
             link_target: None,
-            mode: Default::default(),
             postprocess_steps: Vec::new(),
         });
         fs::write(
@@ -5294,7 +5291,7 @@ delete_after_import = true
                     mtime_ns: 0,
                     sha256: None,
                     link_target: Some(Utf8PathBuf::from("/usr/share/data")),
-                    mode: Default::default(),
+
                     postprocess_steps: Vec::new(),
                 },
                 // Second entry fails (missing staged file).
@@ -5307,7 +5304,7 @@ delete_after_import = true
                     mtime_ns: 2000000,
                     sha256: None,
                     link_target: None,
-                    mode: Default::default(),
+
                     postprocess_steps: Vec::new(),
                 },
             ],
@@ -5609,7 +5606,7 @@ delete_after_import = true
                 mtime_ns: 0,
                 sha256: None,
                 link_target: Some(Utf8PathBuf::from("/etc/config")),
-                mode: Default::default(),
+
                 postprocess_steps: Vec::new(),
             }],
         };
@@ -5741,7 +5738,7 @@ delete_after_import = true
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
-                mode: ManifestEntryMode::Postprocess,
+
                 postprocess_steps: vec!["copy-cmd".into()],
             }],
         };
@@ -5870,7 +5867,7 @@ delete_after_import = true
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
-                mode: ManifestEntryMode::Postprocess,
+
                 postprocess_steps: vec!["copy-cmd".into()],
             }],
         };
@@ -5963,7 +5960,7 @@ delete_after_import = true
                 mtime_ns: 1,
                 sha256: Some("00".repeat(32)),
                 link_target: None,
-                mode: ManifestEntryMode::Postprocess,
+
                 postprocess_steps: vec!["typo".to_owned()],
             }],
         };
@@ -6028,7 +6025,7 @@ delete_after_import = true
                 mtime_ns: 0,
                 sha256: None,
                 link_target: Some("/some/target".into()),
-                mode: ManifestEntryMode::Postprocess,
+
                 postprocess_steps: vec!["test-step".into()],
             }],
         };
@@ -6108,7 +6105,7 @@ delete_after_import = true
                 mtime_ns: 0,
                 sha256: None,
                 link_target: None,
-                mode: ManifestEntryMode::Postprocess,
+
                 postprocess_steps: vec!["test-step".into()],
             }],
         };
