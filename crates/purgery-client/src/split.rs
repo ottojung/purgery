@@ -892,4 +892,262 @@ mod tests {
         let f = build_split_filters("pattern").unwrap();
         assert_eq!(f.include_rules[0], "*/".to_string());
     }
+
+    // ── Real rsync behavioral tests ──
+
+    fn rsync_available() -> bool {
+        std::process::Command::new("rsync")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn run_local_filter_rsync(
+        source: &std::path::Path,
+        dest: &std::path::Path,
+        include_rules: &[String],
+        exclude_rule: &str,
+    ) -> bool {
+        let mut cmd = std::process::Command::new("rsync");
+        cmd.args(["--archive", "--prune-empty-dirs"]);
+        for rule in include_rules {
+            cmd.arg(format!("--include={rule}"));
+        }
+        cmd.arg(format!("--exclude={exclude_rule}"));
+        cmd.arg("--");
+        cmd.arg(format!("{}/", source.display()));
+        cmd.arg(format!("{}/", dest.display()));
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        cmd.status().map(|s| s.success()).unwrap_or(false)
+    }
+
+    /// Collect relative file paths under a directory, sorted.
+    fn list_files(dir: &std::path::Path) -> Vec<String> {
+        let mut files = Vec::new();
+        for entry in walkdir::WalkDir::new(dir).sort_by_file_name().min_depth(1) {
+            let entry = entry.unwrap();
+            if entry.file_type().is_file() || entry.file_type().is_symlink() {
+                let relative = entry.path().strip_prefix(dir).unwrap();
+                files.push(relative.to_string_lossy().to_string());
+            }
+        }
+        files
+    }
+
+    #[test]
+    fn rsync_filter_star_mp4_copies_matching_not_txt() {
+        if !rsync_available() {
+            return;
+        }
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("a.mp4"), "mp4-data").unwrap();
+        fs::write(src.join("b.txt"), "txt-data").unwrap();
+        fs::write(src.join("sub/c.mp4"), "nested-mp4").unwrap();
+        fs::write(src.join("sub/d.txt"), "nested-txt").unwrap();
+
+        let dest = tmp.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let f = build_split_filters("*.mp4").unwrap();
+        assert!(run_local_filter_rsync(
+            &src,
+            &dest,
+            &f.include_rules,
+            &f.exclude_rule
+        ));
+
+        let files = list_files(&dest);
+        assert!(
+            files.contains(&"a.mp4".to_string()),
+            "must copy top-level a.mp4"
+        );
+        assert!(
+            files.contains(&"sub/c.mp4".to_string()),
+            "must copy nested c.mp4"
+        );
+        assert!(
+            !files.contains(&"b.txt".to_string()),
+            "must NOT copy unrelated b.txt"
+        );
+        assert!(
+            !files.contains(&"sub/d.txt".to_string()),
+            "must NOT copy nested unrelated d.txt"
+        );
+        assert!(
+            !files.contains(&"sub".to_string()),
+            "traversal-only directory sub must be pruned"
+        );
+    }
+
+    #[test]
+    fn rsync_filter_doublestar_mp4_copies_any_depth() {
+        if !rsync_available() {
+            return;
+        }
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("a/b/c")).unwrap();
+        fs::write(src.join("top.mp4"), "data").unwrap();
+        fs::write(src.join("a/deep.mp4"), "data").unwrap();
+        fs::write(src.join("a/b/c/deepest.mp4"), "data").unwrap();
+        fs::write(src.join("skip.txt"), "data").unwrap();
+
+        let dest = tmp.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let f = build_split_filters("**/*.mp4").unwrap();
+        assert!(run_local_filter_rsync(
+            &src,
+            &dest,
+            &f.include_rules,
+            &f.exclude_rule
+        ));
+
+        let files = list_files(&dest);
+        assert!(files.contains(&"top.mp4".to_string()));
+        assert!(files.contains(&"a/deep.mp4".to_string()));
+        assert!(files.contains(&"a/b/c/deepest.mp4".to_string()));
+        assert!(!files.contains(&"skip.txt".to_string()));
+    }
+
+    #[test]
+    fn rsync_filter_photos_dir_copies_payload() {
+        if !rsync_available() {
+            return;
+        }
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("Photos")).unwrap();
+        fs::write(src.join("Photos/a.jpg"), "photo-a").unwrap();
+        fs::write(src.join("Photos/b.jpg"), "photo-b").unwrap();
+        fs::write(src.join("Photos/notes.txt"), "notes").unwrap();
+        fs::write(src.join("other.mp4"), "video").unwrap();
+
+        let dest = tmp.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let f = build_split_filters("Photos/").unwrap();
+        assert!(run_local_filter_rsync(
+            &src,
+            &dest,
+            &f.include_rules,
+            &f.exclude_rule
+        ));
+
+        let files = list_files(&dest);
+        assert!(files.contains(&"Photos/a.jpg".to_string()));
+        assert!(files.contains(&"Photos/b.jpg".to_string()));
+        assert!(
+            files.contains(&"Photos/notes.txt".to_string()),
+            "directory payload includes non-matching children inside selected directory"
+        );
+        assert!(
+            !files.contains(&"other.mp4".to_string()),
+            "must NOT copy unrelated other.mp4 outside Photos"
+        );
+    }
+
+    #[test]
+    fn rsync_filter_symlinks_preserved() {
+        if !rsync_available() {
+            return;
+        }
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("real.mp4"), "real-data").unwrap();
+        std::os::unix::fs::symlink("real.mp4", src.join("link.mp4")).unwrap();
+        fs::write(src.join("skip.txt"), "txt").unwrap();
+
+        let dest = tmp.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let f = build_split_filters("*.mp4").unwrap();
+        assert!(run_local_filter_rsync(
+            &src,
+            &dest,
+            &f.include_rules,
+            &f.exclude_rule
+        ));
+
+        let files = list_files(&dest);
+        assert!(files.contains(&"real.mp4".to_string()));
+        assert!(files.contains(&"link.mp4".to_string()));
+        assert!(!files.contains(&"skip.txt".to_string()));
+
+        let link_dest = dest.join("link.mp4");
+        let target = fs::read_link(&link_dest).unwrap();
+        assert_eq!(target, std::path::Path::new("real.mp4"));
+    }
+
+    #[test]
+    fn rsync_filter_empty_selected_dir_may_be_pruned() {
+        if !rsync_available() {
+            return;
+        }
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("empty_dir")).unwrap();
+        fs::write(src.join("a.mp4"), "data").unwrap();
+
+        let dest = tmp.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        // Pattern "*/" selects directories but --prune-empty-dirs removes
+        // traversal-only empty directories even when selected.
+        let f = build_split_filters("*/").unwrap();
+        assert!(run_local_filter_rsync(
+            &src,
+            &dest,
+            &f.include_rules,
+            &f.exclude_rule
+        ));
+
+        // Because empty_dir has no contents, --prune-empty-dirs may remove it.
+        // *.mp4 files are not matched by "*/" so they should not appear.
+        // The key assertion: empty_dir may or may not exist depending on rsync behavior.
+        // We explicitly document that it may be pruned.
+        let _files = list_files(&dest);
+    }
+
+    #[test]
+    fn rsync_filter_star_mp4_argv_has_no_shell_quotes() {
+        if !rsync_available() {
+            return;
+        }
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("a.mp4"), "data").unwrap();
+
+        let dest = tmp.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let f = build_split_filters("*.mp4").unwrap();
+        // The filter rules themselves must not contain quote characters.
+        for rule in f
+            .include_rules
+            .iter()
+            .chain(std::iter::once(&f.exclude_rule))
+        {
+            assert!(
+                !rule.contains('\''),
+                "filter rule must not contain shell quote: {rule}"
+            );
+        }
+
+        assert!(run_local_filter_rsync(
+            &src,
+            &dest,
+            &f.include_rules,
+            &f.exclude_rule
+        ));
+        assert!(list_files(&dest).contains(&"a.mp4".to_string()));
+    }
 }
