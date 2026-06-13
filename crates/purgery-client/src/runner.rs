@@ -314,23 +314,44 @@ impl RemoteRunner {
     ) -> Result<()> {
         let rsync_dest = format!("{host}:{remote_dir}/");
 
+        // All options before --.  Source/dest operands after --.
+        let args: Vec<String> = vec![
+            "--recursive".to_string(),
+            "--partial".to_string(),
+            "--inplace".to_string(),
+            "--mkpath".to_string(),
+            "--archive".to_string(),
+            "--protect-args".to_string(),
+            "--files-from={FILES}".to_string(),
+            "--relative".to_string(),
+            "--from0".to_string(),
+            "--".to_string(),
+            format!("{}/", source),
+            rsync_dest.clone(),
+        ];
+
         match self {
             RemoteRunner::Real => {
-                // Write the file list to a temp file in the system temp dir.
                 let tmp_dir = std::env::temp_dir();
                 let list_path = tmp_dir.join(format!("purgery-rsync-{}.list", std::process::id()));
-                std::fs::write(&list_path, file_list.join("\n"))
+                let list_content = file_list.join("\0");
+                let files_arg = format!("--files-from={}", list_path.display());
+
+                std::fs::write(&list_path, &list_content)
                     .with_context(|| "failed to write rsync file list")?;
                 let result = (|| -> Result<()> {
-                    let mut args = purgery_core::build_rsync_args(source, &rsync_dest);
-                    args.pop();
-                    args.pop();
-                    args.push(format!("--files-from={}", list_path.display()));
-                    args.push("--relative".to_string());
-                    args.push(format!("{}/", source));
-                    args.push(rsync_dest);
+                    let real_args: Vec<String> = args
+                        .iter()
+                        .map(|a| {
+                            if a == "--files-from={FILES}" {
+                                files_arg.clone()
+                            } else {
+                                a.clone()
+                            }
+                        })
+                        .collect();
                     let status = Command::new("rsync")
-                        .args(&args)
+                        .args(&real_args)
                         .status()
                         .with_context(|| {
                             format!("failed to execute rsync: {source} -> {host}:{remote_dir}")
@@ -348,16 +369,12 @@ impl RemoteRunner {
                     hook();
                 }
                 for (rc, err) in inner.rsync_errors.lock().unwrap().iter() {
-                    let cmd = format!(
-                        "rsync --files-from <file-list> --relative -- {source}/ {rsync_dest}"
-                    );
+                    let cmd = args.join(" ");
                     if cmd.contains(rc.as_str()) {
                         anyhow::bail!("{err}");
                     }
                 }
-                inner.log.lock().unwrap().push(format!(
-                    "rsync --files-from <file-list> --relative -- {source}/ {rsync_dest}"
-                ));
+                inner.log.lock().unwrap().push(args.join(" "));
                 Ok(())
             }
         }

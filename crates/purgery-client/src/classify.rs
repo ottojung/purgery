@@ -214,7 +214,12 @@ pub(crate) fn capture_cleanup_identity(source: &str) -> Result<Vec<CleanupEntry>
                 .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
                 .map(|d| d.as_nanos() as i64)
                 .unwrap_or(0);
-            let sha = Utf8Path::from_path(path).and_then(|p| compute_sha256(p).ok());
+            let utf8_path = Utf8Path::from_path(path).ok_or_else(|| {
+                anyhow::anyhow!("non-UTF-8 path for cleanup identity: {}", path.display())
+            })?;
+            let sha = Some(compute_sha256(utf8_path).with_context(|| {
+                format!("SHA-256 failed for cleanup identity: {}", path.display())
+            })?);
             entries.push(CleanupEntry {
                 relative_path: relative_str,
                 local_path: local_str,
