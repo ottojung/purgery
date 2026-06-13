@@ -125,6 +125,6 @@ This is used for client `ssh`, `rsync`, and server postprocess `program` values.
 
 Each run overlays its uploaded tree onto the destination with recursive archive-mode rsync semantics and no delete option. Existing directories are merged, regular files and symlinks replace compatible destination entries, and extra final descendants remain. A regular file or symlink does not replace a non-empty destination directory. Source directory entries can replace conflicting file or symlink parents before descendants are imported.
 
-Symlink targets are stored and recreated literally. Neither staged symlinks nor destination symlinks are traversed as directories. Postprocessing applies to regular files only; directories and symlinks are treated as passthrough regardless of `--postprocess`.
+Symlink targets are stored and recreated literally. Neither staged symlinks nor destination symlinks are traversed as directories. Postprocessing applies to regular files, directories, and symlinks. A postprocessed directory covers its descendants, which are committed as part of the directory's output tree rather than processed independently.
 
 A crash can expose a prefix of the entry overlay. This is expected: the run remains in `processing/` without a terminal status and `process-once` replays it until the final tree converges. The operation is not an all-or-nothing filesystem transaction.

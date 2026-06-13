@@ -77,7 +77,7 @@ destination = "/universe/synced/videos"
 delete_after_import = true
 ```
 
-The `destination` field is the exact client-supplied destination path. It may be absolute or relative. Final paths are computed as `{destination}/{relative_entry_path}`; `work_dir` is never prepended.
+The `destination` field is the client-supplied destination path. It may be absolute or relative. For postprocess runs, a relative destination is resolved against the server's working directory during `prepare-run` and the `run.toml` is atomically rewritten with the absolute path. Final paths are computed as `{destination}/{relative_entry_path}`; `work_dir` is never prepended.
 
 ## Manifest (manifest.toml)
 
@@ -95,9 +95,27 @@ size = 1048576
 mtime_ns = 1700000000000000000
 sha256 = "abc123..."
 postprocess_steps = ["compress-video"]
+
+[[entries]]
+local_path = "/home/user/Videos/photos"
+staged_path = "files/photos"
+relative_path = "photos"
+kind = "directory"
+mode = "postprocess"
+postprocess_steps = ["compress-video"]
+
+[[entries]]
+local_path = "/home/user/Videos/photos/photo1.jpg"
+staged_path = "files/photos/photo1.jpg"
+relative_path = "photos/photo1.jpg"
+kind = "regular_file"
+mode = "covered"
+covered_by = "photos"
 ```
 
-Staged paths use the format `files/<relative-path>`.
+- `mode` is one of `passthrough`, `postprocess`, or `covered`.
+- `covered` entries have no `postprocess_steps`; they are covered by a postprocessed directory ancestor named in `covered_by`.
+- Staged paths use the format `files/<relative-path>`.
 
 ## Status (status.toml)
 

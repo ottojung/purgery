@@ -46,7 +46,7 @@ Full config reference: [docs/config.md](docs/config.md)
 
 ## Transforms (postprocessing)
 
-Transformations are defined on the server. Clients request named steps via the `--postprocess` flag. Postprocessing applies only to regular files; directories and symlinks are treated as passthrough regardless of `--postprocess`.
+Transformations are defined on the server. Clients request named steps via the `--postprocess` flag. Postprocessing applies to regular files, directories, and symlinks. A postprocessed directory covers its descendants, which are committed as part of the directory's output tree rather than processed independently.
 
 ```toml
 # server.toml

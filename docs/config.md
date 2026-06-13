@@ -113,11 +113,11 @@ destination = "/universe/synced/videos"
 delete_after_import = true
 ```
 
-The `destination` field is the path portion of the rsync-style client destination. It may be absolute or relative. The server computes final paths as `{destination}/{relative_entry_path}` and never places final files under `work_dir`.
+The `destination` field is the client-supplied destination path. It may be absolute or relative. For postprocess runs, `prepare-run` resolves a relative destination against the server's current working directory and atomically rewrites `run.toml` with the absolute path. The server computes final paths as `{destination}/{relative_entry_path}` and never places final files under `work_dir`.
 
 ## Config strictness
 
-All config structs reject unknown fields. Old configs with stale or misspelled fields produce clear errors rather than being silently ignored.
+All config structs reject unknown fields. Misspelled fields produce clear errors rather than being silently ignored.
 
 ## Cleanup identity requirements
 
