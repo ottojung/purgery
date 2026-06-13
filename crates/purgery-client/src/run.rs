@@ -981,6 +981,7 @@ state = "done"
         let args = SyncArgs {
             postprocess: vec!["compress".to_string()],
             delete_after_import: false,
+            split: None,
             state_dir: Some(state_dir),
             source: src_dir_str(&tmp),
             destination: "host:dest".to_string(),
@@ -1361,6 +1362,7 @@ state = "done"
         SyncArgs {
             postprocess: vec!["transform".to_string()],
             delete_after_import: true,
+            split: None,
             state_dir: Some(state_dir.to_owned()),
             source: src_with_file(tmp),
             destination: "laptop:rel".to_string(),

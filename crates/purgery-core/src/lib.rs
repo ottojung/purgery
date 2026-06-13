@@ -188,7 +188,7 @@ pub fn build_rsync_args(source: &str, destination: &str) -> Vec<String> {
         "--archive".to_string(),
         "--protect-args".to_string(),
         "--".to_string(),
-        format!("{}/", source),
+        source.to_string(),
         destination.to_string(),
     ]
 }
@@ -756,7 +756,7 @@ files = []
                 "--archive",
                 "--protect-args",
                 "--",
-                "/home/user/Videos/",
+                "/home/user/Videos",
                 "example.com:/remote/path",
             ]
         );
@@ -791,7 +791,7 @@ files = []
         let args = build_rsync_args("/home/user/My Videos", "host:/dst");
         // Source is the last path operand, after the -- separator
         let dashdash_pos = args.iter().position(|a| a == "--").unwrap();
-        assert_eq!(args[dashdash_pos + 1], "/home/user/My Videos/");
+        assert_eq!(args[dashdash_pos + 1], "/home/user/My Videos");
     }
 
     #[test]
@@ -803,7 +803,7 @@ files = []
             .expect("must contain -- separator");
         let src_pos = args
             .iter()
-            .position(|a| a == "/src/")
+            .position(|a| a == "/src")
             .expect("must contain source");
         let dst_pos = args
             .iter()

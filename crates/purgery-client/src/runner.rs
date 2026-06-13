@@ -270,7 +270,7 @@ impl RemoteRunner {
     pub(crate) fn run_rsync(&self, source: &str, host: &str, remote_dir: &str) -> Result<()> {
         let rsync_dest = format!("{host}:{remote_dir}/");
         let rsync_cmd = format!(
-            "rsync --recursive --partial --inplace --mkpath --archive --protect-args -- {source}/ {rsync_dest}"
+            "rsync --recursive --partial --inplace --mkpath --archive --protect-args -- {source} {rsync_dest}"
         );
 
         match self {

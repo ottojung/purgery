@@ -43,7 +43,7 @@ struct Cli {
 
 #[derive(Parser)]
 enum Command {
-    /// Sync a local source tree to a remote server
+    /// Sync a local source entry to a remote destination
     Sync(SyncArgs),
 }
 
@@ -57,6 +57,11 @@ struct SyncArgs {
     #[arg(long)]
     delete_after_import: bool,
 
+    /// Split pattern using rsync-style syntax: select matching source entries
+    /// and process each individually
+    #[arg(long)]
+    split: Option<String>,
+
     /// Directory for client state files (default: XDG_STATE_HOME/purgery)
     #[arg(long)]
     state_dir: Option<String>,
@@ -65,7 +70,7 @@ struct SyncArgs {
     #[arg(long, default_value = "purgery-server")]
     server_command: String,
 
-    /// Local source directory path
+    /// Local source path (file, directory, or symlink)
     #[arg(allow_hyphen_values = true)]
     source: String,
 
