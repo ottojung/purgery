@@ -765,7 +765,10 @@ status = "imported"
 covered_by = "parent"
 "#;
         let result = RunStatus::from_toml(toml);
-        assert!(result.is_err(), "unknown entry status field must be rejected");
+        assert!(
+            result.is_err(),
+            "unknown entry status field must be rejected"
+        );
     }
 
     #[test]
@@ -784,7 +787,10 @@ mtime_ns = 0
 cleaned = false
 "#;
         let result: Result<DurableCleanupState, _> = toml::from_str(toml);
-        assert!(result.is_err(), "unknown cleanup state field must be rejected");
+        assert!(
+            result.is_err(),
+            "unknown cleanup state field must be rejected"
+        );
     }
 
     #[test]
@@ -801,7 +807,10 @@ phase = "cleanup_complete"
 unknown_field = "value"
 "#;
         let result: Result<ClientRunState, _> = toml::from_str(toml);
-        assert!(result.is_err(), "unknown client run state field must be rejected");
+        assert!(
+            result.is_err(),
+            "unknown client run state field must be rejected"
+        );
     }
 
     // ── Identity tests ──

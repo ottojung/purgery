@@ -373,9 +373,7 @@ impl RemoteRunner {
                         )
                     })?;
                 if !status.success() {
-                    anyhow::bail!(
-                        "rsync filter transfer failed: {source} -> {host}:{remote_dir}"
-                    );
+                    anyhow::bail!("rsync filter transfer failed: {source} -> {host}:{remote_dir}");
                 }
                 Ok(())
             }
@@ -517,7 +515,11 @@ mod tests {
                 "/src",
                 "host",
                 "/dest",
-                &["*/".to_string(), "*.mp4/***".to_string(), "*.mp4".to_string()],
+                &[
+                    "*/".to_string(),
+                    "*.mp4/***".to_string(),
+                    "*.mp4".to_string(),
+                ],
                 "*",
             )
             .unwrap();
@@ -538,7 +540,10 @@ mod tests {
             before_sep.contains("--exclude='*'"),
             "--exclude='*' must be before --"
         );
-        assert!(before_sep.contains("--prune-empty-dirs"), "-m must be before --");
+        assert!(
+            before_sep.contains("--prune-empty-dirs"),
+            "-m must be before --"
+        );
         assert!(
             cmd.contains("/src/"),
             "source dir with trailing / must be after --"
@@ -557,7 +562,11 @@ mod tests {
                 "/src",
                 "host",
                 "/dest",
-                &["*/".to_string(), "*.mp4/***".to_string(), "*.mp4".to_string()],
+                &[
+                    "*/".to_string(),
+                    "*.mp4/***".to_string(),
+                    "*.mp4".to_string(),
+                ],
                 "*",
             )
             .unwrap();
@@ -569,7 +578,11 @@ mod tests {
     #[test]
     fn filter_transfer_records_rules() {
         let runner = RemoteRunner::fake();
-        let includes = vec!["*/".to_string(), "*.mp4/***".to_string(), "*.mp4".to_string()];
+        let includes = vec![
+            "*/".to_string(),
+            "*.mp4/***".to_string(),
+            "*.mp4".to_string(),
+        ];
         runner
             .run_rsync_filter_transfer("/src", "host", "/dest", &includes, "*")
             .unwrap();

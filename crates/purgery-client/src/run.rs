@@ -2154,10 +2154,7 @@ state = "done"
             cmd.contains("--include='*/'"),
             "must include directory traversal rule"
         );
-        assert!(
-            cmd.contains("--exclude='*'"),
-            "must include exclude rule"
-        );
+        assert!(cmd.contains("--exclude='*'"), "must include exclude rule");
         assert!(
             cmd.contains("--prune-empty-dirs"),
             "must include -m to prune traversal scaffolding"

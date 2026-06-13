@@ -844,7 +844,11 @@ mod tests {
         let f = build_split_filters("*.mp4").unwrap();
         assert_eq!(
             f.include_rules,
-            vec!["*/".to_string(), "*.mp4/***".to_string(), "*.mp4".to_string()]
+            vec![
+                "*/".to_string(),
+                "*.mp4/***".to_string(),
+                "*.mp4".to_string()
+            ]
         );
         assert_eq!(f.exclude_rule, "*".to_string());
     }

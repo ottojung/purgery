@@ -708,6 +708,9 @@ mod tests {
     #[test]
     fn normalize_source_rejects_root_in_all_forms() {
         assert!(normalize_source("/").is_err());
-        assert!(normalize_source("//").is_err(), "double-slash root should also be invalid");
+        assert!(
+            normalize_source("//").is_err(),
+            "double-slash root should also be invalid"
+        );
     }
 }
