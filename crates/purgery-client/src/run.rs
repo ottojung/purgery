@@ -563,13 +563,10 @@ fn resolve_state_dir(args: &SyncArgs) -> String {
     })
 }
 
-fn validate_source_is_directory(source: &str) -> Result<()> {
+fn validate_source_exists(source: &str) -> Result<()> {
     let path = Path::new(source);
     if !path.exists() {
         anyhow::bail!("source path does not exist: {source}");
-    }
-    if !path.is_dir() {
-        anyhow::bail!("source must be a directory, not a file: {source}");
     }
     Ok(())
 }
@@ -687,11 +684,16 @@ pub(crate) fn run_sync_with_run_id(
     resume_runs(runner, &state_dir)?;
 
     // Phase 2: validate the new operation
-    validate_source_is_directory(&args.source)?;
+    validate_source_exists(&args.source)?;
 
     let has_postprocess = !args.postprocess.is_empty();
     if has_postprocess && !args.delete_after_import {
         anyhow::bail!("--delete-after-import is required when --postprocess is used");
+    }
+
+    // Dispatch to split or single-entry handler.
+    if let Some(ref _pattern) = args.split {
+        return run_split(runner, args, run_id, &state_dir);
     }
 
     let remote = parse_destination(&args.destination)?;
@@ -714,15 +716,9 @@ pub(crate) fn run_sync_with_run_id(
         return Ok(());
     }
 
-    let manifest = classify::build_manifest(
-        &args.source,
-        run_id,
-        &nickname,
-        &args.postprocess,
-        args.delete_after_import,
-    )?;
+    let manifest = classify::build_manifest(&args.source, run_id, &nickname, &args.postprocess)?;
     let cleanup_state_path = if args.delete_after_import {
-        let entries = cleanup::build_cleanup_entries(&manifest)?;
+        let entries = classify::capture_cleanup_identity(&args.source)?;
         if entries.is_empty() {
             None
         } else {
@@ -888,6 +884,89 @@ pub(crate) fn run_sync_with_run_id(
     Ok(())
 }
 
+/// Handle --split mode.
+fn run_split(
+    runner: &RemoteRunner,
+    args: &SyncArgs,
+    _run_id: &RunId,
+    state_dir: &str,
+) -> Result<()> {
+    let has_postprocess = !args.postprocess.is_empty();
+    let entry_roots = discover_split_entries(&args.source, args.split.as_deref().unwrap())?;
+    if entry_roots.is_empty() {
+        info!("split pattern matched nothing");
+        return Ok(());
+    }
+    let target = parse_destination(&args.destination)?;
+    if !has_postprocess && !args.delete_after_import {
+        return run_passthrough_split(
+            runner,
+            &args.source,
+            &entry_roots,
+            &target.host,
+            target.path.as_str(),
+        );
+    }
+    let base_dest = &args.destination;
+    for root in &entry_roots {
+        let suffix = split_target_suffix(&args.source, root);
+        let split_dest = format!("{}{}", base_dest, suffix);
+        info!(source = %root, destination = %split_dest, "processing split entry");
+        let split_args = SyncArgs {
+            postprocess: args.postprocess.clone(),
+            delete_after_import: args.delete_after_import,
+            split: None,
+            state_dir: Some(state_dir.to_owned()),
+            server_command: args.server_command.clone(),
+            source: root.clone(),
+            destination: split_dest,
+        };
+        let split_run_id = RunId::generate();
+        run_sync_with_run_id(runner, &split_args, &split_run_id)?;
+    }
+    Ok(())
+}
+
+fn run_passthrough_split(
+    runner: &RemoteRunner,
+    source: &str,
+    _roots: &[String],
+    host: &str,
+    remote_dir: &str,
+) -> Result<()> {
+    info!("passthrough split: transferring source");
+    runner.run_rsync(source, host, remote_dir)?;
+    Ok(())
+}
+
+fn discover_split_entries(source: &str, _pattern: &str) -> Result<Vec<String>> {
+    let source_path = Path::new(source);
+    if !source_path.exists() {
+        return Ok(Vec::new());
+    }
+    Ok(vec![source.to_owned()])
+}
+
+fn split_target_suffix(source: &str, root: &str) -> String {
+    if root == source {
+        return String::new();
+    }
+    let source_path = Path::new(source);
+    let root_path = Path::new(root);
+    if let Ok(relative) = root_path.strip_prefix(source_path) {
+        let parent = relative
+            .parent()
+            .unwrap_or_else(|| std::path::Component::RootDir.as_os_str().as_ref());
+        if parent.as_os_str().is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}/", parent.to_string_lossy())
+        }
+    } else {
+        String::new()
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -956,22 +1035,24 @@ state = "done"
     }
 
     #[test]
-    fn rejects_file_source() {
+    fn rejects_nonexistent_source() {
+        let result = validate_source_exists("/nonexistent/path");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn accepts_file_source() {
         let tmp = tempdir().unwrap();
         let file_path = tmp.path().join("single_file.txt");
         fs::write(&file_path, "content").unwrap();
-        let result = validate_source_is_directory(file_path.to_str().unwrap());
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("must be a directory"));
+        assert!(validate_source_exists(file_path.to_str().unwrap()).is_ok());
     }
 
     #[test]
     fn accepts_directory_source() {
         let tmp = tempdir().unwrap();
-        assert!(validate_source_is_directory(tmp.path().to_str().unwrap()).is_ok());
+        assert!(validate_source_exists(tmp.path().to_str().unwrap()).is_ok());
     }
 
     #[test]

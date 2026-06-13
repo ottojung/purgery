@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use purgery_core::{
-    CleanupEntry, DurableCleanupState, FileStatus, Manifest, ManifestEntryKind, RunStatus,
+    CleanupEntry, DurableCleanupState, FileStatus, ManifestEntryKind, RunStatus,
 };
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -146,73 +146,6 @@ pub(crate) fn resume_pending_cleanups(state_dir: &str) -> Result<()> {
         info!(deleted = deleted_total, "resumed pending cleanups");
     }
     Ok(())
-}
-
-pub(crate) fn build_cleanup_entries(manifest: &Manifest) -> Result<Vec<CleanupEntry>> {
-    let mut entries: Vec<CleanupEntry> = Vec::new();
-    let mut dirs: Vec<(String, String)> = Vec::new();
-
-    for entry in manifest.entries.iter() {
-        let local_path = entry.local_path.as_str();
-
-        let relative_from_root = entry.relative_path.as_str().to_owned();
-
-        match entry.kind {
-            ManifestEntryKind::Directory => {
-                dirs.push((relative_from_root, local_path.to_owned()));
-            }
-            ManifestEntryKind::Symlink => {
-                let link_target = entry.link_target.as_ref().map(|t| t.as_str().to_owned());
-                entries.push(CleanupEntry {
-                    relative_path: relative_from_root,
-                    local_path: local_path.to_owned(),
-                    kind: ManifestEntryKind::Symlink,
-                    size: 0,
-                    mtime_ns: 0,
-                    sha256: None,
-                    link_target,
-                    import_confirmed: false,
-                    cleaned: false,
-                });
-            }
-            ManifestEntryKind::RegularFile => {
-                let ident = entry.identity();
-                entries.push(CleanupEntry {
-                    relative_path: relative_from_root,
-                    local_path: local_path.to_owned(),
-                    kind: ManifestEntryKind::RegularFile,
-                    size: ident.size,
-                    mtime_ns: ident.mtime_ns,
-                    sha256: ident.sha256,
-                    link_target: None,
-                    import_confirmed: false,
-                    cleaned: false,
-                });
-            }
-        }
-    }
-
-    for (relative_str, local_path_str) in dirs.into_iter().rev() {
-        entries.push(CleanupEntry {
-            relative_path: relative_str,
-            local_path: local_path_str,
-            kind: ManifestEntryKind::Directory,
-            size: 0,
-            mtime_ns: 0,
-            sha256: None,
-            link_target: None,
-            import_confirmed: false,
-            cleaned: false,
-        });
-    }
-
-    entries.sort_by(|a, b| {
-        let a_depth = a.local_path.matches('/').count();
-        let b_depth = b.local_path.matches('/').count();
-        b_depth.cmp(&a_depth)
-    });
-
-    Ok(entries)
 }
 
 pub(crate) fn compute_sha256(path: &Path) -> Result<String> {
