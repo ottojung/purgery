@@ -6,7 +6,7 @@ Purgery operates on one source entry per `sync` invocation.
 
 Without `--postprocess`, the client runs rsync directly to `USER@HOST:DESTINATION`. It does not create a server run, upload a manifest, poll status, or invoke `finish-run`.
 
-The source entry is transferred with trailing slashes stripped. Trailing slashes on the source operand do not change source-entry semantics. The final path is `<DESTINATION>/<SOURCE-NAME>`.
+The source entry is transferred with trailing slashes stripped. Trailing slashes on the source operand do not change source-entry semantics. The source entry base final path is `<DESTINATION>/<SOURCE-NAME>`. Postprocess outputs commit under the same parent, using the output file names.
 
 With `--delete-after-import`, the client first records durable local identity. Successful rsync authorizes cleanup, but the local entry is removed only if its current kind and identity still match the recorded entry.
 
