@@ -100,7 +100,7 @@ Each matched root gets a target suffix that preserves its relative layout under 
 
 ### Pure passthrough optimization
 
-Without `--delete-after-import` or `--postprocess`, the split is implemented as a single rsync transfer using `--files-from` with the selected roots and their descendants. The file list is NUL-delimited (safe for filenames containing newlines) and transferred with `--relative` so nested entries preserve their parent path under `<TARGET>`. No server run or client state is created.
+Without `--delete-after-import` or `--postprocess`, the split is implemented as a single rsync transfer that copies only the selected roots and their payloads. Nested entries preserve their relative parent paths under `<TARGET>`. No server run or client state is created. No destination collision preflight is added.
 
 ### Serialized split for cleanup and postprocess
 
