@@ -9,6 +9,7 @@ mod classify;
 mod cleanup;
 mod run;
 mod runner;
+mod split;
 
 #[derive(Parser)]
 #[command(

@@ -1,8 +1,6 @@
 use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
-use purgery_core::{
-    CleanupEntry, DurableCleanupState, FileStatus, ManifestEntryKind, RunStatus,
-};
+use purgery_core::{CleanupEntry, DurableCleanupState, FileStatus, ManifestEntryKind, RunStatus};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Read;

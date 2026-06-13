@@ -13,6 +13,7 @@ use tracing::{debug, error, info, warn};
 use crate::classify;
 use crate::cleanup;
 use crate::runner::RemoteRunner;
+use crate::split;
 use crate::SyncArgs;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -892,7 +893,8 @@ fn run_split(
     state_dir: &str,
 ) -> Result<()> {
     let has_postprocess = !args.postprocess.is_empty();
-    let entry_roots = discover_split_entries(&args.source, args.split.as_deref().unwrap())?;
+    let entry_roots = split::discover_split_entries(&args.source, args.split.as_deref().unwrap())
+        .map_err(|e| anyhow::anyhow!("split discovery failed: {e}"))?;
     if entry_roots.is_empty() {
         info!("split pattern matched nothing");
         return Ok(());
@@ -909,7 +911,7 @@ fn run_split(
     }
     let base_dest = &args.destination;
     for root in &entry_roots {
-        let suffix = split_target_suffix(&args.source, root);
+        let suffix = split::split_target_suffix(&args.source, root);
         let split_dest = format!("{}{}", base_dest, suffix);
         info!(source = %root, destination = %split_dest, "processing split entry");
         let split_args = SyncArgs {
@@ -937,34 +939,6 @@ fn run_passthrough_split(
     info!("passthrough split: transferring source");
     runner.run_rsync(source, host, remote_dir)?;
     Ok(())
-}
-
-fn discover_split_entries(source: &str, _pattern: &str) -> Result<Vec<String>> {
-    let source_path = Path::new(source);
-    if !source_path.exists() {
-        return Ok(Vec::new());
-    }
-    Ok(vec![source.to_owned()])
-}
-
-fn split_target_suffix(source: &str, root: &str) -> String {
-    if root == source {
-        return String::new();
-    }
-    let source_path = Path::new(source);
-    let root_path = Path::new(root);
-    if let Ok(relative) = root_path.strip_prefix(source_path) {
-        let parent = relative
-            .parent()
-            .unwrap_or_else(|| std::path::Component::RootDir.as_os_str().as_ref());
-        if parent.as_os_str().is_empty() {
-            "/".to_string()
-        } else {
-            format!("/{}/", parent.to_string_lossy())
-        }
-    } else {
-        String::new()
-    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
