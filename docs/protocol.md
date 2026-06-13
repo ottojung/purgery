@@ -52,14 +52,23 @@ Pure passthrough split uses rsync filter semantics for the transfer. There is no
 
 For `--split "."` (source entry itself matched), ordinary source-entry rsync is used with no filters and no source trailing slash.
 
-For all other patterns, one rsync invocation is constructed with these constant filter rules:
+For all other patterns, one rsync invocation is constructed with these constant filter rules (actual argv values):
+
+```
+--include=*/
+--include=<P-as-directory-payload>
+--include=<P-as-entry>
+--exclude=*
+```
+
+When shown as shell examples, filter arguments are quoted so the shell does not expand wildcards. The actual Rust `Command::args` argv values must not contain those quote characters.
 
 ```
 rsync -a -m \
-  --include=*/ \
-  --include=<P-as-directory-payload> \
-  --include=<P-as-entry> \
-  --exclude=* \
+  --include='*/' \
+  --include='<P-as-directory-payload>' \
+  --include='<P-as-entry>' \
+  --exclude='*' \
   -- <SOURCE>/ <HOST>:<TARGET>/
 ```
 
@@ -70,7 +79,9 @@ The source operand has a trailing slash so selected entries land under `<TARGET>
 
 `--include=*/` keeps parent directories traversable. `--include=<P-as-directory-payload>` ensures matched directories transfer their full payload. `--include=<P-as-entry>` selects matching files, symlinks, and directory entries. `--exclude=*` prevents unrelated entries from being copied. `-m` / `--prune-empty-dirs` removes traversal-only directory scaffolding.
 
-Examples:
+For directory sources, rsync always runs for non-dot patterns; when nothing matches the filter, rsync transfers nothing. For non-directory sources (regular files, symlinks), only `--split "."` can match; other patterns are no-op and exit successfully without invoking rsync.
+
+Examples (actual argv):
 
 ```
 --split "*.mp4"    → include=*/ include=*.mp4/*** include=*.mp4 exclude=*

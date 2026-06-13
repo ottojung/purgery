@@ -70,7 +70,7 @@ The `SOURCE` operand may be a regular file, directory, or symlink. The target is
 - `/` is invalid in every mode — it has no source entry name.
 - Symlink sources remain symlink sources. Source paths are not canonicalized through symlinks.
 
-The source entry name is used consistently for the manifest `relative_path`, staged path, cleanup root, server expected staged path, and server final path.
+The source entry name is used consistently for the manifest `relative_path`, staged path, cleanup root, server expected staged path, and server base final path (`<destination>/<source_entry_name>`).
 
 ## Split
 
@@ -92,13 +92,24 @@ Split operates in one of two modes depending on the presence of `--delete-after-
 
 Without `--delete-after-import` or `--postprocess`, the client performs one rsync filter transfer with constant include/exclude rules derived from the pattern. No Purgery-side candidate discovery, ancestor pruning, or root ordering is performed. The contract is final destination effect under the generated rsync filter rules.
 
-Rsync filter rules:
+Rsync filter rules (actual argv, not shell-quoted):
 
 ```
---include='*/'
---include='<P-as-directory-payload>'
---include='<P-as-entry>'
---exclude='*'
+--include=*/
+--include=<P-as-directory-payload>
+--include=<P-as-entry>
+--exclude=*
+```
+
+When shown as shell examples, filter arguments are quoted so the shell does not expand wildcards. The actual Rust `Command::args` argv values must not contain those quote characters.
+
+```
+rsync -a -m \
+  --include='*/' \
+  --include='<P-as-directory-payload>' \
+  --include='<P-as-entry>' \
+  --exclude='*' \
+  -- <SOURCE>/ <HOST>:<TARGET>/
 ```
 
 `<P-as-entry>` is the pattern verbatim. `<P-as-directory-payload>` appends `/***` to the pattern (stripping a trailing `/` if present), ensuring that when the pattern matches a directory, its full payload is transferred.
@@ -109,7 +120,9 @@ The source operand in filter mode intentionally has a trailing slash (`<SOURCE>/
 
 Pure passthrough split uses `--prune-empty-dirs` to remove traversal-only directory scaffolding created by the `*/` rule. Empty directories selected only by the filter may not be created at the destination. Cleanup and postprocess split do not use this optimization.
 
-No server run, manifest, or client state is created. No destination collision preflight is performed. Rsync always runs; when nothing matches the filter, rsync simply transfers nothing.
+No server run, manifest, or client state is created. No destination collision preflight is performed.
+
+For directory sources, rsync always runs for non-dot patterns; when nothing matches the filter, rsync transfers nothing. For non-directory sources (regular files, symlinks), only `--split "."` can match; other patterns are no-op and exit successfully without invoking rsync.
 
 ### Serialized split for cleanup and postprocess
 
