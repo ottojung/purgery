@@ -15,7 +15,7 @@ client: if --delete-after-import, mark the transfer successful and remove only u
 ### Path B: Postprocess (with --postprocess)
 
 ```
-client: validate args (#postprocess requires --delete-after-import)
+client: validate args (--postprocess requires --delete-after-import)
 client: walk source tree, build manifest with entry classification
 client: generate run ID
 client: begin-run over SSH -> server creates incoming directory, returns paths
