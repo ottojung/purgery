@@ -911,16 +911,16 @@ fn run_split(
     }
     let base_dest = &args.destination;
     for root in &entry_roots {
-        let suffix = split::split_target_suffix(&args.source, root);
+        let suffix = split::split_target_suffix(&args.source, &root.path);
         let split_dest = format!("{}{}", base_dest, suffix);
-        info!(source = %root, destination = %split_dest, "processing split entry");
+        info!(source = %root.path, destination = %split_dest, "processing split entry");
         let split_args = SyncArgs {
             postprocess: args.postprocess.clone(),
             delete_after_import: args.delete_after_import,
             split: None,
             state_dir: Some(state_dir.to_owned()),
             server_command: args.server_command.clone(),
-            source: root.clone(),
+            source: root.path.clone(),
             destination: split_dest,
         };
         let split_run_id = RunId::generate();
@@ -932,7 +932,7 @@ fn run_split(
 fn run_passthrough_split(
     runner: &RemoteRunner,
     source: &str,
-    _roots: &[String],
+    _roots: &[split::SplitCandidate],
     host: &str,
     remote_dir: &str,
 ) -> Result<()> {

@@ -2,11 +2,19 @@
 use std::path::Path;
 use walkdir::WalkDir;
 
+pub(crate) struct SplitCandidate {
+    pub path: String,
+    pub is_dir: bool,
+}
+
 /// Discover split entries under `source` that match `pattern`.
 ///
 /// Returns a deterministic non-overlapping set of root paths in
 /// normalized path order, with ancestor pruning applied.
-pub(crate) fn discover_split_entries(source: &str, pattern: &str) -> Result<Vec<String>, String> {
+pub(crate) fn discover_split_entries(
+    source: &str,
+    pattern: &str,
+) -> Result<Vec<SplitCandidate>, String> {
     let source_path = Path::new(source);
     if !source_path.exists() {
         return Ok(Vec::new());
@@ -15,10 +23,13 @@ pub(crate) fn discover_split_entries(source: &str, pattern: &str) -> Result<Vec<
     let matcher = PatternMatcher::new(pattern);
 
     // Collect all candidates (including source itself).
-    let mut candidates: Vec<String> = Vec::new();
+    let mut candidates: Vec<SplitCandidate> = Vec::new();
 
     // SOURCE itself is candidate ".".
-    candidates.push(source.to_owned());
+    candidates.push(SplitCandidate {
+        path: source.to_owned(),
+        is_dir: source_path.is_dir(),
+    });
 
     // Walk descendants.
     for walk_entry in WalkDir::new(source_path).follow_links(false).min_depth(1) {
@@ -32,49 +43,58 @@ pub(crate) fn discover_split_entries(source: &str, pattern: &str) -> Result<Vec<
             Err(_) => continue,
         };
         let candidate = source_path.join(relative);
-        candidates.push(candidate.to_string_lossy().to_string());
+        candidates.push(SplitCandidate {
+            path: candidate.to_string_lossy().to_string(),
+            is_dir: walk_entry.file_type().is_dir(),
+        });
     }
 
     // Filter by pattern.
-    let matched: Vec<String> = candidates
+    let matched: Vec<SplitCandidate> = candidates
         .into_iter()
         .filter(|c| {
-            let relative_str = if c == source {
+            let relative_str = if c.path == source {
                 ".".to_string()
             } else {
-                let path = Path::new(c);
+                let path = Path::new(&c.path);
                 path.strip_prefix(source_path)
                     .unwrap_or(std::path::Path::new(""))
                     .to_string_lossy()
                     .to_string()
             };
-            matcher.is_match(&relative_str)
+            matcher.is_match(&relative_str, c.is_dir)
         })
         .collect();
 
     // Prune descendants of matched ancestors.
-    let mut pruned: Vec<String> = Vec::new();
+    let mut pruned: Vec<SplitCandidate> = Vec::new();
     for candidate in &matched {
-        if candidate == source {
+        if candidate.path == source {
             // SOURCE matches — all descendants are pruned.
-            return Ok(vec![source.to_owned()]);
+            return Ok(vec![SplitCandidate {
+                path: source.to_owned(),
+                is_dir: true,
+            }]);
         }
         // Check if any ancestor is also matched.
         let has_ancestor = matched.iter().any(|other| {
-            if other == candidate {
+            if other.path == candidate.path {
                 return false;
             }
-            let candidate_path = Path::new(candidate);
-            let other_path = Path::new(other);
+            let candidate_path = Path::new(&candidate.path);
+            let other_path = Path::new(&other.path);
             candidate_path.starts_with(other_path)
         });
         if !has_ancestor {
-            pruned.push(candidate.clone());
+            pruned.push(SplitCandidate {
+                path: candidate.path.clone(),
+                is_dir: candidate.is_dir,
+            });
         }
     }
 
     // Deterministic sort.
-    pruned.sort();
+    pruned.sort_by(|a, b| a.path.cmp(&b.path));
 
     Ok(pruned)
 }
@@ -124,12 +144,14 @@ impl PatternMatcher {
         }
     }
 
-    fn is_match(&self, path: &str) -> bool {
-        if self.dir_only {
-            let path_obj = std::path::Path::new(path);
-            if !path_obj.is_dir() && !path.ends_with('/') && path != "." {
-                return false;
-            }
+    fn is_match(&self, path: &str, is_dir: bool) -> bool {
+        if self.dir_only && !is_dir {
+            return false;
+        }
+        // The root sentinel "." is not a regular path component and
+        // should not match dir-only patterns like "*/".
+        if self.dir_only && path == "." {
+            return false;
         }
 
         // For rsync patterns without /, match against any component.
@@ -359,30 +381,30 @@ mod tests {
     #[test]
     fn pattern_star_matches_single_component() {
         let m = PatternMatcher::new("*.txt");
-        assert!(m.is_match("file.txt"));
-        assert!(m.is_match("sub/file.txt"));
+        assert!(m.is_match("file.txt", false));
+        assert!(m.is_match("sub/file.txt", false));
     }
 
     #[test]
     fn pattern_star_does_not_cross_slash() {
         let m = PatternMatcher::new("*/*.txt");
-        assert!(m.is_match("sub/file.txt"));
-        assert!(!m.is_match("file.txt"));
+        assert!(m.is_match("sub/file.txt", false));
+        assert!(!m.is_match("file.txt", false));
     }
 
     #[test]
     fn pattern_doublestar_matches_across_dirs() {
         let m = PatternMatcher::new("**/*.txt");
-        assert!(m.is_match("file.txt"));
-        assert!(m.is_match("sub/file.txt"));
-        assert!(m.is_match("a/b/c/file.txt"));
+        assert!(m.is_match("file.txt", false));
+        assert!(m.is_match("sub/file.txt", false));
+        assert!(m.is_match("a/b/c/file.txt", false));
     }
 
     #[test]
     fn pattern_anchored_matches_from_root() {
         let m = PatternMatcher::new("/file.txt");
-        assert!(m.is_match("file.txt"));
-        assert!(!m.is_match("sub/file.txt"));
+        assert!(m.is_match("file.txt", false));
+        assert!(!m.is_match("sub/file.txt", false));
     }
 
     #[test]
@@ -429,5 +451,19 @@ mod tests {
         fs::write(tmp.path().join("a.txt"), "").unwrap();
         let entries = discover_split_entries(tmp.path().to_str().unwrap(), "*.mp4").unwrap();
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn split_dir_pattern_selects_directories() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("photos");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("a.jpg"), "").unwrap();
+        fs::write(tmp.path().join("readme.txt"), "").unwrap();
+        // Pattern "*/" should select photos directory but not readme.txt
+        let entries = discover_split_entries(tmp.path().to_str().unwrap(), "*/").unwrap();
+        assert_eq!(entries.len(), 1);
+        let path = std::path::Path::new(&entries[0].path);
+        assert_eq!(path.file_name().unwrap().to_str().unwrap(), "photos");
     }
 }
