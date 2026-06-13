@@ -1,0 +1,280 @@
+#![allow(dead_code)]
+
+use anyhow::{Context, Result};
+use purgery_core::{shell_escape, BeginRunResponse, PrepareRunResponse, RunStateResponse};
+use std::collections::HashMap;
+use std::process::Command;
+use std::sync::{Arc, Mutex};
+
+/// Pre-scripted response for a remote server command.
+/// The `cmd_contains` string must be a substring of the full SSH command.
+#[derive(Debug, Clone)]
+struct ScriptedResponse {
+    cmd_contains: String,
+    stdout: String,
+}
+
+/// A command-execution backend that either runs real SSH/rsync or returns
+/// scripted responses for testing.
+///
+/// Clone is cheap: for Real it's a trivial copy; for Fake it shares the
+/// underlying state via Arc so all clones see the same scripted responses
+/// and log.
+#[derive(Clone)]
+#[allow(dead_code)]
+pub(crate) enum RemoteRunner {
+    Real,
+    Fake { inner: Arc<FakeState> },
+}
+
+#[derive(Debug)]
+pub(crate) struct FakeState {
+    responses: Mutex<Vec<ScriptedResponse>>,
+    errors: Mutex<Vec<(String, String)>>,
+    log: Mutex<Vec<String>>,
+    written_files: Mutex<HashMap<String, String>>,
+}
+
+impl RemoteRunner {
+    pub(crate) fn real() -> Self {
+        RemoteRunner::Real
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn fake() -> Self {
+        RemoteRunner::Fake {
+            inner: Arc::new(FakeState {
+                responses: Mutex::new(Vec::new()),
+                errors: Mutex::new(Vec::new()),
+                log: Mutex::new(Vec::new()),
+                written_files: Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+
+    pub(crate) fn add_response(&self, cmd_contains: &str, stdout: &str) {
+        match self {
+            RemoteRunner::Fake { inner } => {
+                inner.responses.lock().unwrap().push(ScriptedResponse {
+                    cmd_contains: cmd_contains.to_owned(),
+                    stdout: stdout.to_owned(),
+                });
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    pub(crate) fn add_error(&self, cmd_contains: &str, error_msg: &str) {
+        match self {
+            RemoteRunner::Fake { inner } => {
+                inner
+                    .errors
+                    .lock()
+                    .unwrap()
+                    .push((cmd_contains.to_owned(), error_msg.to_owned()));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    pub(crate) fn command_log(&self) -> Vec<String> {
+        match self {
+            RemoteRunner::Fake { inner } => inner.log.lock().unwrap().clone(),
+            _ => unreachable!(),
+        }
+    }
+
+    pub(crate) fn written_files(&self) -> HashMap<String, String> {
+        match self {
+            RemoteRunner::Fake { inner } => inner.written_files.lock().unwrap().clone(),
+            _ => unreachable!(),
+        }
+    }
+
+    /// Run a purgery-server command on the remote host via SSH.
+    /// Returns stdout on success.
+    pub(crate) fn server_cmd(&self, host: &str, server_cmd: &str, args: &[&str]) -> Result<String> {
+        let full_cmd = {
+            let mut cmd = server_cmd.to_owned();
+            for a in args {
+                cmd.push(' ');
+                cmd.push_str(&shell_escape(a));
+            }
+            cmd
+        };
+        let ssh_cmd = format!("ssh -- {host} {full_cmd}");
+
+        match self {
+            RemoteRunner::Real => {
+                let output = Command::new("ssh")
+                    .arg("--")
+                    .arg(host)
+                    .arg(&full_cmd)
+                    .output()
+                    .with_context(|| format!("failed to execute SSH command on {host}"))?;
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    anyhow::bail!("SSH command on {host} failed: {stderr}");
+                }
+                Ok(String::from_utf8_lossy(&output.stdout).to_string())
+            }
+            RemoteRunner::Fake { inner } => {
+                inner.log.lock().unwrap().push(ssh_cmd.clone());
+                for (ec, err) in inner.errors.lock().unwrap().iter() {
+                    if ssh_cmd.contains(ec.as_str()) {
+                        anyhow::bail!("{err}");
+                    }
+                }
+                for resp in inner.responses.lock().unwrap().iter().rev() {
+                    if ssh_cmd.contains(&resp.cmd_contains) {
+                        return Ok(resp.stdout.clone());
+                    }
+                }
+                anyhow::bail!(
+                    "no scripted response for command (did you forget add_response?), \
+                     cmd was: {ssh_cmd}"
+                )
+            }
+        }
+    }
+
+    /// Write a file on the remote host via SSH.
+    pub(crate) fn write_remote_file(&self, host: &str, path: &str, content: &str) -> Result<()> {
+        match self {
+            RemoteRunner::Real => {
+                let remote_cmd = format!("cat > {}", shell_escape(path));
+                let mut child = Command::new("ssh")
+                    .arg("--")
+                    .arg(host)
+                    .arg(&remote_cmd)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .with_context(|| format!("failed to spawn SSH write to {host}:{path}"))?;
+                use std::io::Write;
+                if let Some(mut stdin) = child.stdin.take() {
+                    stdin
+                        .write_all(content.as_bytes())
+                        .with_context(|| "failed to write content to SSH stdin")?;
+                }
+                let output = child
+                    .wait_with_output()
+                    .with_context(|| "failed to wait for SSH write")?;
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    anyhow::bail!("failed to write remote file {path} on {host}: {stderr}");
+                }
+                Ok(())
+            }
+            RemoteRunner::Fake { inner } => {
+                inner
+                    .log
+                    .lock()
+                    .unwrap()
+                    .push(format!("write {host}:{path}"));
+                inner
+                    .written_files
+                    .lock()
+                    .unwrap()
+                    .insert(path.to_owned(), content.to_owned());
+                Ok(())
+            }
+        }
+    }
+
+    /// Run rsync to transfer files to a remote host.
+    pub(crate) fn run_rsync(&self, source: &str, host: &str, remote_dir: &str) -> Result<()> {
+        let rsync_dest = format!("{host}:{remote_dir}/");
+        let rsync_cmd = format!(
+            "rsync --recursive --partial --inplace --mkpath --archive --protect-args -- {source}/ {rsync_dest}"
+        );
+
+        match self {
+            RemoteRunner::Real => {
+                let rsync_args = purgery_core::build_rsync_args(source, &rsync_dest);
+                let status = Command::new("rsync")
+                    .args(&rsync_args)
+                    .status()
+                    .with_context(|| {
+                        format!("failed to execute rsync: {source} -> {host}:{remote_dir}")
+                    })?;
+                if !status.success() {
+                    anyhow::bail!("rsync failed: {source} -> {host}:{remote_dir}");
+                }
+                Ok(())
+            }
+            RemoteRunner::Fake { inner } => {
+                inner.log.lock().unwrap().push(rsync_cmd);
+                Ok(())
+            }
+        }
+    }
+
+    /// Parse a BeginRunResponse from the given TOML string. Convenience for tests.
+    pub(crate) fn parse_begin_response(toml: &str) -> Result<BeginRunResponse> {
+        let resp: BeginRunResponse =
+            toml::from_str(toml).with_context(|| "failed to parse begin-run response")?;
+        if resp.protocol_version != 1 {
+            anyhow::bail!("unsupported protocol version");
+        }
+        Ok(resp)
+    }
+
+    /// Parse a PrepareRunResponse from the given TOML string.
+    pub(crate) fn parse_prepare_response(toml: &str) -> Result<PrepareRunResponse> {
+        let resp: PrepareRunResponse =
+            toml::from_str(toml).with_context(|| "failed to parse prepare-run response")?;
+        if resp.protocol_version != 1 {
+            anyhow::bail!("unsupported protocol version");
+        }
+        Ok(resp)
+    }
+
+    /// Parse a RunStateResponse from the given TOML string.
+    pub(crate) fn parse_run_state_response(toml: &str) -> Result<RunStateResponse> {
+        toml::from_str(toml).with_context(|| "failed to parse run-state response")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fake_runner_returns_scripted_responses() {
+        let runner = RemoteRunner::fake();
+        runner.add_response("begin-run", "protocol_version = 1\n");
+        runner.add_response("prepare-run", "protocol_version = 1\n");
+
+        let out = runner.server_cmd("host", "ps", &["begin-run"]).unwrap();
+        assert_eq!(out, "protocol_version = 1\n");
+
+        let out = runner.server_cmd("host", "ps", &["prepare-run"]).unwrap();
+        assert_eq!(out, "protocol_version = 1\n");
+
+        let log = runner.command_log();
+        assert!(log.iter().any(|c| c.contains("begin-run")));
+        assert!(log.iter().any(|c| c.contains("prepare-run")));
+    }
+
+    #[test]
+    fn fake_runner_errors_on_unrecognized_command() {
+        let runner = RemoteRunner::fake();
+        let result = runner.server_cmd("host", "ps", &["unknown-command"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn fake_runner_add_error_overrides_response() {
+        let runner = RemoteRunner::fake();
+        runner.add_response("begin-run", "ok");
+        runner.add_error("begin-run", "simulated failure");
+        let result = runner.server_cmd("host", "ps", &["begin-run"]);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("simulated failure"));
+    }
+}

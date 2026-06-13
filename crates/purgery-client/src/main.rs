@@ -8,6 +8,7 @@ use purgery_core::{ColorMode, LogFormat, LogLevel, LoggingConfig};
 mod classify;
 mod cleanup;
 mod run;
+mod runner;
 mod ssh;
 mod transfer;
 
