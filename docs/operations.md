@@ -32,7 +32,6 @@ Precedence: CLI flags > config file > default. The `RUST_LOG` environment variab
 ## Server setup
 
 ```sh
-# Verify configuration and dependencies
 purgery-server check --config server.toml
 ```
 
@@ -43,19 +42,15 @@ If server directories do not exist, `check` reports an error.
 ## Normal operation
 
 ```sh
-# Server: recover processing runs and process ready runs
 purgery-server process-once --config server.toml
 
-# Client: sync files and clean up confirmed imports
 purgery-client sync -- ~/Videos user@server:/universe/synced/videos
 
-# Client: sync with postprocessing and cleanup
 purgery-client sync \
   --postprocess compress-video \
   --delete-after-import \
   -- ~/Videos user@server:/universe/synced/videos
 
-# Server: run garbage collection manually
 purgery-server gc --config server.toml
 ```
 
@@ -130,6 +125,6 @@ This is used for client `ssh`, `rsync`, and server postprocess `program` values.
 
 Each run overlays its uploaded tree onto the destination with recursive archive-mode rsync semantics and no delete option. Existing directories are merged, regular files and symlinks replace compatible destination entries, and extra final descendants remain. A regular file or symlink does not replace a non-empty destination directory. Source directory entries can replace conflicting file or symlink parents before descendants are imported.
 
-Symlink targets are stored and recreated literally. Neither staged symlinks nor destination symlinks are traversed as directories. Postprocessing applies to regular files, directories, and symlinks.
+Symlink targets are stored and recreated literally. Neither staged symlinks nor destination symlinks are traversed as directories. Postprocessing applies to regular files only; directories and symlinks are treated as passthrough regardless of `--postprocess`.
 
 A crash can expose a prefix of the entry overlay. This is expected: the run remains in `processing/` without a terminal status and `process-once` replays it until the final tree converges. The operation is not an all-or-nothing filesystem transaction.

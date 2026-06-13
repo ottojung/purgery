@@ -7,10 +7,7 @@ Purgery imports filesystem entries from devices into a destination, optionally t
 ### Server
 
 ```sh
-# Verify configuration and dependencies
 purgery-server check --config /etc/purgery/server.toml
-
-# Run one batch of imports
 purgery-server process-once --config /etc/purgery/server.toml
 ```
 If `--config` is omitted, the server looks for config at `$PURGERY_SERVER_CONFIG_PATH`, `$XDG_CONFIG_HOME/purgery/server.toml`, `~/.config/purgery/server.toml`, or `/etc/purgery/server.toml`.
@@ -18,17 +15,15 @@ If `--config` is omitted, the server looks for config at `$PURGERY_SERVER_CONFIG
 ### Client (source device)
 
 ```sh
-# Direct passthrough import (no transformation, no cleanup)
 purgery-client sync -- ~/Videos user@server:/universe/synced/videos
 
-# Import with server-side transformation and local cleanup
 purgery-client sync \
   --postprocess compress-video \
   --delete-after-import \
   -- ~/Videos user@server:/universe/synced/videos
 ```
 
-The destination is rsync-style: `USER@HOST:/absolute/path` or `USER@HOST:relative/path`. Both absolute and relative destinations are accepted.
+SOURCE must be a local directory. The destination is rsync-style: `USER@HOST:/absolute/path` or `USER@HOST:relative/path`. Both absolute and relative destinations are accepted. For postprocess runs, a relative destination is resolved against the server's working directory during `prepare-run` and the resolved absolute path persists in the run.
 
 ## How it works
 
@@ -51,7 +46,7 @@ Full config reference: [docs/config.md](docs/config.md)
 
 ## Transforms (postprocessing)
 
-Transformations are defined on the server. Clients request named steps via the `--postprocess` flag.
+Transformations are defined on the server. Clients request named steps via the `--postprocess` flag. Postprocessing applies only to regular files; directories and symlinks are treated as passthrough regardless of `--postprocess`.
 
 ```toml
 # server.toml
