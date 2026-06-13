@@ -151,7 +151,27 @@ final_paths = ["/archive/video.mp4"]
 postprocess = ["compress-video"]
 ```
 
-`final_paths` entries are `<destination>/<source-entry-name>`. The nickname is operational metadata and does not appear in final_paths.
+### Final path computation
+
+The source entry base final path is `<destination>/<source_entry_name>`.
+
+- If `keep_original = true`, the original work entry commits to that base final path.
+- Each expected postprocess output commits under the same parent as the base final path, using the output file name.
+- For split nested entries, the split target suffix already points at the selected entry's relative parent, so the same rule applies.
+
+Examples:
+
+```
+sync --postprocess compress -- ./video.mp4 host:/archive
+  original, if kept: /archive/video.mp4
+  output video.Z.webm: /archive/video.Z.webm
+
+sync --postprocess compress -- ./Videos/2024/a.mp4 host:/archive/2024
+  original, if kept: /archive/2024/a.mp4
+  output a.Z.webm: /archive/2024/a.Z.webm
+```
+
+The nickname is operational metadata and does not appear in final_paths.
 
 ## RunStateResponse
 

@@ -18,10 +18,16 @@ The source entry is staged at `files/<source-name>`. The server verifies the sta
 
 For a directory source, the staging tree is the directory itself. The subprocess receives the directory path and may read its contents. The manifest describes one logical entry regardless of directory depth.
 
-The run destination is final storage. For source `video.mp4`:
+The run destination is final storage. Final path computation:
 
-- destination `/archive` commits to `/archive/video.mp4`;
-- destination `incoming/videos` commits to `incoming/videos/video.mp4`, relative to the remote server process environment.
+- The source entry base final path is `<destination>/<source_entry_name>`.
+- If `keep_original = true`, the original work entry commits to that base final path.
+- Each expected postprocess output commits under the same parent as the base final path, using the output file name.
+
+Examples:
+
+- source `video.mp4` → `keep_original = true`: original commits to `/archive/video.mp4`, output `video.Z.webm` commits to `/archive/video.Z.webm`.
+- source `Videos/2024/a.mp4` → `keep_original = true`: original commits to `/archive/2024/a.mp4`, output `a.Z.webm` commits to `/archive/2024/a.Z.webm`.
 
 `work_dir` contains only Purgery state and work areas. It is never a final-storage root.
 

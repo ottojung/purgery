@@ -113,7 +113,14 @@ destination = "/universe/synced/videos"
 delete_after_import = true
 ```
 
-The `destination` field is the client-supplied destination path. It may be absolute or relative. For postprocess runs, `prepare-run` resolves a relative destination against the server's current working directory and atomically rewrites `run.toml` with the absolute path. The server computes final paths as `{destination}/{relative_entry_path}` and never places final files under `work_dir`.
+The `destination` field is the client-supplied destination path. It may be absolute or relative. For postprocess runs, `prepare-run` resolves a relative destination against the server's current working directory and atomically rewrites `run.toml` with the absolute path.
+
+Final path computation:
+
+- The source entry base final path is `<destination>/<source_entry_name>`.
+- If `keep_original = true`, the original work entry commits to that base path.
+- Each expected postprocess output commits under the same parent, using the output file name.
+- The server never places final files under `work_dir`.
 
 ## Config strictness
 
