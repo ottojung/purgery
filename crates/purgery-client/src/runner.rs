@@ -532,9 +532,6 @@ mod tests {
             .unwrap();
         let log = runner.command_log();
         assert_eq!(log.len(), 1, "pure passthrough split must use one rsync");
-        assert!(
-            !log[0].contains("ssh"),
-            "must be an rsync command, not ssh"
-        );
+        assert!(!log[0].contains("ssh"), "must be an rsync command, not ssh");
     }
 }
