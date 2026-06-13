@@ -64,7 +64,7 @@ purgery-server gc --config server.toml
 
 ## Split
 
-The `--split <PATTERN>` flag selects source entries to process individually. The pattern is an rsync-style single positive selector. It supports a documented subset of rsync include/exclude pattern forms without implementing a full ordered rule list.
+The `--split <PATTERN>` flag selects source entries to process individually. The pattern is an rsync-style single positive selector, not an ordered include/exclude rule list.
 
 ### Pattern syntax
 
@@ -100,7 +100,7 @@ Each matched root gets a target suffix that preserves its relative layout under 
 
 ### Pure passthrough split
 
-Without `--delete-after-import` or `--postprocess`, the split is implemented as a single rsync transfer that copies only the selected roots and their payloads. Nested entries preserve their relative parent paths under `<TARGET>`. No server run or client state is created. No destination collision preflight is added.
+Without `--delete-after-import` or `--postprocess`, the split performs one transfer of the selected roots and their payloads. Nested entries preserve their relative parent paths under `<TARGET>`. No server run or client state is created. No destination collision preflight is added.
 
 ### Serialized split for cleanup and postprocess
 

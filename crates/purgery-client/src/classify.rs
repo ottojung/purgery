@@ -8,6 +8,59 @@ use std::fs;
 use std::path::Path;
 use std::time::SystemTime;
 
+/// Compute the source entry name from a source path.
+///
+/// - Ordinary paths use the final path component.
+/// - Trailing slashes are ignored.
+/// - Symlinks use the symlink path's own name, not the target's.
+/// - `.` uses the current directory's name.
+/// - `..` uses the parent directory's name.
+/// - `/` is rejected (no valid source entry name).
+pub(crate) fn source_entry_name(source: &str) -> Result<String> {
+    let path = Path::new(source);
+
+    // Reject root path which has no entry name.
+    if path == Path::new("/") {
+        anyhow::bail!("cannot use root path as source entry: /");
+    }
+
+    // For . and .., resolve to the actual directory name.
+    if source == "." || source.ends_with("/.") {
+        let cwd = std::env::current_dir()
+            .map_err(|e| anyhow::anyhow!("failed to resolve current directory: {e}"))?;
+        return cwd
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .ok_or_else(|| {
+                anyhow::anyhow!("cannot determine source entry name for current directory")
+            });
+    }
+    if source == ".." || source.ends_with("/..") {
+        let cwd = std::env::current_dir()
+            .map_err(|e| anyhow::anyhow!("failed to resolve current directory: {e}"))?;
+        let parent = cwd.parent().map(|p| p.to_owned()).unwrap_or(cwd);
+        return parent
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .ok_or_else(|| {
+                anyhow::anyhow!("cannot determine source entry name for parent directory")
+            });
+    }
+
+    // Strip trailing slashes.
+    let cleaned = path;
+    let name = cleaned
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .ok_or_else(|| anyhow::anyhow!("cannot determine source entry name from path: {source}"))?;
+
+    if name.is_empty() {
+        anyhow::bail!("cannot determine source entry name from path: {source}");
+    }
+
+    Ok(name)
+}
+
 /// Build a manifest with one logical source entry.
 pub(crate) fn build_manifest(
     source: &str,
@@ -112,13 +165,10 @@ pub(crate) fn capture_cleanup_identity(source: &str) -> Result<Vec<CleanupEntry>
 
     let source_path = Path::new(source);
     if std::fs::symlink_metadata(source_path).is_err() {
-        return Ok(Vec::new());
+        anyhow::bail!("source path does not exist: {source}");
     }
 
-    let source_name = source_path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| source.to_owned());
+    let source_name = source_entry_name(source)?;
 
     let metadata = fs::symlink_metadata(source_path)
         .with_context(|| format!("failed to read metadata: {source}"))?;

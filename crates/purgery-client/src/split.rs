@@ -28,7 +28,9 @@ pub(crate) fn discover_split_entries(
     // SOURCE itself is candidate ".".
     candidates.push(SplitCandidate {
         path: source.to_owned(),
-        is_dir: source_path.is_dir(),
+        is_dir: std::fs::symlink_metadata(source_path)
+            .map(|m| m.file_type().is_dir() && !m.file_type().is_symlink())
+            .unwrap_or(false),
     });
 
     // Walk descendants.
@@ -45,7 +47,7 @@ pub(crate) fn discover_split_entries(
         let candidate = source_path.join(relative);
         candidates.push(SplitCandidate {
             path: candidate.to_string_lossy().to_string(),
-            is_dir: walk_entry.file_type().is_dir(),
+            is_dir: walk_entry.file_type().is_dir() && !walk_entry.file_type().is_symlink(),
         });
     }
 

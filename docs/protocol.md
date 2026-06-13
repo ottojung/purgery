@@ -15,7 +15,7 @@ client: if --delete-after-import, mark the transfer successful and remove only u
 
 ### Path B: Postprocess (with --postprocess)
 
-Server runs are postprocess-only. Every manifest entry must have `mode = postprocess` and non-empty `postprocess_steps`.
+Server runs are postprocess-only. Every manifest entry must have non-empty `postprocess_steps`.
 
 ```
 client: validate args (--postprocess requires --delete-after-import)
