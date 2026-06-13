@@ -479,4 +479,58 @@ mod tests {
         perms.set_mode(0o644);
         fs::set_permissions(&file, perms).unwrap();
     }
+
+    #[test]
+    fn source_entry_name_for_regular_file() {
+        let name = source_entry_name("/home/user/video.mp4").unwrap();
+        assert_eq!(name, "video.mp4");
+    }
+
+    #[test]
+    fn source_entry_name_for_directory() {
+        let name = source_entry_name("/home/user/Videos").unwrap();
+        assert_eq!(name, "Videos");
+    }
+
+    #[test]
+    fn source_entry_name_with_trailing_slash() {
+        let name = source_entry_name("/home/user/Videos/").unwrap();
+        assert_eq!(name, "Videos");
+    }
+
+    #[test]
+    fn source_entry_name_for_symlink_uses_symlink_name() {
+        let tmp = tempdir().unwrap();
+        let target = tmp.path().join("target");
+        fs::write(&target, "data").unwrap();
+        let link = tmp.path().join("mylink");
+        unix::fs::symlink(&target, &link).unwrap();
+        let name = source_entry_name(link.to_str().unwrap()).unwrap();
+        assert_eq!(name, "mylink");
+    }
+
+    #[test]
+    fn source_entry_name_rejects_root() {
+        let result = source_entry_name("/");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn manifest_and_cleanup_agree_on_source_name() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("Videos");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("a.mp4"), "data").unwrap();
+        let manifest = build_manifest(
+            dir.to_str().unwrap(),
+            &RunId::new("test".into()).unwrap(),
+            &Nickname::new("host".into()).unwrap(),
+            &[],
+        )
+        .unwrap();
+        let cleanup = capture_cleanup_identity(dir.to_str().unwrap()).unwrap();
+        // Both must use the same source entry name.
+        assert_eq!(manifest.entries[0].relative_path.as_str(), "Videos");
+        assert!(cleanup.iter().any(|e| e.relative_path == "Videos"));
+    }
 }

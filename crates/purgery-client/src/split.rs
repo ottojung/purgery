@@ -379,6 +379,7 @@ fn simple_glob(pattern: &str, path: &str) -> bool {
 mod tests {
     use super::*;
     use std::fs;
+    use std::os::unix;
     use tempfile::tempdir;
 
     #[test]
@@ -596,5 +597,70 @@ mod tests {
         let m = PatternMatcher::new("a?c.mp4");
         assert!(m.is_match("abc.mp4", false));
         assert!(!m.is_match("abbc.mp4", false));
+    }
+
+    #[test]
+    fn split_dir_pattern_does_not_match_symlink_to_directory() {
+        let tmp = tempdir().unwrap();
+        let real_dir = tmp.path().join("realdir");
+        fs::create_dir(&real_dir).unwrap();
+        let link = tmp.path().join("linkdir");
+        unix::fs::symlink(&real_dir, &link).unwrap();
+        fs::write(tmp.path().join("f.txt"), "").unwrap();
+        // Pattern "*/" should match realdir but not linkdir (symlink) or f.txt (file)
+        let entries = discover_split_entries(tmp.path().to_str().unwrap(), "*/").unwrap();
+        let matched: Vec<&str> = entries
+            .iter()
+            .map(|e| {
+                std::path::Path::new(&e.path)
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            matched,
+            vec!["realdir"],
+            "only real directory should match */"
+        );
+    }
+
+    #[test]
+    fn split_dot_returns_exactly_source_itself() {
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("a.txt"), "").unwrap();
+        let entries = discover_split_entries(tmp.path().to_str().unwrap(), ".").unwrap();
+        assert_eq!(entries.len(), 1, "dot pattern must match exactly one entry");
+        let path = std::path::Path::new(&entries[0].path);
+        assert_eq!(path, tmp.path(), "must match the source directory itself");
+        assert!(entries[0].is_dir, "source is a directory");
+    }
+
+    #[test]
+    fn split_mp4_matches_exact_files() {
+        let tmp = tempdir().unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        fs::write(tmp.path().join("a.mp4"), "").unwrap();
+        fs::write(tmp.path().join("b.txt"), "").unwrap();
+        fs::write(tmp.path().join("sub/c.mp4"), "").unwrap();
+        let entries = discover_split_entries(tmp.path().to_str().unwrap(), "*.mp4").unwrap();
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|e| {
+                std::path::Path::new(&e.path)
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"a.mp4"));
+        assert!(names.contains(&"c.mp4"));
+        assert!(
+            !names.contains(&"b.txt"),
+            "unrelated .txt files must not be included"
+        );
     }
 }
