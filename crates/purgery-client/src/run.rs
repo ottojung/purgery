@@ -644,6 +644,7 @@ impl HeartbeatGuard {
         }
     }
 
+    #[cfg(test)]
     fn check_heartbeat(&self) -> Result<()> {
         match &self.result {
             Some(Ok(())) => Ok(()),
@@ -1650,6 +1651,52 @@ state = "done"
         assert!(
             hb_positions.iter().all(|&p| p < finish_pos.unwrap()),
             "all heartbeats must occur before finish-run"
+        );
+    }
+
+    #[test]
+    fn client_updates_run_config_with_resolved_destination() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = postprocess_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-resolved-dest".into()).unwrap();
+
+        let begin = begin_resp_toml().replace(
+            "heartbeat_interval_secs = 60",
+            "heartbeat_interval_secs = 1",
+        );
+        runner.add_response("begin-run", &begin);
+        // Server returns a resolved absolute destination.
+        runner.add_response(
+            "prepare-run",
+            "protocol_version = 1\nnickname = \"laptop\"\nrun_id = \"test-resolved-dest\"\n\
+             destination = \"/server/resolved/absolute/path\"\n",
+        );
+        runner.add_response("heartbeat-run", "");
+        // Make finish-run fail so UploadCompleteFinishPending persists.
+        runner.add_error("finish-run", "simulated finish failure");
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        assert!(result.is_err(), "sync must fail when finish-run fails");
+
+        // The persisted UploadCompleteFinishPending state must contain
+        // the resolved absolute destination from prepare-run.
+        let runs_dir = camino::Utf8PathBuf::from(&state_dir).join("runs");
+        let mut found = false;
+        for entry in fs::read_dir(runs_dir.as_std_path()).unwrap() {
+            let entry = entry.unwrap();
+            let state_path = entry.path().join("state.toml");
+            if state_path.exists() {
+                let content = fs::read_to_string(&state_path).unwrap();
+                if content.contains("/server/resolved/absolute/path") {
+                    found = true;
+                }
+            }
+        }
+        assert!(
+            found,
+            "persisted UploadCompleteFinishPending must contain resolved destination"
         );
     }
 }

@@ -760,6 +760,22 @@ delete_after_import = true
         fs::write(dir.join("run.toml"), &content).unwrap();
     }
 
+    fn write_run_toml_with_raw_destination(
+        dir: &Utf8Path,
+        nickname: &Nickname,
+        destination_raw: &str,
+    ) {
+        let content = format!(
+            r#"nickname = "{}"
+destination = "{}"
+delete_after_import = true
+"#,
+            nickname.as_str(),
+            destination_raw,
+        );
+        fs::write(dir.join("run.toml"), &content).unwrap();
+    }
+
     /// Helper to create a basic setup with a ready run containing one file.
     #[allow(clippy::too_many_arguments)]
     fn setup_single_file_ready(
@@ -3487,6 +3503,126 @@ delete_after_import = true
             "prepare_run must succeed with only postprocess/covered entries: {:?}",
             result.err()
         );
+    }
+
+    #[test]
+    fn prepare_run_rewrites_relative_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("test-relative-dest".into()).unwrap();
+        let incoming = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Incoming);
+        fs::create_dir_all(&incoming).unwrap();
+
+        // Write run.toml with a relative destination verbatim.
+        write_run_toml_with_raw_destination(&incoming, &nickname, "relative/path");
+
+        // Manifest with one passthrough entry.
+        let manifest = Manifest {
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![ManifestEntry {
+                local_path: ClientLocalPath::new("/source/file.txt".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/file.txt".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("file.txt".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
+                size: 13,
+                mtime_ns: 0,
+                sha256: None,
+                link_target: None,
+                mode: purgery_core::ManifestEntryMode::Passthrough,
+                postprocess_steps: Vec::new(),
+                covered_by: None,
+            }],
+        };
+        fs::write(incoming.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+
+        let result = prepare_run(&config, &nickname, &run_id);
+        assert!(result.is_ok(), "prepare_run must succeed");
+
+        let response_str = result.unwrap();
+        let response: purgery_core::PrepareRunResponse = toml::from_str(&response_str).unwrap();
+        assert!(
+            response.destination.is_some(),
+            "relative destination must produce a resolved destination in response"
+        );
+        let resolved = response.destination.unwrap();
+        assert!(
+            resolved.starts_with('/'),
+            "resolved destination must be absolute, got: {resolved}"
+        );
+        assert!(
+            resolved.ends_with("relative/path"),
+            "resolved destination must end with the original relative path, got: {resolved}"
+        );
+
+        // run.toml must be atomically rewritten with absolute path.
+        let run_config_content = fs::read_to_string(incoming.join("run.toml")).unwrap();
+        let run_config: purgery_core::RunConfig = toml::from_str(&run_config_content).unwrap();
+        assert!(
+            run_config.destination.is_absolute(),
+            "rewritten run.toml destination must be absolute"
+        );
+    }
+
+    #[test]
+    fn prepare_run_does_not_rewrite_absolute_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("test-absolute-dest".into()).unwrap();
+        let incoming = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Incoming);
+        fs::create_dir_all(&incoming).unwrap();
+
+        // Use write_run_toml_with_destination which already produces an
+        // absolute path via test_destination_from_run_dir.
+        write_run_toml_with_destination(&incoming, &nickname, "absolute/dest");
+        // Make sure it is actually absolute.
+        let run_config_content = fs::read_to_string(incoming.join("run.toml")).unwrap();
+        let run_config: purgery_core::RunConfig = toml::from_str(&run_config_content).unwrap();
+        assert!(run_config.destination.is_absolute());
+        let original_dest = run_config.destination.as_str().to_owned();
+
+        // Manifest with one passthrough entry.
+        let manifest = Manifest {
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![ManifestEntry {
+                local_path: ClientLocalPath::new("/source/file.txt".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/file.txt".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("file.txt".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
+                size: 13,
+                mtime_ns: 0,
+                sha256: None,
+                link_target: None,
+                mode: purgery_core::ManifestEntryMode::Passthrough,
+                postprocess_steps: Vec::new(),
+                covered_by: None,
+            }],
+        };
+        fs::write(incoming.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+
+        let result = prepare_run(&config, &nickname, &run_id);
+        assert!(result.is_ok(), "prepare_run must succeed");
+
+        let response_str = result.unwrap();
+        let response: purgery_core::PrepareRunResponse = toml::from_str(&response_str).unwrap();
+        assert!(
+            response.destination.is_none(),
+            "absolute destination must not produce a resolved destination in response"
+        );
+
+        // run.toml must be unchanged.
+        let final_content = fs::read_to_string(incoming.join("run.toml")).unwrap();
+        let final_run_config: purgery_core::RunConfig = toml::from_str(&final_content).unwrap();
+        assert_eq!(final_run_config.destination.as_str(), original_dest);
     }
 
     #[test]
