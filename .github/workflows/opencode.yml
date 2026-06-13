@@ -9,10 +9,10 @@ on:
 jobs:
   opencode:
     if: |
-      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association) &&
       (
         startsWith(github.event.comment.body, 'plsoc') ||
         startsWith(github.event.comment.body, 'plsocz') ||
+        startsWith(github.event.comment.body, '/opencode-pro-zen') ||
         startsWith(github.event.comment.body, '/opencode')
       )
     runs-on: ubuntu-latest
