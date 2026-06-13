@@ -18,7 +18,12 @@ pub(crate) struct SplitFilters {
 ///
 /// - `--include='*/'` keeps parent directories traversable.
 /// - `--include='<P-as-directory-payload>'` transfers matched directory
-///   payloads.
+///   payloads at the top level.
+/// - `--include='<P-as-nested-directory-payload>'` transfers matched
+///   directory payloads at any nesting depth (only for patterns without
+///   `/`). Without this additional rule, a directory whose name matches
+///   a component-only pattern at a nested level would match as an entry
+///   but would not transfer its payload.
 /// - `--include='<P-as-entry>'` selects matching files, symlinks, and
 ///   directory entries.
 /// - `--exclude='*'` prevents unrelated entries from being copied.
@@ -29,6 +34,10 @@ pub(crate) struct SplitFilters {
 /// element appended (after stripping any existing trailing `/`), so
 /// rsync knows to recurse into matched directories.
 ///
+/// `<P-as-nested-directory-payload>` is the same but prefixed with
+/// `**/` so directories whose names match a component-only pattern
+/// at any nesting depth transfer their full payload.
+///
 /// Returns `None` for the `"."` sentinel pattern which means the
 /// source entry itself matched — that case uses ordinary rsync.
 pub(crate) fn build_split_filters(pattern: &str) -> Option<SplitFilters> {
@@ -38,8 +47,15 @@ pub(crate) fn build_split_filters(pattern: &str) -> Option<SplitFilters> {
 
     let dir_payload = build_dir_payload(pattern);
 
+    let has_slash = pattern.contains('/');
+    let mut include_rules = vec!["*/".to_string(), dir_payload];
+    if !has_slash {
+        include_rules.push(build_nested_dir_payload(pattern));
+    }
+    include_rules.push(pattern.to_string());
+
     Some(SplitFilters {
-        include_rules: vec!["*/".to_string(), dir_payload, pattern.to_string()],
+        include_rules,
         exclude_rule: "*".to_string(),
     })
 }
@@ -57,6 +73,46 @@ pub(crate) fn build_split_filters(pattern: &str) -> Option<SplitFilters> {
 fn build_dir_payload(pattern: &str) -> String {
     let stripped = pattern.trim_end_matches('/');
     format!("{}/***", stripped)
+}
+
+/// Build the nested directory-payload include pattern for patterns
+/// without `/`. This ensures directories whose name matches a
+/// component-only pattern at any nesting depth transfer their full
+/// payload.
+///
+/// Example: for `"*.mp4"`, produces `"**/*.mp4/***"`.
+fn build_nested_dir_payload(pattern: &str) -> String {
+    let stripped = pattern.trim_end_matches('/');
+    format!("**/{}/***", stripped)
+}
+
+/// Validate a split pattern, returning an error for patterns that are
+/// empty, consist only of `/` separators, or would otherwise produce
+/// dangerous filter rules when translated for pure passthrough split.
+///
+/// Rejected patterns:
+///
+/// - `""` (empty)
+/// - `"/"` and `"///"` (root-anchored-slash-only — stripped to empty,
+///   causing `build_dir_payload` to produce `"***"` with no qualifying
+///   prefix, which matches everything)
+pub(crate) fn validate_split_pattern(pattern: &str) -> Result<(), String> {
+    if pattern.is_empty() {
+        return Err("split pattern must not be empty".to_string());
+    }
+
+    let mut stripped = pattern.trim_end_matches('/');
+    if stripped.starts_with('/') {
+        stripped = &stripped[1..];
+    }
+
+    if stripped.is_empty() {
+        return Err(format!(
+            "split pattern \"{pattern}\" consists only of path separators"
+        ));
+    }
+
+    Ok(())
 }
 
 pub(crate) struct SplitCandidate {
@@ -839,6 +895,46 @@ mod tests {
         assert!(build_split_filters(".").is_none());
     }
 
+    // ── Pattern validation tests ──
+
+    #[test]
+    fn validate_split_pattern_rejects_empty() {
+        let err = validate_split_pattern("").unwrap_err();
+        assert!(err.contains("must not be empty"));
+    }
+
+    #[test]
+    fn validate_split_pattern_rejects_root_slash() {
+        let err = validate_split_pattern("/").unwrap_err();
+        assert!(err.contains("path separators"));
+    }
+
+    #[test]
+    fn validate_split_pattern_rejects_multislash() {
+        let err = validate_split_pattern("///").unwrap_err();
+        assert!(err.contains("path separators"));
+    }
+
+    #[test]
+    fn validate_split_pattern_accepts_dot() {
+        assert!(validate_split_pattern(".").is_ok());
+    }
+
+    #[test]
+    fn validate_split_pattern_accepts_star_mp4() {
+        assert!(validate_split_pattern("*.mp4").is_ok());
+    }
+
+    #[test]
+    fn validate_split_pattern_accepts_doublestar() {
+        assert!(validate_split_pattern("**/*.mp4").is_ok());
+    }
+
+    #[test]
+    fn validate_split_pattern_accepts_dir_trailing_slash() {
+        assert!(validate_split_pattern("Photos/").is_ok());
+    }
+
     #[test]
     fn build_split_filters_star_mp4() {
         let f = build_split_filters("*.mp4").unwrap();
@@ -847,6 +943,7 @@ mod tests {
             vec![
                 "*/".to_string(),
                 "*.mp4/***".to_string(),
+                "**/*.mp4/***".to_string(),
                 "*.mp4".to_string()
             ]
         );
@@ -1192,6 +1289,53 @@ mod tests {
         assert!(
             !entries.contains(&"skip.txt".to_string()),
             "unrelated file must not be copied"
+        );
+    }
+
+    #[test]
+    fn rsync_filter_star_mp4_copies_nested_matching_directory_payload() {
+        if !rsync_available() {
+            return;
+        }
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("video.mp4")).unwrap();
+        fs::create_dir_all(src.join("sub/video.mp4")).unwrap();
+        fs::write(src.join("video.mp4/top.txt"), "payload").unwrap();
+        fs::write(src.join("sub/video.mp4/nested.txt"), "payload").unwrap();
+        fs::write(src.join("skip.txt"), "text").unwrap();
+
+        let dest = tmp.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let f = build_split_filters("*.mp4").unwrap();
+        assert!(run_local_filter_rsync(
+            &src,
+            &dest,
+            &f.include_rules,
+            &f.exclude_rule
+        ));
+
+        let entries = list_entries(&dest);
+        assert!(
+            entries.contains(&"video.mp4/".to_string()),
+            "top-level video.mp4 directory must be created"
+        );
+        assert!(
+            entries.contains(&"video.mp4/top.txt".to_string()),
+            "top-level video.mp4 payload must be transferred"
+        );
+        assert!(
+            entries.contains(&"sub/video.mp4/".to_string()),
+            "nested sub/video.mp4 directory must be created"
+        );
+        assert!(
+            entries.contains(&"sub/video.mp4/nested.txt".to_string()),
+            "nested sub/video.mp4 payload must be transferred"
+        );
+        assert!(
+            !entries.contains(&"skip.txt".to_string()),
+            "unrelated skip.txt must not be copied"
         );
     }
 

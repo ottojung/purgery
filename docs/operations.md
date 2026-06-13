@@ -97,22 +97,24 @@ Rsync filter rules (actual argv, not shell-quoted):
 ```
 --include=*/
 --include=<P-as-directory-payload>
+--include=<P-as-nested-directory-payload>   (patterns without "/" only)
 --include=<P-as-entry>
 --exclude=*
 ```
 
-When shown as shell examples, filter arguments are quoted so the shell does not expand wildcards. The actual Rust `Command::args` argv values must not contain those quote characters.
+When shown as shell examples, filter arguments are quoted so the shell does not expand wildcards. The actual process argv values must not contain those quote characters.
 
 ```
 rsync -a -m \
   --include='*/' \
   --include='<P-as-directory-payload>' \
+  --include='<P-as-nested-directory-payload>' \
   --include='<P-as-entry>' \
   --exclude='*' \
   -- <SOURCE>/ <HOST>:<TARGET>/
 ```
 
-`<P-as-entry>` is the pattern verbatim. `<P-as-directory-payload>` appends `/***` to the pattern (stripping a trailing `/` if present), ensuring that when the pattern matches a directory, its full payload is transferred.
+`<P-as-entry>` is the pattern verbatim. `<P-as-directory-payload>` appends `/***` to the pattern (stripping a trailing `/` if present), ensuring that top-level matched directories transfer their full payload. `<P-as-nested-directory-payload>` is the same but prefixed with `**/`, ensuring that directories whose names match a component-only pattern at any nesting depth transfer their full payload. This rule is only emitted for patterns without `/`.
 
 The source operand in filter mode intentionally has a trailing slash (`<SOURCE>/`) so selected entries land directly under `<TARGET>` rather than under `<TARGET>/<SOURCE-NAME>`. Nested entries preserve their relative parent paths under `<TARGET>`.
 
@@ -212,7 +214,7 @@ This is used for client `ssh`, `rsync`, and server postprocess `program` values.
 
 ## Final-storage overlay
 
-Each run overlays its uploaded source onto the destination with recursive archive-mode rsync semantics and no delete option. The source entry name is appended to the destination to form the final path. Existing directories are merged, regular files and symlinks replace compatible destination entries.
+Each run overlays its uploaded source onto the destination with recursive archive-mode rsync semantics and no delete option. The source entry base final path is `<destination>/<source_entry_name>`. If `keep_original = true`, the original work entry commits to that base final path. Each expected postprocess output commits under the same parent, using the output file name. Existing directories are merged, regular files and symlinks replace compatible destination entries.
 
 Symlink targets are stored and recreated literally. Neither staged symlinks nor destination symlinks are traversed as directories. Postprocessing applies to the source entry, regardless of kind.
 

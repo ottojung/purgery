@@ -910,6 +910,9 @@ fn run_split(
     state_dir: &str,
     source_spec: &classify::SourceSpec,
 ) -> Result<()> {
+    let pattern = args.split.as_deref().unwrap();
+    split::validate_split_pattern(pattern).map_err(|e| anyhow::anyhow!("{e}"))?;
+
     let has_postprocess = !args.postprocess.is_empty();
     let target = parse_destination(&args.destination)?;
 
@@ -918,15 +921,14 @@ fn run_split(
             runner,
             &source_spec.operation_path,
             source_spec.kind,
-            args.split.as_deref().unwrap(),
+            pattern,
             &target.host,
             target.path.as_str(),
         );
     }
 
-    let entry_roots =
-        split::discover_split_entries(&source_spec.operation_path, args.split.as_deref().unwrap())
-            .map_err(|e| anyhow::anyhow!("split discovery failed: {e}"))?;
+    let entry_roots = split::discover_split_entries(&source_spec.operation_path, pattern)
+        .map_err(|e| anyhow::anyhow!("split discovery failed: {e}"))?;
     if entry_roots.is_empty() {
         info!("split pattern matched nothing");
         return Ok(());
@@ -2054,7 +2056,11 @@ state = "done"
         );
         assert!(
             includes.contains(&"*.mp4/***".to_string()),
-            "must include '*.mp4/***' for directory payload"
+            "must include '*.mp4/***' for top-level directory payload"
+        );
+        assert!(
+            includes.contains(&"**/*.mp4/***".to_string()),
+            "must include '**/*.mp4/***' for nested directory payload"
         );
         assert!(
             includes.contains(&"*.mp4".to_string()),
@@ -2204,5 +2210,79 @@ state = "done"
         let cmd = &log[0];
         assert!(cmd.contains("--include=*.mp4"));
         assert!(cmd.contains("--exclude=*"));
+    }
+
+    // ── Invalid split pattern tests ──
+
+    #[test]
+    fn invalid_split_pattern_rejected_pure_passthrough() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let src = src_dir_str(&tmp);
+        fs::write(std::path::Path::new(&src).join("a.txt"), "data").unwrap();
+
+        for bad in &["", "/", "///"] {
+            let args = SyncArgs {
+                postprocess: vec![],
+                delete_after_import: false,
+                split: Some(bad.to_string()),
+                state_dir: Some(state_dir.clone()),
+                source: src.clone(),
+                destination: "host:/dest".to_string(),
+                server_command: "purgery-server".to_string(),
+            };
+            let result = run_sync_with_runner(&runner, &args);
+            assert!(
+                result.is_err(),
+                "split pattern \"{bad}\" must be rejected in pure passthrough mode"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_split_pattern_rejected_cleanup_postprocess() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let src = src_dir_str(&tmp);
+        fs::write(std::path::Path::new(&src).join("a.txt"), "data").unwrap();
+
+        for bad in &["", "/", "///"] {
+            // Cleanup (delete without postprocess)
+            {
+                let args = SyncArgs {
+                    postprocess: vec![],
+                    delete_after_import: true,
+                    split: Some(bad.to_string()),
+                    state_dir: Some(state_dir.clone()),
+                    source: src.clone(),
+                    destination: "host:/dest".to_string(),
+                    server_command: "purgery-server".to_string(),
+                };
+                let result = run_sync_with_runner(&runner, &args);
+                assert!(
+                    result.is_err(),
+                    "split pattern \"{bad}\" must be rejected in cleanup mode"
+                );
+            }
+            // Postprocess
+            {
+                let args = SyncArgs {
+                    postprocess: vec!["transform".to_string()],
+                    delete_after_import: true,
+                    split: Some(bad.to_string()),
+                    state_dir: Some(state_dir.clone()),
+                    source: src.clone(),
+                    destination: "host:/dest".to_string(),
+                    server_command: "purgery-server".to_string(),
+                };
+                let result = run_sync_with_runner(&runner, &args);
+                assert!(
+                    result.is_err(),
+                    "split pattern \"{bad}\" must be rejected in postprocess mode"
+                );
+            }
+        }
     }
 }

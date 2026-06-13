@@ -57,16 +57,18 @@ For all other patterns, one rsync invocation is constructed with these constant 
 ```
 --include=*/
 --include=<P-as-directory-payload>
+--include=<P-as-nested-directory-payload>   (patterns without "/" only)
 --include=<P-as-entry>
 --exclude=*
 ```
 
-When shown as shell examples, filter arguments are quoted so the shell does not expand wildcards. The actual Rust `Command::args` argv values must not contain those quote characters.
+When shown as shell examples, filter arguments are quoted so the shell does not expand wildcards. The actual process argv values must not contain those quote characters.
 
 ```
 rsync -a -m \
   --include='*/' \
   --include='<P-as-directory-payload>' \
+  --include='<P-as-nested-directory-payload>' \
   --include='<P-as-entry>' \
   --exclude='*' \
   -- <SOURCE>/ <HOST>:<TARGET>/
@@ -76,15 +78,16 @@ The source operand has a trailing slash so selected entries land under `<TARGET>
 
 - `<P-as-entry>` is the pattern unchanged.
 - `<P-as-directory-payload>` is the pattern with a trailing `/***` appended (after stripping any existing trailing `/`).
+- `<P-as-nested-directory-payload>` is the same but prefixed with `**/` so directories whose names match a component-only pattern at any nesting depth transfer their full payload. Only emitted for patterns without `/`.
 
-`--include=*/` keeps parent directories traversable. `--include=<P-as-directory-payload>` ensures matched directories transfer their full payload. `--include=<P-as-entry>` selects matching files, symlinks, and directory entries. `--exclude=*` prevents unrelated entries from being copied. `-m` / `--prune-empty-dirs` removes traversal-only directory scaffolding.
+`--include=*/` keeps parent directories traversable. `--include=<P-as-directory-payload>` ensures top-level matched directories transfer their full payload. `--include=<P-as-nested-directory-payload>` ensures nested directories whose names match a component-only pattern transfer their full payload. `--include=<P-as-entry>` selects matching files, symlinks, and directory entries. `--exclude=*` prevents unrelated entries from being copied. `-m` / `--prune-empty-dirs` removes traversal-only directory scaffolding.
 
 For directory sources, rsync always runs for non-dot patterns; when nothing matches the filter, rsync transfers nothing. For non-directory sources (regular files, symlinks), only `--split "."` can match; other patterns are no-op and exit successfully without invoking rsync.
 
 Examples (actual argv):
 
 ```
---split "*.mp4"    → include=*/ include=*.mp4/*** include=*.mp4 exclude=*
+--split "*.mp4"    → include=*/ include=*.mp4/*** include=**/*.mp4/*** include=*.mp4 exclude=*
 --split "**/*.mp4" → include=*/ include=**/*.mp4/*** include=**/*.mp4 exclude=*
 --split "Photos/"  → include=*/ include=Photos/*** include=Photos/ exclude=*
 ```
@@ -157,7 +160,13 @@ destination = "/archive"
 delete_after_import = true
 ```
 
-The `destination` field is the target parent directory. It may be absolute or relative. For postprocess runs, a relative destination is resolved against the server's working directory during `prepare-run` and the `run.toml` is atomically rewritten with the absolute path. The server computes the final path as `{destination}/{source_entry_name}`; `work_dir` is never prepended.
+The `destination` field is the target parent directory. It may be absolute or relative. For postprocess runs, a relative destination is resolved against the server's working directory during `prepare-run` and the `run.toml` is atomically rewritten with the absolute path.
+
+The source entry base final path is `<destination>/<source_entry_name>`.
+
+- If `keep_original = true`, the original work entry commits to that base final path.
+- Each expected postprocess output commits under the same parent as the base final path, using the output file name.
+- `work_dir` is never final storage.
 
 ## Manifest (manifest.toml)
 
