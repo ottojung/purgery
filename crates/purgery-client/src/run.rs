@@ -2088,4 +2088,108 @@ state = "done"
             "pure passthrough split must not create cleanup state"
         );
     }
+
+    #[test]
+    fn passthrough_split_dot_uses_ordinary_rsync_no_trailing_slash() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let src = tmp.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("a.mp4"), "data").unwrap();
+
+        let args = SyncArgs {
+            postprocess: vec![],
+            delete_after_import: false,
+            split: Some(".".to_string()),
+            state_dir: Some(state_dir),
+            source: src.to_str().unwrap().to_string(),
+            destination: "host:/dest".to_string(),
+            server_command: "purgery-server".to_string(),
+        };
+        run_sync_with_runner(&runner, &args).unwrap();
+
+        let log = runner.command_log();
+        assert_eq!(log.len(), 1, "must use exactly one rsync process");
+        let cmd = &log[0];
+        // --split "." uses ordinary rsync; source should NOT have trailing slash
+        assert!(cmd.contains("--recursive"), "must include --recursive");
+        assert!(cmd.contains("--archive"), "must include --archive");
+        assert!(
+            cmd.contains(format!("-- {}", src.to_str().unwrap()).as_str()),
+            "source operand should not have trailing slash for --split '.'"
+        );
+    }
+
+    #[test]
+    fn passthrough_split_filter_mode_uses_source_with_trailing_slash() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let src = tmp.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("a.mp4"), "data").unwrap();
+        fs::write(src.join("b.txt"), "text").unwrap();
+
+        let args = SyncArgs {
+            postprocess: vec![],
+            delete_after_import: false,
+            split: Some("*.mp4".to_string()),
+            state_dir: Some(state_dir),
+            source: src.to_str().unwrap().to_string(),
+            destination: "host:/dest".to_string(),
+            server_command: "purgery-server".to_string(),
+        };
+        run_sync_with_runner(&runner, &args).unwrap();
+
+        let log = runner.command_log();
+        assert_eq!(log.len(), 1);
+        let cmd = &log[0];
+        // Filter mode: source operand must have trailing slash
+        assert!(
+            cmd.contains(format!(" {}/", src.to_str().unwrap()).as_str()),
+            "source operand must have trailing slash in filter mode"
+        );
+        assert!(
+            cmd.contains("--include='*/'"),
+            "must include directory traversal rule"
+        );
+        assert!(
+            cmd.contains("--exclude='*'"),
+            "must include exclude rule"
+        );
+        assert!(
+            cmd.contains("--prune-empty-dirs"),
+            "must include -m to prune traversal scaffolding"
+        );
+    }
+
+    #[test]
+    fn passthrough_split_star_does_not_transfer_unrelated_files() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("a.mp4"), "mp4-content").unwrap();
+        fs::write(src.join("b.txt"), "txt-content").unwrap();
+        fs::write(src.join("sub/c.mp4"), "nested-mp4").unwrap();
+
+        let args = SyncArgs {
+            postprocess: vec![],
+            delete_after_import: false,
+            split: Some("*.mp4".to_string()),
+            state_dir: Some(state_dir),
+            source: src.to_str().unwrap().to_string(),
+            destination: "host:/dest".to_string(),
+            server_command: "purgery-server".to_string(),
+        };
+        run_sync_with_runner(&runner, &args).unwrap();
+
+        let log = runner.command_log();
+        assert_eq!(log.len(), 1);
+        let cmd = &log[0];
+        assert!(cmd.contains("--include='*.mp4'"));
+        assert!(cmd.contains("--exclude='*'"));
+    }
 }

@@ -831,4 +831,61 @@ mod tests {
             "unrelated .txt files must not be included"
         );
     }
+
+    // ── Filter generation tests ──
+
+    #[test]
+    fn build_split_filters_dot_returns_none() {
+        assert!(build_split_filters(".").is_none());
+    }
+
+    #[test]
+    fn build_split_filters_star_mp4() {
+        let f = build_split_filters("*.mp4").unwrap();
+        assert_eq!(
+            f.include_rules,
+            vec!["*/".to_string(), "*.mp4/***".to_string(), "*.mp4".to_string()]
+        );
+        assert_eq!(f.exclude_rule, "*".to_string());
+    }
+
+    #[test]
+    fn build_split_filters_doublestar_mp4() {
+        let f = build_split_filters("**/*.mp4").unwrap();
+        assert_eq!(
+            f.include_rules,
+            vec![
+                "*/".to_string(),
+                "**/*.mp4/***".to_string(),
+                "**/*.mp4".to_string()
+            ]
+        );
+        assert_eq!(f.exclude_rule, "*".to_string());
+    }
+
+    #[test]
+    fn build_split_filters_photos_slash() {
+        let f = build_split_filters("Photos/").unwrap();
+        assert_eq!(
+            f.include_rules,
+            vec![
+                "*/".to_string(),
+                "Photos/***".to_string(),
+                "Photos/".to_string()
+            ]
+        );
+        assert_eq!(f.exclude_rule, "*".to_string());
+    }
+
+    #[test]
+    fn build_split_filters_always_has_exclude_wildcard() {
+        let f = build_split_filters("*.mp4").unwrap();
+        assert_eq!(f.exclude_rule, "*".to_string());
+    }
+
+    #[test]
+    fn build_split_filters_always_has_dir_traversal() {
+        let f = build_split_filters("pattern").unwrap();
+        assert_eq!(f.include_rules[0], "*/".to_string());
+    }
 }
