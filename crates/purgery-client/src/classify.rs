@@ -61,7 +61,6 @@ pub(crate) fn build_manifest(
                 link_target: None,
                 mode: ManifestEntryMode::Passthrough,
                 postprocess_steps: Vec::new(),
-                covered_by: None,
             });
         } else if file_type.is_file() {
             let size = metadata.len();
@@ -112,7 +111,6 @@ pub(crate) fn build_manifest(
                 } else {
                     Vec::new()
                 },
-                covered_by: None,
             });
         } else if file_type.is_symlink() {
             let target = fs::read_link(path)
@@ -131,34 +129,7 @@ pub(crate) fn build_manifest(
                 link_target: Some(target),
                 mode: ManifestEntryMode::Passthrough,
                 postprocess_steps: Vec::new(),
-                covered_by: None,
             });
-        }
-    }
-
-    let covering_dirs: Vec<String> = entries
-        .iter()
-        .filter(|e| {
-            e.kind == ManifestEntryKind::Directory && e.mode == ManifestEntryMode::Postprocess
-        })
-        .map(|e| e.relative_path.as_str().to_owned())
-        .collect();
-    for entry in entries.iter_mut() {
-        if entry.mode == ManifestEntryMode::Postprocess {
-            continue;
-        }
-        let rp = entry.relative_path.as_str();
-        for dir_path in &covering_dirs {
-            if rp == dir_path.as_str() {
-                continue;
-            }
-            if rp.starts_with(dir_path.as_str()) && rp.as_bytes().get(dir_path.len()) == Some(&b'/')
-            {
-                entry.mode = ManifestEntryMode::Covered;
-                entry.covered_by = Some(dir_path.clone());
-                entry.postprocess_steps = Vec::new();
-                break;
-            }
         }
     }
 

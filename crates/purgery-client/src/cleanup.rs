@@ -1,8 +1,7 @@
 use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use purgery_core::{
-    CleanupEntry, DurableCleanupState, FileStatus, Manifest, ManifestEntryKind, ManifestEntryMode,
-    RunStatus,
+    CleanupEntry, DurableCleanupState, FileStatus, Manifest, ManifestEntryKind, RunStatus,
 };
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -133,10 +132,6 @@ pub(crate) fn build_cleanup_entries(manifest: &Manifest) -> Result<Vec<CleanupEn
 
     for entry in manifest.entries.iter() {
         let local_path = entry.local_path.as_str();
-
-        if entry.mode == ManifestEntryMode::Covered {
-            continue;
-        }
 
         let relative_from_root = entry.relative_path.as_str().to_owned();
 

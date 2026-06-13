@@ -6,7 +6,7 @@ use purgery_core::{
     RunConfig, RunId, RunPhase, RunState, RunStatus, ServerConfig,
 };
 use std::fs;
-use tracing::{debug, info, span, warn, Level};
+use tracing::{info, span, warn, Level};
 
 use crate::commit::{
     commit_directory_entry, commit_output_entry, commit_regular_file_entry, commit_symlink_entry,
@@ -28,12 +28,6 @@ pub(crate) enum EntryOutcome {
         postprocess: Option<Vec<String>>,
     },
     Failure {
-        kind: ManifestEntryKind,
-        local_path: String,
-        relative_path: String,
-        error: String,
-    },
-    Skipped {
         kind: ManifestEntryKind,
         local_path: String,
         relative_path: String,
@@ -69,20 +63,6 @@ impl EntryOutcome {
                 local_path,
                 relative_path,
                 status: FileStatus::Failed,
-                final_paths: vec![],
-                postprocess: None,
-                error: Some(error),
-            },
-            EntryOutcome::Skipped {
-                kind,
-                local_path,
-                relative_path,
-                error,
-            } => EntryStatusEntry {
-                kind,
-                local_path,
-                relative_path,
-                status: FileStatus::Skipped,
                 final_paths: vec![],
                 postprocess: None,
                 error: Some(error),
@@ -474,13 +454,6 @@ pub fn process_processing_run(
         anyhow::bail!("{msg}");
     }
 
-    let covered_by_dirs: Vec<String> = manifest
-        .entries
-        .iter()
-        .filter(|e| e.kind == ManifestEntryKind::Directory && !e.postprocess_steps.is_empty())
-        .map(|e| e.relative_path.as_str().to_owned())
-        .collect();
-
     // Write initial progress before processing entries
     write_progress_best_effort(
         &processing_path,
@@ -506,22 +479,6 @@ pub fn process_processing_run(
             entry.relative_path.as_str(),
             "",
         );
-
-        let np = entry.relative_path.as_str().to_owned();
-        let covered = covered_by_dirs.iter().any(|prefix| {
-            np.strip_prefix(prefix.as_str())
-                .is_some_and(|tail| tail.starts_with('/'))
-        });
-        if covered {
-            debug!(path = %np, "entry covered by postprocessed ancestor directory, skipping");
-            outcomes.push(EntryOutcome::Skipped {
-                kind: entry.kind,
-                local_path: entry.local_path.as_str().to_owned(),
-                relative_path: entry.relative_path.as_str().to_owned(),
-                error: "covered by postprocessed ancestor directory".into(),
-            });
-            continue;
-        }
 
         outcomes.push(process_manifest_entry(
             &run_plan,

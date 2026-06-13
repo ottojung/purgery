@@ -400,7 +400,6 @@ pub enum ManifestEntryMode {
     Passthrough,
     #[default]
     Postprocess,
-    Covered,
 }
 
 // ── Path Safety ──────────────────────────────────────────────────────
