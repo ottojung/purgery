@@ -181,6 +181,10 @@ impl ServerConfig {
                     td.name
                 )));
             }
+
+            crate::validate_transform_definition(&td)
+                .map_err(|e| ConfigError::Invalid(format!("transform '{}': {e}", td.name)))?;
+
             transforms.insert(td.name.clone(), td);
         }
         Ok(Self {

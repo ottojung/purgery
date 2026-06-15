@@ -43,6 +43,9 @@ pub fn apply_transform_with_heartbeat(
 ) -> Result<Vec<Utf8PathBuf>, String> {
     let def = &resolved.def;
 
+    purgery_core::validate_transform_definition(def)
+        .map_err(|e| format!("transform '{}' definition is invalid: {e}", resolved.name))?;
+
     let work_parent = work_path
         .parent()
         .ok_or_else(|| "work path has no parent directory".to_string())?;

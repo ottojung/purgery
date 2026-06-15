@@ -6423,4 +6423,37 @@ delete_after_import = true
             "error must reference expected_output validation, got: {err}"
         );
     }
+
+    #[test]
+    fn apply_transform_rejects_invalid_definition_before_spawn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let mut config = test_server_config(&work_dir);
+        config.transforms = single_transform(
+            "bad-transform",
+            TransformDefinition {
+                name: "bad-transform".into(),
+                kind: TransformKind::Subprocess,
+                program: "".to_owned(),
+                args: vec![],
+                expected_outputs: vec!["output.txt".into()],
+                keep_original: true,
+            },
+        );
+
+        let work_path = work_dir.join("work").join("test.txt");
+        fs::create_dir_all(work_path.parent().unwrap()).unwrap();
+        fs::write(&work_path, b"test data").unwrap();
+
+        let result = test_apply_transform(&config, &work_path);
+        assert!(
+            result.is_err(),
+            "apply_transform must reject invalid definition before spawning"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("definition is invalid") || err.contains("program is empty"),
+            "error must indicate transform definition validation, got: {err}"
+        );
+    }
 }

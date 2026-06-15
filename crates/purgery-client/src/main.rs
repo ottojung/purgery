@@ -348,4 +348,22 @@ mod tests {
         let cfg = build_logging_config(&args);
         assert!(matches!(cfg.level, LogLevel::Info));
     }
+
+    #[test]
+    fn cli_rejects_multiple_transform_flags() {
+        let result = Cli::try_parse_from([
+            "purgery-client",
+            "sync",
+            "--transform",
+            "a",
+            "--transform",
+            "b",
+            "--delete-after-import",
+            "--",
+            "/src",
+            "host:dest",
+        ]);
+
+        assert!(result.is_err());
+    }
 }

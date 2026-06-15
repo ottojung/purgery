@@ -1640,6 +1640,74 @@ expected_outputs = []
     }
 
     #[test]
+    fn server_config_rejects_invalid_expected_outputs() {
+        let config = r#"
+work_dir = "/var/lib/purgery/work"
+
+[[transform]]
+name = "compress-video"
+kind = "subprocess"
+program = "my-compress-video"
+args = ["--input", "{input}"]
+expected_outputs = ["{input}"]
+keep_original = true
+"#;
+        let result = ServerConfig::from_toml(config);
+        assert!(
+            result.is_err(),
+            "config with {{input}} in expected_outputs must be rejected"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "must use Invalid variant, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("compress-video"),
+            "error must name the transform, got: {msg}"
+        );
+        assert!(
+            msg.contains("expected_output") || msg.contains("{input}"),
+            "error must reference expected_outputs, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn server_config_rejects_empty_program() {
+        let config = r#"
+work_dir = "/var/lib/purgery/work"
+
+[[transform]]
+name = "compress-video"
+kind = "subprocess"
+program = ""
+args = ["--input", "{input}"]
+expected_outputs = ["{file_stem}.Z.webm"]
+keep_original = true
+"#;
+        let result = ServerConfig::from_toml(config);
+        assert!(
+            result.is_err(),
+            "config with empty program must be rejected"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "must use Invalid variant, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("compress-video"),
+            "error must name the transform, got: {msg}"
+        );
+        assert!(
+            msg.contains("program is empty") || msg.contains("empty"),
+            "error must mention empty program, got: {msg}"
+        );
+    }
+
+    #[test]
     fn transform_definition_rejects_missing_name() {
         let toml = r#"
 kind = "subprocess"
