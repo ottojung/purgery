@@ -376,7 +376,7 @@ mod tests {
                 relative_path: "a.txt".to_owned(),
                 status: file_status,
                 final_paths: vec!["/destination/a.txt".to_owned()],
-                postprocess: Some(vec!["transform".to_owned()]),
+                transform: Some(vec!["transform".to_owned()]),
                 error: None,
             }],
             error: None,
@@ -384,7 +384,7 @@ mod tests {
     }
 
     #[test]
-    fn postprocess_cleanup_waits_for_imported_server_status() {
+    fn transform_cleanup_waits_for_imported_server_status() {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("a.txt");
         fs::write(&file, "original").unwrap();
@@ -586,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn postprocess_cleanup_preserves_failed_and_skipped_entries() {
+    fn transform_cleanup_preserves_failed_and_skipped_entries() {
         for status in [FileStatus::Failed, FileStatus::Skipped] {
             let tmp = tempfile::tempdir().unwrap();
             let file = tmp.path().join("a.txt");
@@ -664,7 +664,7 @@ mod tests {
                 relative_path: "photos".to_owned(),
                 status: FileStatus::Imported,
                 final_paths: vec!["/dest/photos".to_owned()],
-                postprocess: Some(vec!["transform".to_owned()]),
+                transform: Some(vec!["transform".to_owned()]),
                 error: None,
             }],
             error: None,
@@ -741,7 +741,7 @@ mod tests {
                 relative_path: "photos".to_owned(),
                 status: FileStatus::Failed,
                 final_paths: vec![],
-                postprocess: None,
+                transform: None,
                 error: Some("something went wrong".to_owned()),
             }],
             error: None,
@@ -809,7 +809,7 @@ mod tests {
                 relative_path: "unrelated.txt".to_owned(),
                 status: FileStatus::Imported,
                 final_paths: vec!["/dest/unrelated.txt".to_owned()],
-                postprocess: None,
+                transform: None,
                 error: None,
             }],
             error: None,

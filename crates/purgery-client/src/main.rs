@@ -50,11 +50,11 @@ enum Command {
 
 #[derive(Parser)]
 struct SyncArgs {
-    /// Postprocess step to run on the server (repeatable)
-    #[arg(long = "postprocess", short = 'p')]
-    postprocess: Vec<String>,
+    /// Transform step to run on the server (repeatable)
+    #[arg(long = "transform", short = 'p')]
+    transform: Vec<String>,
 
-    /// Delete source files after successful import (required with --postprocess)
+    /// Delete source files after successful import (required with --transform)
     #[arg(long)]
     delete_after_import: bool,
 
@@ -218,17 +218,17 @@ mod tests {
                 assert_eq!(s.source, "/home/user/Videos");
                 assert_eq!(s.destination, "user@host:/dest");
                 assert!(!s.delete_after_import);
-                assert!(s.postprocess.is_empty());
+                assert!(s.transform.is_empty());
             }
         }
     }
 
     #[test]
-    fn cli_parses_sync_with_postprocess() {
+    fn cli_parses_sync_with_transform() {
         let args = Cli::try_parse_from([
             "purgery-client",
             "sync",
-            "--postprocess",
+            "--transform",
             "compress",
             "--delete-after-import",
             "--",
@@ -238,7 +238,7 @@ mod tests {
         .unwrap();
         match args.command {
             Command::Sync(s) => {
-                assert_eq!(s.postprocess, vec!["compress"]);
+                assert_eq!(s.transform, vec!["compress"]);
                 assert!(s.delete_after_import);
             }
         }

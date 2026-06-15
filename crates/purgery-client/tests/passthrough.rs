@@ -158,7 +158,7 @@ fn passthrough_cleanup_preserves_an_original_changed_during_rsync() {
 }
 
 #[test]
-fn postprocess_requires_delete_after_import_before_any_command_runs() {
+fn transform_requires_delete_after_import_before_any_command_runs() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
     fs::create_dir(&source).unwrap();
@@ -167,7 +167,7 @@ fn postprocess_requires_delete_after_import_before_any_command_runs() {
     let output = Command::new(env!("CARGO_BIN_EXE_purgery-client"))
         .args([
             "sync",
-            "--postprocess",
+            "--transform",
             "transform",
             "--",
             source.to_str().unwrap(),
@@ -178,7 +178,7 @@ fn postprocess_requires_delete_after_import_before_any_command_runs() {
 
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr)
-        .contains("--delete-after-import is required when --postprocess is used"));
+        .contains("--delete-after-import is required when --transform is used"));
 }
 
 #[test]

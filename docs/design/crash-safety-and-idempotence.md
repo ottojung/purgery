@@ -9,13 +9,13 @@ Each cleanup entry records the local path, relative path, entry kind, and identi
 Authority depends on the mode:
 
 - direct passthrough: successful rsync confirms the transfer;
-- postprocess: a valid terminal server status confirms only entries marked `imported`.
+- transform: a valid terminal server status confirms only entries marked `imported`.
 
-A successful upload to postprocess staging never authorizes cleanup.
+A successful upload to transform staging never authorizes cleanup.
 
 ## Server phases
 
-Postprocess runs move through `incoming -> ready -> processing -> done|failed`. `prepare-run` validates the plan while it is still incoming. `finish-run` is the only transition to ready.
+Transform runs move through `incoming -> ready -> processing -> done|failed`. `prepare-run` validates the plan while it is still incoming. `finish-run` is the only transition to ready.
 
 Processing uses staged sources and a run-local work area. Status files are published atomically before terminal phase publication. Recovery resumes processing runs from staged data and filesystem state, so repeated commits converge on the requested destination.
 

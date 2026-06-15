@@ -2,11 +2,11 @@
 
 ## Project Overview
 
-Purgery is a Rust client/server file sync and postprocessing tool. Two binaries:
+Purgery is a Rust client/server file sync and transforming tool. Two binaries:
 
 ```
 purgery-client    # uploads files via rsync, deletes confirmed imports
-purgery-server    # processes ready runs, postprocesses, writes status
+purgery-server    # processes ready runs, transformes, writes status
 ```
 
 Shared types live in `crates/purgery-core`.

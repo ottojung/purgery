@@ -19,7 +19,7 @@ pub(crate) enum SourceKind {
 /// Normalized source specification used by all client paths.
 ///
 /// Established by `normalize_source()` before dispatch to passthrough,
-/// split, cleanup, or postprocess. All modes use `operation_path` for
+/// split, cleanup, or transform. All modes use `operation_path` for
 /// rsync and `source_entry_name` for manifest, staging, and cleanup.
 #[derive(Debug, Clone)]
 pub(crate) struct SourceSpec {
@@ -128,7 +128,7 @@ pub(crate) fn build_manifest(
     spec: &SourceSpec,
     run_id: &RunId,
     nickname: &Nickname,
-    postprocess_steps: &[String],
+    transform_steps: &[String],
 ) -> Result<Manifest> {
     let source_path = Path::new(&spec.operation_path);
 
@@ -147,7 +147,7 @@ pub(crate) fn build_manifest(
     let local_path = ClientLocalPath::new(spec.operation_path.clone())
         .with_context(|| format!("invalid local path: {}", spec.operation_path))?;
 
-    let has_postprocess = !postprocess_steps.is_empty();
+    let has_transform = !transform_steps.is_empty();
 
     let kind = match spec.kind {
         SourceKind::Directory => ManifestEntryKind::Directory,
@@ -161,7 +161,7 @@ pub(crate) fn build_manifest(
         0
     };
 
-    let (mtime_ns, sha256) = if file_type.is_file() && has_postprocess {
+    let (mtime_ns, sha256) = if file_type.is_file() && has_transform {
         let mtime = metadata
             .modified()
             .ok()
@@ -198,7 +198,7 @@ pub(crate) fn build_manifest(
         mtime_ns,
         sha256,
         link_target,
-        postprocess_steps: postprocess_steps.to_vec(),
+        transform_steps: transform_steps.to_vec(),
     };
 
     Ok(Manifest {
@@ -412,7 +412,7 @@ mod tests {
         .unwrap();
         assert_eq!(manifest.entries.len(), 1);
         assert_eq!(manifest.entries[0].kind, ManifestEntryKind::RegularFile);
-        assert_eq!(manifest.entries[0].postprocess_steps, vec!["compress"]);
+        assert_eq!(manifest.entries[0].transform_steps, vec!["compress"]);
     }
 
     #[test]
@@ -453,7 +453,7 @@ mod tests {
     }
 
     #[test]
-    fn postprocess_single_entry_no_recursive_entries() {
+    fn transform_single_entry_no_recursive_entries() {
         let tmp = tempdir().unwrap();
         let dir = tmp.path().join("Videos");
         fs::create_dir(&dir).unwrap();

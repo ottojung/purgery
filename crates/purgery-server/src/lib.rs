@@ -14,15 +14,15 @@ use purgery_core::{FileStatus, Manifest, ManifestEntryKind, PurgeryRoot, RunStat
 mod commit;
 mod gc;
 mod phases;
-mod postprocess;
 mod process;
 mod recover;
+mod transform;
 
 pub use gc::run_gc;
 pub use phases::{begin_run, find_processing_runs, find_ready_runs, finish_run, move_to_failed};
-pub use postprocess::{apply_postprocessing, apply_postprocessing_with_heartbeat};
 pub use process::{process_once_raw, process_processing_run, process_ready_run};
 pub use recover::recover_or_process_processing_run;
+pub use transform::{apply_transforms, apply_transforms_with_heartbeat};
 
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use commit::{
@@ -31,17 +31,17 @@ pub(crate) use commit::{
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use phases::{write_progress, write_progress_best_effort};
 
-/// A resolved postprocess step definition.
+/// A resolved transform step definition.
 #[derive(Debug, Clone)]
 pub struct ResolvedStep {
     pub step_name: String,
-    pub step_def: purgery_core::PostprocessStepDefinition,
+    pub step_def: purgery_core::TransformStepDefinition,
 }
 
 /// A validated run plan: validated step definitions from the server config.
 #[derive(Debug)]
 pub struct RunPlan {
-    pub steps: std::collections::BTreeMap<String, purgery_core::PostprocessStepDefinition>,
+    pub steps: std::collections::BTreeMap<String, purgery_core::TransformStepDefinition>,
 }
 
 impl RunPlan {
@@ -50,27 +50,27 @@ impl RunPlan {
     /// Validates all step definitions in the server config. Returns an error
     /// (suitable for run-level failure) if anything is invalid.
     pub fn build(server_config: &ServerConfig) -> Result<Self, String> {
-        for (name, step) in &server_config.postprocess.steps {
+        for (name, step) in &server_config.transform.steps {
             if step.program.is_empty() {
-                return Err(format!("postprocess step '{name}' has empty program"));
+                return Err(format!("transform step '{name}' has empty program"));
             }
 
             for output in &step.expected_outputs {
                 purgery_core::validate_expected_output_name(output).map_err(|e| {
-                    format!("postprocess step '{name}': expected_output {output:?}: {e}")
+                    format!("transform step '{name}': expected_output {output:?}: {e}")
                 })?;
             }
 
             if !step.keep_original && step.expected_outputs.is_empty() {
                 return Err(format!(
-                    "postprocess step '{name}': keep_original=false with no \
+                    "transform step '{name}': keep_original=false with no \
                      expected_outputs would produce zero committed outputs"
                 ));
             }
         }
 
         Ok(RunPlan {
-            steps: server_config.postprocess.steps.clone(),
+            steps: server_config.transform.steps.clone(),
         })
     }
 
@@ -82,7 +82,7 @@ impl RunPlan {
                 let def = self
                     .steps
                     .get(name.as_str())
-                    .ok_or_else(|| format!("postprocess step '{name}' not defined on server"))?;
+                    .ok_or_else(|| format!("transform step '{name}' not defined on server"))?;
                 Ok(ResolvedStep {
                     step_name: name.clone(),
                     step_def: def.clone(),
@@ -127,7 +127,7 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
         .with_context(|| "failed to parse run config")?;
 
     if !run_config.delete_after_import {
-        anyhow::bail!("postprocess runs require delete_after_import = true");
+        anyhow::bail!("transform runs require delete_after_import = true");
     }
 
     let manifest_path = incoming_path.join("manifest.toml");
@@ -151,14 +151,14 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
     }
 
     for entry in &manifest.entries {
-        if entry.postprocess_steps.is_empty() {
+        if entry.transform_steps.is_empty() {
             anyhow::bail!(
-                "server run entry '{}' has no postprocess_steps",
+                "server run entry '{}' has no transform_steps",
                 entry.relative_path.as_str(),
             );
         }
         run_plan
-            .resolve_steps(&entry.postprocess_steps)
+            .resolve_steps(&entry.transform_steps)
             .map_err(|error| {
                 anyhow::anyhow!(
                     "run plan validation failed for '{}': {error}",
@@ -531,15 +531,15 @@ pub fn server_check(config: &ServerConfig) -> Result<()> {
     }
     info!(path = %purgery_path.as_str(), "work_dir: OK");
 
-    for (name, step) in &config.postprocess.steps {
+    for (name, step) in &config.transform.steps {
         let program = &step.program;
         if program.is_empty() {
-            anyhow::bail!("postprocess step '{}' has empty program", name);
+            anyhow::bail!("transform step '{}' has empty program", name);
         }
 
         if !step.keep_original && step.expected_outputs.is_empty() {
             anyhow::bail!(
-                "postprocess step '{}': keep_original=false with no expected_outputs \
+                "transform step '{}': keep_original=false with no expected_outputs \
                  would produce zero committed outputs",
                 name
             );
@@ -547,12 +547,12 @@ pub fn server_check(config: &ServerConfig) -> Result<()> {
 
         for output in &step.expected_outputs {
             purgery_core::validate_expected_output_name(output).map_err(|e| {
-                anyhow::anyhow!("postprocess step '{name}': expected_output {output:?}: {e}")
+                anyhow::anyhow!("transform step '{name}': expected_output {output:?}: {e}")
             })?;
         }
 
         purgery_core::resolve_executable(program)
-            .map(|r| info!(step = name, path = %r.path.as_str(), "postprocess program found"))?;
+            .map(|r| info!(step = name, path = %r.path.as_str(), "transform program found"))?;
     }
 
     info!("server configuration: OK");
@@ -650,12 +650,12 @@ mod tests {
     use crate::commit::commit_directory_tree;
     use camino::Utf8PathBuf;
     use purgery_core::{
-        ClientLocalPath, ManifestEntry, NormalizedRelativePath, PostprocessConfig, PostprocessKind,
-        PostprocessStepDefinition,
+        ClientLocalPath, ManifestEntry, NormalizedRelativePath, TransformConfig, TransformKind,
+        TransformStepDefinition,
     };
 
-    /// Call apply_postprocessing with a no-op progress callback for testing.
-    fn test_apply_postprocessing(
+    /// Call apply_transforms with a no-op progress callback for testing.
+    fn test_apply_transforms(
         run_plan: &RunPlan,
         work_path: &Utf8Path,
     ) -> Result<Vec<Utf8PathBuf>, String> {
@@ -667,7 +667,7 @@ mod tests {
                 step_def: def.clone(),
             })
             .collect();
-        apply_postprocessing(
+        apply_transforms(
             &all_steps,
             work_path,
             &mut |_: &purgery_core::ProgressUpdate| {},
@@ -682,7 +682,7 @@ mod tests {
         ServerConfig {
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
-            postprocess: PostprocessConfig::default(),
+            transform: TransformConfig::default(),
             logging: Default::default(),
         }
     }
@@ -783,7 +783,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                postprocess_steps: Vec::new(),
+                transform_steps: Vec::new(),
             }],
         };
         fs::write(
@@ -906,7 +906,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                postprocess_steps: Vec::new(),
+                transform_steps: Vec::new(),
             }],
         };
         fs::write(
@@ -1000,7 +1000,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                postprocess_steps: Vec::new(),
+                transform_steps: Vec::new(),
             }],
         };
         fs::write(
@@ -1079,7 +1079,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                postprocess_steps: Vec::new(),
+                transform_steps: Vec::new(),
             }],
         };
         fs::write(
@@ -1120,17 +1120,17 @@ delete_after_import = true
     }
 
     #[test]
-    fn test_postprocessing_path_with_spaces() {
+    fn test_transforms_path_with_spaces() {
         let server_config = ServerConfig {
             work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
-            postprocess: PostprocessConfig {
+            transform: TransformConfig {
                 steps: {
                     let mut m = std::collections::BTreeMap::new();
                     m.insert(
                         "compress-video".to_owned(),
-                        PostprocessStepDefinition {
-                            kind: PostprocessKind::Subprocess,
+                        TransformStepDefinition {
+                            kind: TransformKind::Subprocess,
                             program: "true".to_owned(),
                             args: vec![],
                             expected_outputs: vec![],
@@ -1148,28 +1148,28 @@ delete_after_import = true
         fs::write(&work_path, b"test data").unwrap();
 
         let run_plan = RunPlan::build(&server_config).unwrap();
-        let results = test_apply_postprocessing(&run_plan, &work_path);
-        assert!(results.is_ok(), "postprocess with spaces should succeed");
+        let results = test_apply_transforms(&run_plan, &work_path);
+        assert!(results.is_ok(), "transform with spaces should succeed");
         let outputs = results.unwrap();
         assert!(!outputs.is_empty());
         assert!(outputs.contains(&work_path));
     }
 
     #[test]
-    fn test_postprocessing_failure_does_not_create_final_output() {
+    fn test_transforms_failure_does_not_create_final_output() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
 
         let server_config = ServerConfig {
             work_dir: PurgeryRoot::new(work_dir.as_str().into()).unwrap(),
             gc: Default::default(),
-            postprocess: PostprocessConfig {
+            transform: TransformConfig {
                 steps: {
                     let mut m = std::collections::BTreeMap::new();
                     m.insert(
                         "compress-video".to_owned(),
-                        PostprocessStepDefinition {
-                            kind: PostprocessKind::Subprocess,
+                        TransformStepDefinition {
+                            kind: TransformKind::Subprocess,
                             program: "false".to_owned(),
                             args: vec![],
                             expected_outputs: vec![],
@@ -1207,7 +1207,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                postprocess_steps: vec!["compress-video".into()],
+                transform_steps: vec!["compress-video".into()],
             }],
         };
         fs::write(
@@ -1230,7 +1230,7 @@ delete_after_import = true
         let final_path = server_config.work_dir.as_path().join("videos/test.mp4");
         assert!(
             !final_path.exists(),
-            "failed postprocess must not create final output"
+            "failed transform must not create final output"
         );
     }
 
@@ -1244,13 +1244,13 @@ delete_after_import = true
         let server_config = ServerConfig {
             work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
-            postprocess: PostprocessConfig {
+            transform: TransformConfig {
                 steps: {
                     let mut m = std::collections::BTreeMap::new();
                     m.insert(
                         "compress-video".to_owned(),
-                        PostprocessStepDefinition {
-                            kind: PostprocessKind::Subprocess,
+                        TransformStepDefinition {
+                            kind: TransformKind::Subprocess,
                             program: "true".to_owned(),
                             args: vec![],
                             expected_outputs: vec![],
@@ -1263,7 +1263,7 @@ delete_after_import = true
             logging: Default::default(),
         };
         let pp_run_plan = RunPlan::build(&server_config).unwrap();
-        let result = test_apply_postprocessing(&pp_run_plan, &work_path);
+        let result = test_apply_transforms(&pp_run_plan, &work_path);
         assert!(result.is_ok());
         let outputs = result.unwrap();
         assert!(outputs.contains(&work_path));
@@ -1282,13 +1282,13 @@ delete_after_import = true
         let server_config = ServerConfig {
             work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
-            postprocess: PostprocessConfig {
+            transform: TransformConfig {
                 steps: {
                     let mut m = std::collections::BTreeMap::new();
                     m.insert(
                         "compress-video".to_owned(),
-                        PostprocessStepDefinition {
-                            kind: PostprocessKind::Subprocess,
+                        TransformStepDefinition {
+                            kind: TransformKind::Subprocess,
                             program: "true".to_owned(),
                             args: vec![],
                             expected_outputs: vec!["{stem}.Z.webm".into()],
@@ -1301,7 +1301,7 @@ delete_after_import = true
             logging: Default::default(),
         };
         let pp_run_plan = RunPlan::build(&server_config).unwrap();
-        let result = test_apply_postprocessing(&pp_run_plan, &work_path);
+        let result = test_apply_transforms(&pp_run_plan, &work_path);
         assert!(result.is_ok());
         let outputs = result.unwrap();
         assert!(
@@ -1327,13 +1327,13 @@ delete_after_import = true
         let server_config = ServerConfig {
             work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
-            postprocess: PostprocessConfig {
+            transform: TransformConfig {
                 steps: {
                     let mut m = std::collections::BTreeMap::new();
                     m.insert(
                         "compress-video".to_owned(),
-                        PostprocessStepDefinition {
-                            kind: PostprocessKind::Subprocess,
+                        TransformStepDefinition {
+                            kind: TransformKind::Subprocess,
                             program: "true".to_owned(),
                             args: vec![],
                             expected_outputs: vec!["{stem}.Z.webm".into()],
@@ -1346,7 +1346,7 @@ delete_after_import = true
             logging: Default::default(),
         };
         let pp_run_plan = RunPlan::build(&server_config).unwrap();
-        let result = test_apply_postprocessing(&pp_run_plan, &work_path);
+        let result = test_apply_transforms(&pp_run_plan, &work_path);
         assert!(result.is_ok());
         let outputs = result.unwrap();
         assert!(
@@ -1527,7 +1527,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                postprocess_steps: Vec::new(),
+                transform_steps: Vec::new(),
             }],
         };
         fs::write(
@@ -1580,7 +1580,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                postprocess_steps: vec!["compress-video".into()],
+                transform_steps: vec!["compress-video".into()],
             }],
         };
         fs::write(
@@ -1659,7 +1659,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                postprocess_steps: Vec::new(),
+                transform_steps: Vec::new(),
             }],
         };
         fs::write(
@@ -1719,13 +1719,13 @@ delete_after_import = true
         let server_config = ServerConfig {
             work_dir: PurgeryRoot::new(work_dir.as_str().into()).unwrap(),
             gc: Default::default(),
-            postprocess: PostprocessConfig {
+            transform: TransformConfig {
                 steps: {
                     let mut m = std::collections::BTreeMap::new();
                     m.insert(
                         "compress-video".to_owned(),
-                        PostprocessStepDefinition {
-                            kind: PostprocessKind::Subprocess,
+                        TransformStepDefinition {
+                            kind: TransformKind::Subprocess,
                             program: "false".to_owned(),
                             args: vec![],
                             expected_outputs: vec![],
@@ -1761,7 +1761,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                postprocess_steps: vec!["compress-video".into()],
+                transform_steps: vec!["compress-video".into()],
             }],
         };
         fs::write(
@@ -1806,13 +1806,13 @@ delete_after_import = true
         let server_config = ServerConfig {
             work_dir: PurgeryRoot::new(work_dir.as_str().into()).unwrap(),
             gc: Default::default(),
-            postprocess: PostprocessConfig {
+            transform: TransformConfig {
                 steps: {
                     let mut m = std::collections::BTreeMap::new();
                     m.insert(
                         "compress-video".to_owned(),
-                        PostprocessStepDefinition {
-                            kind: PostprocessKind::Subprocess,
+                        TransformStepDefinition {
+                            kind: TransformKind::Subprocess,
                             program: script_path.to_string_lossy().to_string(),
                             args: vec!["--input".into(), "{input}".into()],
                             expected_outputs: vec!["{stem}.Z.webm".into()],
@@ -1848,7 +1848,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                postprocess_steps: vec!["compress-video".into()],
+                transform_steps: vec!["compress-video".into()],
             }],
         };
         fs::write(
@@ -1895,13 +1895,13 @@ delete_after_import = true
         let server_config = ServerConfig {
             work_dir: PurgeryRoot::new(work_dir.as_str().into()).unwrap(),
             gc: Default::default(),
-            postprocess: PostprocessConfig {
+            transform: TransformConfig {
                 steps: {
                     let mut m = std::collections::BTreeMap::new();
                     m.insert(
                         "compress-video".to_owned(),
-                        PostprocessStepDefinition {
-                            kind: PostprocessKind::Subprocess,
+                        TransformStepDefinition {
+                            kind: TransformKind::Subprocess,
                             program: script_path.to_string_lossy().to_string(),
                             args: vec!["--input".into(), "{input}".into()],
                             expected_outputs: vec!["{stem}.Z.webm".into()],
@@ -1937,7 +1937,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                postprocess_steps: vec!["compress-video".into()],
+                transform_steps: vec!["compress-video".into()],
             }],
         };
         fs::write(
@@ -1980,7 +1980,7 @@ delete_after_import = true
             )
             .unwrap(),
             gc: Default::default(),
-            postprocess: PostprocessConfig::default(),
+            transform: TransformConfig::default(),
             logging: Default::default(),
         };
         let nickname = Nickname::new("laptop".into()).unwrap();
@@ -2010,7 +2010,7 @@ delete_after_import = true
             )
             .unwrap(),
             gc: Default::default(),
-            postprocess: PostprocessConfig::default(),
+            transform: TransformConfig::default(),
             logging: Default::default(),
         };
         let nickname = Nickname::new("laptop".into()).unwrap();
@@ -2066,7 +2066,7 @@ delete_after_import = true
             )
             .unwrap(),
             gc: Default::default(),
-            postprocess: PostprocessConfig::default(),
+            transform: TransformConfig::default(),
             logging: Default::default(),
         };
         let nickname = Nickname::new("laptop".into()).unwrap();
@@ -2086,7 +2086,7 @@ delete_after_import = true
             )
             .unwrap(),
             gc: Default::default(),
-            postprocess: PostprocessConfig::default(),
+            transform: TransformConfig::default(),
             logging: Default::default(),
         };
         let nickname = Nickname::new("laptop".into()).unwrap();
@@ -2122,7 +2122,7 @@ delete_after_import = true
             )
             .unwrap(),
             gc: Default::default(),
-            postprocess: PostprocessConfig::default(),
+            transform: TransformConfig::default(),
             logging: Default::default(),
         };
         let nickname = Nickname::new("laptop".into()).unwrap();
@@ -2541,7 +2541,7 @@ delete_after_import = true
             )
             .unwrap(),
             gc: Default::default(),
-            postprocess: PostprocessConfig::default(),
+            transform: TransformConfig::default(),
             logging: Default::default(),
         };
         let nickname = Nickname::new("laptop".into()).unwrap();
@@ -2733,7 +2733,7 @@ delete_after_import = true
             mtime_ns: 0,
             sha256: None,
             link_target: target.map(Utf8PathBuf::from),
-            postprocess_steps: Vec::new(),
+            transform_steps: Vec::new(),
         };
         let manifest = Manifest {
             run_id: run_id.clone(),
@@ -2805,8 +2805,8 @@ delete_after_import = true
         let mut steps = std::collections::BTreeMap::new();
         steps.insert(
             "generate".to_owned(),
-            PostprocessStepDefinition {
-                kind: PostprocessKind::Subprocess,
+            TransformStepDefinition {
+                kind: TransformKind::Subprocess,
                 program: "true".into(),
                 args: vec![],
                 expected_outputs: vec!["{stem}.out".into()],
@@ -2817,29 +2817,28 @@ delete_after_import = true
     }
 
     #[test]
-    fn postprocess_regular_expected_output_succeeds() {
+    fn transform_regular_expected_output_succeeds() {
         let tmp = tempfile::tempdir().unwrap();
         let work_path = Utf8PathBuf::from_path_buf(tmp.path().join("input.txt")).unwrap();
         fs::write(&work_path, "input").unwrap();
         fs::write(work_path.with_file_name("input.out"), "output").unwrap();
 
-        let outputs = test_apply_postprocessing(&expected_output_test_plan(), &work_path).unwrap();
+        let outputs = test_apply_transforms(&expected_output_test_plan(), &work_path).unwrap();
         assert_eq!(outputs, vec![work_path.with_file_name("input.out")]);
     }
 
     #[test]
-    fn postprocess_missing_expected_output_fails() {
+    fn transform_missing_expected_output_fails() {
         let tmp = tempfile::tempdir().unwrap();
         let work_path = Utf8PathBuf::from_path_buf(tmp.path().join("input.txt")).unwrap();
         fs::write(&work_path, "input").unwrap();
 
-        let error =
-            test_apply_postprocessing(&expected_output_test_plan(), &work_path).unwrap_err();
+        let error = test_apply_transforms(&expected_output_test_plan(), &work_path).unwrap_err();
         assert!(error.contains("expected output not found"));
     }
 
     #[test]
-    fn postprocess_symlink_expected_output_is_not_followed() {
+    fn transform_symlink_expected_output_is_not_followed() {
         let tmp = tempfile::tempdir().unwrap();
         let work_path = Utf8PathBuf::from_path_buf(tmp.path().join("input.txt")).unwrap();
         fs::write(&work_path, "input").unwrap();
@@ -2849,7 +2848,7 @@ delete_after_import = true
         // itself must be accepted — Purgery must not follow or reject it.
         std::os::unix::fs::symlink(&target, work_path.with_file_name("input.out")).unwrap();
 
-        let outputs = test_apply_postprocessing(&expected_output_test_plan(), &work_path).unwrap();
+        let outputs = test_apply_transforms(&expected_output_test_plan(), &work_path).unwrap();
         assert!(
             outputs.contains(&work_path.with_file_name("input.out")),
             "symlink expected output must be accepted"
@@ -2865,29 +2864,29 @@ delete_after_import = true
     }
 
     #[test]
-    fn postprocess_directory_expected_output_succeeds() {
+    fn transform_directory_expected_output_succeeds() {
         let tmp = tempfile::tempdir().unwrap();
         let work_path = Utf8PathBuf::from_path_buf(tmp.path().join("input.txt")).unwrap();
         fs::write(&work_path, "input").unwrap();
         fs::create_dir(work_path.with_file_name("input.out")).unwrap();
 
-        let outputs = test_apply_postprocessing(&expected_output_test_plan(), &work_path).unwrap();
+        let outputs = test_apply_transforms(&expected_output_test_plan(), &work_path).unwrap();
         assert!(outputs.contains(&work_path.with_file_name("input.out")));
     }
 
     #[test]
-    fn postprocess_symlink_expected_output_succeeds() {
+    fn transform_symlink_expected_output_succeeds() {
         let tmp = tempfile::tempdir().unwrap();
         let work_path = Utf8PathBuf::from_path_buf(tmp.path().join("input.txt")).unwrap();
         fs::write(&work_path, "input").unwrap();
         std::os::unix::fs::symlink("some-target", work_path.with_file_name("input.out")).unwrap();
 
-        let outputs = test_apply_postprocessing(&expected_output_test_plan(), &work_path).unwrap();
+        let outputs = test_apply_transforms(&expected_output_test_plan(), &work_path).unwrap();
         assert!(outputs.contains(&work_path.with_file_name("input.out")));
     }
 
     #[test]
-    fn postprocess_fifo_expected_output_fails() {
+    fn transform_fifo_expected_output_fails() {
         let tmp = tempfile::tempdir().unwrap();
         let work_path = Utf8PathBuf::from_path_buf(tmp.path().join("input.txt")).unwrap();
         fs::write(&work_path, "input").unwrap();
@@ -2897,8 +2896,7 @@ delete_after_import = true
             .status()
             .unwrap();
 
-        let error =
-            test_apply_postprocessing(&expected_output_test_plan(), &work_path).unwrap_err();
+        let error = test_apply_transforms(&expected_output_test_plan(), &work_path).unwrap_err();
         assert!(error.contains("expected output is not a supported entry type"));
     }
 
@@ -2907,10 +2905,10 @@ delete_after_import = true
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let mut config = test_server_config(&work_dir);
-        config.postprocess.steps.insert(
+        config.transform.steps.insert(
             "test-step".to_string(),
-            PostprocessStepDefinition {
-                kind: PostprocessKind::Subprocess,
+            TransformStepDefinition {
+                kind: TransformKind::Subprocess,
                 program: "/bin/true".to_string(),
                 args: Vec::new(),
                 expected_outputs: Vec::new(),
@@ -2939,7 +2937,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                postprocess_steps: vec!["test-step".into()],
+                transform_steps: vec!["test-step".into()],
             }],
         };
         fs::write(incoming.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
@@ -2977,10 +2975,10 @@ delete_after_import = true
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let mut config = test_server_config(&work_dir);
-        config.postprocess.steps.insert(
+        config.transform.steps.insert(
             "test-step".to_string(),
-            PostprocessStepDefinition {
-                kind: PostprocessKind::Subprocess,
+            TransformStepDefinition {
+                kind: TransformKind::Subprocess,
                 program: "/bin/true".to_string(),
                 args: Vec::new(),
                 expected_outputs: Vec::new(),
@@ -3013,7 +3011,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                postprocess_steps: vec!["test-step".into()],
+                transform_steps: vec!["test-step".into()],
             }],
         };
         fs::write(incoming.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
@@ -3041,13 +3039,13 @@ delete_after_import = true
         let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let config = test_server_config(&work_dir);
         let config = ServerConfig {
-            postprocess: PostprocessConfig {
+            transform: TransformConfig {
                 steps: {
                     let mut m = std::collections::BTreeMap::new();
                     m.insert(
                         "pack".to_owned(),
-                        PostprocessStepDefinition {
-                            kind: PostprocessKind::Subprocess,
+                        TransformStepDefinition {
+                            kind: TransformKind::Subprocess,
                             program: "true".into(),
                             args: vec![],
                             expected_outputs: vec![],
@@ -3081,7 +3079,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                postprocess_steps: Vec::new(),
+                transform_steps: Vec::new(),
             }],
         };
         fs::write(ready.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
@@ -3095,8 +3093,8 @@ delete_after_import = true
         assert_eq!(status.entries.len(), 1);
         assert_eq!(status.entries[0].status, FileStatus::Imported);
         assert!(
-            status.entries[0].postprocess.is_none()
-                || status.entries[0].postprocess.as_deref() == Some(&[])
+            status.entries[0].transform.is_none()
+                || status.entries[0].transform.as_deref() == Some(&[])
         );
     }
 
@@ -3153,13 +3151,13 @@ delete_after_import = true
         let server_config = ServerConfig {
             work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
-            postprocess: PostprocessConfig {
+            transform: TransformConfig {
                 steps: {
                     let mut m = std::collections::BTreeMap::new();
                     m.insert(
                         "compress".to_owned(),
-                        PostprocessStepDefinition {
-                            kind: PostprocessKind::Subprocess,
+                        TransformStepDefinition {
+                            kind: TransformKind::Subprocess,
                             program: "true".into(),
                             args: vec![],
                             expected_outputs: vec!["{stem}.out".into()],
@@ -3192,7 +3190,7 @@ delete_after_import = true
                 step_def: d.clone(),
             })
             .collect();
-        apply_postprocessing_with_heartbeat(
+        apply_transforms_with_heartbeat(
             &all_steps,
             &work_path,
             std::time::Duration::from_millis(1),
@@ -3201,7 +3199,7 @@ delete_after_import = true
             1,
             "data/input.txt",
         )
-        .expect("postprocessing must succeed");
+        .expect("transforms must succeed");
 
         let updates = captured.lock().unwrap();
         assert!(
@@ -3247,7 +3245,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                postprocess_steps: Vec::new(),
+                transform_steps: Vec::new(),
             }],
         };
         fs::write(
@@ -3317,7 +3315,7 @@ delete_after_import = true
     #[test]
     fn per_entry_progress_has_real_context() {
         // Use a progress callback capture to verify entry context is propagated
-        // through the postprocessing pipeline.
+        // through the transform pipeline.
         let tmp = tempfile::tempdir().unwrap();
         let work_path = Utf8PathBuf::from_path_buf(tmp.path().join("input.txt")).unwrap();
         fs::write(&work_path, b"input").unwrap();
@@ -3327,13 +3325,13 @@ delete_after_import = true
         let server_config = ServerConfig {
             work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
-            postprocess: PostprocessConfig {
+            transform: TransformConfig {
                 steps: {
                     let mut m = std::collections::BTreeMap::new();
                     m.insert(
                         "compress".to_owned(),
-                        PostprocessStepDefinition {
-                            kind: PostprocessKind::Subprocess,
+                        TransformStepDefinition {
+                            kind: TransformKind::Subprocess,
                             program: "true".into(),
                             args: vec![],
                             expected_outputs: vec!["{stem}.out".into()],
@@ -3366,7 +3364,7 @@ delete_after_import = true
                 step_def: d.clone(),
             })
             .collect();
-        apply_postprocessing_with_heartbeat(
+        apply_transforms_with_heartbeat(
             &all_steps,
             &work_path,
             std::time::Duration::from_millis(1),
@@ -3401,16 +3399,16 @@ delete_after_import = true
     // ── Entry index and progress invariant tests ──
 
     #[test]
-    fn progress_tests_do_not_ignore_postprocess_result() {
+    fn progress_tests_do_not_ignore_transform_result() {
         // Regression guard: progress tests must not discard the result of
-        // apply_postprocessing_with_heartbeat with let _ = .
+        // apply_transforms_with_heartbeat with let _ = .
         let source = include_str!("lib.rs");
         // Check each line for the bad pattern, skipping this test's own assertion text.
         for (lineno, line) in source.lines().enumerate() {
             let trimmed = line.trim();
-            if trimmed == "let _ = apply_postprocessing_with_heartbeat(" {
+            if trimmed == "let _ = apply_transforms_with_heartbeat(" {
                 panic!(
-                    "line {}: progress tests must not ignore apply_postprocessing_with_heartbeat results;\n\
+                    "line {}: progress tests must not ignore apply_transforms_with_heartbeat results;\n\
                      use .unwrap() or .expect() instead",
                     lineno + 1
                 );
@@ -3420,7 +3418,7 @@ delete_after_import = true
 
     #[test]
     fn per_entry_first_entry_allows_index_zero() {
-        // A manifest with at least one postprocessed entry should have
+        // A manifest with at least one transformed entry should have
         // step_started/step_running/step_finished with entry_index=0 for
         // the first entry, entry_total>0, and current_entry!="".
         let tmp = tempfile::tempdir().unwrap();
@@ -3431,13 +3429,13 @@ delete_after_import = true
         let server_config = ServerConfig {
             work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
-            postprocess: PostprocessConfig {
+            transform: TransformConfig {
                 steps: {
                     let mut m = std::collections::BTreeMap::new();
                     m.insert(
                         "compress".to_owned(),
-                        PostprocessStepDefinition {
-                            kind: PostprocessKind::Subprocess,
+                        TransformStepDefinition {
+                            kind: TransformKind::Subprocess,
                             program: "true".into(),
                             args: vec![],
                             expected_outputs: vec!["{stem}.out".into()],
@@ -3470,7 +3468,7 @@ delete_after_import = true
                 step_def: d.clone(),
             })
             .collect();
-        apply_postprocessing_with_heartbeat(
+        apply_transforms_with_heartbeat(
             &all_steps,
             &work_path,
             std::time::Duration::from_millis(1),
@@ -3479,7 +3477,7 @@ delete_after_import = true
             1,
             "data/input.txt",
         )
-        .expect("postprocessing must succeed");
+        .expect("transforms must succeed");
 
         let updates = captured.lock().unwrap();
         for (state, ei, et, ce, _cs) in updates.iter() {
@@ -4276,7 +4274,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                postprocess_steps: Vec::new(),
+                transform_steps: Vec::new(),
             }],
         };
         fs::write(
@@ -4307,13 +4305,13 @@ delete_after_import = true
         let config = ServerConfig {
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
-            postprocess: PostprocessConfig {
+            transform: TransformConfig {
                 steps: {
                     let mut m = std::collections::BTreeMap::new();
                     m.insert(
                         "always-fail".to_owned(),
-                        PostprocessStepDefinition {
-                            kind: PostprocessKind::Subprocess,
+                        TransformStepDefinition {
+                            kind: TransformKind::Subprocess,
                             program: "false".to_owned(),
                             args: vec![],
                             expected_outputs: vec![],
@@ -4348,7 +4346,7 @@ delete_after_import = true
                     sha256: None,
                     link_target: None,
 
-                    postprocess_steps: vec!["always-fail".into()],
+                    transform_steps: vec!["always-fail".into()],
                 },
                 ManifestEntry {
                     local_path: ClientLocalPath::new("/home/user/b.mp4".into()).unwrap(),
@@ -4360,7 +4358,7 @@ delete_after_import = true
                     sha256: None,
                     link_target: None,
 
-                    postprocess_steps: vec!["always-fail".into()],
+                    transform_steps: vec!["always-fail".into()],
                 },
             ],
         };
@@ -4392,7 +4390,7 @@ delete_after_import = true
     }
 
     #[test]
-    fn postprocess_outputs_produced_in_work_area_before_commit_to_final() {
+    fn transform_outputs_produced_in_work_area_before_commit_to_final() {
         // A subprocess creates output files; cwd is the work-area parent so
         // relative-path outputs land inside the work area. Purgery validates
         // expected outputs are under the work area before committing.
@@ -4404,13 +4402,13 @@ delete_after_import = true
         let server_config = ServerConfig {
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
-            postprocess: PostprocessConfig {
+            transform: TransformConfig {
                 steps: {
                     let mut m = std::collections::BTreeMap::new();
                     m.insert(
                         "echo-args".to_owned(),
-                        PostprocessStepDefinition {
-                            kind: PostprocessKind::Subprocess,
+                        TransformStepDefinition {
+                            kind: TransformKind::Subprocess,
                             program: "sh".to_owned(),
                             args: vec![
                                 "-c".to_owned(),
@@ -4449,7 +4447,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                postprocess_steps: vec!["echo-args".into()],
+                transform_steps: vec!["echo-args".into()],
             }],
         };
         fs::write(
@@ -4459,7 +4457,7 @@ delete_after_import = true
         .unwrap();
 
         let result = process_run(&server_config, &nickname, &run_id);
-        assert!(result.is_ok(), "postprocess run should succeed: {result:?}");
+        assert!(result.is_ok(), "transform run should succeed: {result:?}");
 
         let done_path = server_config
             .work_dir
@@ -4735,8 +4733,8 @@ delete_after_import = true
 
     #[test]
     #[cfg(unix)]
-    fn postprocess_symlink_output_committed_without_operational_paths() {
-        // A postprocess subprocess produces a symlink as output.
+    fn transform_symlink_output_committed_without_operational_paths() {
+        // A transform subprocess produces a symlink as output.
         // The symlink entry is moved from the work area to the final path.
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
@@ -4746,13 +4744,13 @@ delete_after_import = true
         let server_config = ServerConfig {
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
-            postprocess: PostprocessConfig {
+            transform: TransformConfig {
                 steps: {
                     let mut m = std::collections::BTreeMap::new();
                     m.insert(
                         "make-symlink".to_owned(),
-                        PostprocessStepDefinition {
-                            kind: PostprocessKind::Subprocess,
+                        TransformStepDefinition {
+                            kind: TransformKind::Subprocess,
                             program: "sh".to_owned(),
                             args: vec!["-c".to_owned(), "ln -sf /etc/hostname the-link".to_owned()],
                             expected_outputs: vec!["the-link".to_owned()],
@@ -4788,7 +4786,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                postprocess_steps: vec!["make-symlink".into()],
+                transform_steps: vec!["make-symlink".into()],
             }],
         };
         fs::write(
@@ -4800,7 +4798,7 @@ delete_after_import = true
         let result = process_run(&server_config, &nickname, &run_id);
         assert!(
             result.is_ok(),
-            "postprocess symlink run should succeed: {result:?}"
+            "transform symlink run should succeed: {result:?}"
         );
 
         let done_path = server_config
@@ -5015,8 +5013,8 @@ delete_after_import = true
     }
 
     #[test]
-    fn postprocess_directory_output_with_recursive_descendants() {
-        // A postprocess subprocess produces a directory tree as output.
+    fn transform_directory_output_with_recursive_descendants() {
+        // A transform subprocess produces a directory tree as output.
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
 
@@ -5025,13 +5023,13 @@ delete_after_import = true
         let server_config = ServerConfig {
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
-            postprocess: PostprocessConfig {
+            transform: TransformConfig {
                 steps: {
                     let mut m = std::collections::BTreeMap::new();
                     m.insert(
                         "make-tree".to_owned(),
-                        PostprocessStepDefinition {
-                            kind: PostprocessKind::Subprocess,
+                        TransformStepDefinition {
+                            kind: TransformKind::Subprocess,
                             program: "sh".to_owned(),
                             args: vec![
                                 "-c".to_owned(),
@@ -5071,7 +5069,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                postprocess_steps: vec!["make-tree".into()],
+                transform_steps: vec!["make-tree".into()],
             }],
         };
         fs::write(
@@ -5083,7 +5081,7 @@ delete_after_import = true
         let result = process_run(&server_config, &nickname, &run_id);
         assert!(
             result.is_ok(),
-            "postprocess dir run should succeed: {result:?}"
+            "transform dir run should succeed: {result:?}"
         );
 
         let done_path = server_config
@@ -5139,11 +5137,11 @@ delete_after_import = true
 
     // ── Staged file preservation tests ────────────────────────────────
 
-    /// Non-postprocess staged files are immutable replay source and must
+    /// Non-transform staged files are immutable replay source and must
     /// not be consumed by final materialization. Only work-area copies are
     /// consumed.
     #[test]
-    fn non_postprocess_staged_file_preserved_after_successful_materialization() {
+    fn non_transform_staged_file_preserved_after_successful_materialization() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
@@ -5173,7 +5171,7 @@ delete_after_import = true
             mtime_ns: 2000000,
             sha256: None,
             link_target: None,
-            postprocess_steps: Vec::new(),
+            transform_steps: Vec::new(),
         });
         fs::write(
             ready_path.join("manifest.toml"),
@@ -5256,11 +5254,11 @@ delete_after_import = true
         assert_root_contains_exactly(config.work_dir.as_path(), &expected);
     }
 
-    /// Non-postprocess symlink entries must preserve the staged symlink
+    /// Non-transform symlink entries must preserve the staged symlink
     /// while the work-area copy is consumed by materialization.
     #[test]
     #[cfg(unix)]
-    fn non_postprocess_staged_symlink_preserved_after_materialization() {
+    fn non_transform_staged_symlink_preserved_after_materialization() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
@@ -5292,7 +5290,7 @@ delete_after_import = true
                     sha256: None,
                     link_target: Some(Utf8PathBuf::from("/usr/share/data")),
 
-                    postprocess_steps: Vec::new(),
+                    transform_steps: Vec::new(),
                 },
                 // Second entry fails (missing staged file).
                 ManifestEntry {
@@ -5305,7 +5303,7 @@ delete_after_import = true
                     sha256: None,
                     link_target: None,
 
-                    postprocess_steps: Vec::new(),
+                    transform_steps: Vec::new(),
                 },
             ],
         };
@@ -5487,10 +5485,10 @@ delete_after_import = true
 
     // ── Work-area consumption tests ───────────────────────────────────
 
-    /// For a non-postprocess regular file, the work-area copy is consumed
+    /// For a non-transform regular file, the work-area copy is consumed
     /// by materialization while the staged original remains.
     #[test]
-    fn non_postprocess_regular_file_work_copy_consumed_staged_preserved() {
+    fn non_transform_regular_file_work_copy_consumed_staged_preserved() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
@@ -5573,11 +5571,11 @@ delete_after_import = true
         assert_root_contains_exactly(config.work_dir.as_path(), &expected);
     }
 
-    /// For a non-postprocess symlink, the work-area symlink copy is
+    /// For a non-transform symlink, the work-area symlink copy is
     /// consumed by materialization while the staged original remains.
     #[test]
     #[cfg(unix)]
-    fn non_postprocess_symlink_work_copy_consumed_staged_preserved() {
+    fn non_transform_symlink_work_copy_consumed_staged_preserved() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
@@ -5607,7 +5605,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: Some(Utf8PathBuf::from("/etc/config")),
 
-                postprocess_steps: Vec::new(),
+                transform_steps: Vec::new(),
             }],
         };
         fs::write(
@@ -5683,12 +5681,12 @@ delete_after_import = true
         assert_root_contains_exactly(config.work_dir.as_path(), &expected);
     }
 
-    // ── postprocess archive paths nickname-free ──
+    // ── transform archive paths nickname-free ──
 
-    /// For postprocess outputs, final paths use the requested destination
+    /// For transform outputs, final paths use the requested destination
     /// destination path without nickname.
     #[test]
-    fn postprocess_paths_use_destination() {
+    fn transform_paths_use_destination() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
 
@@ -5697,13 +5695,13 @@ delete_after_import = true
         let server_config = ServerConfig {
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
-            postprocess: PostprocessConfig {
+            transform: TransformConfig {
                 steps: {
                     let mut m = std::collections::BTreeMap::new();
                     m.insert(
                         "copy-cmd".to_owned(),
-                        PostprocessStepDefinition {
-                            kind: PostprocessKind::Subprocess,
+                        TransformStepDefinition {
+                            kind: TransformKind::Subprocess,
                             program: "sh".to_owned(),
                             args: vec!["-c".to_owned(), "cp {input} {input}.out".to_owned()],
                             expected_outputs: vec!["{file_name}.out".to_owned()],
@@ -5739,7 +5737,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                postprocess_steps: vec!["copy-cmd".into()],
+                transform_steps: vec!["copy-cmd".into()],
             }],
         };
         fs::write(
@@ -5749,7 +5747,7 @@ delete_after_import = true
         .unwrap();
 
         let result = process_run(&server_config, &nickname, &run_id);
-        assert!(result.is_ok(), "postprocess run failed: {result:?}");
+        assert!(result.is_ok(), "transform run failed: {result:?}");
 
         let done_path = server_config
             .work_dir
@@ -5813,11 +5811,11 @@ delete_after_import = true
         assert_root_contains_exactly(server_config.work_dir.as_path(), &expected);
     }
 
-    /// For postprocess outputs, the work-area outputs are consumed by
+    /// For transform outputs, the work-area outputs are consumed by
     /// materialization. The staged original still exists but the
     /// work-area output is gone after successful commit.
     #[test]
-    fn postprocess_work_area_outputs_consumed_after_materialization() {
+    fn transform_work_area_outputs_consumed_after_materialization() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
 
@@ -5826,13 +5824,13 @@ delete_after_import = true
         let server_config = ServerConfig {
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
-            postprocess: PostprocessConfig {
+            transform: TransformConfig {
                 steps: {
                     let mut m = std::collections::BTreeMap::new();
                     m.insert(
                         "copy-cmd".to_owned(),
-                        PostprocessStepDefinition {
-                            kind: PostprocessKind::Subprocess,
+                        TransformStepDefinition {
+                            kind: TransformKind::Subprocess,
                             program: "sh".to_owned(),
                             args: vec!["-c".to_owned(), "cp {input} {input}.out".to_owned()],
                             expected_outputs: vec!["{file_name}.out".to_owned()],
@@ -5868,7 +5866,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                postprocess_steps: vec!["copy-cmd".into()],
+                transform_steps: vec!["copy-cmd".into()],
             }],
         };
         fs::write(
@@ -5878,7 +5876,7 @@ delete_after_import = true
         .unwrap();
 
         let result = process_run(&server_config, &nickname, &run_id);
-        assert!(result.is_ok(), "postprocess run failed: {result:?}");
+        assert!(result.is_ok(), "transform run failed: {result:?}");
 
         let done_path = server_config
             .work_dir
@@ -5938,7 +5936,7 @@ delete_after_import = true
     }
 
     #[test]
-    fn prepare_run_rejects_unknown_requested_postprocess_step_before_finish() {
+    fn prepare_run_rejects_unknown_requested_transform_step_before_finish() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("work")).unwrap();
         let config = test_server_config(&work_dir);
@@ -5961,7 +5959,7 @@ delete_after_import = true
                 sha256: Some("00".repeat(32)),
                 link_target: None,
 
-                postprocess_steps: vec!["typo".to_owned()],
+                transform_steps: vec!["typo".to_owned()],
             }],
         };
         fs::write(incoming.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
@@ -5977,7 +5975,7 @@ delete_after_import = true
 
     #[test]
     #[cfg(unix)]
-    fn process_postprocessed_symlink_entry() {
+    fn process_transformed_symlink_entry() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
@@ -5987,13 +5985,13 @@ delete_after_import = true
         let config = ServerConfig {
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
-            postprocess: PostprocessConfig {
+            transform: TransformConfig {
                 steps: {
                     let mut m = std::collections::BTreeMap::new();
                     m.insert(
                         "test-step".to_owned(),
-                        PostprocessStepDefinition {
-                            kind: PostprocessKind::Subprocess,
+                        TransformStepDefinition {
+                            kind: TransformKind::Subprocess,
                             program: "true".to_owned(),
                             args: vec![],
                             expected_outputs: vec![],
@@ -6026,7 +6024,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: Some("/some/target".into()),
 
-                postprocess_steps: vec!["test-step".into()],
+                transform_steps: vec!["test-step".into()],
             }],
         };
         fs::write(
@@ -6038,7 +6036,7 @@ delete_after_import = true
         let result = process_run(&config, &nickname, &run_id);
         assert!(
             result.is_ok(),
-            "postprocess symlink run should succeed: {result:?}"
+            "transform symlink run should succeed: {result:?}"
         );
 
         let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
@@ -6055,7 +6053,7 @@ delete_after_import = true
     }
 
     #[test]
-    fn process_postprocessed_directory_entry() {
+    fn process_transformed_directory_entry() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
@@ -6065,13 +6063,13 @@ delete_after_import = true
         let config = ServerConfig {
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
-            postprocess: PostprocessConfig {
+            transform: TransformConfig {
                 steps: {
                     let mut m = std::collections::BTreeMap::new();
                     m.insert(
                         "test-step".to_owned(),
-                        PostprocessStepDefinition {
-                            kind: PostprocessKind::Subprocess,
+                        TransformStepDefinition {
+                            kind: TransformKind::Subprocess,
                             program: "true".to_owned(),
                             args: vec![],
                             expected_outputs: vec![],
@@ -6106,7 +6104,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                postprocess_steps: vec!["test-step".into()],
+                transform_steps: vec!["test-step".into()],
             }],
         };
         fs::write(
@@ -6118,7 +6116,7 @@ delete_after_import = true
         let result = process_run(&config, &nickname, &run_id);
         assert!(
             result.is_ok(),
-            "postprocess directory run should succeed: {result:?}"
+            "transform directory run should succeed: {result:?}"
         );
 
         let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);

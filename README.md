@@ -21,12 +21,12 @@ purgery-client sync -- ~/video.mp4 user@server:/archive
 purgery-client sync -- ~/Videos user@server:/archive
 
 purgery-client sync \
-  --postprocess compress-video \
+  --transform compress-video \
   --delete-after-import \
   -- ~/Videos/trip user@server:/archive
 ```
 
-SOURCE may be a regular file, directory, or symlink. The destination is rsync-style: `USER@HOST:/absolute/path` or `USER@HOST:relative/path`. Both absolute and relative destinations are accepted. For postprocess runs, a relative destination is resolved against the server's working directory during `prepare-run` and the resolved absolute path persists in the run.
+SOURCE may be a regular file, directory, or symlink. The destination is rsync-style: `USER@HOST:/absolute/path` or `USER@HOST:relative/path`. Both absolute and relative destinations are accepted. For transform runs, a relative destination is resolved against the server's working directory during `prepare-run` and the resolved absolute path persists in the run.
 
 ## How it works
 
@@ -40,21 +40,21 @@ purgery-client sync -- ./Photos user@server:/archive
   → /archive/Photos
 ```
 
-1. Without `--postprocess`, the client transfers directly to the destination with rsync; no server run or manifest exists.
+1. Without `--transform`, the client transfers directly to the destination with rsync; no server run or manifest exists.
 2. With passthrough cleanup, the client records local identity before rsync and removes only unchanged originals after rsync succeeds.
-3. With `--postprocess`, the client creates a server run for the source entry, waits for processing, and retires only unchanged originals that server status marks imported.
+3. With `--transform`, the client creates a server run for the source entry, waits for processing, and retires only unchanged originals that server status marks imported.
 
 For multiple source entries under a common root, use `--split <PATTERN>`:
 
 ```sh
 purgery-client sync \
-  --postprocess compress-video \
+  --transform compress-video \
   --delete-after-import \
   --split "**/*.mp4" \
   -- ~/Videos user@server:/archive
 ```
 
-Each matched entry is processed as a separate operation. Postprocess operations each create a server run; passthrough cleanup operations use direct rsync plus cleanup; pure passthrough uses one transfer of the selected roots.
+Each matched entry is processed as a separate operation. Transform operations each create a server run; passthrough cleanup operations use direct rsync plus cleanup; pure passthrough uses one transfer of the selected roots.
 
 ## Configuration
 
@@ -64,17 +64,17 @@ Minimal server config (`server.toml`):
 work_dir = "/var/lib/purgery/work"
 ```
 
-Server config contains only server-owned concerns: work directory, postprocess step definitions, GC settings, and logging.
+Server config contains only server-owned concerns: work directory, transform step definitions, GC settings, and logging.
 
 Full config reference: [docs/config.md](docs/config.md)
 
-## Transforms (postprocessing)
+## Transforms (transforming)
 
-Transformations are defined on the server. Clients request named steps via the `--postprocess` flag. Postprocessing applies to the source entry itself, regardless of kind. A directory source is passed as a single work path; its contents are available to the subprocess but the operation is one logical entry.
+Transformations are defined on the server. Clients request named steps via the `--transform` flag. Transforming applies to the source entry itself, regardless of kind. A directory source is passed as a single work path; its contents are available to the subprocess but the operation is one logical entry.
 
 ```toml
 # server.toml
-[postprocess.steps.compress-video]
+[transform.steps.compress-video]
 kind = "subprocess"
 program = "/usr/local/bin/compress"
 args = ["--input", "{input}"]
@@ -86,7 +86,7 @@ keep_original = true
 
 Because transformed outputs are not the original source files, Purgery cannot use the final archive alone to know that an unchanged local original has already been processed in a previous run.
 
-For this reason, `--postprocess` requires `--delete-after-import`. The transformed import is an import-and-retire operation:
+For this reason, `--transform` requires `--delete-after-import`. The transformed import is an import-and-retire operation:
 
 1. the source entry is uploaded into a server run;
 2. the server transforms and commits outputs;

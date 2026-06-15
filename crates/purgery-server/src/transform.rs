@@ -9,7 +9,7 @@ use crate::ResolvedStep;
 const DEFAULT_HEARTBEAT_SECS: u64 = 5;
 
 #[allow(clippy::too_many_arguments)]
-pub fn apply_postprocessing(
+pub fn apply_transforms(
     steps: &[ResolvedStep],
     work_path: &Utf8Path,
     progress_step: &mut dyn FnMut(&purgery_core::ProgressUpdate),
@@ -17,7 +17,7 @@ pub fn apply_postprocessing(
     entry_total: usize,
     current_entry: &str,
 ) -> Result<Vec<Utf8PathBuf>, String> {
-    apply_postprocessing_with_heartbeat(
+    apply_transforms_with_heartbeat(
         steps,
         work_path,
         std::time::Duration::from_secs(DEFAULT_HEARTBEAT_SECS),
@@ -29,7 +29,7 @@ pub fn apply_postprocessing(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn apply_postprocessing_with_heartbeat(
+pub fn apply_transforms_with_heartbeat(
     steps: &[ResolvedStep],
     work_path: &Utf8Path,
     heartbeat_interval: std::time::Duration,
@@ -48,9 +48,9 @@ pub fn apply_postprocessing_with_heartbeat(
         let step_def = &step.step_def;
 
         match step_def.kind {
-            purgery_core::PostprocessKind::Subprocess => {
+            purgery_core::TransformKind::Subprocess => {
                 let args = step_def.build_args(work_path);
-                info!(step = %step.step_name, program = %step_def.program, "running postprocess step");
+                info!(step = %step.step_name, program = %step_def.program, "running transform step");
                 progress_step(&purgery_core::ProgressUpdate::new(
                     "step_started",
                     entry_index,
@@ -151,7 +151,7 @@ pub fn apply_postprocessing_with_heartbeat(
     }
 
     if results.is_empty() {
-        return Err("postprocessing produced zero outputs, but at least one is required".into());
+        return Err("transforms produced zero outputs, but at least one is required".into());
     }
 
     Ok(results)
