@@ -6,7 +6,7 @@ Purgery operates on one source entry per `sync` invocation.
 
 Without `--transform`, the client runs rsync directly to `USER@HOST:DESTINATION`. It does not create a server run, upload a manifest, poll status, or invoke `finish-run`.
 
-The source entry is transferred with trailing slashes stripped. Trailing slashes on the source operand do not change source-entry semantics. The source entry base final path is `<DESTINATION>/<SOURCE-NAME>`. Transform outputs commit under the same parent, using the output file names.
+The source entry is transferred with trailing slashes stripped. Trailing slashes on the source operand do not change source-entry semantics. The source entry base final path is `<DESTINATION>/<SOURCE-NAME>`.
 
 With `--delete-after-import`, the client first records durable local identity. Successful rsync authorizes cleanup, but the local entry is removed only if its current kind and identity still match the recorded entry.
 
@@ -18,16 +18,16 @@ The source entry is staged at `files/<source-name>`. The server verifies the sta
 
 For a directory source, the staging tree is the directory itself. The subprocess receives the directory path and may read its contents. The manifest describes one logical entry regardless of directory depth.
 
-The run destination is final storage. Final path computation:
+The run destination is final storage. `{target_directory}` is `<destination>` (the parent of the base final path `<destination>/<source_entry_name>`).
 
-- The source entry base final path is `<destination>/<source_entry_name>`.
-- If `keep_original = true`, the original work entry commits to that base final path.
-- Each expected transform output commits under the same parent as the base final path, using the output file name.
+Transform programs are responsible for placing outputs into `{target_directory}`. After each subprocess step exits successfully, Purgery checks that each declared expected output exists in `{target_directory}`. Purgery does not move or commit transform outputs.
+
+If `expected_outputs = []`, no output-existence checks are performed. Successful subprocess exit is sufficient for the entry to be marked `imported`. This allows intentionally deletion-only or verification-only transforms.
 
 Examples:
 
-- source `video.mp4` → `keep_original = true`: original commits to `/archive/video.mp4`, output `video.Z.webm` commits to `/archive/video.Z.webm`.
-- source `Videos/2024/a.mp4` → `keep_original = true`: original commits to `/archive/2024/a.mp4`, output `a.Z.webm` commits to `/archive/2024/a.Z.webm`.
+- source `video.mp4` → transform writes `{target_directory}/video.Z.webm`; `final_paths` records `/archive/video.Z.webm`.
+- source `Videos/2024/a.mp4` → transform writes `{target_directory}/a.Z.webm`; `final_paths` records `/archive/2024/a.Z.webm`.
 
 `work_dir` contains only Purgery state and work areas. It is never a final-storage root.
 

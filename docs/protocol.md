@@ -162,11 +162,13 @@ delete_after_import = true
 
 The `destination` field is the target parent directory. It may be absolute or relative. For transform runs, a relative destination is resolved against the server's working directory during `prepare-run` and the `run.toml` is atomically rewritten with the absolute path.
 
-The source entry base final path is `<destination>/<source_entry_name>`.
+The source entry base final path is `<destination>/<source_entry_name>`. `{target_directory}` is `<destination>` (the parent of the base final path).
 
-- If `keep_original = true`, the original work entry commits to that base final path.
-- Each expected transform output commits under the same parent as the base final path, using the output file name.
-- `work_dir` is never final storage.
+Transform programs are responsible for placing outputs into `{target_directory}`. Purgery does not move or commit transform outputs. After each step exits successfully, Purgery checks that each declared expected output exists in `{target_directory}`.
+
+For non-transform entries, the server commits the work entry directly to the base final path.
+
+`work_dir` is never final storage.
 
 ## Manifest (manifest.toml)
 
@@ -213,27 +215,27 @@ state = "done"
 local_path = "/home/user/video.mp4"
 relative_path = "video.mp4"
 status = "imported"
-final_paths = ["/archive/video.mp4"]
+final_paths = ["/archive/video.Z.webm"]
 transform = ["compress-video"]
 ```
 
 ### Final path computation
 
-The source entry base final path is `<destination>/<source_entry_name>`.
+The source entry base final path is `<destination>/<source_entry_name>`. `{target_directory}` is `<destination>`.
 
-- If `keep_original = true`, the original work entry commits to that base final path.
-- Each expected transform output commits under the same parent as the base final path, using the output file name.
-- For split nested entries, the split target suffix already points at the selected entry's relative parent, so the same rule applies.
+For non-transform entries, the server commits the work entry to the base final path.
+
+For transform entries, `final_paths` in the status records the resolved expected output paths that were checked (i.e., the paths under `{target_directory}` whose existence Purgery confirmed after the transform step). If `expected_outputs = []`, no paths are checked and `final_paths` is empty. Purgery does not move or commit transform outputs; it only checks that declared expected outputs exist.
 
 Examples:
 
 ```
 sync --transform compress -- ./video.mp4 host:/archive
-  original, if kept: /archive/video.mp4
+  {target_directory}: /archive
   output video.Z.webm: /archive/video.Z.webm
 
 sync --transform compress -- ./Videos/2024/a.mp4 host:/archive/2024
-  original, if kept: /archive/2024/a.mp4
+  {target_directory}: /archive/2024
   output a.Z.webm: /archive/2024/a.Z.webm
 ```
 

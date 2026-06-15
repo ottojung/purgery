@@ -60,13 +60,6 @@ impl RunPlan {
                     format!("transform step '{name}': expected_output {output:?}: {e}")
                 })?;
             }
-
-            if !step.keep_original && step.expected_outputs.is_empty() {
-                return Err(format!(
-                    "transform step '{name}': keep_original=false with no \
-                     expected_outputs would produce zero committed outputs"
-                ));
-            }
         }
 
         Ok(RunPlan {
@@ -537,14 +530,6 @@ pub fn server_check(config: &ServerConfig) -> Result<()> {
             anyhow::bail!("transform step '{}' has empty program", name);
         }
 
-        if !step.keep_original && step.expected_outputs.is_empty() {
-            anyhow::bail!(
-                "transform step '{}': keep_original=false with no expected_outputs \
-                 would produce zero committed outputs",
-                name
-            );
-        }
-
         for output in &step.expected_outputs {
             purgery_core::validate_expected_output_name(output).map_err(|e| {
                 anyhow::anyhow!("transform step '{name}': expected_output {output:?}: {e}")
@@ -655,17 +640,19 @@ mod tests {
     };
 
     /// Call apply_transforms with a no-op progress callback for testing.
+    /// Resolves expected outputs against the work path's parent directory.
     fn test_apply_transforms(
         run_plan: &RunPlan,
         work_path: &Utf8Path,
     ) -> Result<Vec<Utf8PathBuf>, String> {
-        test_apply_transforms_with_dest(run_plan, work_path, work_path)
+        let target_directory = work_path.parent().unwrap_or(work_path).to_owned();
+        test_apply_transforms_with_target(run_plan, work_path, &target_directory)
     }
 
-    fn test_apply_transforms_with_dest(
+    fn test_apply_transforms_with_target(
         run_plan: &RunPlan,
         work_path: &Utf8Path,
-        final_destination: &Utf8Path,
+        target_directory: &Utf8Path,
     ) -> Result<Vec<Utf8PathBuf>, String> {
         let all_steps: Vec<ResolvedStep> = run_plan
             .steps
@@ -678,7 +665,7 @@ mod tests {
         apply_transforms(
             &all_steps,
             work_path,
-            final_destination,
+            target_directory,
             &mut |_: &purgery_core::ProgressUpdate| {},
             0,
             1,
@@ -1159,9 +1146,8 @@ delete_after_import = true
         let run_plan = RunPlan::build(&server_config).unwrap();
         let results = test_apply_transforms(&run_plan, &work_path);
         assert!(results.is_ok(), "transform with spaces should succeed");
-        let outputs = results.unwrap();
-        assert!(!outputs.is_empty());
-        assert!(outputs.contains(&work_path));
+        // empty expected_outputs means zero outputs — this is valid
+        assert!(results.unwrap().is_empty());
     }
 
     #[test]
@@ -1274,8 +1260,8 @@ delete_after_import = true
         let pp_run_plan = RunPlan::build(&server_config).unwrap();
         let result = test_apply_transforms(&pp_run_plan, &work_path);
         assert!(result.is_ok());
-        let outputs = result.unwrap();
-        assert!(outputs.contains(&work_path));
+        // empty expected_outputs means zero outputs
+        assert!(result.unwrap().is_empty());
     }
 
     #[test]
@@ -1313,13 +1299,15 @@ delete_after_import = true
         let result = test_apply_transforms(&pp_run_plan, &work_path);
         assert!(result.is_ok());
         let outputs = result.unwrap();
-        assert!(
-            outputs.contains(&work_path),
-            "keep_original=true must include original"
-        );
+        assert_eq!(outputs.len(), 1);
         assert!(
             outputs.contains(&compressed),
-            "keep_original=true must include compressed"
+            "must include expected output"
+        );
+        // keep_original is metadata only; server does not include work_path
+        assert!(
+            !outputs.contains(&work_path),
+            "server must not include work_path based on keep_original"
         );
     }
 
@@ -1358,6 +1346,7 @@ delete_after_import = true
         let result = test_apply_transforms(&pp_run_plan, &work_path);
         assert!(result.is_ok());
         let outputs = result.unwrap();
+        assert_eq!(outputs.len(), 1);
         assert!(
             !outputs.contains(&work_path),
             "keep_original=false must NOT include original"
@@ -1797,15 +1786,20 @@ delete_after_import = true
     // ── compress-video keep_original end-to-end ──
 
     #[test]
-    fn test_compress_video_keep_original_records_both_paths() {
+    fn test_compress_video_keep_original_records_expected_outputs() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
 
         let script_path = tmp.path().join("compress.sh");
         std::fs::write(
             &script_path,
-            "#!/bin/sh\nbase=$(basename \"$2\");stem=\"${base%.*}\";dir=$(dirname \"$2\");touch \"$dir/$stem.Z.webm\"\n",
-        ).unwrap();
+            "#!/bin/sh\n\
+             input=\"$2\"; target_dir=\"$3\"\n\
+             stem=\"${input##*/}\"; stem=\"${stem%.*}\"\n\
+             mkdir -p \"$target_dir\"\n\
+             touch \"$target_dir/$stem.Z.webm\"\n",
+        )
+        .unwrap();
         std::fs::set_permissions(
             &script_path,
             std::os::unix::fs::PermissionsExt::from_mode(0o755),
@@ -1823,7 +1817,11 @@ delete_after_import = true
                         TransformStepDefinition {
                             kind: TransformKind::Subprocess,
                             program: script_path.to_string_lossy().to_string(),
-                            args: vec!["--input".into(), "{input}".into()],
+                            args: vec![
+                                "--input".into(),
+                                "{input}".into(),
+                                "{target_directory}".into(),
+                            ],
                             expected_outputs: vec!["{stem}.Z.webm".into()],
                             keep_original: true,
                         },
@@ -1875,7 +1873,7 @@ delete_after_import = true
         let status = RunStatus::from_toml(&status_content).unwrap();
         assert_eq!(status.state, RunState::Done);
         assert_eq!(status.entries[0].status, FileStatus::Imported);
-        assert_eq!(status.entries[0].final_paths.len(), 2);
+        assert_eq!(status.entries[0].final_paths.len(), 1);
 
         let original_final =
             test_storage_root(server_config.work_dir.as_path()).join("univ/videos/video.mp4");
@@ -1883,11 +1881,11 @@ delete_after_import = true
             test_storage_root(server_config.work_dir.as_path()).join("univ/videos/video.Z.webm");
         assert!(
             !original_final.exists(),
-            "transform outputs are not moved to final destination"
+            "server must not commit original to final destination"
         );
         assert!(
-            !compressed_final.exists(),
-            "transform outputs are not moved to final destination"
+            compressed_final.exists(),
+            "transform script wrote compressed output to target_directory"
         );
     }
 
@@ -1899,8 +1897,13 @@ delete_after_import = true
         let script_path = tmp.path().join("compress.sh");
         std::fs::write(
             &script_path,
-            "#!/bin/sh\nbase=$(basename \"$2\");stem=\"${base%.*}\";dir=$(dirname \"$2\");touch \"$dir/$stem.Z.webm\"\n",
-        ).unwrap();
+            "#!/bin/sh\n\
+             input=\"$2\"; target_dir=\"$3\"\n\
+             stem=\"${input##*/}\"; stem=\"${stem%.*}\"\n\
+             mkdir -p \"$target_dir\"\n\
+             touch \"$target_dir/$stem.Z.webm\"\n",
+        )
+        .unwrap();
         std::fs::set_permissions(
             &script_path,
             std::os::unix::fs::PermissionsExt::from_mode(0o755),
@@ -1918,7 +1921,11 @@ delete_after_import = true
                         TransformStepDefinition {
                             kind: TransformKind::Subprocess,
                             program: script_path.to_string_lossy().to_string(),
-                            args: vec!["--input".into(), "{input}".into()],
+                            args: vec![
+                                "--input".into(),
+                                "{input}".into(),
+                                "{target_directory}".into(),
+                            ],
                             expected_outputs: vec!["{stem}.Z.webm".into()],
                             keep_original: false,
                         },
@@ -1978,11 +1985,11 @@ delete_after_import = true
             test_storage_root(server_config.work_dir.as_path()).join("univ/videos/video.Z.webm");
         assert!(
             !original_final.exists(),
-            "original must NOT exist with keep_original=false"
+            "server must not commit original to final destination"
         );
         assert!(
-            !compressed_final.exists(),
-            "transform outputs are not moved to final destination"
+            compressed_final.exists(),
+            "transform script wrote compressed output to target_directory"
         );
     }
 
@@ -3211,7 +3218,7 @@ delete_after_import = true
         apply_transforms_with_heartbeat(
             &all_steps,
             &work_path,
-            &work_path,
+            work_path.parent().unwrap(),
             std::time::Duration::from_millis(1),
             &mut callback,
             0,
@@ -3386,7 +3393,7 @@ delete_after_import = true
         apply_transforms_with_heartbeat(
             &all_steps,
             &work_path,
-            &work_path,
+            work_path.parent().unwrap(),
             std::time::Duration::from_millis(1),
             &mut callback,
             0,
@@ -3491,7 +3498,7 @@ delete_after_import = true
         apply_transforms_with_heartbeat(
             &all_steps,
             &work_path,
-            &work_path,
+            work_path.parent().unwrap(),
             std::time::Duration::from_millis(1),
             &mut callback,
             0,
@@ -4433,7 +4440,9 @@ delete_after_import = true
                             program: "sh".to_owned(),
                             args: vec![
                                 "-c".to_owned(),
-                                "mkdir -p _outputs && echo done > _outputs/result.txt".to_owned(),
+                                "mkdir -p $0/_outputs && echo done > $0/_outputs/result.txt"
+                                    .to_owned(),
+                                "{target_directory}".to_owned(),
                             ],
                             expected_outputs: vec!["_outputs".to_owned()],
                             keep_original: false,
@@ -4528,6 +4537,11 @@ delete_after_import = true
             server_config.work_dir.as_path().join("laptop/ready"),
         ];
         assert_root_contains_exactly(server_config.work_dir.as_path(), &expected);
+
+        let result_txt = test_storage_root(server_config.work_dir.as_path())
+            .join("univ/data/_outputs/result.txt");
+        assert!(result_txt.exists());
+        assert_eq!(fs::read_to_string(&result_txt).unwrap(), "done\n");
     }
 
     // ── Replacement and replay tests ─────────────────────────────────
@@ -4773,7 +4787,11 @@ delete_after_import = true
                         TransformStepDefinition {
                             kind: TransformKind::Subprocess,
                             program: "sh".to_owned(),
-                            args: vec!["-c".to_owned(), "ln -sf /etc/hostname the-link".to_owned()],
+                            args: vec![
+                                "-c".to_owned(),
+                                "mkdir -p $0 && ln -sf /etc/hostname $0/the-link".to_owned(),
+                                "{target_directory}".to_owned(),
+                            ],
                             expected_outputs: vec!["the-link".to_owned()],
                             keep_original: false,
                         },
@@ -4865,6 +4883,16 @@ delete_after_import = true
             server_config.work_dir.as_path().join("laptop/ready"),
         ];
         assert_root_contains_exactly(server_config.work_dir.as_path(), &expected);
+
+        let the_link =
+            test_storage_root(server_config.work_dir.as_path()).join("univ/data/the-link");
+        assert!(the_link.exists());
+        assert!(
+            fs::symlink_metadata(&the_link)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false),
+            "the-link must be a symlink at the target directory"
+        );
     }
 
     // ── Move-based final materialization tests ──────────────────────
@@ -5054,8 +5082,9 @@ delete_after_import = true
                             program: "sh".to_owned(),
                             args: vec![
                                 "-c".to_owned(),
-                                "mkdir -p out/sub && echo a > out/sub/a.txt && echo b > out/b.txt"
+                                "mkdir -p $0/out/sub && echo a > $0/out/sub/a.txt && echo b > $0/out/b.txt"
                                     .to_owned(),
+                                "{target_directory}".to_owned(),
                             ],
                             expected_outputs: vec!["out".to_owned()],
                             keep_original: false,
@@ -5154,6 +5183,14 @@ delete_after_import = true
             server_config.work_dir.as_path().join("laptop/ready"),
         ];
         assert_root_contains_exactly(server_config.work_dir.as_path(), &expected);
+
+        let out_b = test_storage_root(server_config.work_dir.as_path()).join("univ/data/out/b.txt");
+        let out_sub_a =
+            test_storage_root(server_config.work_dir.as_path()).join("univ/data/out/sub/a.txt");
+        assert!(out_b.exists());
+        assert_eq!(fs::read_to_string(&out_b).unwrap(), "b\n");
+        assert!(out_sub_a.exists());
+        assert_eq!(fs::read_to_string(&out_sub_a).unwrap(), "a\n");
     }
 
     // ── Staged file preservation tests ────────────────────────────────
@@ -5724,7 +5761,11 @@ delete_after_import = true
                         TransformStepDefinition {
                             kind: TransformKind::Subprocess,
                             program: "sh".to_owned(),
-                            args: vec!["-c".to_owned(), "cp {input} {input}.out".to_owned()],
+                            args: vec![
+                                "-c".to_owned(),
+                                "mkdir -p $0 && cp {input} $0/{file_name}.out".to_owned(),
+                                "{target_directory}".to_owned(),
+                            ],
                             expected_outputs: vec!["{file_name}.out".to_owned()],
                             keep_original: false,
                         },
@@ -5787,8 +5828,8 @@ delete_after_import = true
         let final_output =
             test_storage_root(server_config.work_dir.as_path()).join("univ/data/input.bin.out");
         assert!(
-            !final_output.exists(),
-            "transform outputs are not moved to final destination"
+            final_output.exists(),
+            "script writes expected output to target directory"
         );
 
         let expected = vec![
@@ -5850,7 +5891,11 @@ delete_after_import = true
                         TransformStepDefinition {
                             kind: TransformKind::Subprocess,
                             program: "sh".to_owned(),
-                            args: vec!["-c".to_owned(), "cp {input} {input}.out".to_owned()],
+                            args: vec![
+                                "-c".to_owned(),
+                                "mkdir -p $0 && cp {input} $0/{file_name}.out".to_owned(),
+                                "{target_directory}".to_owned(),
+                            ],
                             expected_outputs: vec!["{file_name}.out".to_owned()],
                             keep_original: false,
                         },
@@ -6157,7 +6202,7 @@ delete_after_import = true
     // ── No-commit (skip move) tests for transformed entries ──
 
     #[test]
-    fn transform_records_final_paths_without_committing() {
+    fn transform_empty_expected_outputs_succeeds_with_empty_final_paths() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
 
@@ -6219,16 +6264,13 @@ delete_after_import = true
         let status = RunStatus::from_toml(&status_content).unwrap();
         assert_eq!(status.state, RunState::Done);
         assert_eq!(status.entries[0].status, FileStatus::Imported);
-        assert_eq!(status.entries[0].final_paths.len(), 1);
+        assert!(
+            status.entries[0].final_paths.is_empty(),
+            "empty expected_outputs must produce zero final_paths"
+        );
 
         let expected_final =
             test_storage_root(config.work_dir.as_path()).join("univ/output/data.bin");
-        assert!(
-            status.entries[0]
-                .final_paths
-                .contains(&expected_final.as_str().to_owned()),
-            "final_paths must record the expected destination path"
-        );
         assert!(
             !expected_final.exists(),
             "transformed entry output must not be committed to final destination"
@@ -6236,16 +6278,17 @@ delete_after_import = true
     }
 
     #[test]
-    fn final_destination_placeholder_resolves() {
+    fn target_directory_placeholder_resolves() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
 
         let script_path = tmp.path().join("dst-script.sh");
         std::fs::write(
             &script_path,
-            "#!/bin/sh\n# args: --input {input} --output {final_destination}\n\
-             mkdir -p \"$(dirname \"$4\")\"\n\
-             touch \"$4\"\n",
+            "#!/bin/sh\n# args: --input {input} --output-dir {target_directory}\n\
+             target_dir=\"$4\"\n\
+             mkdir -p \"$target_dir\"\n\
+             touch \"$target_dir/result\"\n",
         )
         .unwrap();
         std::fs::set_permissions(
@@ -6268,10 +6311,10 @@ delete_after_import = true
                             args: vec![
                                 "--input".into(),
                                 "{input}".into(),
-                                "--output".into(),
-                                "{final_destination}".into(),
+                                "--output-dir".into(),
+                                "{target_directory}".into(),
                             ],
-                            expected_outputs: vec![],
+                            expected_outputs: vec!["result".into()],
                             keep_original: true,
                         },
                     );
@@ -6320,16 +6363,16 @@ delete_after_import = true
         assert_eq!(status.entries[0].final_paths.len(), 1);
 
         let expected_final =
-            test_storage_root(config.work_dir.as_path()).join("univ/output/data.bin");
+            test_storage_root(config.work_dir.as_path()).join("univ/output/result");
         assert!(
             status.entries[0]
                 .final_paths
                 .contains(&expected_final.as_str().to_owned()),
-            "final_paths must record the destination path"
+            "final_paths must record the expected output path"
         );
         assert!(
             expected_final.exists(),
-            "script using {{final_destination}} must place output at final destination"
+            "script using {{target_directory}} must place output at target directory"
         );
     }
 
@@ -6367,23 +6410,20 @@ delete_after_import = true
     }
 
     #[test]
-    fn transform_with_final_destination_and_expected_output() {
+    fn transform_with_target_directory_and_expected_output() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
 
         let script_path = tmp.path().join("compress-dst.sh");
         std::fs::write(
             &script_path,
-            "#!/bin/sh\n# args: --input {input} --output {final_destination} --parent {parent}\n\
+            "#!/bin/sh\n# args: --input {input} --output-dir {target_directory}\n\
              input=\"$2\"\n\
-             output=\"$4\"\n\
-             parent=\"$6\"\n\
-             stem=$(basename \"$output\" | sed 's/\\.[^.]*$//')\n\
-             # expected output must exist in work parent for validation\n\
-             touch \"$parent/${stem}.Z.webm\"\n\
-             # place the compressed output at final destination\n\
-             mkdir -p \"$(dirname \"$output\")\"\n\
-             cp \"$parent/${stem}.Z.webm\" \"$(dirname \"$output\")/${stem}.Z.webm\"\n",
+             target_dir=\"$4\"\n\
+             stem=\"${input##*/}\"\n\
+             stem=\"${stem%.*}\"\n\
+             mkdir -p \"$target_dir\"\n\
+             touch \"$target_dir/${stem}.Z.webm\"\n",
         )
         .unwrap();
         std::fs::set_permissions(
@@ -6406,10 +6446,8 @@ delete_after_import = true
                             args: vec![
                                 "--input".into(),
                                 "{input}".into(),
-                                "--output".into(),
-                                "{final_destination}".into(),
-                                "--parent".into(),
-                                "{parent}".into(),
+                                "--output-dir".into(),
+                                "{target_directory}".into(),
                             ],
                             expected_outputs: vec!["{stem}.Z.webm".into()],
                             keep_original: false,
@@ -6465,11 +6503,11 @@ delete_after_import = true
             test_storage_root(config.work_dir.as_path()).join("univ/videos/video.Z.webm");
         assert!(
             !original_final.exists(),
-            "keep_original=false: original must not be moved"
+            "keep_original=false: original must not be committed"
         );
         assert!(
             compressed_final.exists(),
-            "script using {{final_destination}} placed compressed output at destination"
+            "script using {{target_directory}} placed compressed output at destination"
         );
     }
 }

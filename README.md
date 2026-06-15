@@ -77,10 +77,14 @@ Transformations are defined on the server. Clients request named steps via the `
 [transform.steps.compress-video]
 kind = "subprocess"
 program = "/usr/local/bin/compress"
-args = ["--input", "{input}"]
+args = ["--input", "{input}", "--output-dir", "{target_directory}"]
 expected_outputs = ["{file_stem}.compressed.webm"]
 keep_original = true
 ```
+
+The server invokes transform steps in order. After each subprocess step exits successfully, the server checks that each declared `expected_output` exists in `{target_directory}` (the directory where the entry's normal non-transform final path would be placed). The transform program is responsible for placing outputs into `{target_directory}`; Purgery does not move or commit transform outputs.
+
+`expected_outputs` is required but may be empty (`[]`). When empty, no output-existence checks are performed — successful subprocess exit is sufficient for the entry to be marked `imported`. This allows intentionally deletion-only or verification-only transforms.
 
 ## Transform and cleanup coupling
 
@@ -89,7 +93,7 @@ Because transformed outputs are not the original source files, Purgery cannot us
 For this reason, `--transform` requires `--delete-after-import`. The transformed import is an import-and-retire operation:
 
 1. the source entry is uploaded into a server run;
-2. the server transforms and commits outputs;
+2. the server runs transform steps and checks expected outputs;
 3. the server writes a bounded run status;
 4. the client removes the unchanged local original after server-confirmed import.
 
