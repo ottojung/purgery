@@ -107,6 +107,13 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
                 entry.relative_path.as_str()
             );
         }
+        let def = &config.transforms[transform_name];
+        if let Err(e) = purgery_core::validate_transform_definition(def) {
+            anyhow::bail!(
+                "run plan validation failed for '{}': transform '{transform_name}' definition is invalid: {e}",
+                entry.relative_path.as_str()
+            );
+        }
     }
 
     // Resolve relative destination against server cwd.
@@ -474,18 +481,10 @@ pub fn server_check(config: &ServerConfig) -> Result<()> {
     info!(path = %purgery_path.as_str(), "work_dir: OK");
 
     for td in config.transforms.values() {
-        let program = &td.program;
-        if program.is_empty() {
-            anyhow::bail!("transform '{}' has empty program", td.name);
-        }
+        purgery_core::validate_transform_definition(td)
+            .map_err(|e| anyhow::anyhow!("transform '{}': {e}", td.name))?;
 
-        for output in &td.expected_outputs {
-            purgery_core::validate_expected_output_name(output).map_err(|e| {
-                anyhow::anyhow!("transform '{}': expected_output {output:?}: {e}", td.name)
-            })?;
-        }
-
-        purgery_core::resolve_executable(program).map(
+        purgery_core::resolve_executable(&td.program).map(
             |r| info!(transform = td.name, path = %r.path.as_str(), "transform program found"),
         )?;
     }
@@ -6354,6 +6353,74 @@ delete_after_import = true
         assert!(
             compressed_final.exists(),
             "script using {{target_directory}} placed compressed output at destination"
+        );
+    }
+
+    // ── prepare-run transform-definition validation ──────────────────
+
+    #[test]
+    fn prepare_run_rejects_invalid_expected_outputs_in_transform_definition() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let storage = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let mut config = test_server_config(&work_dir);
+        config.transforms = single_transform(
+            "compress-video",
+            TransformDefinition {
+                name: "compress-video".into(),
+                kind: TransformKind::Subprocess,
+                program: "true".to_owned(),
+                args: vec![],
+                expected_outputs: vec!["{input}".into()], // INVALID: uses {input} placeholder
+                keep_original: true,
+            },
+        );
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("test-prepare-bad-output".into()).unwrap();
+
+        let incoming_path = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Incoming);
+        fs::create_dir_all(&incoming_path).unwrap();
+
+        let dest = storage.join("univ/videos");
+        let run_config_content = format!(
+            "nickname = \"{}\"\ndestination = \"{}\"\ndelete_after_import = true\n",
+            nickname.as_str(),
+            dest.as_str()
+        );
+        fs::write(incoming_path.join("run.toml"), &run_config_content).unwrap();
+
+        let manifest = Manifest {
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![ManifestEntry {
+                local_path: ClientLocalPath::new("/home/user/Videos/test.mp4".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/test.mp4".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("test.mp4".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
+                size: 13,
+                mtime_ns: 1000000,
+                sha256: None,
+                link_target: None,
+                transform: Some("compress-video".into()),
+            }],
+        };
+        fs::write(
+            incoming_path.join("manifest.toml"),
+            manifest.to_toml().unwrap(),
+        )
+        .unwrap();
+
+        let result = prepare_run(&config, &nickname, &run_id);
+        assert!(
+            result.is_err(),
+            "prepare_run must reject invalid expected_outputs"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("invalid") || err.contains("expected_output"),
+            "error must reference expected_output validation, got: {err}"
         );
     }
 }

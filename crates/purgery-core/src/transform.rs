@@ -92,6 +92,21 @@ impl TransformDefinition {
     }
 }
 
+/// Validate a single transform definition's `program` and `expected_outputs`.
+///
+/// Does not check whether the program binary exists on disk — that is a
+/// separate concern handled by `server_check`.
+pub fn validate_transform_definition(def: &TransformDefinition) -> Result<(), String> {
+    if def.program.is_empty() {
+        return Err("program is empty".into());
+    }
+    for output in &def.expected_outputs {
+        validate_expected_output_name(output)
+            .map_err(|e| format!("expected_output {output:?}: {e}"))?;
+    }
+    Ok(())
+}
+
 pub fn validate_expected_output_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("expected output name is empty".into());
