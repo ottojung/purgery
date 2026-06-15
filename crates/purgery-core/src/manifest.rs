@@ -51,7 +51,7 @@ pub struct ManifestEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link_target: Option<Utf8PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub postprocess_steps: Vec<String>,
+    pub transform_steps: Vec<String>,
 }
 
 impl ManifestEntry {

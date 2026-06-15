@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
 use crate::path::*;
-use crate::postprocess::PostprocessConfig;
+use crate::transform::TransformConfig;
 use crate::ConfigError;
 
 // ── Lease / GC Config ────────────────────────────────────────────────
@@ -154,7 +154,7 @@ impl FromStr for ColorMode {
 struct ServerConfigFile {
     pub work_dir: PurgeryRoot,
     #[serde(default)]
-    pub postprocess: PostprocessConfig,
+    pub transform: TransformConfig,
     #[serde(default)]
     pub gc: GCConfig,
     #[serde(default)]
@@ -164,7 +164,7 @@ struct ServerConfigFile {
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub work_dir: PurgeryRoot,
-    pub postprocess: PostprocessConfig,
+    pub transform: TransformConfig,
     pub gc: GCConfig,
     pub logging: LoggingConfig,
 }
@@ -174,7 +174,7 @@ impl ServerConfig {
         let config: ServerConfigFile = toml::from_str(input)?;
         Ok(Self {
             work_dir: config.work_dir,
-            postprocess: config.postprocess,
+            transform: config.transform,
             gc: config.gc,
             logging: config.logging,
         })
@@ -265,7 +265,7 @@ pub struct ProcessingProgress {
     pub updated_at_unix_secs: u64,
 }
 
-/// Progress update passed into postprocess callbacks.
+/// Progress update passed into transform callbacks.
 /// Carries full entry context for progress reporting.
 #[derive(Debug, Clone)]
 pub struct ProgressUpdate<'a> {
@@ -294,7 +294,7 @@ impl<'a> ProgressUpdate<'a> {
     }
 }
 
-/// Client-persisted phases for a postprocess run.
+/// Client-persisted phases for a transform run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClientRunPhase {
@@ -306,7 +306,7 @@ pub enum ClientRunPhase {
     Corrupt,
 }
 
-/// Client-persisted state for a postprocess run, used to resume
+/// Client-persisted state for a transform run, used to resume
 /// waiting and cleanup after a crash.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -27,9 +27,9 @@ work_dir = "/var/lib/purgery/work"
 incoming_lease_secs = 1800
 heartbeat_interval_secs = 60
 
-[postprocess]
+[transform]
 
-[postprocess.steps.compress-video]
+[transform.steps.compress-video]
 kind = "subprocess"
 program = "/usr/local/bin/compress-video"
 args = ["--input", "{input}"]
@@ -41,9 +41,9 @@ keep_original = true
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `work_dir` | yes | Absolute path to Purgery's working/state directory. Contains all non-final server state: incoming runs, ready/processing/done/failed runs, lease files, manifests, status files, postprocess work areas, and temporary files used for atomic writes |
+| `work_dir` | yes | Absolute path to Purgery's working/state directory. Contains all non-final server state: incoming runs, ready/processing/done/failed runs, lease files, manifests, status files, transform work areas, and temporary files used for atomic writes |
 | `gc` | no | GC configuration (see below) |
-| `postprocess` | no | Postprocessing configuration (see below) |
+| `transform` | no | Transforming configuration (see below) |
 
 ### Logging config
 
@@ -60,13 +60,13 @@ keep_original = true
 | `incoming_lease_secs` | `1800` | Lease duration for incoming runs |
 | `heartbeat_interval_secs` | `60` | Recommended heartbeat interval |
 
-### Postprocess config
+### Transform config
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `steps` | `{}` | Map of named postprocess step definitions |
+| `steps` | `{}` | Map of named transform step definitions |
 
-## Postprocess step definition
+## Transform step definition
 
 | Field | Required | Description |
 |-------|----------|-------------|
@@ -92,7 +92,7 @@ A subprocess step must produce at least one committed output. If `keep_original 
 
 ### Subprocess safety
 
-Postprocess commands are always represented as argv-style argument vectors (the `args` list), never as shell strings. There is no shell interpolation, no `sh -c` invocation, and no concatenation of user-derived paths into shell snippets.
+Transform commands are always represented as argv-style argument vectors (the `args` list), never as shell strings. There is no shell interpolation, no `sh -c` invocation, and no concatenation of user-derived paths into shell snippets.
 
 Placeholder expansion substitutes resolved paths into the argument vector directly as separate argv elements.
 
@@ -113,13 +113,13 @@ destination = "/universe/synced/videos"
 delete_after_import = true
 ```
 
-The `destination` field is the client-supplied destination path. It may be absolute or relative. For postprocess runs, `prepare-run` resolves a relative destination against the server's current working directory and atomically rewrites `run.toml` with the absolute path.
+The `destination` field is the client-supplied destination path. It may be absolute or relative. For transform runs, `prepare-run` resolves a relative destination against the server's current working directory and atomically rewrites `run.toml` with the absolute path.
 
 Final path computation:
 
 - The source entry base final path is `<destination>/<source_entry_name>`.
 - If `keep_original = true`, the original work entry commits to that base path.
-- Each expected postprocess output commits under the same parent, using the output file name.
+- Each expected transform output commits under the same parent, using the output file name.
 - The server never places final files under `work_dir`.
 
 ## Config strictness
@@ -152,7 +152,7 @@ Each descendant's identity follows the same rules: regular files capture size, m
 
 ### SHA computation failure
 
-- Postprocess source files: SHA failure is fatal during manifest building.
+- Transform source files: SHA failure is fatal during manifest building.
 - Passthrough files with `--delete-after-import`: SHA failure is fatal during cleanup identity capture.
 - Pure passthrough pre-rsync cleanup ledger capture: a regular file whose SHA cannot be computed is skipped (not added to the ledger).
 
@@ -162,7 +162,7 @@ Purgery's security model assumes:
 
 1. **Server config** is trusted server admin configuration.
 2. **`--server-command`** is a trusted configuration value (not user input).
-3. **Postprocess programs and their argv** are trusted server-side configuration set by the server admin. Clients request steps by name but never upload arbitrary commands.
+3. **Transform programs and their argv** are trusted server-side configuration set by the server admin. Clients request steps by name but never upload arbitrary commands.
 4. **Source filenames and paths** may contain arbitrary characters (spaces, special characters, leading `-`) and must not become shell syntax or local subprocess options. Purgery uses argv-style invocation and shell-escaping for remote commands to prevent injection.
 5. **Local filesystem and server storage** are non-hostile unless documented otherwise.
 
@@ -177,13 +177,13 @@ Purgery hardens its own `ssh` and `rsync` argv to prevent option injection:
 
 All `rsync` options, including filter merge files, appear before the `--` separator. Source and destination operands appear after it.
 
-### Postprocess commands
+### Transform commands
 
-Postprocess argv is trusted server-side configuration and is not rewritten, validated, or auto-fixed by Purgery. Purgery passes the configured `args` vector directly to the subprocess without modification.
+Transform argv is trusted server-side configuration and is not rewritten, validated, or auto-fixed by Purgery. Purgery passes the configured `args` vector directly to the subprocess without modification.
 
 ## Server work area layout
 
-Server postprocess work areas live under `work_dir`:
+Server transform work areas live under `work_dir`:
 
 ```text
 {work_dir}/{nickname}/processing/{run_id}/work/

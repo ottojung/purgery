@@ -13,8 +13,8 @@ use crate::gc::run_gc;
 use crate::phases::{
     finalize_processing_run, move_to_failed, write_progress_best_effort, write_run_failure,
 };
-use crate::postprocess::apply_postprocessing;
 use crate::recover::recover_or_process_processing_run;
+use crate::transform::apply_transforms;
 use crate::RunPlan;
 
 pub(crate) enum EntryOutcome {
@@ -23,7 +23,7 @@ pub(crate) enum EntryOutcome {
         local_path: String,
         relative_path: String,
         final_paths: Vec<String>,
-        postprocess: Option<Vec<String>>,
+        transform: Option<Vec<String>>,
     },
     Failure {
         kind: ManifestEntryKind,
@@ -41,14 +41,14 @@ impl EntryOutcome {
                 local_path,
                 relative_path,
                 final_paths,
-                postprocess,
+                transform,
             } => EntryStatusEntry {
                 kind,
                 local_path,
                 relative_path,
                 status: FileStatus::Imported,
                 final_paths,
-                postprocess,
+                transform,
                 error: None,
             },
             EntryOutcome::Failure {
@@ -62,7 +62,7 @@ impl EntryOutcome {
                 relative_path,
                 status: FileStatus::Failed,
                 final_paths: vec![],
-                postprocess: None,
+                transform: None,
                 error: Some(error),
             },
         }
@@ -243,7 +243,7 @@ fn process_manifest_entry(
     };
 
     // No steps → commit the original work path directly (identity transform).
-    if entry.postprocess_steps.is_empty() {
+    if entry.transform_steps.is_empty() {
         let final_destination = final_path.as_str().to_owned();
         return match commit_output_entry(&work_path, &final_path, destination_root, run_id) {
             Ok(_) => EntryOutcome::Success {
@@ -251,7 +251,7 @@ fn process_manifest_entry(
                 local_path: entry.local_path.as_str().to_owned(),
                 relative_path: entry.relative_path.as_str().to_owned(),
                 final_paths: vec![final_destination],
-                postprocess: None,
+                transform: None,
             },
             Err(error) => failed_entry(entry, error),
         };
@@ -269,11 +269,11 @@ fn process_manifest_entry(
             update.current_step,
         );
     };
-    let resolved_steps = match run_plan.resolve_steps(&entry.postprocess_steps) {
+    let resolved_steps = match run_plan.resolve_steps(&entry.transform_steps) {
         Ok(s) => s,
         Err(error) => return failed_entry(entry, error),
     };
-    match apply_postprocessing(
+    match apply_transforms(
         &resolved_steps,
         &work_path,
         &mut pp_helper,
@@ -318,13 +318,13 @@ fn process_manifest_entry(
                 };
                 final_paths.push(destination.join(&output_relative).as_str().to_owned());
             }
-            let steps: Vec<String> = entry.postprocess_steps.clone();
+            let steps: Vec<String> = entry.transform_steps.clone();
             EntryOutcome::Success {
                 kind: entry.kind,
                 local_path: entry.local_path.as_str().to_owned(),
                 relative_path: entry.relative_path.as_str().to_owned(),
                 final_paths,
-                postprocess: (!steps.is_empty()).then_some(steps),
+                transform: (!steps.is_empty()).then_some(steps),
             }
         }
         Err(error) => failed_entry(entry, error),

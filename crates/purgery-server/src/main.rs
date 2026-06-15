@@ -108,7 +108,7 @@ enum Command {
     Bootstrap,
     /// Run garbage collection on expired incoming runs
     Gc,
-    /// Validate an incoming postprocess run plan
+    /// Validate an incoming transform run plan
     PrepareRun {
         #[arg(long)]
         nickname: String,

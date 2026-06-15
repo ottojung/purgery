@@ -11,15 +11,15 @@ mod cleanup_state;
 mod config;
 mod manifest;
 mod path;
-mod postprocess;
 mod status;
+mod transform;
 
 pub use cleanup_state::*;
 pub use config::*;
 pub use manifest::*;
 pub use path::*;
-pub use postprocess::*;
 pub use status::*;
+pub use transform::*;
 
 // ── Error Types ──────────────────────────────────────────────────────
 
@@ -593,22 +593,22 @@ mod tests {
     // ── Config parsing tests ──
 
     #[test]
-    fn postprocess_step_rejects_old_command_format() {
+    fn transform_step_rejects_old_command_format() {
         let toml = r#"
 kind = "subprocess"
 command = "my-compress-video"
 "#;
-        let result: Result<PostprocessStepDefinition, _> = toml::from_str(toml);
+        let result: Result<TransformStepDefinition, _> = toml::from_str(toml);
         assert!(result.is_err(), "old 'command' field must be rejected");
     }
 
     #[test]
-    fn postprocess_step_rejects_old_compress_video_kind() {
+    fn transform_step_rejects_old_compress_video_kind() {
         let toml = r#"
 kind = "compress-video"
 program = "my-compress-video"
 "#;
-        let result: Result<PostprocessStepDefinition, _> = toml::from_str(toml);
+        let result: Result<TransformStepDefinition, _> = toml::from_str(toml);
         assert!(
             result.is_err(),
             "old 'compress-video' kind must be rejected"
@@ -616,11 +616,11 @@ program = "my-compress-video"
     }
 
     #[test]
-    fn postprocess_step_rejects_unknown_kind() {
+    fn transform_step_rejects_unknown_kind() {
         let toml = r#"
 kind = "builtin"
 "#;
-        let result: Result<PostprocessStepDefinition, _> = toml::from_str(toml);
+        let result: Result<TransformStepDefinition, _> = toml::from_str(toml);
         assert!(result.is_err(), "unknown kind must be rejected");
     }
 
@@ -972,10 +972,10 @@ unknown_field = "value"
     }
 
     #[test]
-    fn postprocess_argv_not_rewritten() {
+    fn transform_argv_not_rewritten() {
         let configured_args = vec!["--input".to_string(), "{input}".to_string()];
-        let step = PostprocessStepDefinition {
-            kind: PostprocessKind::Subprocess,
+        let step = TransformStepDefinition {
+            kind: TransformKind::Subprocess,
             program: "true".to_owned(),
             args: configured_args.clone(),
             expected_outputs: vec![],
@@ -993,9 +993,9 @@ unknown_field = "value"
     }
 
     #[test]
-    fn postprocess_argv_not_rejected_for_placeholders() {
-        let step = PostprocessStepDefinition {
-            kind: PostprocessKind::Subprocess,
+    fn transform_argv_not_rejected_for_placeholders() {
+        let step = TransformStepDefinition {
+            kind: TransformKind::Subprocess,
             program: "ffmpeg".to_owned(),
             args: vec!["--input".to_string(), "{input}".to_string()],
             expected_outputs: vec![],
@@ -1078,23 +1078,23 @@ unknown_field = "value"
         assert_eq!(wd.as_str(), "/tmp/purgery/laptop/processing/run1/work");
     }
 
-    // ── PostprocessKind serde tests ──
+    // ── TransformKind serde tests ──
 
     #[test]
-    fn postprocess_kind_subprocess() {
-        let kind: PostprocessKind = serde_json::from_str("\"subprocess\"").unwrap();
-        assert_eq!(kind, PostprocessKind::Subprocess);
+    fn transform_kind_subprocess() {
+        let kind: TransformKind = serde_json::from_str("\"subprocess\"").unwrap();
+        assert_eq!(kind, TransformKind::Subprocess);
     }
 
     #[test]
-    fn postprocess_kind_rejects_unknown() {
-        let result: Result<PostprocessKind, _> = serde_json::from_str("\"builtin\"");
+    fn transform_kind_rejects_unknown() {
+        let result: Result<TransformKind, _> = serde_json::from_str("\"builtin\"");
         assert!(result.is_err());
     }
 
     #[test]
-    fn postprocess_kind_rejects_old_compress_video() {
-        let result: Result<PostprocessKind, _> = serde_json::from_str("\"compress-video\"");
+    fn transform_kind_rejects_old_compress_video() {
+        let result: Result<TransformKind, _> = serde_json::from_str("\"compress-video\"");
         assert!(result.is_err());
     }
 
@@ -1125,8 +1125,8 @@ unknown_field = "value"
 
     #[test]
     fn resolve_input_placeholder() {
-        let step = PostprocessStepDefinition {
-            kind: PostprocessKind::Subprocess,
+        let step = TransformStepDefinition {
+            kind: TransformKind::Subprocess,
             program: "ffmpeg".into(),
             args: vec!["--input".into(), "{input}".into()],
             expected_outputs: vec!["{stem}.Z.webm".into()],
@@ -1139,8 +1139,8 @@ unknown_field = "value"
 
     #[test]
     fn resolve_stem_placeholder() {
-        let step = PostprocessStepDefinition {
-            kind: PostprocessKind::Subprocess,
+        let step = TransformStepDefinition {
+            kind: TransformKind::Subprocess,
             program: "ffmpeg".into(),
             args: vec![],
             expected_outputs: vec!["{stem}.Z.webm".into()],
@@ -1154,8 +1154,8 @@ unknown_field = "value"
 
     #[test]
     fn resolve_parent_placeholder() {
-        let step = PostprocessStepDefinition {
-            kind: PostprocessKind::Subprocess,
+        let step = TransformStepDefinition {
+            kind: TransformKind::Subprocess,
             program: "ffmpeg".into(),
             args: vec!["--output-dir".into(), "{parent}".into()],
             expected_outputs: vec![],

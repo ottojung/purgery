@@ -1,36 +1,36 @@
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
 
-// ── Postprocess Types ────────────────────────────────────────────────
+// ── Transform Types ────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PostprocessConfig {
+pub struct TransformConfig {
     #[serde(default)]
-    pub steps: std::collections::BTreeMap<String, PostprocessStepDefinition>,
+    pub steps: std::collections::BTreeMap<String, TransformStepDefinition>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PostprocessKind {
+pub enum TransformKind {
     Subprocess,
 }
 
-impl<'de> Deserialize<'de> for PostprocessKind {
+impl<'de> Deserialize<'de> for TransformKind {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
         match s.as_str() {
-            "subprocess" => Ok(PostprocessKind::Subprocess),
+            "subprocess" => Ok(TransformKind::Subprocess),
             other => Err(serde::de::Error::custom(format!(
-                "unknown postprocess kind: {other}"
+                "unknown transform kind: {other}"
             ))),
         }
     }
 }
 
-impl Serialize for PostprocessKind {
+impl Serialize for TransformKind {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let s = match self {
-            PostprocessKind::Subprocess => "subprocess",
+            TransformKind::Subprocess => "subprocess",
         };
         s.serialize(serializer)
     }
@@ -42,8 +42,8 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PostprocessStepDefinition {
-    pub kind: PostprocessKind,
+pub struct TransformStepDefinition {
+    pub kind: TransformKind,
     pub program: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -53,7 +53,7 @@ pub struct PostprocessStepDefinition {
     pub keep_original: bool,
 }
 
-impl PostprocessStepDefinition {
+impl TransformStepDefinition {
     pub fn resolve_placeholders(&self, work_path: &Utf8Path, s: &str) -> String {
         let input = work_path.as_str();
         let parent = work_path.parent().map(|p| p.as_str()).unwrap_or("");

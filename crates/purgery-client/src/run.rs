@@ -690,9 +690,9 @@ pub(crate) fn run_sync_with_run_id(
     // path uses the same normalized operation_path and source_entry_name.
     let source_spec = classify::normalize_source(&args.source)?;
 
-    let has_postprocess = !args.postprocess.is_empty();
-    if has_postprocess && !args.delete_after_import {
-        anyhow::bail!("--delete-after-import is required when --postprocess is used");
+    let has_transform = !args.transform.is_empty();
+    if has_transform && !args.delete_after_import {
+        anyhow::bail!("--delete-after-import is required when --transform is used");
     }
 
     if let Some(ref _pattern) = args.split {
@@ -712,7 +712,7 @@ pub(crate) fn run_sync_with_run_id(
     );
 
     // Passthrough, no cleanup: direct rsync only
-    if !has_postprocess && !args.delete_after_import {
+    if !has_transform && !args.delete_after_import {
         info!("starting direct rsync");
         runner.run_rsync(
             &source_spec.operation_path,
@@ -723,7 +723,7 @@ pub(crate) fn run_sync_with_run_id(
         return Ok(());
     }
 
-    let manifest = classify::build_manifest(&source_spec, run_id, &nickname, &args.postprocess)?;
+    let manifest = classify::build_manifest(&source_spec, run_id, &nickname, &args.transform)?;
     let cleanup_state_path = if args.delete_after_import {
         let entries = classify::capture_cleanup_identity(&source_spec)?;
         if entries.is_empty() {
@@ -741,7 +741,7 @@ pub(crate) fn run_sync_with_run_id(
     };
 
     // Passthrough with cleanup: direct rsync + durable cleanup
-    if !has_postprocess {
+    if !has_transform {
         info!("starting direct rsync with durable cleanup");
         runner.run_rsync(
             &source_spec.operation_path,
@@ -756,7 +756,7 @@ pub(crate) fn run_sync_with_run_id(
         return Ok(());
     }
 
-    // Postprocess: server run flow with heartbeat and crash-safe persistence
+    // Transform: server run flow with heartbeat and crash-safe persistence
     let server_cmd = &args.server_command;
     let mut run_config = RunConfig {
         nickname: nickname.clone(),
@@ -901,7 +901,7 @@ pub(crate) fn run_sync_with_run_id(
 ///
 /// Pure passthrough split runs one rsync with constant filter rules derived
 /// from the pattern — no pre-discovery, no server run, no cleanup state.
-/// Cleanup/postprocess split uses Purgery discovery with ancestor pruning
+/// Cleanup/transform split uses Purgery discovery with ancestor pruning
 /// and serialized non-split operations.
 fn run_split(
     runner: &RemoteRunner,
@@ -913,10 +913,10 @@ fn run_split(
     let pattern = args.split.as_deref().unwrap();
     split::validate_split_pattern(pattern).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let has_postprocess = !args.postprocess.is_empty();
+    let has_transform = !args.transform.is_empty();
     let target = parse_destination(&args.destination)?;
 
-    if !has_postprocess && !args.delete_after_import {
+    if !has_transform && !args.delete_after_import {
         return run_passthrough_split(
             runner,
             &source_spec.operation_path,
@@ -939,7 +939,7 @@ fn run_split(
         let split_dest = format!("{}{}", base_dest, suffix);
         info!(source = %root.path, destination = %split_dest, "processing split entry");
         let split_args = SyncArgs {
-            postprocess: args.postprocess.clone(),
+            transform: args.transform.clone(),
             delete_after_import: args.delete_after_import,
             split: None,
             state_dir: Some(state_dir.to_owned()),
@@ -1081,11 +1081,11 @@ state = "done"
     }
 
     #[test]
-    fn postprocess_requires_delete_after_import() {
+    fn transform_requires_delete_after_import() {
         let tmp = tempdir().unwrap();
         let state_dir = mk_state_dir(&tmp);
         let args = SyncArgs {
-            postprocess: vec!["compress".to_string()],
+            transform: vec!["compress".to_string()],
             delete_after_import: false,
             split: None,
             state_dir: Some(state_dir),
@@ -1418,7 +1418,7 @@ state = "done"
         let tmp = tempdir().unwrap();
         let state_dir = mk_state_dir(&tmp);
         let runner = mk_runner();
-        let args = postprocess_args(&tmp, &state_dir);
+        let args = transform_args(&tmp, &state_dir);
         let run_id = RunId::new("test-run".into()).unwrap();
 
         let begin = begin_resp_toml().replace(
@@ -1464,9 +1464,9 @@ state = "done"
         src.to_string_lossy().to_string()
     }
 
-    fn postprocess_args(tmp: &tempfile::TempDir, state_dir: &str) -> SyncArgs {
+    fn transform_args(tmp: &tempfile::TempDir, state_dir: &str) -> SyncArgs {
         SyncArgs {
-            postprocess: vec!["transform".to_string()],
+            transform: vec!["transform".to_string()],
             delete_after_import: true,
             split: None,
             state_dir: Some(state_dir.to_owned()),
@@ -1481,7 +1481,7 @@ state = "done"
         let tmp = tempdir().unwrap();
         let state_dir = mk_state_dir(&tmp);
         let runner = mk_runner();
-        let args = postprocess_args(&tmp, &state_dir);
+        let args = transform_args(&tmp, &state_dir);
 
         runner.add_response("begin-run", &begin_resp_toml());
         runner.add_write_error("run.toml", "simulated write failure");
@@ -1499,7 +1499,7 @@ state = "done"
         let tmp = tempdir().unwrap();
         let state_dir = mk_state_dir(&tmp);
         let runner = mk_runner();
-        let args = postprocess_args(&tmp, &state_dir);
+        let args = transform_args(&tmp, &state_dir);
 
         runner.add_response("begin-run", &begin_resp_toml());
         runner.add_write_error("manifest.toml", "write failed");
@@ -1522,7 +1522,7 @@ state = "done"
         let tmp = tempdir().unwrap();
         let state_dir = mk_state_dir(&tmp);
         let runner = mk_runner();
-        let args = postprocess_args(&tmp, &state_dir);
+        let args = transform_args(&tmp, &state_dir);
 
         runner.add_response("begin-run", &begin_resp_toml());
         runner.add_response(
@@ -1544,7 +1544,7 @@ state = "done"
         let tmp = tempdir().unwrap();
         let state_dir = mk_state_dir(&tmp);
         let runner = mk_runner();
-        let args = postprocess_args(&tmp, &state_dir);
+        let args = transform_args(&tmp, &state_dir);
 
         runner.add_response("begin-run", &begin_resp_toml());
         runner.add_response(
@@ -1566,7 +1566,7 @@ state = "done"
         let tmp = tempdir().unwrap();
         let state_dir = mk_state_dir(&tmp);
         let runner = mk_runner();
-        let args = postprocess_args(&tmp, &state_dir);
+        let args = transform_args(&tmp, &state_dir);
 
         runner.add_response("begin-run", &begin_resp_toml());
         runner.add_write_error("run.toml", "write failed");
@@ -1586,7 +1586,7 @@ state = "done"
         let tmp = tempdir().unwrap();
         let state_dir = mk_state_dir(&tmp);
         let runner = mk_runner();
-        let args = postprocess_args(&tmp, &state_dir);
+        let args = transform_args(&tmp, &state_dir);
 
         runner.add_response("begin-run", &begin_resp_toml());
         runner.add_response(
@@ -1620,7 +1620,7 @@ state = "done"
         let tmp = tempdir().unwrap();
         let state_dir = mk_state_dir(&tmp);
         let runner = mk_runner();
-        let args = postprocess_args(&tmp, &state_dir);
+        let args = transform_args(&tmp, &state_dir);
 
         let begin = begin_resp_toml().replace(
             "heartbeat_interval_secs = 60",
@@ -1678,7 +1678,7 @@ state = "done"
         let tmp = tempdir().unwrap();
         let state_dir = mk_state_dir(&tmp);
         let runner = mk_runner();
-        let args = postprocess_args(&tmp, &state_dir);
+        let args = transform_args(&tmp, &state_dir);
         let run_id = RunId::new("test-run".into()).unwrap();
 
         let begin = begin_resp_toml().replace(
@@ -1767,7 +1767,7 @@ state = "done"
         let tmp = tempdir().unwrap();
         let state_dir = mk_state_dir(&tmp);
         let runner = mk_runner();
-        let args = postprocess_args(&tmp, &state_dir);
+        let args = transform_args(&tmp, &state_dir);
         let run_id = RunId::new("test-resolved-dest".into()).unwrap();
 
         let begin = begin_resp_toml().replace(
@@ -1820,7 +1820,7 @@ state = "done"
         // Use trailing slash to exercise normalization.
         let src_slash = format!("{}/", src.to_str().unwrap());
         let args = SyncArgs {
-            postprocess: vec![],
+            transform: vec![],
             delete_after_import: false,
             split: None,
             state_dir: Some(state_dir),
@@ -1856,7 +1856,7 @@ state = "done"
         fs::create_dir(&src).unwrap();
         let src_slash = format!("{}/", src.to_str().unwrap());
         let args = SyncArgs {
-            postprocess: vec![],
+            transform: vec![],
             delete_after_import: true,
             split: None,
             state_dir: Some(state_dir.clone()),
@@ -1883,7 +1883,7 @@ state = "done"
     }
 
     #[test]
-    fn postprocess_trailing_slash_stages_as_files_source_name() {
+    fn transform_trailing_slash_stages_as_files_source_name() {
         let tmp = tempdir().unwrap();
         let state_dir = mk_state_dir(&tmp);
         let runner = mk_runner();
@@ -1892,7 +1892,7 @@ state = "done"
         fs::write(src.join("a.mp4"), "data").unwrap();
         let src_slash = format!("{}/", src.to_str().unwrap());
         let args = SyncArgs {
-            postprocess: vec!["transform".to_string()],
+            transform: vec!["transform".to_string()],
             delete_after_import: true,
             split: None,
             state_dir: Some(state_dir.clone()),
@@ -1942,7 +1942,7 @@ state = "done"
             let tmp = tempdir().unwrap();
             let runner = mk_runner();
             let args = SyncArgs {
-                postprocess: vec![],
+                transform: vec![],
                 delete_after_import: false,
                 split: None,
                 state_dir: Some(mk_state_dir(&tmp)),
@@ -1962,7 +1962,7 @@ state = "done"
             let tmp = tempdir().unwrap();
             let runner = mk_runner();
             let args = SyncArgs {
-                postprocess: vec![],
+                transform: vec![],
                 delete_after_import: true,
                 split: None,
                 state_dir: Some(mk_state_dir(&tmp)),
@@ -1977,12 +1977,12 @@ state = "done"
             );
             assert!(result.unwrap_err().to_string().contains("root"));
         }
-        // Postprocess
+        // Transform
         {
             let tmp = tempdir().unwrap();
             let runner = mk_runner();
             let args = SyncArgs {
-                postprocess: vec!["transform".to_string()],
+                transform: vec!["transform".to_string()],
                 delete_after_import: true,
                 split: None,
                 state_dir: Some(mk_state_dir(&tmp)),
@@ -1991,7 +1991,7 @@ state = "done"
                 server_command: "purgery-server".to_string(),
             };
             let result = run_sync_with_runner(&runner, &args);
-            assert!(result.is_err(), "/ must be rejected in postprocess mode");
+            assert!(result.is_err(), "/ must be rejected in transform mode");
             assert!(result.unwrap_err().to_string().contains("root"));
         }
         // Split
@@ -1999,7 +1999,7 @@ state = "done"
             let tmp = tempdir().unwrap();
             let runner = mk_runner();
             let args = SyncArgs {
-                postprocess: vec![],
+                transform: vec![],
                 delete_after_import: false,
                 split: Some("*.mp4".to_string()),
                 state_dir: Some(mk_state_dir(&tmp)),
@@ -2026,7 +2026,7 @@ state = "done"
         fs::write(src.join("sub/c.mp4"), "mp4").unwrap();
 
         let args = SyncArgs {
-            postprocess: vec![],
+            transform: vec![],
             delete_after_import: false,
             split: Some("*.mp4".to_string()),
             state_dir: Some(state_dir),
@@ -2079,7 +2079,7 @@ state = "done"
         fs::write(src.join("a.mp4"), "data").unwrap();
 
         let args = SyncArgs {
-            postprocess: vec![],
+            transform: vec![],
             delete_after_import: false,
             split: Some("*.mp4".to_string()),
             state_dir: Some(state_dir.clone()),
@@ -2121,7 +2121,7 @@ state = "done"
         fs::write(src.join("a.mp4"), "data").unwrap();
 
         let args = SyncArgs {
-            postprocess: vec![],
+            transform: vec![],
             delete_after_import: false,
             split: Some(".".to_string()),
             state_dir: Some(state_dir),
@@ -2154,7 +2154,7 @@ state = "done"
         fs::write(src.join("b.txt"), "text").unwrap();
 
         let args = SyncArgs {
-            postprocess: vec![],
+            transform: vec![],
             delete_after_import: false,
             split: Some("*.mp4".to_string()),
             state_dir: Some(state_dir),
@@ -2195,7 +2195,7 @@ state = "done"
         fs::write(src.join("sub/c.mp4"), "nested-mp4").unwrap();
 
         let args = SyncArgs {
-            postprocess: vec![],
+            transform: vec![],
             delete_after_import: false,
             split: Some("*.mp4".to_string()),
             state_dir: Some(state_dir),
@@ -2224,7 +2224,7 @@ state = "done"
 
         for bad in &["", "/", "///"] {
             let args = SyncArgs {
-                postprocess: vec![],
+                transform: vec![],
                 delete_after_import: false,
                 split: Some(bad.to_string()),
                 state_dir: Some(state_dir.clone()),
@@ -2241,7 +2241,7 @@ state = "done"
     }
 
     #[test]
-    fn invalid_split_pattern_rejected_cleanup_postprocess() {
+    fn invalid_split_pattern_rejected_cleanup_transform() {
         let tmp = tempdir().unwrap();
         let state_dir = mk_state_dir(&tmp);
         let runner = mk_runner();
@@ -2249,10 +2249,10 @@ state = "done"
         fs::write(std::path::Path::new(&src).join("a.txt"), "data").unwrap();
 
         for bad in &["", "/", "///"] {
-            // Cleanup (delete without postprocess)
+            // Cleanup (delete without transform)
             {
                 let args = SyncArgs {
-                    postprocess: vec![],
+                    transform: vec![],
                     delete_after_import: true,
                     split: Some(bad.to_string()),
                     state_dir: Some(state_dir.clone()),
@@ -2266,10 +2266,10 @@ state = "done"
                     "split pattern \"{bad}\" must be rejected in cleanup mode"
                 );
             }
-            // Postprocess
+            // Transform
             {
                 let args = SyncArgs {
-                    postprocess: vec!["transform".to_string()],
+                    transform: vec!["transform".to_string()],
                     delete_after_import: true,
                     split: Some(bad.to_string()),
                     state_dir: Some(state_dir.clone()),
@@ -2280,7 +2280,7 @@ state = "done"
                 let result = run_sync_with_runner(&runner, &args);
                 assert!(
                     result.is_err(),
-                    "split pattern \"{bad}\" must be rejected in postprocess mode"
+                    "split pattern \"{bad}\" must be rejected in transform mode"
                 );
             }
         }
