@@ -35,7 +35,7 @@ Precedence: CLI flags > config file > default. The `RUST_LOG` environment variab
 purgery-server check --config server.toml
 ```
 
-Server checks: parse config, verify `work_dir` exists (but does not create it), resolve every transform `program`, validate step invariants.
+Server checks: parse config, verify `work_dir` exists (but does not create it), resolve every transform `program`, validate transform invariants.
 
 If server directories do not exist, `check` reports an error.
 

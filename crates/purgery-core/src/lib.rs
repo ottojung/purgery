@@ -723,6 +723,67 @@ covered_by = "Videos"
         assert!(result.is_err(), "covered_by field must be rejected");
     }
 
+    #[test]
+    fn manifest_rejects_old_transform_steps_field() {
+        let toml = r#"
+run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+nickname = "laptop"
+
+[[entries]]
+local_path = "/tmp/test.mp4"
+staged_path = "files/test.mp4"
+relative_path = "test.mp4"
+kind = "regular_file"
+transform_steps = ["compress-video"]
+"#;
+        let result = Manifest::from_toml(toml);
+        assert!(
+            result.is_err(),
+            "old transform_steps field must be rejected"
+        );
+    }
+
+    #[test]
+    fn manifest_accepts_new_transform_field() {
+        let toml = r#"
+run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+nickname = "laptop"
+
+[[entries]]
+local_path = "/tmp/test.mp4"
+staged_path = "files/test.mp4"
+relative_path = "test.mp4"
+kind = "regular_file"
+transform = "compress-video"
+"#;
+        let manifest = Manifest::from_toml(toml).unwrap();
+        assert_eq!(manifest.entries.len(), 1);
+        assert_eq!(
+            manifest.entries[0].transform,
+            Some("compress-video".to_owned())
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_transform_as_array() {
+        let toml = r#"
+run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+nickname = "laptop"
+
+[[entries]]
+local_path = "/tmp/test.mp4"
+staged_path = "files/test.mp4"
+relative_path = "test.mp4"
+kind = "regular_file"
+transform = ["compress-video", "another"]
+"#;
+        let result = Manifest::from_toml(toml);
+        assert!(
+            result.is_err(),
+            "transform field as array (multiple transforms) must be rejected"
+        );
+    }
+
     // ── Status tests ──
 
     #[test]
@@ -771,6 +832,48 @@ covered_by = "parent"
         assert!(
             result.is_err(),
             "unknown entry status field must be rejected"
+        );
+    }
+
+    #[test]
+    fn status_accepts_new_transform_field() {
+        let toml = r#"
+run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+nickname = "laptop"
+state = "done"
+
+[[entries]]
+local_path = "/tmp/video.mp4"
+relative_path = "video.mp4"
+status = "imported"
+final_paths = ["/archive/video.Z.webm"]
+transform = "compress-video"
+"#;
+        let status = RunStatus::from_toml(toml).unwrap();
+        assert_eq!(status.entries.len(), 1);
+        assert_eq!(
+            status.entries[0].transform,
+            Some("compress-video".to_owned())
+        );
+    }
+
+    #[test]
+    fn status_rejects_transform_as_array() {
+        let toml = r#"
+run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+nickname = "laptop"
+state = "done"
+
+[[entries]]
+local_path = "/tmp/video.mp4"
+relative_path = "video.mp4"
+status = "imported"
+transform = ["compress-video"]
+"#;
+        let result = RunStatus::from_toml(toml);
+        assert!(
+            result.is_err(),
+            "transform field as array must be rejected in status"
         );
     }
 
@@ -1450,5 +1553,134 @@ name = "archive"
 path = "/archive"
 "#;
         assert!(ServerConfig::from_toml(config).is_err());
+    }
+
+    #[test]
+    fn server_config_rejects_old_transform_steps_format() {
+        let config = r#"
+work_dir = "/var/lib/purgery/work"
+
+[transform.steps.compress-video]
+kind = "subprocess"
+program = "my-compress-video"
+args = ["--input", "{input}"]
+expected_outputs = ["{file_stem}.Z.webm"]
+keep_original = true
+"#;
+        assert!(
+            ServerConfig::from_toml(config).is_err(),
+            "old [transform.steps.<name>] format must be rejected"
+        );
+    }
+
+    #[test]
+    fn server_config_accepts_new_transform_format() {
+        let config = r#"
+work_dir = "/var/lib/purgery/work"
+
+[[transform]]
+name = "compress-video"
+kind = "subprocess"
+program = "my-compress-video"
+args = ["--input", "{input}", "--output-dir", "{target_directory}"]
+expected_outputs = ["{file_stem}.Z.webm"]
+keep_original = true
+"#;
+        let result = ServerConfig::from_toml(config);
+        assert!(
+            result.is_ok(),
+            "new [[transform]] format must be accepted, got: {:?}",
+            result.err()
+        );
+        let cfg = result.unwrap();
+        assert_eq!(cfg.transform.transforms.len(), 1);
+        assert_eq!(cfg.transform.transforms[0].name, "compress-video");
+        assert_eq!(cfg.transform.transforms[0].program, "my-compress-video");
+    }
+
+    #[test]
+    fn server_config_rejects_duplicate_transform_names() {
+        let config = r#"
+work_dir = "/var/lib/purgery/work"
+
+[[transform]]
+name = "compress-video"
+kind = "subprocess"
+program = "a"
+args = []
+expected_outputs = []
+
+[[transform]]
+name = "compress-video"
+kind = "subprocess"
+program = "b"
+args = []
+expected_outputs = []
+"#;
+        let result = ServerConfig::from_toml(config);
+        assert!(
+            result.is_err(),
+            "duplicate transform names must be rejected"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate"),
+            "error must mention duplicate, got: {err}"
+        );
+    }
+
+    #[test]
+    fn transform_definition_rejects_missing_name() {
+        let toml = r#"
+kind = "subprocess"
+program = "my-compress-video"
+expected_outputs = []
+"#;
+        let result: Result<TransformDefinition, _> = toml::from_str(toml);
+        assert!(result.is_err(), "missing 'name' field must be rejected");
+    }
+
+    // ── Terminology regression tests ──────────────────────────────
+
+    /// Verify that documentation does not describe transform sequences
+    /// using the old "step"/"steps" terminology.
+    #[test]
+    fn no_step_terminology_in_public_docs() {
+        let readme = include_str!("../../../README.md");
+        let config_md = include_str!("../../../docs/config.md");
+        let protocol_md = include_str!("../../../docs/protocol.md");
+        let docs = [
+            ("README.md", readme),
+            ("config.md", config_md),
+            ("protocol.md", protocol_md),
+        ];
+        let banned = ["transform_steps", "transform step", "transform steps"];
+        for (name, content) in &docs {
+            for term in &banned {
+                if content.contains(term) {
+                    panic!(
+                        "{name} contains banned term '{term}' — use singular transform terminology"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Verify that the example server.toml uses the new [[transform]] format.
+    #[test]
+    fn example_server_toml_uses_new_transform_format() {
+        let example = include_str!("../../../examples/server.toml");
+        assert!(
+            example.contains("[[transform]]"),
+            "examples/server.toml must use [[transform]] format"
+        );
+        assert!(
+            example.contains("name = "),
+            "examples/server.toml must include name field in transform definitions"
+        );
+        assert!(
+            !example.contains("[transform.steps"),
+            "examples/server.toml must not use old [transform.steps.xxx] format"
+        );
     }
 }
