@@ -61,9 +61,7 @@ keep_original = true
 
 ### Transform config
 
-| Field | Default | Description |
-|-------|---------|-------------|
-| `steps` | `[]` | List of named transform definitions |
+Transforms are defined as an array of tables using `[[transform]]`. Each named transform is a separate table entry.
 
 ## Transform definition
 

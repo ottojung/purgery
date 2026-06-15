@@ -38,51 +38,6 @@ pub struct ResolvedTransform {
     pub def: purgery_core::TransformDefinition,
 }
 
-/// A validated run plan: validated transform definitions from the server config.
-#[derive(Debug)]
-pub struct RunPlan {
-    transforms: std::collections::HashMap<String, purgery_core::TransformDefinition>,
-}
-
-impl RunPlan {
-    /// Build a run plan from server config.
-    ///
-    /// Validates all transform definitions in the server config. Returns an error
-    /// (suitable for run-level failure) if anything is invalid.
-    pub fn build(server_config: &ServerConfig) -> Result<Self, String> {
-        let mut transforms = std::collections::HashMap::new();
-        for td in &server_config.transform.transforms {
-            if td.program.is_empty() {
-                return Err(format!("transform '{}' has empty program", td.name));
-            }
-
-            for output in &td.expected_outputs {
-                purgery_core::validate_expected_output_name(output).map_err(|e| {
-                    format!("transform '{}': expected_output {output:?}: {e}", td.name)
-                })?;
-            }
-
-            if transforms.insert(td.name.clone(), td.clone()).is_some() {
-                return Err(format!("duplicate transform name: {}", td.name));
-            }
-        }
-
-        Ok(RunPlan { transforms })
-    }
-
-    /// Resolve a transform name to its ResolvedTransform.
-    pub fn resolve_transform(&self, name: &str) -> Result<ResolvedTransform, String> {
-        let def = self
-            .transforms
-            .get(name)
-            .ok_or_else(|| format!("transform '{name}' not defined on server"))?;
-        Ok(ResolvedTransform {
-            name: name.to_owned(),
-            def: def.clone(),
-        })
-    }
-}
-
 /// Process a ready run. Kept as the public single-run entry point.
 pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> Result<()> {
     process_ready_run(config, nickname, run_id)
@@ -131,9 +86,6 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
         anyhow::bail!("envelope validation failed: {e}");
     }
 
-    let run_plan =
-        RunPlan::build(config).map_err(|e| anyhow::anyhow!("run plan validation failed: {e}"))?;
-
     if manifest.entries.len() != 1 {
         anyhow::bail!(
             "server run manifest must contain exactly one entry, got {}",
@@ -148,14 +100,13 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
                 entry.relative_path.as_str(),
             );
         }
-        run_plan
-            .resolve_transform(entry.transform.as_deref().unwrap())
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "run plan validation failed for '{}': {error}",
-                    entry.relative_path.as_str()
-                )
-            })?;
+        let transform_name = entry.transform.as_deref().unwrap();
+        if !config.transforms.contains_key(transform_name) {
+            anyhow::bail!(
+                "run plan validation failed for '{}': transform '{transform_name}' not defined on server",
+                entry.relative_path.as_str()
+            );
+        }
     }
 
     // Resolve relative destination against server cwd.
@@ -522,7 +473,7 @@ pub fn server_check(config: &ServerConfig) -> Result<()> {
     }
     info!(path = %purgery_path.as_str(), "work_dir: OK");
 
-    for td in &config.transform.transforms {
+    for td in config.transforms.values() {
         let program = &td.program;
         if program.is_empty() {
             anyhow::bail!("transform '{}' has empty program", td.name);
@@ -634,31 +585,43 @@ mod tests {
     use crate::commit::commit_directory_tree;
     use camino::Utf8PathBuf;
     use purgery_core::{
-        ClientLocalPath, ManifestEntry, NormalizedRelativePath, TransformConfig,
-        TransformDefinition, TransformKind,
+        ClientLocalPath, ManifestEntry, NormalizedRelativePath, TransformDefinition, TransformKind,
     };
+    use std::collections::BTreeMap;
+
+    fn single_transform(
+        name: &str,
+        def: TransformDefinition,
+    ) -> BTreeMap<String, TransformDefinition> {
+        let mut m = BTreeMap::new();
+        m.insert(name.to_owned(), def);
+        m
+    }
 
     /// Call apply_transform with a no-op progress callback for testing.
     /// Resolves expected outputs against the work path's parent directory.
     fn test_apply_transform(
-        run_plan: &RunPlan,
+        server_config: &ServerConfig,
         work_path: &Utf8Path,
     ) -> Result<Vec<Utf8PathBuf>, String> {
         let target_directory = work_path.parent().unwrap_or(work_path).to_owned();
-        test_apply_transform_with_target(run_plan, work_path, &target_directory)
+        test_apply_transform_with_target(server_config, work_path, &target_directory)
     }
 
     fn test_apply_transform_with_target(
-        run_plan: &RunPlan,
+        server_config: &ServerConfig,
         work_path: &Utf8Path,
         target_directory: &Utf8Path,
     ) -> Result<Vec<Utf8PathBuf>, String> {
-        let (name, _) = run_plan
+        let (name, _) = server_config
             .transforms
             .iter()
             .next()
             .expect("test plan must have at least one transform");
-        let resolved = run_plan.resolve_transform(name).unwrap();
+        let resolved = ResolvedTransform {
+            name: name.clone(),
+            def: server_config.transforms[name].clone(),
+        };
         apply_transform(
             &resolved,
             work_path,
@@ -675,7 +638,7 @@ mod tests {
         ServerConfig {
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
-            transform: TransformConfig::default(),
+            transforms: BTreeMap::new(),
             logging: Default::default(),
         }
     }
@@ -1117,16 +1080,17 @@ delete_after_import = true
         let server_config = ServerConfig {
             work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
-            transform: TransformConfig {
-                transforms: vec![TransformDefinition {
+            transforms: single_transform(
+                "compress-video",
+                TransformDefinition {
                     name: "compress-video".into(),
                     kind: TransformKind::Subprocess,
                     program: "true".to_owned(),
                     args: vec![],
                     expected_outputs: vec![],
                     keep_original: true,
-                }],
-            },
+                },
+            ),
             logging: Default::default(),
         };
         let tmp = tempfile::tempdir().unwrap();
@@ -1134,8 +1098,7 @@ delete_after_import = true
         let work_path = work_area.join("some file.mp4");
         fs::write(&work_path, b"test data").unwrap();
 
-        let run_plan = RunPlan::build(&server_config).unwrap();
-        let results = test_apply_transform(&run_plan, &work_path);
+        let results = test_apply_transform(&server_config, &work_path);
         assert!(results.is_ok(), "transform with spaces should succeed");
         // empty expected_outputs means zero outputs — this is valid
         assert!(results.unwrap().is_empty());
@@ -1149,16 +1112,17 @@ delete_after_import = true
         let server_config = ServerConfig {
             work_dir: PurgeryRoot::new(work_dir.as_str().into()).unwrap(),
             gc: Default::default(),
-            transform: TransformConfig {
-                transforms: vec![TransformDefinition {
+            transforms: single_transform(
+                "compress-video",
+                TransformDefinition {
                     name: "compress-video".into(),
                     kind: TransformKind::Subprocess,
                     program: "false".to_owned(),
                     args: vec![],
                     expected_outputs: vec![],
                     keep_original: true,
-                }],
-            },
+                },
+            ),
             logging: Default::default(),
         };
 
@@ -1224,20 +1188,20 @@ delete_after_import = true
         let server_config = ServerConfig {
             work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
-            transform: TransformConfig {
-                transforms: vec![TransformDefinition {
+            transforms: single_transform(
+                "compress-video",
+                TransformDefinition {
                     name: "compress-video".into(),
                     kind: TransformKind::Subprocess,
                     program: "true".to_owned(),
                     args: vec![],
                     expected_outputs: vec![],
                     keep_original: true,
-                }],
-            },
+                },
+            ),
             logging: Default::default(),
         };
-        let pp_run_plan = RunPlan::build(&server_config).unwrap();
-        let result = test_apply_transform(&pp_run_plan, &work_path);
+        let result = test_apply_transform(&server_config, &work_path);
         assert!(result.is_ok());
         // empty expected_outputs means zero outputs
         assert!(result.unwrap().is_empty());
@@ -1256,20 +1220,20 @@ delete_after_import = true
         let server_config = ServerConfig {
             work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
-            transform: TransformConfig {
-                transforms: vec![TransformDefinition {
+            transforms: single_transform(
+                "compress-video",
+                TransformDefinition {
                     name: "compress-video".into(),
                     kind: TransformKind::Subprocess,
                     program: "true".to_owned(),
                     args: vec![],
                     expected_outputs: vec!["{stem}.Z.webm".into()],
                     keep_original: true,
-                }],
-            },
+                },
+            ),
             logging: Default::default(),
         };
-        let pp_run_plan = RunPlan::build(&server_config).unwrap();
-        let result = test_apply_transform(&pp_run_plan, &work_path);
+        let result = test_apply_transform(&server_config, &work_path);
         assert!(result.is_ok());
         let outputs = result.unwrap();
         assert_eq!(outputs.len(), 1);
@@ -1297,20 +1261,20 @@ delete_after_import = true
         let server_config = ServerConfig {
             work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
-            transform: TransformConfig {
-                transforms: vec![TransformDefinition {
+            transforms: single_transform(
+                "compress-video",
+                TransformDefinition {
                     name: "compress-video".into(),
                     kind: TransformKind::Subprocess,
                     program: "true".to_owned(),
                     args: vec![],
                     expected_outputs: vec!["{stem}.Z.webm".into()],
                     keep_original: false,
-                }],
-            },
+                },
+            ),
             logging: Default::default(),
         };
-        let pp_run_plan = RunPlan::build(&server_config).unwrap();
-        let result = test_apply_transform(&pp_run_plan, &work_path);
+        let result = test_apply_transform(&server_config, &work_path);
         assert!(result.is_ok());
         let outputs = result.unwrap();
         assert_eq!(outputs.len(), 1);
@@ -1684,16 +1648,17 @@ delete_after_import = true
         let server_config = ServerConfig {
             work_dir: PurgeryRoot::new(work_dir.as_str().into()).unwrap(),
             gc: Default::default(),
-            transform: TransformConfig {
-                transforms: vec![TransformDefinition {
+            transforms: single_transform(
+                "compress-video",
+                TransformDefinition {
                     name: "compress-video".into(),
                     kind: TransformKind::Subprocess,
                     program: "false".to_owned(),
                     args: vec![],
                     expected_outputs: vec![],
                     keep_original: true,
-                }],
-            },
+                },
+            ),
             logging: Default::default(),
         };
 
@@ -1770,8 +1735,9 @@ delete_after_import = true
         let server_config = ServerConfig {
             work_dir: PurgeryRoot::new(work_dir.as_str().into()).unwrap(),
             gc: Default::default(),
-            transform: TransformConfig {
-                transforms: vec![TransformDefinition {
+            transforms: single_transform(
+                "compress-video",
+                TransformDefinition {
                     name: "compress-video".into(),
                     kind: TransformKind::Subprocess,
                     program: script_path.to_string_lossy().to_string(),
@@ -1782,8 +1748,8 @@ delete_after_import = true
                     ],
                     expected_outputs: vec!["{stem}.Z.webm".into()],
                     keep_original: true,
-                }],
-            },
+                },
+            ),
             logging: Default::default(),
         };
 
@@ -1868,8 +1834,9 @@ delete_after_import = true
         let server_config = ServerConfig {
             work_dir: PurgeryRoot::new(work_dir.as_str().into()).unwrap(),
             gc: Default::default(),
-            transform: TransformConfig {
-                transforms: vec![TransformDefinition {
+            transforms: single_transform(
+                "compress-video",
+                TransformDefinition {
                     name: "compress-video".into(),
                     kind: TransformKind::Subprocess,
                     program: script_path.to_string_lossy().to_string(),
@@ -1880,8 +1847,8 @@ delete_after_import = true
                     ],
                     expected_outputs: vec!["{stem}.Z.webm".into()],
                     keep_original: false,
-                }],
-            },
+                },
+            ),
             logging: Default::default(),
         };
 
@@ -1954,7 +1921,7 @@ delete_after_import = true
             )
             .unwrap(),
             gc: Default::default(),
-            transform: TransformConfig::default(),
+            transforms: BTreeMap::new(),
             logging: Default::default(),
         };
         let nickname = Nickname::new("laptop".into()).unwrap();
@@ -1984,7 +1951,7 @@ delete_after_import = true
             )
             .unwrap(),
             gc: Default::default(),
-            transform: TransformConfig::default(),
+            transforms: BTreeMap::new(),
             logging: Default::default(),
         };
         let nickname = Nickname::new("laptop".into()).unwrap();
@@ -2040,7 +2007,7 @@ delete_after_import = true
             )
             .unwrap(),
             gc: Default::default(),
-            transform: TransformConfig::default(),
+            transforms: BTreeMap::new(),
             logging: Default::default(),
         };
         let nickname = Nickname::new("laptop".into()).unwrap();
@@ -2060,7 +2027,7 @@ delete_after_import = true
             )
             .unwrap(),
             gc: Default::default(),
-            transform: TransformConfig::default(),
+            transforms: BTreeMap::new(),
             logging: Default::default(),
         };
         let nickname = Nickname::new("laptop".into()).unwrap();
@@ -2096,7 +2063,7 @@ delete_after_import = true
             )
             .unwrap(),
             gc: Default::default(),
-            transform: TransformConfig::default(),
+            transforms: BTreeMap::new(),
             logging: Default::default(),
         };
         let nickname = Nickname::new("laptop".into()).unwrap();
@@ -2515,7 +2482,7 @@ delete_after_import = true
             )
             .unwrap(),
             gc: Default::default(),
-            transform: TransformConfig::default(),
+            transforms: BTreeMap::new(),
             logging: Default::default(),
         };
         let nickname = Nickname::new("laptop".into()).unwrap();
@@ -2775,20 +2742,23 @@ delete_after_import = true
         assert!(error.to_string().contains("status envelope mismatch"));
     }
 
-    fn expected_output_test_plan() -> RunPlan {
-        let mut transforms = std::collections::HashMap::new();
-        transforms.insert(
-            "generate".to_owned(),
-            TransformDefinition {
-                name: "generate".into(),
-                kind: TransformKind::Subprocess,
-                program: "true".into(),
-                args: vec![],
-                expected_outputs: vec!["{stem}.out".into()],
-                keep_original: false,
-            },
-        );
-        RunPlan { transforms }
+    fn expected_output_test_plan() -> ServerConfig {
+        ServerConfig {
+            work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
+            gc: Default::default(),
+            transforms: single_transform(
+                "generate",
+                TransformDefinition {
+                    name: "generate".into(),
+                    kind: TransformKind::Subprocess,
+                    program: "true".into(),
+                    args: vec![],
+                    expected_outputs: vec!["{stem}.out".into()],
+                    keep_original: false,
+                },
+            ),
+            logging: Default::default(),
+        }
     }
 
     #[test]
@@ -2880,14 +2850,17 @@ delete_after_import = true
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let mut config = test_server_config(&work_dir);
-        config.transform.transforms.push(TransformDefinition {
-            name: "test-step".into(),
-            kind: TransformKind::Subprocess,
-            program: "/bin/true".to_string(),
-            args: Vec::new(),
-            expected_outputs: Vec::new(),
-            keep_original: true,
-        });
+        config.transforms.insert(
+            "test-step".into(),
+            TransformDefinition {
+                name: "test-step".into(),
+                kind: TransformKind::Subprocess,
+                program: "/bin/true".to_string(),
+                args: Vec::new(),
+                expected_outputs: Vec::new(),
+                keep_original: true,
+            },
+        );
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-relative-dest".into()).unwrap();
         let incoming = config
@@ -2948,14 +2921,17 @@ delete_after_import = true
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let mut config = test_server_config(&work_dir);
-        config.transform.transforms.push(TransformDefinition {
-            name: "test-step".into(),
-            kind: TransformKind::Subprocess,
-            program: "/bin/true".to_string(),
-            args: Vec::new(),
-            expected_outputs: Vec::new(),
-            keep_original: true,
-        });
+        config.transforms.insert(
+            "test-step".into(),
+            TransformDefinition {
+                name: "test-step".into(),
+                kind: TransformKind::Subprocess,
+                program: "/bin/true".to_string(),
+                args: Vec::new(),
+                expected_outputs: Vec::new(),
+                keep_original: true,
+            },
+        );
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-absolute-dest".into()).unwrap();
         let incoming = config
@@ -3010,16 +2986,17 @@ delete_after_import = true
         let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
         let config = test_server_config(&work_dir);
         let config = ServerConfig {
-            transform: TransformConfig {
-                transforms: vec![TransformDefinition {
+            transforms: single_transform(
+                "pack",
+                TransformDefinition {
                     name: "pack".into(),
                     kind: TransformKind::Subprocess,
                     program: "true".into(),
                     args: vec![],
                     expected_outputs: vec![],
                     keep_original: true,
-                }],
-            },
+                },
+            ),
             ..config
         };
         let nickname = Nickname::new("laptop".into()).unwrap();
@@ -3113,19 +3090,19 @@ delete_after_import = true
         let server_config = ServerConfig {
             work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
-            transform: TransformConfig {
-                transforms: vec![TransformDefinition {
+            transforms: single_transform(
+                "compress",
+                TransformDefinition {
                     name: "compress".into(),
                     kind: TransformKind::Subprocess,
                     program: "true".into(),
                     args: vec![],
                     expected_outputs: vec!["{stem}.out".into()],
                     keep_original: false,
-                }],
-            },
+                },
+            ),
             logging: Default::default(),
         };
-        let run_plan = RunPlan::build(&server_config).unwrap();
 
         let captured = std::sync::Mutex::new(Vec::new());
         let mut callback = |update: &purgery_core::ProgressUpdate| {
@@ -3138,12 +3115,15 @@ delete_after_import = true
             ));
         };
 
-        let (name, _) = run_plan
+        let (name, _) = server_config
             .transforms
             .iter()
             .next()
             .expect("test plan must have at least one transform");
-        let resolved = run_plan.resolve_transform(name).unwrap();
+        let resolved = ResolvedTransform {
+            name: name.clone(),
+            def: server_config.transforms[name].clone(),
+        };
         apply_transform_with_heartbeat(
             &resolved,
             &work_path,
@@ -3280,19 +3260,19 @@ delete_after_import = true
         let server_config = ServerConfig {
             work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
-            transform: TransformConfig {
-                transforms: vec![TransformDefinition {
+            transforms: single_transform(
+                "compress",
+                TransformDefinition {
                     name: "compress".into(),
                     kind: TransformKind::Subprocess,
                     program: "true".into(),
                     args: vec![],
                     expected_outputs: vec!["{stem}.out".into()],
                     keep_original: false,
-                }],
-            },
+                },
+            ),
             logging: Default::default(),
         };
-        let run_plan = RunPlan::build(&server_config).unwrap();
 
         let captured = std::sync::Mutex::new(Vec::new());
         let mut callback = |update: &purgery_core::ProgressUpdate| {
@@ -3305,12 +3285,15 @@ delete_after_import = true
             ));
         };
 
-        let (name, _) = run_plan
+        let (name, _) = server_config
             .transforms
             .iter()
             .next()
             .expect("test plan must have at least one transform");
-        let resolved = run_plan.resolve_transform(name).unwrap();
+        let resolved = ResolvedTransform {
+            name: name.clone(),
+            def: server_config.transforms[name].clone(),
+        };
         apply_transform_with_heartbeat(
             &resolved,
             &work_path,
@@ -3380,19 +3363,19 @@ delete_after_import = true
         let server_config = ServerConfig {
             work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
-            transform: TransformConfig {
-                transforms: vec![TransformDefinition {
+            transforms: single_transform(
+                "compress",
+                TransformDefinition {
                     name: "compress".into(),
                     kind: TransformKind::Subprocess,
                     program: "true".into(),
                     args: vec![],
                     expected_outputs: vec!["{stem}.out".into()],
                     keep_original: false,
-                }],
-            },
+                },
+            ),
             logging: Default::default(),
         };
-        let run_plan = RunPlan::build(&server_config).unwrap();
 
         let captured = std::sync::Mutex::new(Vec::new());
         let mut callback = |update: &purgery_core::ProgressUpdate| {
@@ -3405,12 +3388,15 @@ delete_after_import = true
             ));
         };
 
-        let (name, _) = run_plan
+        let (name, _) = server_config
             .transforms
             .iter()
             .next()
             .expect("test plan must have at least one transform");
-        let resolved = run_plan.resolve_transform(name).unwrap();
+        let resolved = ResolvedTransform {
+            name: name.clone(),
+            def: server_config.transforms[name].clone(),
+        };
         apply_transform_with_heartbeat(
             &resolved,
             &work_path,
@@ -4249,16 +4235,17 @@ delete_after_import = true
         let config = ServerConfig {
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
-            transform: TransformConfig {
-                transforms: vec![TransformDefinition {
+            transforms: single_transform(
+                "always-fail",
+                TransformDefinition {
                     name: "always-fail".into(),
                     kind: TransformKind::Subprocess,
                     program: "false".to_owned(),
                     args: vec![],
                     expected_outputs: vec![],
                     keep_original: true,
-                }],
-            },
+                },
+            ),
             logging: Default::default(),
         };
 
@@ -4340,8 +4327,9 @@ delete_after_import = true
         let server_config = ServerConfig {
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
-            transform: TransformConfig {
-                transforms: vec![TransformDefinition {
+            transforms: single_transform(
+                "echo-args",
+                TransformDefinition {
                     name: "echo-args".into(),
                     kind: TransformKind::Subprocess,
                     program: "sh".to_owned(),
@@ -4352,8 +4340,8 @@ delete_after_import = true
                     ],
                     expected_outputs: vec!["_outputs".to_owned()],
                     keep_original: false,
-                }],
-            },
+                },
+            ),
             logging: Default::default(),
         };
 
@@ -4682,8 +4670,9 @@ delete_after_import = true
         let server_config = ServerConfig {
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
-            transform: TransformConfig {
-                transforms: vec![TransformDefinition {
+            transforms: single_transform(
+                "make-symlink",
+                TransformDefinition {
                     name: "make-symlink".into(),
                     kind: TransformKind::Subprocess,
                     program: "sh".to_owned(),
@@ -4694,8 +4683,8 @@ delete_after_import = true
                     ],
                     expected_outputs: vec!["the-link".to_owned()],
                     keep_original: false,
-                }],
-            },
+                },
+            ),
             logging: Default::default(),
         };
 
@@ -4969,8 +4958,9 @@ delete_after_import = true
         let server_config = ServerConfig {
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
-            transform: TransformConfig {
-                transforms: vec![TransformDefinition {
+            transforms: single_transform(
+                "make-tree",
+                TransformDefinition {
                     name: "make-tree".into(),
                     kind: TransformKind::Subprocess,
                     program: "sh".to_owned(),
@@ -4982,8 +4972,8 @@ delete_after_import = true
                     ],
                     expected_outputs: vec!["out".to_owned()],
                     keep_original: false,
-                }],
-            },
+                },
+            ),
             logging: Default::default(),
         };
 
@@ -5644,8 +5634,9 @@ delete_after_import = true
         let server_config = ServerConfig {
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
-            transform: TransformConfig {
-                transforms: vec![TransformDefinition {
+            transforms: single_transform(
+                "copy-cmd",
+                TransformDefinition {
                     name: "copy-cmd".into(),
                     kind: TransformKind::Subprocess,
                     program: "sh".to_owned(),
@@ -5656,8 +5647,8 @@ delete_after_import = true
                     ],
                     expected_outputs: vec!["{file_name}.out".to_owned()],
                     keep_original: false,
-                }],
-            },
+                },
+            ),
             logging: Default::default(),
         };
 
@@ -5768,8 +5759,9 @@ delete_after_import = true
         let server_config = ServerConfig {
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
-            transform: TransformConfig {
-                transforms: vec![TransformDefinition {
+            transforms: single_transform(
+                "copy-cmd",
+                TransformDefinition {
                     name: "copy-cmd".into(),
                     kind: TransformKind::Subprocess,
                     program: "sh".to_owned(),
@@ -5780,8 +5772,8 @@ delete_after_import = true
                     ],
                     expected_outputs: vec!["{file_name}.out".to_owned()],
                     keep_original: false,
-                }],
-            },
+                },
+            ),
             logging: Default::default(),
         };
 
@@ -5927,16 +5919,17 @@ delete_after_import = true
         let config = ServerConfig {
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
-            transform: TransformConfig {
-                transforms: vec![TransformDefinition {
+            transforms: single_transform(
+                "test-step",
+                TransformDefinition {
                     name: "test-step".into(),
                     kind: TransformKind::Subprocess,
                     program: "true".to_owned(),
                     args: vec![],
                     expected_outputs: vec![],
                     keep_original: true,
-                }],
-            },
+                },
+            ),
             logging: Default::default(),
         };
 
@@ -6001,16 +5994,17 @@ delete_after_import = true
         let config = ServerConfig {
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
-            transform: TransformConfig {
-                transforms: vec![TransformDefinition {
+            transforms: single_transform(
+                "test-step",
+                TransformDefinition {
                     name: "test-step".into(),
                     kind: TransformKind::Subprocess,
                     program: "true".to_owned(),
                     args: vec![],
                     expected_outputs: vec![],
                     keep_original: true,
-                }],
-            },
+                },
+            ),
             logging: Default::default(),
         };
 
@@ -6076,16 +6070,17 @@ delete_after_import = true
         let config = ServerConfig {
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
-            transform: TransformConfig {
-                transforms: vec![TransformDefinition {
+            transforms: single_transform(
+                "noop",
+                TransformDefinition {
                     name: "noop".into(),
                     kind: TransformKind::Subprocess,
                     program: "true".to_owned(),
                     args: vec![],
                     expected_outputs: vec![],
                     keep_original: true,
-                }],
-            },
+                },
+            ),
             logging: Default::default(),
         };
 
@@ -6161,8 +6156,9 @@ delete_after_import = true
         let config = ServerConfig {
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
-            transform: TransformConfig {
-                transforms: vec![TransformDefinition {
+            transforms: single_transform(
+                "place-at-dest",
+                TransformDefinition {
                     name: "place-at-dest".into(),
                     kind: TransformKind::Subprocess,
                     program: script_path.to_string_lossy().to_string(),
@@ -6174,8 +6170,8 @@ delete_after_import = true
                     ],
                     expected_outputs: vec!["result".into()],
                     keep_original: true,
-                }],
-            },
+                },
+            ),
             logging: Default::default(),
         };
 
@@ -6290,8 +6286,9 @@ delete_after_import = true
         let config = ServerConfig {
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
-            transform: TransformConfig {
-                transforms: vec![TransformDefinition {
+            transforms: single_transform(
+                "compress",
+                TransformDefinition {
                     name: "compress".into(),
                     kind: TransformKind::Subprocess,
                     program: script_path.to_string_lossy().to_string(),
@@ -6303,8 +6300,8 @@ delete_after_import = true
                     ],
                     expected_outputs: vec!["{stem}.Z.webm".into()],
                     keep_original: false,
-                }],
-            },
+                },
+            ),
             logging: Default::default(),
         };
 

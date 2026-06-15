@@ -3,17 +3,11 @@ use serde::{Deserialize, Serialize};
 
 // ── Transform Types ────────────────────────────────────────────────
 
-/// Server-side transform configuration.
+/// Server-side transform definition.
 ///
-/// Deserialised from `[[transform]]` array-of-tables. Duplicate `name`
-/// values are rejected during validation.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TransformConfig {
-    #[serde(default)]
-    pub transforms: Vec<TransformDefinition>,
-}
-
+/// Each instance represents a named transform that clients can request. Transform
+/// definitions are deserialised from `[[transform]]` array-of-tables in server config.
+/// Duplicate `name` values are rejected during config validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransformKind {
     Subprocess,

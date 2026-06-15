@@ -50,7 +50,7 @@ enum Command {
 
 #[derive(Parser)]
 struct SyncArgs {
-    /// Transform step to run on the server
+    /// Transform to run on the server
     #[arg(long = "transform", short = 'p')]
     transform: Option<String>,
 

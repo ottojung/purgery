@@ -37,6 +37,8 @@ pub enum ConfigError {
     Path(#[from] PathValidationError),
     #[error("invalid run ID: {0}")]
     RunId(#[from] RunIdError),
+    #[error("invalid config: {0}")]
+    Invalid(String),
 }
 
 #[derive(Error, Debug)]
@@ -1593,9 +1595,12 @@ keep_original = true
             result.err()
         );
         let cfg = result.unwrap();
-        assert_eq!(cfg.transform.transforms.len(), 1);
-        assert_eq!(cfg.transform.transforms[0].name, "compress-video");
-        assert_eq!(cfg.transform.transforms[0].program, "my-compress-video");
+        assert_eq!(cfg.transforms.len(), 1);
+        assert_eq!(cfg.transforms["compress-video"].name, "compress-video");
+        assert_eq!(
+            cfg.transforms["compress-video"].program,
+            "my-compress-video"
+        );
     }
 
     #[test]
@@ -1622,9 +1627,14 @@ expected_outputs = []
             result.is_err(),
             "duplicate transform names must be rejected"
         );
-        let err = result.unwrap_err().to_string();
+        let err = result.unwrap_err();
         assert!(
-            err.contains("duplicate"),
+            matches!(err, ConfigError::Invalid(_)),
+            "duplicate transform names must use Invalid variant, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("duplicate"),
             "error must mention duplicate, got: {err}"
         );
     }
@@ -1649,12 +1659,23 @@ expected_outputs = []
         let readme = include_str!("../../../README.md");
         let config_md = include_str!("../../../docs/config.md");
         let protocol_md = include_str!("../../../docs/protocol.md");
+        let operations_md = include_str!("../../../docs/operations.md");
+        let import_semantics_md = include_str!("../../../docs/design/import-semantics.md");
+        let crash_safety_md = include_str!("../../../docs/design/crash-safety-and-idempotence.md");
         let docs = [
             ("README.md", readme),
             ("config.md", config_md),
             ("protocol.md", protocol_md),
+            ("operations.md", operations_md),
+            ("import-semantics.md", import_semantics_md),
+            ("crash-safety-and-idempotence.md", crash_safety_md),
         ];
-        let banned = ["transform_steps", "transform step", "transform steps"];
+        let banned = [
+            "transform_steps",
+            "transform step",
+            "transform steps",
+            "[transform.steps",
+        ];
         for (name, content) in &docs {
             for term in &banned {
                 if content.contains(term) {
@@ -1663,6 +1684,13 @@ expected_outputs = []
                     );
                 }
             }
+        }
+        // config.md must not have a `| steps |` TOML config table row in the
+        // transform config section (which would mean the old array-of-steps model).
+        if config_md.contains("| `steps` |") {
+            panic!(
+                "docs/config.md contains '`steps`' config field — use [[transform]] array-of-tables instead"
+            );
         }
     }
 

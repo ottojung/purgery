@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use crate::path::*;
-use crate::transform::{TransformConfig, TransformDefinition};
+use crate::transform::TransformDefinition;
 use crate::ConfigError;
 
 // ── Lease / GC Config ────────────────────────────────────────────────
@@ -165,7 +165,7 @@ struct ServerConfigFile {
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub work_dir: PurgeryRoot,
-    pub transform: TransformConfig,
+    pub transforms: BTreeMap<String, TransformDefinition>,
     pub gc: GCConfig,
     pub logging: LoggingConfig,
 }
@@ -173,20 +173,19 @@ pub struct ServerConfig {
 impl ServerConfig {
     pub fn from_toml(input: &str) -> Result<Self, ConfigError> {
         let config: ServerConfigFile = toml::from_str(input)?;
-        let transforms = config.transform;
-        // Reject duplicate transform names.
-        let mut seen = HashSet::new();
-        for td in &transforms {
-            if !seen.insert(&td.name) {
-                return Err(ConfigError::TomlSerialize(format!(
+        let mut transforms: BTreeMap<String, TransformDefinition> = BTreeMap::new();
+        for td in config.transform {
+            if transforms.contains_key(&td.name) {
+                return Err(ConfigError::Invalid(format!(
                     "duplicate transform name: {}",
                     td.name
                 )));
             }
+            transforms.insert(td.name.clone(), td);
         }
         Ok(Self {
             work_dir: config.work_dir,
-            transform: TransformConfig { transforms },
+            transforms,
             gc: config.gc,
             logging: config.logging,
         })

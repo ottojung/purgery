@@ -15,7 +15,7 @@ use crate::phases::{
 };
 use crate::recover::recover_or_process_processing_run;
 use crate::transform::apply_transform;
-use crate::RunPlan;
+use crate::ResolvedTransform;
 
 pub(crate) enum EntryOutcome {
     Success {
@@ -165,7 +165,7 @@ fn failed_entry(entry: &ManifestEntry, error: impl Into<String>) -> EntryOutcome
 
 #[allow(clippy::too_many_arguments)]
 fn process_manifest_entry(
-    run_plan: &RunPlan,
+    config: &ServerConfig,
     entry: &ManifestEntry,
     nickname: &Nickname,
     run_id: &RunId,
@@ -277,9 +277,17 @@ fn process_manifest_entry(
         );
     };
     let transform_name = entry.transform.as_deref().unwrap();
-    let resolved = match run_plan.resolve_transform(transform_name) {
-        Ok(r) => r,
-        Err(error) => return failed_entry(entry, error),
+    let resolved = match config.transforms.get(transform_name) {
+        Some(def) => ResolvedTransform {
+            name: transform_name.to_owned(),
+            def: def.clone(),
+        },
+        None => {
+            return failed_entry(
+                entry,
+                format!("transform '{transform_name}' not defined on server"),
+            )
+        }
     };
     match apply_transform(
         &resolved,
@@ -378,16 +386,6 @@ pub fn process_processing_run(
         }
     };
 
-    let run_plan = match RunPlan::build(config) {
-        Ok(plan) => plan,
-        Err(error) => {
-            let msg = format!("run plan validation failed: {error}");
-            warn!("{}", msg);
-            write_run_failure(&config.work_dir, nickname, run_id, &msg)?;
-            anyhow::bail!("{msg}");
-        }
-    };
-
     let manifest_path = processing_path.join("manifest.toml");
     let manifest_content = match fs::read_to_string(&manifest_path) {
         Ok(content) => content,
@@ -445,7 +443,7 @@ pub fn process_processing_run(
         );
 
         outcomes.push(process_manifest_entry(
-            &run_plan,
+            config,
             entry,
             nickname,
             run_id,
