@@ -66,10 +66,13 @@ impl TransformStepDefinition {
             .replace("{stem}", file_stem)
     }
 
-    pub fn build_args(&self, work_path: &Utf8Path) -> Vec<String> {
+    pub fn build_args(&self, work_path: &Utf8Path, final_destination: &Utf8Path) -> Vec<String> {
         self.args
             .iter()
-            .map(|a| self.resolve_placeholders(work_path, a))
+            .map(|a| {
+                self.resolve_placeholders(work_path, a)
+                    .replace("{final_destination}", final_destination.as_str())
+            })
             .collect()
     }
 

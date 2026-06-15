@@ -12,6 +12,7 @@ const DEFAULT_HEARTBEAT_SECS: u64 = 5;
 pub fn apply_transforms(
     steps: &[ResolvedStep],
     work_path: &Utf8Path,
+    final_destination: &Utf8Path,
     progress_step: &mut dyn FnMut(&purgery_core::ProgressUpdate),
     entry_index: usize,
     entry_total: usize,
@@ -20,6 +21,7 @@ pub fn apply_transforms(
     apply_transforms_with_heartbeat(
         steps,
         work_path,
+        final_destination,
         std::time::Duration::from_secs(DEFAULT_HEARTBEAT_SECS),
         progress_step,
         entry_index,
@@ -32,6 +34,7 @@ pub fn apply_transforms(
 pub fn apply_transforms_with_heartbeat(
     steps: &[ResolvedStep],
     work_path: &Utf8Path,
+    final_destination: &Utf8Path,
     heartbeat_interval: std::time::Duration,
     progress_step: &mut dyn FnMut(&purgery_core::ProgressUpdate),
     entry_index: usize,
@@ -49,7 +52,7 @@ pub fn apply_transforms_with_heartbeat(
 
         match step_def.kind {
             purgery_core::TransformKind::Subprocess => {
-                let args = step_def.build_args(work_path);
+                let args = step_def.build_args(work_path, final_destination);
                 info!(step = %step.step_name, program = %step_def.program, "running transform step");
                 progress_step(&purgery_core::ProgressUpdate::new(
                     "step_started",

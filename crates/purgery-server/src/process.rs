@@ -273,9 +273,11 @@ fn process_manifest_entry(
         Ok(s) => s,
         Err(error) => return failed_entry(entry, error),
     };
+    let final_destination = final_path.clone();
     match apply_transforms(
         &resolved_steps,
         &work_path,
+        &final_destination,
         &mut pp_helper,
         entry_index,
         entry_total,
@@ -285,21 +287,16 @@ fn process_manifest_entry(
             let mut final_paths = Vec::new();
             for output in outputs {
                 let output_final = if output == work_path {
-                    final_path.clone()
+                    final_destination.clone()
                 } else {
                     let filename = output.file_name().unwrap_or("");
-                    final_path.parent().map_or_else(
+                    final_destination.parent().map_or_else(
                         || Utf8PathBuf::from(filename),
                         |parent| parent.join(filename),
                     )
                 };
                 if !path_is_within_root(&output_final, destination_root) {
                     return failed_entry(entry, "output escapes root");
-                }
-                if let Err(error) =
-                    commit_output_entry(&output, &output_final, destination_root, run_id)
-                {
-                    return failed_entry(entry, format!("commit failed: {error}"));
                 }
                 let output_relative = if output == work_path {
                     entry.relative_path.clone()

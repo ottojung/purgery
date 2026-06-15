@@ -981,7 +981,10 @@ unknown_field = "value"
             expected_outputs: vec![],
             keep_original: true,
         };
-        let built = step.build_args(camino::Utf8Path::new("/tmp/work/file.mp4"));
+        let built = step.build_args(
+            camino::Utf8Path::new("/tmp/work/file.mp4"),
+            camino::Utf8Path::new("/dest/file.mp4"),
+        );
         // build_args must resolve placeholders but not reorder or reject the argv
         assert_eq!(built.len(), 2, "argv length must be preserved");
         assert_eq!(built[0], "--input", "first arg must be unchanged");
@@ -1001,7 +1004,10 @@ unknown_field = "value"
             expected_outputs: vec![],
             keep_original: true,
         };
-        let built = step.build_args(camino::Utf8Path::new("/tmp/work/file.mp4"));
+        let built = step.build_args(
+            camino::Utf8Path::new("/tmp/work/file.mp4"),
+            camino::Utf8Path::new("/dest/file.mp4"),
+        );
         assert!(
             built.iter().any(|a| a.contains("/tmp/work")),
             "build_args must resolve placeholders, not reject them"
@@ -1133,7 +1139,7 @@ unknown_field = "value"
             keep_original: true,
         };
         let work_path = Utf8Path::new("/work/videos/video.mp4");
-        let args = step.build_args(work_path);
+        let args = step.build_args(work_path, Utf8Path::new("/dest/video.mp4"));
         assert_eq!(args, vec!["--input", "/work/videos/video.mp4"]);
     }
 
@@ -1162,7 +1168,8 @@ unknown_field = "value"
             keep_original: false,
         };
         let work_path = Utf8Path::new("/work/videos/video.mp4");
-        let args = step.build_args(work_path);
+        let final_dest = Utf8Path::new("/dest/video.mp4");
+        let args = step.build_args(work_path, final_dest);
         assert_eq!(args, vec!["--output-dir", "/work/videos"]);
     }
 

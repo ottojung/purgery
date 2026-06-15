@@ -659,6 +659,14 @@ mod tests {
         run_plan: &RunPlan,
         work_path: &Utf8Path,
     ) -> Result<Vec<Utf8PathBuf>, String> {
+        test_apply_transforms_with_dest(run_plan, work_path, work_path)
+    }
+
+    fn test_apply_transforms_with_dest(
+        run_plan: &RunPlan,
+        work_path: &Utf8Path,
+        final_destination: &Utf8Path,
+    ) -> Result<Vec<Utf8PathBuf>, String> {
         let all_steps: Vec<ResolvedStep> = run_plan
             .steps
             .iter()
@@ -670,6 +678,7 @@ mod tests {
         apply_transforms(
             &all_steps,
             work_path,
+            final_destination,
             &mut |_: &purgery_core::ProgressUpdate| {},
             0,
             1,
@@ -1872,8 +1881,14 @@ delete_after_import = true
             test_storage_root(server_config.work_dir.as_path()).join("univ/videos/video.mp4");
         let compressed_final =
             test_storage_root(server_config.work_dir.as_path()).join("univ/videos/video.Z.webm");
-        assert!(original_final.exists());
-        assert!(compressed_final.exists());
+        assert!(
+            !original_final.exists(),
+            "transform outputs are not moved to final destination"
+        );
+        assert!(
+            !compressed_final.exists(),
+            "transform outputs are not moved to final destination"
+        );
     }
 
     #[test]
@@ -1965,7 +1980,10 @@ delete_after_import = true
             !original_final.exists(),
             "original must NOT exist with keep_original=false"
         );
-        assert!(compressed_final.exists());
+        assert!(
+            !compressed_final.exists(),
+            "transform outputs are not moved to final destination"
+        );
     }
 
     // ── begin_run / finish_run tests ──
@@ -3193,6 +3211,7 @@ delete_after_import = true
         apply_transforms_with_heartbeat(
             &all_steps,
             &work_path,
+            &work_path,
             std::time::Duration::from_millis(1),
             &mut callback,
             0,
@@ -3367,6 +3386,7 @@ delete_after_import = true
         apply_transforms_with_heartbeat(
             &all_steps,
             &work_path,
+            &work_path,
             std::time::Duration::from_millis(1),
             &mut callback,
             0,
@@ -3470,6 +3490,7 @@ delete_after_import = true
             .collect();
         apply_transforms_with_heartbeat(
             &all_steps,
+            &work_path,
             &work_path,
             std::time::Duration::from_millis(1),
             &mut callback,
@@ -5765,16 +5786,13 @@ delete_after_import = true
 
         let final_output =
             test_storage_root(server_config.work_dir.as_path()).join("univ/data/input.bin.out");
-        assert!(final_output.exists());
-        assert_eq!(fs::read_to_string(&final_output).unwrap(), "binary data");
+        assert!(
+            !final_output.exists(),
+            "transform outputs are not moved to final destination"
+        );
 
         let expected = vec![
-            server_config.work_dir.as_path().join("univ"),
             test_storage_root(server_config.work_dir.as_path()).join("univ/data"),
-            server_config
-                .work_dir
-                .as_path()
-                .join("univ/data/input.bin.out"),
             server_config.work_dir.as_path().join("laptop"),
             server_config.work_dir.as_path().join("laptop/done"),
             server_config
@@ -6048,8 +6066,10 @@ delete_after_import = true
         assert_eq!(status.entries[0].status, FileStatus::Imported);
 
         let final_path = test_storage_root(config.work_dir.as_path()).join("univ/data/the-link");
-        let target = std::fs::read_link(final_path.as_std_path()).unwrap();
-        assert_eq!(target, std::path::Path::new("/some/target"));
+        assert!(
+            !final_path.exists(),
+            "transform outputs are not moved to final destination"
+        );
     }
 
     #[test]
@@ -6128,7 +6148,328 @@ delete_after_import = true
         assert_eq!(status.entries[0].status, FileStatus::Imported);
 
         let final_dir = test_storage_root(config.work_dir.as_path()).join("univ/data/photos");
-        assert!(final_dir.as_std_path().is_dir());
-        assert!(final_dir.join("photo1.jpg").as_std_path().exists());
+        assert!(
+            !final_dir.exists(),
+            "transform outputs are not moved to final destination"
+        );
+    }
+
+    // ── No-commit (skip move) tests for transformed entries ──
+
+    #[test]
+    fn transform_records_final_paths_without_committing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+
+        let config = ServerConfig {
+            work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
+            gc: Default::default(),
+            transform: TransformConfig {
+                steps: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "noop".to_owned(),
+                        TransformStepDefinition {
+                            kind: TransformKind::Subprocess,
+                            program: "true".to_owned(),
+                            args: vec![],
+                            expected_outputs: vec![],
+                            keep_original: true,
+                        },
+                    );
+                    m
+                },
+            },
+            logging: Default::default(),
+        };
+
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("test-no-commit".into()).unwrap();
+
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
+        fs::create_dir_all(ready_path.join("files")).unwrap();
+        fs::write(ready_path.join("files/data.bin"), b"payload").unwrap();
+        write_run_toml_with_destination(&ready_path, &nickname, "univ/output");
+
+        let manifest = Manifest {
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![ManifestEntry {
+                local_path: ClientLocalPath::new("/home/user/data.bin".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/data.bin".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("data.bin".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
+                size: 7,
+                mtime_ns: 1000000,
+                sha256: None,
+                link_target: None,
+                transform_steps: vec!["noop".into()],
+            }],
+        };
+        fs::write(
+            ready_path.join("manifest.toml"),
+            manifest.to_toml().unwrap(),
+        )
+        .unwrap();
+
+        process_run(&config, &nickname, &run_id).unwrap();
+
+        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
+        let status_content = fs::read_to_string(done_path.join("status.toml")).unwrap();
+        let status = RunStatus::from_toml(&status_content).unwrap();
+        assert_eq!(status.state, RunState::Done);
+        assert_eq!(status.entries[0].status, FileStatus::Imported);
+        assert_eq!(status.entries[0].final_paths.len(), 1);
+
+        let expected_final =
+            test_storage_root(config.work_dir.as_path()).join("univ/output/data.bin");
+        assert!(
+            status.entries[0]
+                .final_paths
+                .contains(&expected_final.as_str().to_owned()),
+            "final_paths must record the expected destination path"
+        );
+        assert!(
+            !expected_final.exists(),
+            "transformed entry output must not be committed to final destination"
+        );
+    }
+
+    #[test]
+    fn final_destination_placeholder_resolves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+
+        let script_path = tmp.path().join("dst-script.sh");
+        std::fs::write(
+            &script_path,
+            "#!/bin/sh\n# args: --input {input} --output {final_destination}\n\
+             mkdir -p \"$(dirname \"$4\")\"\n\
+             touch \"$4\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &script_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
+        let config = ServerConfig {
+            work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
+            gc: Default::default(),
+            transform: TransformConfig {
+                steps: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "place-at-dest".to_owned(),
+                        TransformStepDefinition {
+                            kind: TransformKind::Subprocess,
+                            program: script_path.to_string_lossy().to_string(),
+                            args: vec![
+                                "--input".into(),
+                                "{input}".into(),
+                                "--output".into(),
+                                "{final_destination}".into(),
+                            ],
+                            expected_outputs: vec![],
+                            keep_original: true,
+                        },
+                    );
+                    m
+                },
+            },
+            logging: Default::default(),
+        };
+
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("test-final-dest".into()).unwrap();
+
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
+        fs::create_dir_all(ready_path.join("files")).unwrap();
+        fs::write(ready_path.join("files/data.bin"), b"payload").unwrap();
+        write_run_toml_with_destination(&ready_path, &nickname, "univ/output");
+
+        let manifest = Manifest {
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![ManifestEntry {
+                local_path: ClientLocalPath::new("/home/user/data.bin".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/data.bin".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("data.bin".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
+                size: 7,
+                mtime_ns: 1000000,
+                sha256: None,
+                link_target: None,
+                transform_steps: vec!["place-at-dest".into()],
+            }],
+        };
+        fs::write(
+            ready_path.join("manifest.toml"),
+            manifest.to_toml().unwrap(),
+        )
+        .unwrap();
+
+        process_run(&config, &nickname, &run_id).unwrap();
+
+        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
+        let status_content = fs::read_to_string(done_path.join("status.toml")).unwrap();
+        let status = RunStatus::from_toml(&status_content).unwrap();
+        assert_eq!(status.state, RunState::Done);
+        assert_eq!(status.entries[0].status, FileStatus::Imported);
+        assert_eq!(status.entries[0].final_paths.len(), 1);
+
+        let expected_final =
+            test_storage_root(config.work_dir.as_path()).join("univ/output/data.bin");
+        assert!(
+            status.entries[0]
+                .final_paths
+                .contains(&expected_final.as_str().to_owned()),
+            "final_paths must record the destination path"
+        );
+        assert!(
+            expected_final.exists(),
+            "script using {{final_destination}} must place output at final destination"
+        );
+    }
+
+    #[test]
+    fn non_transform_entry_still_commits_to_final_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("test-idemp-commit".into()).unwrap();
+
+        let (config, _) = setup_single_file_ready(
+            &work_dir,
+            &nickname,
+            &run_id,
+            "univ/output",
+            "plain.txt",
+            b"plain content",
+        );
+
+        process_run(&config, &nickname, &run_id).unwrap();
+
+        let final_path = test_storage_root(config.work_dir.as_path()).join("univ/output/plain.txt");
+        assert!(
+            final_path.exists(),
+            "non-transform entry must still be committed to final destination"
+        );
+        assert_eq!(fs::read_to_string(&final_path).unwrap(), "plain content");
+
+        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
+        let status_content = fs::read_to_string(done_path.join("status.toml")).unwrap();
+        let status = RunStatus::from_toml(&status_content).unwrap();
+        assert_eq!(status.state, RunState::Done);
+        assert_eq!(status.entries[0].status, FileStatus::Imported);
+    }
+
+    #[test]
+    fn transform_with_final_destination_and_expected_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+
+        let script_path = tmp.path().join("compress-dst.sh");
+        std::fs::write(
+            &script_path,
+            "#!/bin/sh\n# args: --input {input} --output {final_destination} --parent {parent}\n\
+             input=\"$2\"\n\
+             output=\"$4\"\n\
+             parent=\"$6\"\n\
+             stem=$(basename \"$output\" | sed 's/\\.[^.]*$//')\n\
+             # expected output must exist in work parent for validation\n\
+             touch \"$parent/${stem}.Z.webm\"\n\
+             # place the compressed output at final destination\n\
+             mkdir -p \"$(dirname \"$output\")\"\n\
+             cp \"$parent/${stem}.Z.webm\" \"$(dirname \"$output\")/${stem}.Z.webm\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &script_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
+        let config = ServerConfig {
+            work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
+            gc: Default::default(),
+            transform: TransformConfig {
+                steps: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "compress".to_owned(),
+                        TransformStepDefinition {
+                            kind: TransformKind::Subprocess,
+                            program: script_path.to_string_lossy().to_string(),
+                            args: vec![
+                                "--input".into(),
+                                "{input}".into(),
+                                "--output".into(),
+                                "{final_destination}".into(),
+                                "--parent".into(),
+                                "{parent}".into(),
+                            ],
+                            expected_outputs: vec!["{stem}.Z.webm".into()],
+                            keep_original: false,
+                        },
+                    );
+                    m
+                },
+            },
+            logging: Default::default(),
+        };
+
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("test-pp-dst-out".into()).unwrap();
+
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
+        fs::create_dir_all(ready_path.join("files")).unwrap();
+        fs::write(ready_path.join("files/video.mp4"), b"video").unwrap();
+        write_run_toml_with_destination(&ready_path, &nickname, "univ/videos");
+
+        let manifest = Manifest {
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![ManifestEntry {
+                local_path: ClientLocalPath::new("/home/user/Videos/video.mp4".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/video.mp4".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("video.mp4".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
+                size: 5,
+                mtime_ns: 1000000,
+                sha256: None,
+                link_target: None,
+                transform_steps: vec!["compress".into()],
+            }],
+        };
+        fs::write(
+            ready_path.join("manifest.toml"),
+            manifest.to_toml().unwrap(),
+        )
+        .unwrap();
+
+        process_run(&config, &nickname, &run_id).unwrap();
+
+        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
+        let status_content = fs::read_to_string(done_path.join("status.toml")).unwrap();
+        let status = RunStatus::from_toml(&status_content).unwrap();
+        assert_eq!(status.state, RunState::Done);
+        assert_eq!(status.entries[0].status, FileStatus::Imported);
+        assert_eq!(status.entries[0].final_paths.len(), 1);
+
+        let original_final =
+            test_storage_root(config.work_dir.as_path()).join("univ/videos/video.mp4");
+        let compressed_final =
+            test_storage_root(config.work_dir.as_path()).join("univ/videos/video.Z.webm");
+        assert!(
+            !original_final.exists(),
+            "keep_original=false: original must not be moved"
+        );
+        assert!(
+            compressed_final.exists(),
+            "script using {{final_destination}} placed compressed output at destination"
+        );
     }
 }
