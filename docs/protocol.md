@@ -15,14 +15,14 @@ client: if --delete-after-import, mark the transfer successful and remove only u
 
 ### Path B: Transform (with --transform)
 
-Server runs are transform-only. Every manifest entry must have non-empty `transform_steps`.
+Server runs are transform-only. Every manifest entry must have a transform.
 
 ```
 client: validate args (--transform requires --delete-after-import)
 client: generate run ID
 client: begin-run over SSH -> server creates incoming directory, returns paths
 client: write run.toml + manifest.toml to server incoming dir
-client: prepare-run over SSH -> server validates the destination, envelope, and requested steps
+client: prepare-run over SSH -> server validates the destination, envelope, and requested transform
 client: rsync source entry to server staging area (files/<source-name>)
 client: persist local run state as upload_complete_finish_pending
 client: finish-run over SSH -> server moves incoming -> ready
@@ -119,7 +119,7 @@ Source trailing slashes, `.`, and `..` are normalized before split discovery. `<
 | Command | Side effects | Returns |
 |---------|-------------|---------|
 | `begin-run --nickname N --run-id R` | Creates `incoming/R/` with lease, files/ dir | `BeginRunResponse` TOML |
-| `prepare-run --nickname N --run-id R` | Validates destination, manifest envelope, and requested steps | `PrepareRunResponse` TOML |
+| `prepare-run --nickname N --run-id R` | Validates destination, manifest envelope, and requested transform | `PrepareRunResponse` TOML |
 | `finish-run --nickname N --run-id R` | Moves run from incoming to ready | (none) |
 | `heartbeat-run --nickname N --run-id R` | Extends incoming lease | (none) |
 | `run-state --nickname N --run-id R` | None | `RunStateResponse` TOML |
@@ -164,7 +164,7 @@ The `destination` field is the target parent directory. It may be absolute or re
 
 The source entry base final path is `<destination>/<source_entry_name>`. `{target_directory}` is `<destination>` (the parent of the base final path).
 
-Transform programs are responsible for placing outputs into `{target_directory}`. Purgery does not move or commit transform outputs. After each step exits successfully, Purgery checks that each declared expected output exists in `{target_directory}`.
+Transform programs are responsible for placing outputs into `{target_directory}`. Purgery does not move or commit transform outputs. After the transform exits successfully, Purgery checks that each declared expected output exists in `{target_directory}`.
 
 For non-transform entries, the server commits the work entry directly to the base final path.
 
@@ -186,7 +186,7 @@ kind = "regular_file"
 size = 1048576
 mtime_ns = 1700000000000000000
 sha256 = "abc123..."
-transform_steps = ["compress-video"]
+transform = "compress-video"
 ```
 
 For a directory source:
@@ -197,11 +197,11 @@ local_path = "/home/user/Videos"
 staged_path = "files/Videos"
 relative_path = "Videos"
 kind = "directory"
-transform_steps = ["compress-video"]
+transform = "compress-video"
 ```
 
 - `staged_path` uses the format `files/<source-name>`.
-- Non-empty `transform_steps` is required.
+- A non-empty `transform` field is required.
 - The manifest contains exactly one entry for a non-split run.
 
 ## Status (status.toml)
@@ -216,7 +216,7 @@ local_path = "/home/user/video.mp4"
 relative_path = "video.mp4"
 status = "imported"
 final_paths = ["/archive/video.Z.webm"]
-transform = ["compress-video"]
+transform = "compress-video"
 ```
 
 ### Final path computation
@@ -225,7 +225,7 @@ The source entry base final path is `<destination>/<source_entry_name>`. `{targe
 
 For non-transform entries, the server commits the work entry to the base final path.
 
-For transform entries, `final_paths` in the status records the resolved expected output paths that were checked (i.e., the paths under `{target_directory}` whose existence Purgery confirmed after the transform step). If `expected_outputs = []`, no paths are checked and `final_paths` is empty. Purgery does not move or commit transform outputs; it only checks that declared expected outputs exist.
+For transform entries, `final_paths` in the status records the resolved expected output paths that were checked (i.e., the paths under `{target_directory}` whose existence Purgery confirmed after the transform). If `expected_outputs = []`, no paths are checked and `final_paths` is empty. Purgery does not move or commit transform outputs; it only checks that declared expected outputs exist.
 
 Examples:
 

@@ -3,11 +3,15 @@ use serde::{Deserialize, Serialize};
 
 // ── Transform Types ────────────────────────────────────────────────
 
+/// Server-side transform configuration.
+///
+/// Deserialised from `[[transform]]` array-of-tables. Duplicate `name`
+/// values are rejected during validation.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TransformConfig {
     #[serde(default)]
-    pub steps: std::collections::BTreeMap<String, TransformStepDefinition>,
+    pub transforms: Vec<TransformDefinition>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,7 +46,9 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct TransformStepDefinition {
+pub struct TransformDefinition {
+    /// Unique name for this transform, used as the key for client requests.
+    pub name: String,
     pub kind: TransformKind,
     pub program: String,
     #[serde(default)]
@@ -52,7 +58,7 @@ pub struct TransformStepDefinition {
     pub keep_original: bool,
 }
 
-impl TransformStepDefinition {
+impl TransformDefinition {
     pub fn resolve_placeholders(&self, work_path: &Utf8Path, s: &str) -> String {
         let input = work_path.as_str();
         let parent = work_path.parent().map(|p| p.as_str()).unwrap_or("");

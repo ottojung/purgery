@@ -64,17 +64,18 @@ Minimal server config (`server.toml`):
 work_dir = "/var/lib/purgery/work"
 ```
 
-Server config contains only server-owned concerns: work directory, transform step definitions, GC settings, and logging.
+Server config contains only server-owned concerns: work directory, transform definitions, GC settings, and logging.
 
 Full config reference: [docs/config.md](docs/config.md)
 
 ## Transforms (transforming)
 
-Transformations are defined on the server. Clients request named steps via the `--transform` flag. Transforming applies to the source entry itself, regardless of kind. A directory source is passed as a single work path; its contents are available to the subprocess but the operation is one logical entry.
+Transformations are defined on the server. Clients request a named transform via the `--transform` flag. Transforming applies to the source entry itself, regardless of kind. A directory source is passed as a single work path; its contents are available to the subprocess but the operation is one logical entry.
 
 ```toml
 # server.toml
-[transform.steps.compress-video]
+[[transform]]
+name = "compress-video"
 kind = "subprocess"
 program = "/usr/local/bin/compress"
 args = ["--input", "{input}", "--output-dir", "{target_directory}"]
@@ -82,7 +83,7 @@ expected_outputs = ["{file_stem}.compressed.webm"]
 keep_original = true
 ```
 
-The server invokes transform steps in order. After each subprocess step exits successfully, the server checks that each declared `expected_output` exists in `{target_directory}` (the directory where the entry's normal non-transform final path would be placed). The transform program is responsible for placing outputs into `{target_directory}`; Purgery does not move or commit transform outputs.
+The server invokes the transform. After the subprocess exits successfully, the server checks that each declared `expected_output` exists in `{target_directory}` (the directory where the entry's normal non-transform final path would be placed). The transform program is responsible for placing outputs into `{target_directory}`; Purgery does not move or commit transform outputs.
 
 `expected_outputs` is required but may be empty (`[]`). When empty, no output-existence checks are performed — successful subprocess exit is sufficient for the entry to be marked `imported`. This allows intentionally deletion-only or verification-only transforms.
 
@@ -93,7 +94,7 @@ Because transformed outputs are not the original source files, Purgery cannot us
 For this reason, `--transform` requires `--delete-after-import`. The transformed import is an import-and-retire operation:
 
 1. the source entry is uploaded into a server run;
-2. the server runs transform steps and checks expected outputs;
+2. the server runs the transform and checks expected outputs;
 3. the server writes a bounded run status;
 4. the client removes the unchanged local original after server-confirmed import.
 

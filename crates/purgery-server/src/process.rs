@@ -14,7 +14,7 @@ use crate::phases::{
     finalize_processing_run, move_to_failed, write_progress_best_effort, write_run_failure,
 };
 use crate::recover::recover_or_process_processing_run;
-use crate::transform::apply_transforms;
+use crate::transform::apply_transform;
 use crate::RunPlan;
 
 pub(crate) enum EntryOutcome {
@@ -23,7 +23,7 @@ pub(crate) enum EntryOutcome {
         local_path: String,
         relative_path: String,
         final_paths: Vec<String>,
-        transform: Option<Vec<String>>,
+        transform: Option<String>,
     },
     Failure {
         kind: ManifestEntryKind,
@@ -242,7 +242,7 @@ fn process_manifest_entry(
         Err(error) => return failed_entry(entry, error.to_string()),
     };
 
-    if entry.transform_steps.is_empty() {
+    if entry.transform.is_none() {
         let final_destination = final_path.as_str().to_owned();
         return match commit_output_entry(&work_path, &final_path, destination_root, run_id) {
             Ok(_) => EntryOutcome::Success {
@@ -273,15 +273,16 @@ fn process_manifest_entry(
             update.entry_index,
             update.entry_total,
             update.current_entry,
-            update.current_step,
+            update.current_transform,
         );
     };
-    let resolved_steps = match run_plan.resolve_steps(&entry.transform_steps) {
-        Ok(s) => s,
+    let transform_name = entry.transform.as_deref().unwrap();
+    let resolved = match run_plan.resolve_transform(transform_name) {
+        Ok(r) => r,
         Err(error) => return failed_entry(entry, error),
     };
-    match apply_transforms(
-        &resolved_steps,
+    match apply_transform(
+        &resolved,
         &work_path,
         &target_directory,
         &mut pp_helper,
@@ -297,13 +298,12 @@ fn process_manifest_entry(
                 }
                 final_paths.push(output.as_str().to_owned());
             }
-            let steps: Vec<String> = entry.transform_steps.clone();
             EntryOutcome::Success {
                 kind: entry.kind,
                 local_path: entry.local_path.as_str().to_owned(),
                 relative_path: entry.relative_path.as_str().to_owned(),
                 final_paths,
-                transform: Some(steps),
+                transform: entry.transform.clone(),
             }
         }
         Err(error) => failed_entry(entry, error),

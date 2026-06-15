@@ -22,7 +22,7 @@ pub use gc::run_gc;
 pub use phases::{begin_run, find_processing_runs, find_ready_runs, finish_run, move_to_failed};
 pub use process::{process_once_raw, process_processing_run, process_ready_run};
 pub use recover::recover_or_process_processing_run;
-pub use transform::{apply_transforms, apply_transforms_with_heartbeat};
+pub use transform::{apply_transform, apply_transform_with_heartbeat};
 
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use commit::{
@@ -31,57 +31,55 @@ pub(crate) use commit::{
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use phases::{write_progress, write_progress_best_effort};
 
-/// A resolved transform step definition.
+/// A resolved transform definition.
 #[derive(Debug, Clone)]
-pub struct ResolvedStep {
-    pub step_name: String,
-    pub step_def: purgery_core::TransformStepDefinition,
+pub struct ResolvedTransform {
+    pub name: String,
+    pub def: purgery_core::TransformDefinition,
 }
 
-/// A validated run plan: validated step definitions from the server config.
+/// A validated run plan: validated transform definitions from the server config.
 #[derive(Debug)]
 pub struct RunPlan {
-    pub steps: std::collections::BTreeMap<String, purgery_core::TransformStepDefinition>,
+    transforms: std::collections::HashMap<String, purgery_core::TransformDefinition>,
 }
 
 impl RunPlan {
     /// Build a run plan from server config.
     ///
-    /// Validates all step definitions in the server config. Returns an error
+    /// Validates all transform definitions in the server config. Returns an error
     /// (suitable for run-level failure) if anything is invalid.
     pub fn build(server_config: &ServerConfig) -> Result<Self, String> {
-        for (name, step) in &server_config.transform.steps {
-            if step.program.is_empty() {
-                return Err(format!("transform step '{name}' has empty program"));
+        let mut transforms = std::collections::HashMap::new();
+        for td in &server_config.transform.transforms {
+            if td.program.is_empty() {
+                return Err(format!("transform '{}' has empty program", td.name));
             }
 
-            for output in &step.expected_outputs {
+            for output in &td.expected_outputs {
                 purgery_core::validate_expected_output_name(output).map_err(|e| {
-                    format!("transform step '{name}': expected_output {output:?}: {e}")
+                    format!("transform '{}': expected_output {output:?}: {e}", td.name)
                 })?;
+            }
+
+            if transforms.insert(td.name.clone(), td.clone()).is_some() {
+                return Err(format!("duplicate transform name: {}", td.name));
             }
         }
 
-        Ok(RunPlan {
-            steps: server_config.transform.steps.clone(),
-        })
+        Ok(RunPlan { transforms })
     }
 
-    /// Resolve step names to their ResolvedStep definitions.
-    pub fn resolve_steps(&self, step_names: &[String]) -> Result<Vec<ResolvedStep>, String> {
-        step_names
-            .iter()
-            .map(|name| {
-                let def = self
-                    .steps
-                    .get(name.as_str())
-                    .ok_or_else(|| format!("transform step '{name}' not defined on server"))?;
-                Ok(ResolvedStep {
-                    step_name: name.clone(),
-                    step_def: def.clone(),
-                })
-            })
-            .collect()
+    /// Resolve a transform name to its ResolvedTransform.
+    pub fn resolve_transform(&self, name: &str) -> Result<ResolvedTransform, String> {
+        let def = self
+            .transforms
+            .get(name)
+            .ok_or_else(|| format!("transform '{name}' not defined on server"))?;
+        Ok(ResolvedTransform {
+            name: name.to_owned(),
+            def: def.clone(),
+        })
     }
 }
 
@@ -144,14 +142,14 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
     }
 
     for entry in &manifest.entries {
-        if entry.transform_steps.is_empty() {
+        if entry.transform.is_none() {
             anyhow::bail!(
-                "server run entry '{}' has no transform_steps",
+                "server run entry '{}' has no transform",
                 entry.relative_path.as_str(),
             );
         }
         run_plan
-            .resolve_steps(&entry.transform_steps)
+            .resolve_transform(entry.transform.as_deref().unwrap())
             .map_err(|error| {
                 anyhow::anyhow!(
                     "run plan validation failed for '{}': {error}",
@@ -277,7 +275,7 @@ pub fn run_state(
             entry_index,
             entry_total,
             current_entry,
-            current_step,
+            current_transform,
             progress_status,
         ) = if *phase == RunPhase::Processing {
             read_progress_fields(&dir, nickname, run_id, now)
@@ -306,7 +304,7 @@ pub fn run_state(
             entry_index,
             entry_total,
             current_entry,
-            current_step,
+            current_transform,
             progress_status,
         });
     }
@@ -334,7 +332,7 @@ pub fn run_state(
                     entry_index: None,
                     entry_total: None,
                     current_entry: None,
-                    current_step: None,
+                    current_transform: None,
                     progress_status: None,
                 });
             }
@@ -352,7 +350,7 @@ pub fn run_state(
                     entry_index: None,
                     entry_total: None,
                     current_entry: None,
-                    current_step: None,
+                    current_transform: None,
                     progress_status: None,
                 });
             }
@@ -373,7 +371,7 @@ pub fn run_state(
         entry_index: None,
         entry_total: None,
         current_entry: None,
-        current_step: None,
+        current_transform: None,
         progress_status: None,
     })
 }
@@ -429,11 +427,11 @@ fn read_progress_fields(
         Ok(content) => match toml::from_str::<purgery_core::ProcessingProgress>(&content) {
             Ok(prog) if prog.nickname == nickname.as_str() && prog.run_id == run_id.as_str() => {
                 let msg = format!(
-                    "processing: {}/{} entries, current: {} step: {}",
+                    "processing: {}/{} entries, current: {} transform: {}",
                     prog.entry_index + 1,
                     prog.entry_total,
                     prog.current_entry,
-                    prog.current_step
+                    prog.current_transform
                 );
                 (
                     msg,
@@ -442,7 +440,7 @@ fn read_progress_fields(
                     Some(prog.entry_index),
                     Some(prog.entry_total),
                     Some(prog.current_entry),
-                    Some(prog.current_step),
+                    Some(prog.current_transform),
                     Some("valid".to_string()),
                 )
             }
@@ -524,20 +522,21 @@ pub fn server_check(config: &ServerConfig) -> Result<()> {
     }
     info!(path = %purgery_path.as_str(), "work_dir: OK");
 
-    for (name, step) in &config.transform.steps {
-        let program = &step.program;
+    for td in &config.transform.transforms {
+        let program = &td.program;
         if program.is_empty() {
-            anyhow::bail!("transform step '{}' has empty program", name);
+            anyhow::bail!("transform '{}' has empty program", td.name);
         }
 
-        for output in &step.expected_outputs {
+        for output in &td.expected_outputs {
             purgery_core::validate_expected_output_name(output).map_err(|e| {
-                anyhow::anyhow!("transform step '{name}': expected_output {output:?}: {e}")
+                anyhow::anyhow!("transform '{}': expected_output {output:?}: {e}", td.name)
             })?;
         }
 
-        purgery_core::resolve_executable(program)
-            .map(|r| info!(step = name, path = %r.path.as_str(), "transform program found"))?;
+        purgery_core::resolve_executable(program).map(
+            |r| info!(transform = td.name, path = %r.path.as_str(), "transform program found"),
+        )?;
     }
 
     info!("server configuration: OK");
@@ -635,35 +634,33 @@ mod tests {
     use crate::commit::commit_directory_tree;
     use camino::Utf8PathBuf;
     use purgery_core::{
-        ClientLocalPath, ManifestEntry, NormalizedRelativePath, TransformConfig, TransformKind,
-        TransformStepDefinition,
+        ClientLocalPath, ManifestEntry, NormalizedRelativePath, TransformConfig,
+        TransformDefinition, TransformKind,
     };
 
-    /// Call apply_transforms with a no-op progress callback for testing.
+    /// Call apply_transform with a no-op progress callback for testing.
     /// Resolves expected outputs against the work path's parent directory.
-    fn test_apply_transforms(
+    fn test_apply_transform(
         run_plan: &RunPlan,
         work_path: &Utf8Path,
     ) -> Result<Vec<Utf8PathBuf>, String> {
         let target_directory = work_path.parent().unwrap_or(work_path).to_owned();
-        test_apply_transforms_with_target(run_plan, work_path, &target_directory)
+        test_apply_transform_with_target(run_plan, work_path, &target_directory)
     }
 
-    fn test_apply_transforms_with_target(
+    fn test_apply_transform_with_target(
         run_plan: &RunPlan,
         work_path: &Utf8Path,
         target_directory: &Utf8Path,
     ) -> Result<Vec<Utf8PathBuf>, String> {
-        let all_steps: Vec<ResolvedStep> = run_plan
-            .steps
+        let (name, _) = run_plan
+            .transforms
             .iter()
-            .map(|(name, def)| ResolvedStep {
-                step_name: name.clone(),
-                step_def: def.clone(),
-            })
-            .collect();
-        apply_transforms(
-            &all_steps,
+            .next()
+            .expect("test plan must have at least one transform");
+        let resolved = run_plan.resolve_transform(name).unwrap();
+        apply_transform(
+            &resolved,
             work_path,
             target_directory,
             &mut |_: &purgery_core::ProgressUpdate| {},
@@ -779,7 +776,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                transform_steps: Vec::new(),
+                transform: None,
             }],
         };
         fs::write(
@@ -902,7 +899,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                transform_steps: Vec::new(),
+                transform: None,
             }],
         };
         fs::write(
@@ -996,7 +993,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                transform_steps: Vec::new(),
+                transform: None,
             }],
         };
         fs::write(
@@ -1075,7 +1072,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                transform_steps: Vec::new(),
+                transform: None,
             }],
         };
         fs::write(
@@ -1121,20 +1118,14 @@ delete_after_import = true
             work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
             transform: TransformConfig {
-                steps: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        "compress-video".to_owned(),
-                        TransformStepDefinition {
-                            kind: TransformKind::Subprocess,
-                            program: "true".to_owned(),
-                            args: vec![],
-                            expected_outputs: vec![],
-                            keep_original: true,
-                        },
-                    );
-                    m
-                },
+                transforms: vec![TransformDefinition {
+                    name: "compress-video".into(),
+                    kind: TransformKind::Subprocess,
+                    program: "true".to_owned(),
+                    args: vec![],
+                    expected_outputs: vec![],
+                    keep_original: true,
+                }],
             },
             logging: Default::default(),
         };
@@ -1144,7 +1135,7 @@ delete_after_import = true
         fs::write(&work_path, b"test data").unwrap();
 
         let run_plan = RunPlan::build(&server_config).unwrap();
-        let results = test_apply_transforms(&run_plan, &work_path);
+        let results = test_apply_transform(&run_plan, &work_path);
         assert!(results.is_ok(), "transform with spaces should succeed");
         // empty expected_outputs means zero outputs — this is valid
         assert!(results.unwrap().is_empty());
@@ -1159,20 +1150,14 @@ delete_after_import = true
             work_dir: PurgeryRoot::new(work_dir.as_str().into()).unwrap(),
             gc: Default::default(),
             transform: TransformConfig {
-                steps: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        "compress-video".to_owned(),
-                        TransformStepDefinition {
-                            kind: TransformKind::Subprocess,
-                            program: "false".to_owned(),
-                            args: vec![],
-                            expected_outputs: vec![],
-                            keep_original: true,
-                        },
-                    );
-                    m
-                },
+                transforms: vec![TransformDefinition {
+                    name: "compress-video".into(),
+                    kind: TransformKind::Subprocess,
+                    program: "false".to_owned(),
+                    args: vec![],
+                    expected_outputs: vec![],
+                    keep_original: true,
+                }],
             },
             logging: Default::default(),
         };
@@ -1202,7 +1187,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                transform_steps: vec!["compress-video".into()],
+                transform: Some("compress-video".into()),
             }],
         };
         fs::write(
@@ -1240,25 +1225,19 @@ delete_after_import = true
             work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
             transform: TransformConfig {
-                steps: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        "compress-video".to_owned(),
-                        TransformStepDefinition {
-                            kind: TransformKind::Subprocess,
-                            program: "true".to_owned(),
-                            args: vec![],
-                            expected_outputs: vec![],
-                            keep_original: true,
-                        },
-                    );
-                    m
-                },
+                transforms: vec![TransformDefinition {
+                    name: "compress-video".into(),
+                    kind: TransformKind::Subprocess,
+                    program: "true".to_owned(),
+                    args: vec![],
+                    expected_outputs: vec![],
+                    keep_original: true,
+                }],
             },
             logging: Default::default(),
         };
         let pp_run_plan = RunPlan::build(&server_config).unwrap();
-        let result = test_apply_transforms(&pp_run_plan, &work_path);
+        let result = test_apply_transform(&pp_run_plan, &work_path);
         assert!(result.is_ok());
         // empty expected_outputs means zero outputs
         assert!(result.unwrap().is_empty());
@@ -1278,25 +1257,19 @@ delete_after_import = true
             work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
             transform: TransformConfig {
-                steps: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        "compress-video".to_owned(),
-                        TransformStepDefinition {
-                            kind: TransformKind::Subprocess,
-                            program: "true".to_owned(),
-                            args: vec![],
-                            expected_outputs: vec!["{stem}.Z.webm".into()],
-                            keep_original: true,
-                        },
-                    );
-                    m
-                },
+                transforms: vec![TransformDefinition {
+                    name: "compress-video".into(),
+                    kind: TransformKind::Subprocess,
+                    program: "true".to_owned(),
+                    args: vec![],
+                    expected_outputs: vec!["{stem}.Z.webm".into()],
+                    keep_original: true,
+                }],
             },
             logging: Default::default(),
         };
         let pp_run_plan = RunPlan::build(&server_config).unwrap();
-        let result = test_apply_transforms(&pp_run_plan, &work_path);
+        let result = test_apply_transform(&pp_run_plan, &work_path);
         assert!(result.is_ok());
         let outputs = result.unwrap();
         assert_eq!(outputs.len(), 1);
@@ -1325,25 +1298,19 @@ delete_after_import = true
             work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
             transform: TransformConfig {
-                steps: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        "compress-video".to_owned(),
-                        TransformStepDefinition {
-                            kind: TransformKind::Subprocess,
-                            program: "true".to_owned(),
-                            args: vec![],
-                            expected_outputs: vec!["{stem}.Z.webm".into()],
-                            keep_original: false,
-                        },
-                    );
-                    m
-                },
+                transforms: vec![TransformDefinition {
+                    name: "compress-video".into(),
+                    kind: TransformKind::Subprocess,
+                    program: "true".to_owned(),
+                    args: vec![],
+                    expected_outputs: vec!["{stem}.Z.webm".into()],
+                    keep_original: false,
+                }],
             },
             logging: Default::default(),
         };
         let pp_run_plan = RunPlan::build(&server_config).unwrap();
-        let result = test_apply_transforms(&pp_run_plan, &work_path);
+        let result = test_apply_transform(&pp_run_plan, &work_path);
         assert!(result.is_ok());
         let outputs = result.unwrap();
         assert_eq!(outputs.len(), 1);
@@ -1525,7 +1492,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                transform_steps: Vec::new(),
+                transform: None,
             }],
         };
         fs::write(
@@ -1578,7 +1545,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                transform_steps: vec!["compress-video".into()],
+                transform: Some("compress-video".into()),
             }],
         };
         fs::write(
@@ -1657,7 +1624,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                transform_steps: Vec::new(),
+                transform: None,
             }],
         };
         fs::write(
@@ -1718,20 +1685,14 @@ delete_after_import = true
             work_dir: PurgeryRoot::new(work_dir.as_str().into()).unwrap(),
             gc: Default::default(),
             transform: TransformConfig {
-                steps: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        "compress-video".to_owned(),
-                        TransformStepDefinition {
-                            kind: TransformKind::Subprocess,
-                            program: "false".to_owned(),
-                            args: vec![],
-                            expected_outputs: vec![],
-                            keep_original: true,
-                        },
-                    );
-                    m
-                },
+                transforms: vec![TransformDefinition {
+                    name: "compress-video".into(),
+                    kind: TransformKind::Subprocess,
+                    program: "false".to_owned(),
+                    args: vec![],
+                    expected_outputs: vec![],
+                    keep_original: true,
+                }],
             },
             logging: Default::default(),
         };
@@ -1759,7 +1720,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                transform_steps: vec!["compress-video".into()],
+                transform: Some("compress-video".into()),
             }],
         };
         fs::write(
@@ -1810,24 +1771,18 @@ delete_after_import = true
             work_dir: PurgeryRoot::new(work_dir.as_str().into()).unwrap(),
             gc: Default::default(),
             transform: TransformConfig {
-                steps: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        "compress-video".to_owned(),
-                        TransformStepDefinition {
-                            kind: TransformKind::Subprocess,
-                            program: script_path.to_string_lossy().to_string(),
-                            args: vec![
-                                "--input".into(),
-                                "{input}".into(),
-                                "{target_directory}".into(),
-                            ],
-                            expected_outputs: vec!["{stem}.Z.webm".into()],
-                            keep_original: true,
-                        },
-                    );
-                    m
-                },
+                transforms: vec![TransformDefinition {
+                    name: "compress-video".into(),
+                    kind: TransformKind::Subprocess,
+                    program: script_path.to_string_lossy().to_string(),
+                    args: vec![
+                        "--input".into(),
+                        "{input}".into(),
+                        "{target_directory}".into(),
+                    ],
+                    expected_outputs: vec!["{stem}.Z.webm".into()],
+                    keep_original: true,
+                }],
             },
             logging: Default::default(),
         };
@@ -1855,7 +1810,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                transform_steps: vec!["compress-video".into()],
+                transform: Some("compress-video".into()),
             }],
         };
         fs::write(
@@ -1914,24 +1869,18 @@ delete_after_import = true
             work_dir: PurgeryRoot::new(work_dir.as_str().into()).unwrap(),
             gc: Default::default(),
             transform: TransformConfig {
-                steps: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        "compress-video".to_owned(),
-                        TransformStepDefinition {
-                            kind: TransformKind::Subprocess,
-                            program: script_path.to_string_lossy().to_string(),
-                            args: vec![
-                                "--input".into(),
-                                "{input}".into(),
-                                "{target_directory}".into(),
-                            ],
-                            expected_outputs: vec!["{stem}.Z.webm".into()],
-                            keep_original: false,
-                        },
-                    );
-                    m
-                },
+                transforms: vec![TransformDefinition {
+                    name: "compress-video".into(),
+                    kind: TransformKind::Subprocess,
+                    program: script_path.to_string_lossy().to_string(),
+                    args: vec![
+                        "--input".into(),
+                        "{input}".into(),
+                        "{target_directory}".into(),
+                    ],
+                    expected_outputs: vec!["{stem}.Z.webm".into()],
+                    keep_original: false,
+                }],
             },
             logging: Default::default(),
         };
@@ -1959,7 +1908,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                transform_steps: vec!["compress-video".into()],
+                transform: Some("compress-video".into()),
             }],
         };
         fs::write(
@@ -2758,7 +2707,7 @@ delete_after_import = true
             mtime_ns: 0,
             sha256: None,
             link_target: target.map(Utf8PathBuf::from),
-            transform_steps: Vec::new(),
+            transform: None,
         };
         let manifest = Manifest {
             run_id: run_id.clone(),
@@ -2827,10 +2776,11 @@ delete_after_import = true
     }
 
     fn expected_output_test_plan() -> RunPlan {
-        let mut steps = std::collections::BTreeMap::new();
-        steps.insert(
+        let mut transforms = std::collections::HashMap::new();
+        transforms.insert(
             "generate".to_owned(),
-            TransformStepDefinition {
+            TransformDefinition {
+                name: "generate".into(),
                 kind: TransformKind::Subprocess,
                 program: "true".into(),
                 args: vec![],
@@ -2838,7 +2788,7 @@ delete_after_import = true
                 keep_original: false,
             },
         );
-        RunPlan { steps }
+        RunPlan { transforms }
     }
 
     #[test]
@@ -2848,7 +2798,7 @@ delete_after_import = true
         fs::write(&work_path, "input").unwrap();
         fs::write(work_path.with_file_name("input.out"), "output").unwrap();
 
-        let outputs = test_apply_transforms(&expected_output_test_plan(), &work_path).unwrap();
+        let outputs = test_apply_transform(&expected_output_test_plan(), &work_path).unwrap();
         assert_eq!(outputs, vec![work_path.with_file_name("input.out")]);
     }
 
@@ -2858,7 +2808,7 @@ delete_after_import = true
         let work_path = Utf8PathBuf::from_path_buf(tmp.path().join("input.txt")).unwrap();
         fs::write(&work_path, "input").unwrap();
 
-        let error = test_apply_transforms(&expected_output_test_plan(), &work_path).unwrap_err();
+        let error = test_apply_transform(&expected_output_test_plan(), &work_path).unwrap_err();
         assert!(error.contains("expected output not found"));
     }
 
@@ -2873,7 +2823,7 @@ delete_after_import = true
         // itself must be accepted — Purgery must not follow or reject it.
         std::os::unix::fs::symlink(&target, work_path.with_file_name("input.out")).unwrap();
 
-        let outputs = test_apply_transforms(&expected_output_test_plan(), &work_path).unwrap();
+        let outputs = test_apply_transform(&expected_output_test_plan(), &work_path).unwrap();
         assert!(
             outputs.contains(&work_path.with_file_name("input.out")),
             "symlink expected output must be accepted"
@@ -2895,7 +2845,7 @@ delete_after_import = true
         fs::write(&work_path, "input").unwrap();
         fs::create_dir(work_path.with_file_name("input.out")).unwrap();
 
-        let outputs = test_apply_transforms(&expected_output_test_plan(), &work_path).unwrap();
+        let outputs = test_apply_transform(&expected_output_test_plan(), &work_path).unwrap();
         assert!(outputs.contains(&work_path.with_file_name("input.out")));
     }
 
@@ -2906,7 +2856,7 @@ delete_after_import = true
         fs::write(&work_path, "input").unwrap();
         std::os::unix::fs::symlink("some-target", work_path.with_file_name("input.out")).unwrap();
 
-        let outputs = test_apply_transforms(&expected_output_test_plan(), &work_path).unwrap();
+        let outputs = test_apply_transform(&expected_output_test_plan(), &work_path).unwrap();
         assert!(outputs.contains(&work_path.with_file_name("input.out")));
     }
 
@@ -2921,7 +2871,7 @@ delete_after_import = true
             .status()
             .unwrap();
 
-        let error = test_apply_transforms(&expected_output_test_plan(), &work_path).unwrap_err();
+        let error = test_apply_transform(&expected_output_test_plan(), &work_path).unwrap_err();
         assert!(error.contains("expected output is not a supported entry type"));
     }
 
@@ -2930,16 +2880,14 @@ delete_after_import = true
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let mut config = test_server_config(&work_dir);
-        config.transform.steps.insert(
-            "test-step".to_string(),
-            TransformStepDefinition {
-                kind: TransformKind::Subprocess,
-                program: "/bin/true".to_string(),
-                args: Vec::new(),
-                expected_outputs: Vec::new(),
-                keep_original: true,
-            },
-        );
+        config.transform.transforms.push(TransformDefinition {
+            name: "test-step".into(),
+            kind: TransformKind::Subprocess,
+            program: "/bin/true".to_string(),
+            args: Vec::new(),
+            expected_outputs: Vec::new(),
+            keep_original: true,
+        });
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-relative-dest".into()).unwrap();
         let incoming = config
@@ -2962,7 +2910,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                transform_steps: vec!["test-step".into()],
+                transform: Some("test-step".into()),
             }],
         };
         fs::write(incoming.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
@@ -3000,16 +2948,14 @@ delete_after_import = true
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let mut config = test_server_config(&work_dir);
-        config.transform.steps.insert(
-            "test-step".to_string(),
-            TransformStepDefinition {
-                kind: TransformKind::Subprocess,
-                program: "/bin/true".to_string(),
-                args: Vec::new(),
-                expected_outputs: Vec::new(),
-                keep_original: true,
-            },
-        );
+        config.transform.transforms.push(TransformDefinition {
+            name: "test-step".into(),
+            kind: TransformKind::Subprocess,
+            program: "/bin/true".to_string(),
+            args: Vec::new(),
+            expected_outputs: Vec::new(),
+            keep_original: true,
+        });
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("test-absolute-dest".into()).unwrap();
         let incoming = config
@@ -3036,7 +2982,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                transform_steps: vec!["test-step".into()],
+                transform: Some("test-step".into()),
             }],
         };
         fs::write(incoming.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
@@ -3065,20 +3011,14 @@ delete_after_import = true
         let config = test_server_config(&work_dir);
         let config = ServerConfig {
             transform: TransformConfig {
-                steps: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        "pack".to_owned(),
-                        TransformStepDefinition {
-                            kind: TransformKind::Subprocess,
-                            program: "true".into(),
-                            args: vec![],
-                            expected_outputs: vec![],
-                            keep_original: true,
-                        },
-                    );
-                    m
-                },
+                transforms: vec![TransformDefinition {
+                    name: "pack".into(),
+                    kind: TransformKind::Subprocess,
+                    program: "true".into(),
+                    args: vec![],
+                    expected_outputs: vec![],
+                    keep_original: true,
+                }],
             },
             ..config
         };
@@ -3104,7 +3044,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                transform_steps: Vec::new(),
+                transform: None,
             }],
         };
         fs::write(ready.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
@@ -3117,10 +3057,7 @@ delete_after_import = true
         // videos/a.mp4 must be imported as passthrough, not processed by pack
         assert_eq!(status.entries.len(), 1);
         assert_eq!(status.entries[0].status, FileStatus::Imported);
-        assert!(
-            status.entries[0].transform.is_none()
-                || status.entries[0].transform.as_deref() == Some(&[])
-        );
+        assert!(status.entries[0].transform.is_none());
     }
 
     // ── Progress context tests ──
@@ -3141,7 +3078,7 @@ delete_after_import = true
         assert_eq!(p.entry_index, 1);
         assert_eq!(p.entry_total, 3);
         assert_eq!(p.current_entry, "b.txt");
-        assert_eq!(p.current_step, "");
+        assert_eq!(p.current_transform, "");
     }
 
     #[test]
@@ -3160,7 +3097,7 @@ delete_after_import = true
         assert_eq!(p.entry_index, 0);
         assert_eq!(p.entry_total, 1);
         assert!(p.current_entry.is_empty());
-        assert!(p.current_step.is_empty());
+        assert!(p.current_transform.is_empty());
     }
 
     // ── Progress sentinel and write-failure tests ──
@@ -3177,20 +3114,14 @@ delete_after_import = true
             work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
             transform: TransformConfig {
-                steps: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        "compress".to_owned(),
-                        TransformStepDefinition {
-                            kind: TransformKind::Subprocess,
-                            program: "true".into(),
-                            args: vec![],
-                            expected_outputs: vec!["{stem}.out".into()],
-                            keep_original: false,
-                        },
-                    );
-                    m
-                },
+                transforms: vec![TransformDefinition {
+                    name: "compress".into(),
+                    kind: TransformKind::Subprocess,
+                    program: "true".into(),
+                    args: vec![],
+                    expected_outputs: vec!["{stem}.out".into()],
+                    keep_original: false,
+                }],
             },
             logging: Default::default(),
         };
@@ -3203,20 +3134,18 @@ delete_after_import = true
                 update.entry_index,
                 update.entry_total,
                 update.current_entry.to_owned(),
-                update.current_step.to_owned(),
+                update.current_transform.to_owned(),
             ));
         };
 
-        let all_steps: Vec<ResolvedStep> = run_plan
-            .steps
+        let (name, _) = run_plan
+            .transforms
             .iter()
-            .map(|(n, d)| ResolvedStep {
-                step_name: n.clone(),
-                step_def: d.clone(),
-            })
-            .collect();
-        apply_transforms_with_heartbeat(
-            &all_steps,
+            .next()
+            .expect("test plan must have at least one transform");
+        let resolved = run_plan.resolve_transform(name).unwrap();
+        apply_transform_with_heartbeat(
+            &resolved,
             &work_path,
             work_path.parent().unwrap(),
             std::time::Duration::from_millis(1),
@@ -3235,7 +3164,7 @@ delete_after_import = true
         for (state, _ei, et, _ce, _cs) in updates.iter() {
             assert!(
                 *et > 0,
-                "step '{state}' must have entry_total > 0, got {et}"
+                "transform '{state}' must have entry_total > 0, got {et}"
             );
         }
     }
@@ -3271,7 +3200,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                transform_steps: Vec::new(),
+                transform: None,
             }],
         };
         fs::write(
@@ -3319,7 +3248,7 @@ delete_after_import = true
     fn publishing_status_is_run_level_progress() {
         // publishing_status is tested via direct write_progress above.
         // This test is kept for documentation: run-level progress has empty
-        // current_entry and current_step and coherent entry_total.
+        // current_entry and current_transform and coherent entry_total.
         let tmp = tempfile::tempdir().unwrap();
         let path = Utf8PathBuf::from_path_buf(tmp.path().join("p")).unwrap();
         fs::create_dir_all(&path).unwrap();
@@ -3333,7 +3262,7 @@ delete_after_import = true
         assert_eq!(p.entry_index, 0);
         assert_eq!(p.entry_total, 10, "entry_total must be coherent");
         assert!(
-            p.current_entry.is_empty() && p.current_step.is_empty(),
+            p.current_entry.is_empty() && p.current_transform.is_empty(),
             "run-level progress must have empty entry/step"
         );
     }
@@ -3352,20 +3281,14 @@ delete_after_import = true
             work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
             transform: TransformConfig {
-                steps: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        "compress".to_owned(),
-                        TransformStepDefinition {
-                            kind: TransformKind::Subprocess,
-                            program: "true".into(),
-                            args: vec![],
-                            expected_outputs: vec!["{stem}.out".into()],
-                            keep_original: false,
-                        },
-                    );
-                    m
-                },
+                transforms: vec![TransformDefinition {
+                    name: "compress".into(),
+                    kind: TransformKind::Subprocess,
+                    program: "true".into(),
+                    args: vec![],
+                    expected_outputs: vec!["{stem}.out".into()],
+                    keep_original: false,
+                }],
             },
             logging: Default::default(),
         };
@@ -3378,20 +3301,18 @@ delete_after_import = true
                 update.entry_index,
                 update.entry_total,
                 update.current_entry.to_owned(),
-                update.current_step.to_owned(),
+                update.current_transform.to_owned(),
             ));
         };
 
-        let all_steps: Vec<ResolvedStep> = run_plan
-            .steps
+        let (name, _) = run_plan
+            .transforms
             .iter()
-            .map(|(n, d)| ResolvedStep {
-                step_name: n.clone(),
-                step_def: d.clone(),
-            })
-            .collect();
-        apply_transforms_with_heartbeat(
-            &all_steps,
+            .next()
+            .expect("test plan must have at least one transform");
+        let resolved = run_plan.resolve_transform(name).unwrap();
+        apply_transform_with_heartbeat(
+            &resolved,
             &work_path,
             work_path.parent().unwrap(),
             std::time::Duration::from_millis(1),
@@ -3417,9 +3338,12 @@ delete_after_import = true
                 !ce.is_empty(),
                 "current_entry must be non-empty for '{state}'"
             );
-            // step_started/step_running/step_finished must have current_step
-            if state.starts_with("step_") {
-                assert!(!cs.is_empty(), "step '{state}' must have current_step");
+            // transform_started/transform_running/transform_finished must have current_transform
+            if state.starts_with("transform_") {
+                assert!(
+                    !cs.is_empty(),
+                    "transform '{state}' must have current_transform"
+                );
             }
         }
     }
@@ -3428,14 +3352,14 @@ delete_after_import = true
     #[test]
     fn progress_tests_do_not_ignore_transform_result() {
         // Regression guard: progress tests must not discard the result of
-        // apply_transforms_with_heartbeat with let _ = .
+        // apply_transform_with_heartbeat with let _ = .
         let source = include_str!("lib.rs");
         // Check each line for the bad pattern, skipping this test's own assertion text.
         for (lineno, line) in source.lines().enumerate() {
             let trimmed = line.trim();
-            if trimmed == "let _ = apply_transforms_with_heartbeat(" {
+            if trimmed == "let _ = apply_transform_with_heartbeat(" {
                 panic!(
-                    "line {}: progress tests must not ignore apply_transforms_with_heartbeat results;\n\
+                    "line {}: progress tests must not ignore apply_transform_with_heartbeat results;\n\
                      use .unwrap() or .expect() instead",
                     lineno + 1
                 );
@@ -3446,7 +3370,7 @@ delete_after_import = true
     #[test]
     fn per_entry_first_entry_allows_index_zero() {
         // A manifest with at least one transformed entry should have
-        // step_started/step_running/step_finished with entry_index=0 for
+        // transform_started/transform_running/transform_finished with entry_index=0 for
         // the first entry, entry_total>0, and current_entry!="".
         let tmp = tempfile::tempdir().unwrap();
         let work_path = Utf8PathBuf::from_path_buf(tmp.path().join("input.txt")).unwrap();
@@ -3457,20 +3381,14 @@ delete_after_import = true
             work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
             transform: TransformConfig {
-                steps: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        "compress".to_owned(),
-                        TransformStepDefinition {
-                            kind: TransformKind::Subprocess,
-                            program: "true".into(),
-                            args: vec![],
-                            expected_outputs: vec!["{stem}.out".into()],
-                            keep_original: false,
-                        },
-                    );
-                    m
-                },
+                transforms: vec![TransformDefinition {
+                    name: "compress".into(),
+                    kind: TransformKind::Subprocess,
+                    program: "true".into(),
+                    args: vec![],
+                    expected_outputs: vec!["{stem}.out".into()],
+                    keep_original: false,
+                }],
             },
             logging: Default::default(),
         };
@@ -3483,20 +3401,18 @@ delete_after_import = true
                 update.entry_index,
                 update.entry_total,
                 update.current_entry.to_owned(),
-                update.current_step.to_owned(),
+                update.current_transform.to_owned(),
             ));
         };
 
-        let all_steps: Vec<ResolvedStep> = run_plan
-            .steps
+        let (name, _) = run_plan
+            .transforms
             .iter()
-            .map(|(n, d)| ResolvedStep {
-                step_name: n.clone(),
-                step_def: d.clone(),
-            })
-            .collect();
-        apply_transforms_with_heartbeat(
-            &all_steps,
+            .next()
+            .expect("test plan must have at least one transform");
+        let resolved = run_plan.resolve_transform(name).unwrap();
+        apply_transform_with_heartbeat(
+            &resolved,
             &work_path,
             work_path.parent().unwrap(),
             std::time::Duration::from_millis(1),
@@ -3510,7 +3426,7 @@ delete_after_import = true
         let updates = captured.lock().unwrap();
         for (state, ei, et, ce, _cs) in updates.iter() {
             match state.as_str() {
-                "step_started" | "step_running" | "step_finished" => {
+                "transform_started" | "transform_running" | "transform_finished" => {
                     // Per-entry invariants
                     assert!(
                         *et > 0,
@@ -3534,9 +3450,9 @@ delete_after_import = true
         assert!(
             updates.iter().any(|(s, _, _, _, _)| matches!(
                 s.as_str(),
-                "step_started" | "step_running" | "step_finished"
+                "transform_started" | "transform_running" | "transform_finished"
             )),
-            "must have at least one step progress update"
+            "must have at least one transform progress update"
         );
     }
 
@@ -3548,7 +3464,7 @@ delete_after_import = true
         fs::create_dir_all(&path).unwrap();
         let n = Nickname::new("laptop".into()).unwrap();
         let r = RunId::new("t".into()).unwrap();
-        let result = write_progress(&path, &n, &r, "step_started", 0, 0, "a.txt", "c");
+        let result = write_progress(&path, &n, &r, "transform_started", 0, 0, "a.txt", "c");
         assert!(result.is_err(), "entry_total=0 must be rejected");
     }
 
@@ -3559,21 +3475,21 @@ delete_after_import = true
         fs::create_dir_all(&path).unwrap();
         let n = Nickname::new("laptop".into()).unwrap();
         let r = RunId::new("t".into()).unwrap();
-        let result = write_progress(&path, &n, &r, "step_started", 0, 1, "", "c");
+        let result = write_progress(&path, &n, &r, "transform_started", 0, 1, "", "c");
         assert!(result.is_err(), "empty current_entry must be rejected");
     }
 
     #[test]
-    fn per_entry_step_progress_rejects_empty_current_step() {
+    fn per_entry_transform_progress_rejects_empty_current_transform() {
         let tmp = tempfile::tempdir().unwrap();
         let path = Utf8PathBuf::from_path_buf(tmp.path().join("p")).unwrap();
         fs::create_dir_all(&path).unwrap();
         let n = Nickname::new("laptop".into()).unwrap();
         let r = RunId::new("t".into()).unwrap();
-        let result = write_progress(&path, &n, &r, "step_started", 0, 1, "a.txt", "");
+        let result = write_progress(&path, &n, &r, "transform_started", 0, 1, "a.txt", "");
         assert!(
             result.is_err(),
-            "step state with empty current_step must be rejected"
+            "transform state with empty current_transform must be rejected"
         );
     }
 
@@ -3584,7 +3500,7 @@ delete_after_import = true
         fs::create_dir_all(&path).unwrap();
         let n = Nickname::new("laptop".into()).unwrap();
         let r = RunId::new("t".into()).unwrap();
-        let result = write_progress(&path, &n, &r, "step_running", 5, 1, "a.txt", "c");
+        let result = write_progress(&path, &n, &r, "transform_running", 5, 1, "a.txt", "c");
         assert!(
             result.is_err(),
             "entry_index >= entry_total must be rejected"
@@ -3606,7 +3522,7 @@ delete_after_import = true
     }
 
     #[test]
-    fn processing_entry_with_empty_step_succeeds() {
+    fn processing_entry_with_empty_transform_succeeds() {
         let tmp = tempfile::tempdir().unwrap();
         let path = Utf8PathBuf::from_path_buf(tmp.path().join("p")).unwrap();
         fs::create_dir_all(&path).unwrap();
@@ -3626,7 +3542,7 @@ delete_after_import = true
         fs::create_dir_all(&path).unwrap();
         let n = Nickname::new("laptop".into()).unwrap();
         let r = RunId::new("t".into()).unwrap();
-        let result = write_progress(&path, &n, &r, "step_started", 0, 1, "a.txt", "c");
+        let result = write_progress(&path, &n, &r, "transform_started", 0, 1, "a.txt", "c");
         assert!(result.is_ok(), "entry_index=0 for first entry must succeed");
     }
 
@@ -3673,7 +3589,7 @@ delete_after_import = true
         let r = RunId::new("t".into()).unwrap();
 
         // Invalid: entry_total=0 for per-entry
-        write_progress_best_effort(&path, &n, &r, "step_started", 0, 0, "a.txt", "c");
+        write_progress_best_effort(&path, &n, &r, "transform_started", 0, 0, "a.txt", "c");
 
         // Invalid: unknown state
         write_progress_best_effort(&path, &n, &r, "nonsense", 0, 1, "a.txt", "c");
@@ -3696,7 +3612,7 @@ delete_after_import = true
         let valid_content = fs::read_to_string(path.join("progress.toml")).unwrap();
 
         // Now call best-effort with invalid progress that doesn't clobber
-        write_progress_best_effort(&path, &n, &r, "step_started", 0, 0, "a.txt", "c");
+        write_progress_best_effort(&path, &n, &r, "transform_started", 0, 0, "a.txt", "c");
 
         // The file content must be unchanged
         let after_content = fs::read_to_string(path.join("progress.toml")).unwrap();
@@ -3717,7 +3633,7 @@ delete_after_import = true
     #[test]
     fn run_level_progress_may_have_empty_current_entry() {
         // processing_started and publishing_status are run-level.
-        // They may have empty current_entry/current_step.
+        // They may have empty current_entry/current_transform.
         let tmp = tempfile::tempdir().unwrap();
         let processing_path = Utf8PathBuf::from_path_buf(tmp.path().join("processing")).unwrap();
         fs::create_dir_all(&processing_path).unwrap();
@@ -3740,7 +3656,7 @@ delete_after_import = true
         let p: purgery_core::ProcessingProgress = toml::from_str(&content).unwrap();
         assert_eq!(p.state, "processing_started");
         assert!(
-            p.current_entry.is_empty() && p.current_step.is_empty(),
+            p.current_entry.is_empty() && p.current_transform.is_empty(),
             "run-level progress may have empty entry/step"
         );
         assert_eq!(p.entry_total, 2, "run-level progress still has entry_total");
@@ -3767,7 +3683,7 @@ delete_after_import = true
             entry_index: 0,
             entry_total: 1,
             current_entry: String::new(),
-            current_step: String::new(),
+            current_transform: String::new(),
             started_at_unix_secs: 5000,
             updated_at_unix_secs: 5000,
         };
@@ -3812,7 +3728,7 @@ delete_after_import = true
             entry_index: 0,
             entry_total: 1,
             current_entry: String::new(),
-            current_step: String::new(),
+            current_transform: String::new(),
             started_at_unix_secs: 5000,
             updated_at_unix_secs: 5000,
         };
@@ -3956,7 +3872,7 @@ delete_after_import = true
             entry_index: 0,
             entry_total: 1,
             current_entry: String::new(),
-            current_step: String::new(),
+            current_transform: String::new(),
             started_at_unix_secs: 1000,
             updated_at_unix_secs: 1000,
         };
@@ -4302,7 +4218,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                transform_steps: Vec::new(),
+                transform: None,
             }],
         };
         fs::write(
@@ -4334,20 +4250,14 @@ delete_after_import = true
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             transform: TransformConfig {
-                steps: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        "always-fail".to_owned(),
-                        TransformStepDefinition {
-                            kind: TransformKind::Subprocess,
-                            program: "false".to_owned(),
-                            args: vec![],
-                            expected_outputs: vec![],
-                            keep_original: true,
-                        },
-                    );
-                    m
-                },
+                transforms: vec![TransformDefinition {
+                    name: "always-fail".into(),
+                    kind: TransformKind::Subprocess,
+                    program: "false".to_owned(),
+                    args: vec![],
+                    expected_outputs: vec![],
+                    keep_original: true,
+                }],
             },
             logging: Default::default(),
         };
@@ -4374,7 +4284,7 @@ delete_after_import = true
                     sha256: None,
                     link_target: None,
 
-                    transform_steps: vec!["always-fail".into()],
+                    transform: Some("always-fail".into()),
                 },
                 ManifestEntry {
                     local_path: ClientLocalPath::new("/home/user/b.mp4".into()).unwrap(),
@@ -4386,7 +4296,7 @@ delete_after_import = true
                     sha256: None,
                     link_target: None,
 
-                    transform_steps: vec!["always-fail".into()],
+                    transform: Some("always-fail".into()),
                 },
             ],
         };
@@ -4431,25 +4341,18 @@ delete_after_import = true
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             transform: TransformConfig {
-                steps: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        "echo-args".to_owned(),
-                        TransformStepDefinition {
-                            kind: TransformKind::Subprocess,
-                            program: "sh".to_owned(),
-                            args: vec![
-                                "-c".to_owned(),
-                                "mkdir -p $0/_outputs && echo done > $0/_outputs/result.txt"
-                                    .to_owned(),
-                                "{target_directory}".to_owned(),
-                            ],
-                            expected_outputs: vec!["_outputs".to_owned()],
-                            keep_original: false,
-                        },
-                    );
-                    m
-                },
+                transforms: vec![TransformDefinition {
+                    name: "echo-args".into(),
+                    kind: TransformKind::Subprocess,
+                    program: "sh".to_owned(),
+                    args: vec![
+                        "-c".to_owned(),
+                        "mkdir -p $0/_outputs && echo done > $0/_outputs/result.txt".to_owned(),
+                        "{target_directory}".to_owned(),
+                    ],
+                    expected_outputs: vec!["_outputs".to_owned()],
+                    keep_original: false,
+                }],
             },
             logging: Default::default(),
         };
@@ -4477,7 +4380,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                transform_steps: vec!["echo-args".into()],
+                transform: Some("echo-args".into()),
             }],
         };
         fs::write(
@@ -4780,24 +4683,18 @@ delete_after_import = true
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             transform: TransformConfig {
-                steps: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        "make-symlink".to_owned(),
-                        TransformStepDefinition {
-                            kind: TransformKind::Subprocess,
-                            program: "sh".to_owned(),
-                            args: vec![
-                                "-c".to_owned(),
-                                "mkdir -p $0 && ln -sf /etc/hostname $0/the-link".to_owned(),
-                                "{target_directory}".to_owned(),
-                            ],
-                            expected_outputs: vec!["the-link".to_owned()],
-                            keep_original: false,
-                        },
-                    );
-                    m
-                },
+                transforms: vec![TransformDefinition {
+                    name: "make-symlink".into(),
+                    kind: TransformKind::Subprocess,
+                    program: "sh".to_owned(),
+                    args: vec![
+                        "-c".to_owned(),
+                        "mkdir -p $0 && ln -sf /etc/hostname $0/the-link".to_owned(),
+                        "{target_directory}".to_owned(),
+                    ],
+                    expected_outputs: vec!["the-link".to_owned()],
+                    keep_original: false,
+                }],
             },
             logging: Default::default(),
         };
@@ -4825,7 +4722,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                transform_steps: vec!["make-symlink".into()],
+                transform: Some("make-symlink".into()),
             }],
         };
         fs::write(
@@ -5073,25 +4970,19 @@ delete_after_import = true
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             transform: TransformConfig {
-                steps: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        "make-tree".to_owned(),
-                        TransformStepDefinition {
-                            kind: TransformKind::Subprocess,
-                            program: "sh".to_owned(),
-                            args: vec![
-                                "-c".to_owned(),
-                                "mkdir -p $0/out/sub && echo a > $0/out/sub/a.txt && echo b > $0/out/b.txt"
-                                    .to_owned(),
-                                "{target_directory}".to_owned(),
-                            ],
-                            expected_outputs: vec!["out".to_owned()],
-                            keep_original: false,
-                        },
-                    );
-                    m
-                },
+                transforms: vec![TransformDefinition {
+                    name: "make-tree".into(),
+                    kind: TransformKind::Subprocess,
+                    program: "sh".to_owned(),
+                    args: vec![
+                        "-c".to_owned(),
+                        "mkdir -p $0/out/sub && echo a > $0/out/sub/a.txt && echo b > $0/out/b.txt"
+                            .to_owned(),
+                        "{target_directory}".to_owned(),
+                    ],
+                    expected_outputs: vec!["out".to_owned()],
+                    keep_original: false,
+                }],
             },
             logging: Default::default(),
         };
@@ -5119,7 +5010,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                transform_steps: vec!["make-tree".into()],
+                transform: Some("make-tree".into()),
             }],
         };
         fs::write(
@@ -5229,7 +5120,7 @@ delete_after_import = true
             mtime_ns: 2000000,
             sha256: None,
             link_target: None,
-            transform_steps: Vec::new(),
+            transform: None,
         });
         fs::write(
             ready_path.join("manifest.toml"),
@@ -5348,7 +5239,7 @@ delete_after_import = true
                     sha256: None,
                     link_target: Some(Utf8PathBuf::from("/usr/share/data")),
 
-                    transform_steps: Vec::new(),
+                    transform: None,
                 },
                 // Second entry fails (missing staged file).
                 ManifestEntry {
@@ -5361,7 +5252,7 @@ delete_after_import = true
                     sha256: None,
                     link_target: None,
 
-                    transform_steps: Vec::new(),
+                    transform: None,
                 },
             ],
         };
@@ -5663,7 +5554,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: Some(Utf8PathBuf::from("/etc/config")),
 
-                transform_steps: Vec::new(),
+                transform: None,
             }],
         };
         fs::write(
@@ -5754,24 +5645,18 @@ delete_after_import = true
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             transform: TransformConfig {
-                steps: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        "copy-cmd".to_owned(),
-                        TransformStepDefinition {
-                            kind: TransformKind::Subprocess,
-                            program: "sh".to_owned(),
-                            args: vec![
-                                "-c".to_owned(),
-                                "mkdir -p $0 && cp {input} $0/{file_name}.out".to_owned(),
-                                "{target_directory}".to_owned(),
-                            ],
-                            expected_outputs: vec!["{file_name}.out".to_owned()],
-                            keep_original: false,
-                        },
-                    );
-                    m
-                },
+                transforms: vec![TransformDefinition {
+                    name: "copy-cmd".into(),
+                    kind: TransformKind::Subprocess,
+                    program: "sh".to_owned(),
+                    args: vec![
+                        "-c".to_owned(),
+                        "mkdir -p $0 && cp {input} $0/{file_name}.out".to_owned(),
+                        "{target_directory}".to_owned(),
+                    ],
+                    expected_outputs: vec!["{file_name}.out".to_owned()],
+                    keep_original: false,
+                }],
             },
             logging: Default::default(),
         };
@@ -5799,7 +5684,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                transform_steps: vec!["copy-cmd".into()],
+                transform: Some("copy-cmd".into()),
             }],
         };
         fs::write(
@@ -5884,24 +5769,18 @@ delete_after_import = true
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             transform: TransformConfig {
-                steps: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        "copy-cmd".to_owned(),
-                        TransformStepDefinition {
-                            kind: TransformKind::Subprocess,
-                            program: "sh".to_owned(),
-                            args: vec![
-                                "-c".to_owned(),
-                                "mkdir -p $0 && cp {input} $0/{file_name}.out".to_owned(),
-                                "{target_directory}".to_owned(),
-                            ],
-                            expected_outputs: vec!["{file_name}.out".to_owned()],
-                            keep_original: false,
-                        },
-                    );
-                    m
-                },
+                transforms: vec![TransformDefinition {
+                    name: "copy-cmd".into(),
+                    kind: TransformKind::Subprocess,
+                    program: "sh".to_owned(),
+                    args: vec![
+                        "-c".to_owned(),
+                        "mkdir -p $0 && cp {input} $0/{file_name}.out".to_owned(),
+                        "{target_directory}".to_owned(),
+                    ],
+                    expected_outputs: vec!["{file_name}.out".to_owned()],
+                    keep_original: false,
+                }],
             },
             logging: Default::default(),
         };
@@ -5929,7 +5808,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                transform_steps: vec!["copy-cmd".into()],
+                transform: Some("copy-cmd".into()),
             }],
         };
         fs::write(
@@ -5999,7 +5878,7 @@ delete_after_import = true
     }
 
     #[test]
-    fn prepare_run_rejects_unknown_requested_transform_step_before_finish() {
+    fn prepare_run_rejects_unknown_requested_transform_before_finish() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("work")).unwrap();
         let config = test_server_config(&work_dir);
@@ -6022,7 +5901,7 @@ delete_after_import = true
                 sha256: Some("00".repeat(32)),
                 link_target: None,
 
-                transform_steps: vec!["typo".to_owned()],
+                transform: Some("typo".to_owned()),
             }],
         };
         fs::write(incoming.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
@@ -6049,20 +5928,14 @@ delete_after_import = true
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             transform: TransformConfig {
-                steps: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        "test-step".to_owned(),
-                        TransformStepDefinition {
-                            kind: TransformKind::Subprocess,
-                            program: "true".to_owned(),
-                            args: vec![],
-                            expected_outputs: vec![],
-                            keep_original: true,
-                        },
-                    );
-                    m
-                },
+                transforms: vec![TransformDefinition {
+                    name: "test-step".into(),
+                    kind: TransformKind::Subprocess,
+                    program: "true".to_owned(),
+                    args: vec![],
+                    expected_outputs: vec![],
+                    keep_original: true,
+                }],
             },
             logging: Default::default(),
         };
@@ -6087,7 +5960,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: Some("/some/target".into()),
 
-                transform_steps: vec!["test-step".into()],
+                transform: Some("test-step".into()),
             }],
         };
         fs::write(
@@ -6129,20 +6002,14 @@ delete_after_import = true
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             transform: TransformConfig {
-                steps: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        "test-step".to_owned(),
-                        TransformStepDefinition {
-                            kind: TransformKind::Subprocess,
-                            program: "true".to_owned(),
-                            args: vec![],
-                            expected_outputs: vec![],
-                            keep_original: true,
-                        },
-                    );
-                    m
-                },
+                transforms: vec![TransformDefinition {
+                    name: "test-step".into(),
+                    kind: TransformKind::Subprocess,
+                    program: "true".to_owned(),
+                    args: vec![],
+                    expected_outputs: vec![],
+                    keep_original: true,
+                }],
             },
             logging: Default::default(),
         };
@@ -6169,7 +6036,7 @@ delete_after_import = true
                 sha256: None,
                 link_target: None,
 
-                transform_steps: vec!["test-step".into()],
+                transform: Some("test-step".into()),
             }],
         };
         fs::write(
@@ -6210,20 +6077,14 @@ delete_after_import = true
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             transform: TransformConfig {
-                steps: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        "noop".to_owned(),
-                        TransformStepDefinition {
-                            kind: TransformKind::Subprocess,
-                            program: "true".to_owned(),
-                            args: vec![],
-                            expected_outputs: vec![],
-                            keep_original: true,
-                        },
-                    );
-                    m
-                },
+                transforms: vec![TransformDefinition {
+                    name: "noop".into(),
+                    kind: TransformKind::Subprocess,
+                    program: "true".to_owned(),
+                    args: vec![],
+                    expected_outputs: vec![],
+                    keep_original: true,
+                }],
             },
             logging: Default::default(),
         };
@@ -6248,7 +6109,7 @@ delete_after_import = true
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
-                transform_steps: vec!["noop".into()],
+                transform: Some("noop".into()),
             }],
         };
         fs::write(
@@ -6301,25 +6162,19 @@ delete_after_import = true
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             transform: TransformConfig {
-                steps: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        "place-at-dest".to_owned(),
-                        TransformStepDefinition {
-                            kind: TransformKind::Subprocess,
-                            program: script_path.to_string_lossy().to_string(),
-                            args: vec![
-                                "--input".into(),
-                                "{input}".into(),
-                                "--output-dir".into(),
-                                "{target_directory}".into(),
-                            ],
-                            expected_outputs: vec!["result".into()],
-                            keep_original: true,
-                        },
-                    );
-                    m
-                },
+                transforms: vec![TransformDefinition {
+                    name: "place-at-dest".into(),
+                    kind: TransformKind::Subprocess,
+                    program: script_path.to_string_lossy().to_string(),
+                    args: vec![
+                        "--input".into(),
+                        "{input}".into(),
+                        "--output-dir".into(),
+                        "{target_directory}".into(),
+                    ],
+                    expected_outputs: vec!["result".into()],
+                    keep_original: true,
+                }],
             },
             logging: Default::default(),
         };
@@ -6344,7 +6199,7 @@ delete_after_import = true
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
-                transform_steps: vec!["place-at-dest".into()],
+                transform: Some("place-at-dest".into()),
             }],
         };
         fs::write(
@@ -6436,25 +6291,19 @@ delete_after_import = true
             work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             transform: TransformConfig {
-                steps: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        "compress".to_owned(),
-                        TransformStepDefinition {
-                            kind: TransformKind::Subprocess,
-                            program: script_path.to_string_lossy().to_string(),
-                            args: vec![
-                                "--input".into(),
-                                "{input}".into(),
-                                "--output-dir".into(),
-                                "{target_directory}".into(),
-                            ],
-                            expected_outputs: vec!["{stem}.Z.webm".into()],
-                            keep_original: false,
-                        },
-                    );
-                    m
-                },
+                transforms: vec![TransformDefinition {
+                    name: "compress".into(),
+                    kind: TransformKind::Subprocess,
+                    program: script_path.to_string_lossy().to_string(),
+                    args: vec![
+                        "--input".into(),
+                        "{input}".into(),
+                        "--output-dir".into(),
+                        "{target_directory}".into(),
+                    ],
+                    expected_outputs: vec!["{stem}.Z.webm".into()],
+                    keep_original: false,
+                }],
             },
             logging: Default::default(),
         };
@@ -6479,7 +6328,7 @@ delete_after_import = true
                 mtime_ns: 1000000,
                 sha256: None,
                 link_target: None,
-                transform_steps: vec!["compress".into()],
+                transform: Some("compress".into()),
             }],
         };
         fs::write(

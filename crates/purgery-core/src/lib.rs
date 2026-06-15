@@ -593,22 +593,24 @@ mod tests {
     // ── Config parsing tests ──
 
     #[test]
-    fn transform_step_rejects_old_command_format() {
+    fn transform_definition_rejects_old_command_format() {
         let toml = r#"
+name = "test"
 kind = "subprocess"
 command = "my-compress-video"
 "#;
-        let result: Result<TransformStepDefinition, _> = toml::from_str(toml);
+        let result: Result<TransformDefinition, _> = toml::from_str(toml);
         assert!(result.is_err(), "old 'command' field must be rejected");
     }
 
     #[test]
-    fn transform_step_rejects_old_compress_video_kind() {
+    fn transform_definition_rejects_old_compress_video_kind() {
         let toml = r#"
+name = "test"
 kind = "compress-video"
 program = "my-compress-video"
 "#;
-        let result: Result<TransformStepDefinition, _> = toml::from_str(toml);
+        let result: Result<TransformDefinition, _> = toml::from_str(toml);
         assert!(
             result.is_err(),
             "old 'compress-video' kind must be rejected"
@@ -616,11 +618,12 @@ program = "my-compress-video"
     }
 
     #[test]
-    fn transform_step_rejects_unknown_kind() {
+    fn transform_definition_rejects_unknown_kind() {
         let toml = r#"
+name = "test"
 kind = "builtin"
 "#;
-        let result: Result<TransformStepDefinition, _> = toml::from_str(toml);
+        let result: Result<TransformDefinition, _> = toml::from_str(toml);
         assert!(result.is_err(), "unknown kind must be rejected");
     }
 
@@ -974,14 +977,15 @@ unknown_field = "value"
     #[test]
     fn transform_argv_not_rewritten() {
         let configured_args = vec!["--input".to_string(), "{input}".to_string()];
-        let step = TransformStepDefinition {
+        let td = TransformDefinition {
+            name: "test".into(),
             kind: TransformKind::Subprocess,
             program: "true".to_owned(),
             args: configured_args.clone(),
             expected_outputs: vec![],
             keep_original: true,
         };
-        let built = step.build_args(
+        let built = td.build_args(
             camino::Utf8Path::new("/tmp/work/file.mp4"),
             camino::Utf8Path::new("/dest"),
         );
@@ -997,14 +1001,15 @@ unknown_field = "value"
 
     #[test]
     fn transform_argv_not_rejected_for_placeholders() {
-        let step = TransformStepDefinition {
+        let td = TransformDefinition {
+            name: "test".into(),
             kind: TransformKind::Subprocess,
             program: "ffmpeg".to_owned(),
             args: vec!["--input".to_string(), "{input}".to_string()],
             expected_outputs: vec![],
             keep_original: true,
         };
-        let built = step.build_args(
+        let built = td.build_args(
             camino::Utf8Path::new("/tmp/work/file.mp4"),
             camino::Utf8Path::new("/dest"),
         );
@@ -1131,7 +1136,8 @@ unknown_field = "value"
 
     #[test]
     fn resolve_input_placeholder() {
-        let step = TransformStepDefinition {
+        let td = TransformDefinition {
+            name: "test".into(),
             kind: TransformKind::Subprocess,
             program: "ffmpeg".into(),
             args: vec!["--input".into(), "{input}".into()],
@@ -1139,13 +1145,14 @@ unknown_field = "value"
             keep_original: true,
         };
         let work_path = Utf8Path::new("/work/videos/video.mp4");
-        let args = step.build_args(work_path, Utf8Path::new("/dest"));
+        let args = td.build_args(work_path, Utf8Path::new("/dest"));
         assert_eq!(args, vec!["--input", "/work/videos/video.mp4"]);
     }
 
     #[test]
     fn resolve_stem_placeholder() {
-        let step = TransformStepDefinition {
+        let td = TransformDefinition {
+            name: "test".into(),
             kind: TransformKind::Subprocess,
             program: "ffmpeg".into(),
             args: vec![],
@@ -1154,16 +1161,15 @@ unknown_field = "value"
         };
         let work_path = Utf8Path::new("/work/videos/video.mp4");
         let target_dir = Utf8Path::new("/dest");
-        let outputs = step
-            .resolve_expected_outputs(work_path, target_dir)
-            .unwrap();
+        let outputs = td.resolve_expected_outputs(work_path, target_dir).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].as_str(), "/dest/video.Z.webm");
     }
 
     #[test]
     fn resolve_parent_placeholder() {
-        let step = TransformStepDefinition {
+        let td = TransformDefinition {
+            name: "test".into(),
             kind: TransformKind::Subprocess,
             program: "ffmpeg".into(),
             args: vec!["--output-dir".into(), "{parent}".into()],
@@ -1172,7 +1178,7 @@ unknown_field = "value"
         };
         let work_path = Utf8Path::new("/work/videos/video.mp4");
         let target_dir = Utf8Path::new("/dest");
-        let args = step.build_args(work_path, target_dir);
+        let args = td.build_args(work_path, target_dir);
         assert_eq!(args, vec!["--output-dir", "/work/videos"]);
     }
 
@@ -1252,7 +1258,8 @@ color = "never"
 
     #[test]
     fn resolve_target_directory_placeholder() {
-        let step = TransformStepDefinition {
+        let td = TransformDefinition {
+            name: "test".into(),
             kind: TransformKind::Subprocess,
             program: "ffmpeg".into(),
             args: vec!["--output-dir".into(), "{target_directory}".into()],
@@ -1261,7 +1268,7 @@ color = "never"
         };
         let work_path = Utf8Path::new("/work/videos/video.mp4");
         let target_dir = Utf8Path::new("/archive/videos");
-        let args = step.build_args(work_path, target_dir);
+        let args = td.build_args(work_path, target_dir);
         assert_eq!(args, vec!["--output-dir", "/archive/videos"]);
     }
 
@@ -1337,7 +1344,7 @@ color = "never"
             entry_index: None,
             entry_total: None,
             current_entry: None,
-            current_step: None,
+            current_transform: None,
             progress_status: None,
         };
         let serialized = toml::to_string(&response).expect("serialize");
@@ -1369,7 +1376,7 @@ color = "never"
             entry_index: None,
             entry_total: None,
             current_entry: None,
-            current_step: None,
+            current_transform: None,
             progress_status: None,
         };
         // When progress is missing, updated_at should not be equal to observed_at
