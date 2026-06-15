@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use crate::path::*;
-use crate::transform::TransformConfig;
+use crate::transform::TransformDefinition;
 use crate::ConfigError;
 
 // ── Lease / GC Config ────────────────────────────────────────────────
@@ -154,7 +155,7 @@ impl FromStr for ColorMode {
 struct ServerConfigFile {
     pub work_dir: PurgeryRoot,
     #[serde(default)]
-    pub transform: TransformConfig,
+    pub transform: Vec<TransformDefinition>,
     #[serde(default)]
     pub gc: GCConfig,
     #[serde(default)]
@@ -164,7 +165,7 @@ struct ServerConfigFile {
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub work_dir: PurgeryRoot,
-    pub transform: TransformConfig,
+    pub transforms: BTreeMap<String, TransformDefinition>,
     pub gc: GCConfig,
     pub logging: LoggingConfig,
 }
@@ -172,9 +173,23 @@ pub struct ServerConfig {
 impl ServerConfig {
     pub fn from_toml(input: &str) -> Result<Self, ConfigError> {
         let config: ServerConfigFile = toml::from_str(input)?;
+        let mut transforms: BTreeMap<String, TransformDefinition> = BTreeMap::new();
+        for td in config.transform {
+            if transforms.contains_key(&td.name) {
+                return Err(ConfigError::Invalid(format!(
+                    "duplicate transform name: {}",
+                    td.name
+                )));
+            }
+
+            crate::validate_transform_definition(&td)
+                .map_err(|e| ConfigError::Invalid(format!("transform '{}': {e}", td.name)))?;
+
+            transforms.insert(td.name.clone(), td);
+        }
         Ok(Self {
             work_dir: config.work_dir,
-            transform: config.transform,
+            transforms,
             gc: config.gc,
             logging: config.logging,
         })
@@ -245,7 +260,7 @@ pub struct RunStateResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_entry: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub current_step: Option<String>,
+    pub current_transform: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress_status: Option<String>,
 }
@@ -260,7 +275,7 @@ pub struct ProcessingProgress {
     pub entry_index: usize,
     pub entry_total: usize,
     pub current_entry: String,
-    pub current_step: String,
+    pub current_transform: String,
     pub started_at_unix_secs: u64,
     pub updated_at_unix_secs: u64,
 }
@@ -273,7 +288,7 @@ pub struct ProgressUpdate<'a> {
     pub entry_index: usize,
     pub entry_total: usize,
     pub current_entry: &'a str,
-    pub current_step: &'a str,
+    pub current_transform: &'a str,
 }
 
 impl<'a> ProgressUpdate<'a> {
@@ -282,14 +297,14 @@ impl<'a> ProgressUpdate<'a> {
         entry_index: usize,
         entry_total: usize,
         current_entry: &'a str,
-        current_step: &'a str,
+        current_transform: &'a str,
     ) -> Self {
         ProgressUpdate {
             state,
             entry_index,
             entry_total,
             current_entry,
-            current_step,
+            current_transform,
         }
     }
 }

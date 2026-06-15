@@ -26,7 +26,7 @@ pub(crate) fn write_progress_best_effort(
     entry_index: usize,
     entry_total: usize,
     current_entry: &str,
-    current_step: &str,
+    current_transform: &str,
 ) {
     if let Err(error) = write_progress(
         processing_path,
@@ -36,16 +36,16 @@ pub(crate) fn write_progress_best_effort(
         entry_index,
         entry_total,
         current_entry,
-        current_step,
+        current_transform,
     ) {
         warn!(
-            nickname = %nickname.as_str(),
-            run_id = %run_id.as_str(),
-            state = state,
-            entry_index = entry_index,
-            entry_total = entry_total,
-            current_entry = current_entry,
-            current_step = current_step,
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                state = state,
+                entry_index = entry_index,
+                entry_total = entry_total,
+                current_entry = current_entry,
+                current_transform = current_transform,
             %error,
             "failed to write progress"
         );
@@ -74,15 +74,15 @@ fn validate_progress_update(
     entry_index: usize,
     entry_total: usize,
     current_entry: &str,
-    current_step: &str,
+    current_transform: &str,
 ) -> Result<()> {
     match state {
         "processing_started" | "publishing_status" => {
             if !current_entry.is_empty() {
                 anyhow::bail!("run-level progress state {state} must not have current_entry");
             }
-            if !current_step.is_empty() {
-                anyhow::bail!("run-level progress state {state} must not have current_step");
+            if !current_transform.is_empty() {
+                anyhow::bail!("run-level progress state {state} must not have current_transform");
             }
             Ok(())
         }
@@ -96,12 +96,12 @@ fn validate_progress_update(
             if current_entry.is_empty() {
                 anyhow::bail!("per-entry progress state {state} must have current_entry");
             }
-            if !current_step.is_empty() {
-                anyhow::bail!("processing_entry must not have current_step");
+            if !current_transform.is_empty() {
+                anyhow::bail!("processing_entry must not have current_transform");
             }
             Ok(())
         }
-        "step_started" | "step_running" | "step_finished" => {
+        "transform_started" | "transform_running" | "transform_finished" => {
             if entry_total == 0 {
                 anyhow::bail!("per-entry progress state {state} must have entry_total > 0");
             }
@@ -111,8 +111,8 @@ fn validate_progress_update(
             if current_entry.is_empty() {
                 anyhow::bail!("per-entry progress state {state} must have current_entry");
             }
-            if current_step.is_empty() {
-                anyhow::bail!("step progress state {state} must have current_step");
+            if current_transform.is_empty() {
+                anyhow::bail!("transform progress state {state} must have current_transform");
             }
             Ok(())
         }
@@ -129,9 +129,15 @@ pub(crate) fn write_progress(
     entry_index: usize,
     entry_total: usize,
     current_entry: &str,
-    current_step: &str,
+    current_transform: &str,
 ) -> Result<()> {
-    validate_progress_update(state, entry_index, entry_total, current_entry, current_step)?;
+    validate_progress_update(
+        state,
+        entry_index,
+        entry_total,
+        current_entry,
+        current_transform,
+    )?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -148,7 +154,7 @@ pub(crate) fn write_progress(
         entry_index,
         entry_total,
         current_entry: current_entry.to_owned(),
-        current_step: current_step.to_owned(),
+        current_transform: current_transform.to_owned(),
         started_at_unix_secs: started_at,
         updated_at_unix_secs: now,
     };

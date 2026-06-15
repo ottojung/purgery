@@ -14,8 +14,8 @@ use crate::phases::{
     finalize_processing_run, move_to_failed, write_progress_best_effort, write_run_failure,
 };
 use crate::recover::recover_or_process_processing_run;
-use crate::transform::apply_transforms;
-use crate::RunPlan;
+use crate::transform::apply_transform;
+use crate::ResolvedTransform;
 
 pub(crate) enum EntryOutcome {
     Success {
@@ -23,7 +23,7 @@ pub(crate) enum EntryOutcome {
         local_path: String,
         relative_path: String,
         final_paths: Vec<String>,
-        transform: Option<Vec<String>>,
+        transform: Option<String>,
     },
     Failure {
         kind: ManifestEntryKind,
@@ -165,7 +165,7 @@ fn failed_entry(entry: &ManifestEntry, error: impl Into<String>) -> EntryOutcome
 
 #[allow(clippy::too_many_arguments)]
 fn process_manifest_entry(
-    run_plan: &RunPlan,
+    config: &ServerConfig,
     entry: &ManifestEntry,
     nickname: &Nickname,
     run_id: &RunId,
@@ -242,7 +242,7 @@ fn process_manifest_entry(
         Err(error) => return failed_entry(entry, error.to_string()),
     };
 
-    if entry.transform_steps.is_empty() {
+    if entry.transform.is_none() {
         let final_destination = final_path.as_str().to_owned();
         return match commit_output_entry(&work_path, &final_path, destination_root, run_id) {
             Ok(_) => EntryOutcome::Success {
@@ -273,15 +273,24 @@ fn process_manifest_entry(
             update.entry_index,
             update.entry_total,
             update.current_entry,
-            update.current_step,
+            update.current_transform,
         );
     };
-    let resolved_steps = match run_plan.resolve_steps(&entry.transform_steps) {
-        Ok(s) => s,
-        Err(error) => return failed_entry(entry, error),
+    let transform_name = entry.transform.as_deref().unwrap();
+    let resolved = match config.transforms.get(transform_name) {
+        Some(def) => ResolvedTransform {
+            name: transform_name.to_owned(),
+            def: def.clone(),
+        },
+        None => {
+            return failed_entry(
+                entry,
+                format!("transform '{transform_name}' not defined on server"),
+            )
+        }
     };
-    match apply_transforms(
-        &resolved_steps,
+    match apply_transform(
+        &resolved,
         &work_path,
         &target_directory,
         &mut pp_helper,
@@ -297,13 +306,12 @@ fn process_manifest_entry(
                 }
                 final_paths.push(output.as_str().to_owned());
             }
-            let steps: Vec<String> = entry.transform_steps.clone();
             EntryOutcome::Success {
                 kind: entry.kind,
                 local_path: entry.local_path.as_str().to_owned(),
                 relative_path: entry.relative_path.as_str().to_owned(),
                 final_paths,
-                transform: Some(steps),
+                transform: entry.transform.clone(),
             }
         }
         Err(error) => failed_entry(entry, error),
@@ -378,16 +386,6 @@ pub fn process_processing_run(
         }
     };
 
-    let run_plan = match RunPlan::build(config) {
-        Ok(plan) => plan,
-        Err(error) => {
-            let msg = format!("run plan validation failed: {error}");
-            warn!("{}", msg);
-            write_run_failure(&config.work_dir, nickname, run_id, &msg)?;
-            anyhow::bail!("{msg}");
-        }
-    };
-
     let manifest_path = processing_path.join("manifest.toml");
     let manifest_content = match fs::read_to_string(&manifest_path) {
         Ok(content) => content,
@@ -445,7 +443,7 @@ pub fn process_processing_run(
         );
 
         outcomes.push(process_manifest_entry(
-            &run_plan,
+            config,
             entry,
             nickname,
             run_id,

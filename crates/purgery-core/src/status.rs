@@ -113,7 +113,7 @@ pub struct EntryStatusEntry {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub final_paths: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub transform: Option<Vec<String>>,
+    pub transform: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }

@@ -50,8 +50,8 @@ pub struct ManifestEntry {
     pub sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link_target: Option<Utf8PathBuf>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub transform_steps: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transform: Option<String>,
 }
 
 impl ManifestEntry {

@@ -3,13 +3,11 @@ use serde::{Deserialize, Serialize};
 
 // ── Transform Types ────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TransformConfig {
-    #[serde(default)]
-    pub steps: std::collections::BTreeMap<String, TransformStepDefinition>,
-}
-
+/// Server-side transform definition.
+///
+/// Each instance represents a named transform that clients can request. Transform
+/// definitions are deserialised from `[[transform]]` array-of-tables in server config.
+/// Duplicate `name` values are rejected during config validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransformKind {
     Subprocess,
@@ -42,7 +40,9 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct TransformStepDefinition {
+pub struct TransformDefinition {
+    /// Unique name for this transform, used as the key for client requests.
+    pub name: String,
     pub kind: TransformKind,
     pub program: String,
     #[serde(default)]
@@ -52,7 +52,7 @@ pub struct TransformStepDefinition {
     pub keep_original: bool,
 }
 
-impl TransformStepDefinition {
+impl TransformDefinition {
     pub fn resolve_placeholders(&self, work_path: &Utf8Path, s: &str) -> String {
         let input = work_path.as_str();
         let parent = work_path.parent().map(|p| p.as_str()).unwrap_or("");
@@ -90,6 +90,21 @@ impl TransformStepDefinition {
         }
         Ok(results)
     }
+}
+
+/// Validate a single transform definition's `program` and `expected_outputs`.
+///
+/// Does not check whether the program binary exists on disk — that is a
+/// separate concern handled by `server_check`.
+pub fn validate_transform_definition(def: &TransformDefinition) -> Result<(), String> {
+    if def.program.is_empty() {
+        return Err("program is empty".into());
+    }
+    for output in &def.expected_outputs {
+        validate_expected_output_name(output)
+            .map_err(|e| format!("expected_output {output:?}: {e}"))?;
+    }
+    Ok(())
 }
 
 pub fn validate_expected_output_name(name: &str) -> Result<(), String> {

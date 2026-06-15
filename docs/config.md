@@ -27,9 +27,8 @@ work_dir = "/var/lib/purgery/work"
 incoming_lease_secs = 1800
 heartbeat_interval_secs = 60
 
-[transform]
-
-[transform.steps.compress-video]
+[[transform]]
+name = "compress-video"
 kind = "subprocess"
 program = "/usr/local/bin/compress-video"
 args = ["--input", "{input}", "--output-dir", "{target_directory}"]
@@ -62,11 +61,9 @@ keep_original = true
 
 ### Transform config
 
-| Field | Default | Description |
-|-------|---------|-------------|
-| `steps` | `{}` | Map of named transform step definitions |
+Transforms are defined as an array of tables using `[[transform]]`. Each named transform is a separate table entry.
 
-## Transform step definition
+## Transform definition
 
 | Field | Required | Description |
 |-------|----------|-------------|
@@ -89,7 +86,7 @@ keep_original = true
 
 `args` may use `{input}`, `{parent}`, `{file_name}`, `{file_stem}`, `{stem}`, and `{target_directory}`. `expected_outputs` may use only `{file_name}`, `{file_stem}`, and `{stem}`, and each resolved expected output must be a plain file name without directory components.
 
-Purgery does not move or commit transform outputs. The transform program is responsible for placing outputs into `{target_directory}`. After each step exits successfully, Purgery checks each declared expected output exists in `{target_directory}`. If `expected_outputs = []`, no output-existence checks are performed; successful subprocess exit is sufficient.
+Purgery does not move or commit transform outputs. The transform program is responsible for placing outputs into `{target_directory}`. After the transform exits successfully, Purgery checks each declared expected output exists in `{target_directory}`. If `expected_outputs = []`, no output-existence checks are performed; successful subprocess exit is sufficient.
 
 ### Subprocess safety
 
@@ -164,7 +161,7 @@ Purgery's security model assumes:
 
 1. **Server config** is trusted server admin configuration.
 2. **`--server-command`** is a trusted configuration value (not user input).
-3. **Transform programs and their argv** are trusted server-side configuration set by the server admin. Clients request steps by name but never upload arbitrary commands. Transform programs are trusted to place outputs in `{target_directory}` and may intentionally perform deletion-only/no-output imports when `expected_outputs = []`.
+3. **Transform programs and their argv** are trusted server-side configuration set by the server admin. Clients request a transform by name but never upload arbitrary commands. Transform programs are trusted to place outputs in `{target_directory}` and may intentionally perform deletion-only/no-output imports when `expected_outputs = []`.
 4. **Source filenames and paths** may contain arbitrary characters (spaces, special characters, leading `-`) and must not become shell syntax or local subprocess options. Purgery uses argv-style invocation and shell-escaping for remote commands to prevent injection.
 5. **Local filesystem and server storage** are non-hostile unless documented otherwise.
 

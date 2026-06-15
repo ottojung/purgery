@@ -690,7 +690,7 @@ pub(crate) fn run_sync_with_run_id(
     // path uses the same normalized operation_path and source_entry_name.
     let source_spec = classify::normalize_source(&args.source)?;
 
-    let has_transform = !args.transform.is_empty();
+    let has_transform = args.transform.is_some();
     if has_transform && !args.delete_after_import {
         anyhow::bail!("--delete-after-import is required when --transform is used");
     }
@@ -723,7 +723,8 @@ pub(crate) fn run_sync_with_run_id(
         return Ok(());
     }
 
-    let manifest = classify::build_manifest(&source_spec, run_id, &nickname, &args.transform)?;
+    let manifest =
+        classify::build_manifest(&source_spec, run_id, &nickname, args.transform.as_deref())?;
     let cleanup_state_path = if args.delete_after_import {
         let entries = classify::capture_cleanup_identity(&source_spec)?;
         if entries.is_empty() {
@@ -913,7 +914,7 @@ fn run_split(
     let pattern = args.split.as_deref().unwrap();
     split::validate_split_pattern(pattern).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let has_transform = !args.transform.is_empty();
+    let has_transform = args.transform.is_some();
     let target = parse_destination(&args.destination)?;
 
     if !has_transform && !args.delete_after_import {
@@ -1085,7 +1086,7 @@ state = "done"
         let tmp = tempdir().unwrap();
         let state_dir = mk_state_dir(&tmp);
         let args = SyncArgs {
-            transform: vec!["compress".to_string()],
+            transform: Some("compress".into()),
             delete_after_import: false,
             split: None,
             state_dir: Some(state_dir),
@@ -1363,7 +1364,7 @@ state = "done"
             entry_index: None,
             entry_total: None,
             current_entry: None,
-            current_step: None,
+            current_transform: None,
             progress_status: None,
         };
         match response.phase.as_str() {
@@ -1466,7 +1467,7 @@ state = "done"
 
     fn transform_args(tmp: &tempfile::TempDir, state_dir: &str) -> SyncArgs {
         SyncArgs {
-            transform: vec!["transform".to_string()],
+            transform: Some("transform".into()),
             delete_after_import: true,
             split: None,
             state_dir: Some(state_dir.to_owned()),
@@ -1820,7 +1821,7 @@ state = "done"
         // Use trailing slash to exercise normalization.
         let src_slash = format!("{}/", src.to_str().unwrap());
         let args = SyncArgs {
-            transform: vec![],
+            transform: None,
             delete_after_import: false,
             split: None,
             state_dir: Some(state_dir),
@@ -1856,7 +1857,7 @@ state = "done"
         fs::create_dir(&src).unwrap();
         let src_slash = format!("{}/", src.to_str().unwrap());
         let args = SyncArgs {
-            transform: vec![],
+            transform: None,
             delete_after_import: true,
             split: None,
             state_dir: Some(state_dir.clone()),
@@ -1892,7 +1893,7 @@ state = "done"
         fs::write(src.join("a.mp4"), "data").unwrap();
         let src_slash = format!("{}/", src.to_str().unwrap());
         let args = SyncArgs {
-            transform: vec!["transform".to_string()],
+            transform: Some("transform".into()),
             delete_after_import: true,
             split: None,
             state_dir: Some(state_dir.clone()),
@@ -1942,7 +1943,7 @@ state = "done"
             let tmp = tempdir().unwrap();
             let runner = mk_runner();
             let args = SyncArgs {
-                transform: vec![],
+                transform: None,
                 delete_after_import: false,
                 split: None,
                 state_dir: Some(mk_state_dir(&tmp)),
@@ -1962,7 +1963,7 @@ state = "done"
             let tmp = tempdir().unwrap();
             let runner = mk_runner();
             let args = SyncArgs {
-                transform: vec![],
+                transform: None,
                 delete_after_import: true,
                 split: None,
                 state_dir: Some(mk_state_dir(&tmp)),
@@ -1982,7 +1983,7 @@ state = "done"
             let tmp = tempdir().unwrap();
             let runner = mk_runner();
             let args = SyncArgs {
-                transform: vec!["transform".to_string()],
+                transform: Some("transform".into()),
                 delete_after_import: true,
                 split: None,
                 state_dir: Some(mk_state_dir(&tmp)),
@@ -1999,7 +2000,7 @@ state = "done"
             let tmp = tempdir().unwrap();
             let runner = mk_runner();
             let args = SyncArgs {
-                transform: vec![],
+                transform: None,
                 delete_after_import: false,
                 split: Some("*.mp4".to_string()),
                 state_dir: Some(mk_state_dir(&tmp)),
@@ -2026,7 +2027,7 @@ state = "done"
         fs::write(src.join("sub/c.mp4"), "mp4").unwrap();
 
         let args = SyncArgs {
-            transform: vec![],
+            transform: None,
             delete_after_import: false,
             split: Some("*.mp4".to_string()),
             state_dir: Some(state_dir),
@@ -2079,7 +2080,7 @@ state = "done"
         fs::write(src.join("a.mp4"), "data").unwrap();
 
         let args = SyncArgs {
-            transform: vec![],
+            transform: None,
             delete_after_import: false,
             split: Some("*.mp4".to_string()),
             state_dir: Some(state_dir.clone()),
@@ -2121,7 +2122,7 @@ state = "done"
         fs::write(src.join("a.mp4"), "data").unwrap();
 
         let args = SyncArgs {
-            transform: vec![],
+            transform: None,
             delete_after_import: false,
             split: Some(".".to_string()),
             state_dir: Some(state_dir),
@@ -2154,7 +2155,7 @@ state = "done"
         fs::write(src.join("b.txt"), "text").unwrap();
 
         let args = SyncArgs {
-            transform: vec![],
+            transform: None,
             delete_after_import: false,
             split: Some("*.mp4".to_string()),
             state_dir: Some(state_dir),
@@ -2195,7 +2196,7 @@ state = "done"
         fs::write(src.join("sub/c.mp4"), "nested-mp4").unwrap();
 
         let args = SyncArgs {
-            transform: vec![],
+            transform: None,
             delete_after_import: false,
             split: Some("*.mp4".to_string()),
             state_dir: Some(state_dir),
@@ -2224,7 +2225,7 @@ state = "done"
 
         for bad in &["", "/", "///"] {
             let args = SyncArgs {
-                transform: vec![],
+                transform: None,
                 delete_after_import: false,
                 split: Some(bad.to_string()),
                 state_dir: Some(state_dir.clone()),
@@ -2252,7 +2253,7 @@ state = "done"
             // Cleanup (delete without transform)
             {
                 let args = SyncArgs {
-                    transform: vec![],
+                    transform: None,
                     delete_after_import: true,
                     split: Some(bad.to_string()),
                     state_dir: Some(state_dir.clone()),
@@ -2269,7 +2270,7 @@ state = "done"
             // Transform
             {
                 let args = SyncArgs {
-                    transform: vec!["transform".to_string()],
+                    transform: Some("transform".into()),
                     delete_after_import: true,
                     split: Some(bad.to_string()),
                     state_dir: Some(state_dir.clone()),

@@ -128,7 +128,7 @@ pub(crate) fn build_manifest(
     spec: &SourceSpec,
     run_id: &RunId,
     nickname: &Nickname,
-    transform_steps: &[String],
+    transform: Option<&str>,
 ) -> Result<Manifest> {
     let source_path = Path::new(&spec.operation_path);
 
@@ -147,7 +147,7 @@ pub(crate) fn build_manifest(
     let local_path = ClientLocalPath::new(spec.operation_path.clone())
         .with_context(|| format!("invalid local path: {}", spec.operation_path))?;
 
-    let has_transform = !transform_steps.is_empty();
+    let has_transform = transform.is_some();
 
     let kind = match spec.kind {
         SourceKind::Directory => ManifestEntryKind::Directory,
@@ -198,7 +198,7 @@ pub(crate) fn build_manifest(
         mtime_ns,
         sha256,
         link_target,
-        transform_steps: transform_steps.to_vec(),
+        transform: transform.map(|s| s.to_owned()),
     };
 
     Ok(Manifest {
@@ -390,7 +390,7 @@ mod tests {
             &s,
             &RunId::new("test".into()).unwrap(),
             &Nickname::new("host".into()).unwrap(),
-            &[],
+            None,
         )
         .unwrap();
         assert_eq!(manifest.entries.len(), 1);
@@ -407,12 +407,12 @@ mod tests {
             &s,
             &RunId::new("test".into()).unwrap(),
             &Nickname::new("host".into()).unwrap(),
-            &["compress".into()],
+            Some("compress"),
         )
         .unwrap();
         assert_eq!(manifest.entries.len(), 1);
         assert_eq!(manifest.entries[0].kind, ManifestEntryKind::RegularFile);
-        assert_eq!(manifest.entries[0].transform_steps, vec!["compress"]);
+        assert_eq!(manifest.entries[0].transform, Some("compress".into()));
     }
 
     #[test]
@@ -425,7 +425,7 @@ mod tests {
             &s,
             &RunId::new("test".into()).unwrap(),
             &Nickname::new("host".into()).unwrap(),
-            &["compress".into()],
+            Some("compress"),
         )
         .unwrap();
         assert_eq!(manifest.entries.len(), 1);
@@ -444,7 +444,7 @@ mod tests {
             &s,
             &RunId::new("test".into()).unwrap(),
             &Nickname::new("host".into()).unwrap(),
-            &["compress".into()],
+            Some("compress"),
         )
         .unwrap();
         assert_eq!(manifest.entries.len(), 1);
@@ -464,7 +464,7 @@ mod tests {
             &s,
             &RunId::new("test".into()).unwrap(),
             &Nickname::new("host".into()).unwrap(),
-            &["compress".into()],
+            Some("compress"),
         )
         .unwrap();
         assert_eq!(manifest.entries.len(), 1);
@@ -606,7 +606,7 @@ mod tests {
             &s,
             &RunId::new("test".into()).unwrap(),
             &Nickname::new("host".into()).unwrap(),
-            &[],
+            None,
         )
         .unwrap();
         let cleanup = capture_cleanup_identity(&s).unwrap();
@@ -647,7 +647,7 @@ mod tests {
             &s,
             &RunId::new("test".into()).unwrap(),
             &Nickname::new("host".into()).unwrap(),
-            &[],
+            None,
         )
         .unwrap();
         assert_eq!(manifest.entries[0].relative_path.as_str(), "Videos");

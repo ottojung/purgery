@@ -1,6 +1,7 @@
 work_dir = "/var/lib/purgery/work"
 
-[transform.steps.compress-video]
+[[transform]]
+name = "compress-video"
 kind = "subprocess"
 program = "my-compress-video"
 args = ["--input", "{input}", "--output-dir", "{target_directory}"]

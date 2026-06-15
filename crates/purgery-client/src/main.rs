@@ -50,9 +50,9 @@ enum Command {
 
 #[derive(Parser)]
 struct SyncArgs {
-    /// Transform step to run on the server (repeatable)
+    /// Transform to run on the server
     #[arg(long = "transform", short = 'p')]
-    transform: Vec<String>,
+    transform: Option<String>,
 
     /// Delete source files after successful import (required with --transform)
     #[arg(long)]
@@ -218,7 +218,7 @@ mod tests {
                 assert_eq!(s.source, "/home/user/Videos");
                 assert_eq!(s.destination, "user@host:/dest");
                 assert!(!s.delete_after_import);
-                assert!(s.transform.is_empty());
+                assert!(s.transform.is_none());
             }
         }
     }
@@ -238,7 +238,7 @@ mod tests {
         .unwrap();
         match args.command {
             Command::Sync(s) => {
-                assert_eq!(s.transform, vec!["compress"]);
+                assert_eq!(s.transform, Some("compress".into()));
                 assert!(s.delete_after_import);
             }
         }
@@ -347,5 +347,23 @@ mod tests {
             Cli::try_parse_from(["purgery-client", "sync", "--", "/src", "host:dest"]).unwrap();
         let cfg = build_logging_config(&args);
         assert!(matches!(cfg.level, LogLevel::Info));
+    }
+
+    #[test]
+    fn cli_rejects_multiple_transform_flags() {
+        let result = Cli::try_parse_from([
+            "purgery-client",
+            "sync",
+            "--transform",
+            "a",
+            "--transform",
+            "b",
+            "--delete-after-import",
+            "--",
+            "/src",
+            "host:dest",
+        ]);
+
+        assert!(result.is_err());
     }
 }
