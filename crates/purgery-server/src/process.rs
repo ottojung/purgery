@@ -242,7 +242,6 @@ fn process_manifest_entry(
         Err(error) => return failed_entry(entry, error.to_string()),
     };
 
-    // No steps → commit the original work path directly (identity transform).
     if entry.transform_steps.is_empty() {
         let final_destination = final_path.as_str().to_owned();
         return match commit_output_entry(&work_path, &final_path, destination_root, run_id) {
@@ -256,6 +255,14 @@ fn process_manifest_entry(
             Err(error) => failed_entry(entry, error),
         };
     }
+
+    let Some(target_directory) = final_path.parent() else {
+        return failed_entry(
+            entry,
+            format!("final path has no parent: {}", final_path.as_str()),
+        );
+    };
+    let target_directory = target_directory.to_owned();
 
     let mut pp_helper = |update: &purgery_core::ProgressUpdate| {
         write_progress_best_effort(
@@ -276,47 +283,19 @@ fn process_manifest_entry(
     match apply_transforms(
         &resolved_steps,
         &work_path,
+        &target_directory,
         &mut pp_helper,
         entry_index,
         entry_total,
         entry.relative_path.as_str(),
     ) {
         Ok(outputs) => {
-            let mut final_paths = Vec::new();
+            let mut final_paths: Vec<String> = Vec::new();
             for output in outputs {
-                let output_final = if output == work_path {
-                    final_path.clone()
-                } else {
-                    let filename = output.file_name().unwrap_or("");
-                    final_path.parent().map_or_else(
-                        || Utf8PathBuf::from(filename),
-                        |parent| parent.join(filename),
-                    )
-                };
-                if !path_is_within_root(&output_final, destination_root) {
+                if !path_is_within_root(&output, destination_root) {
                     return failed_entry(entry, "output escapes root");
                 }
-                if let Err(error) =
-                    commit_output_entry(&output, &output_final, destination_root, run_id)
-                {
-                    return failed_entry(entry, format!("commit failed: {error}"));
-                }
-                let output_relative = if output == work_path {
-                    entry.relative_path.clone()
-                } else {
-                    let filename = output.file_name().unwrap_or("");
-                    let relative = entry.relative_path.as_path().parent().map_or_else(
-                        || Utf8PathBuf::from(filename),
-                        |parent| parent.join(filename),
-                    );
-                    match NormalizedRelativePath::new(relative) {
-                        Ok(path) => path,
-                        Err(error) => {
-                            return failed_entry(entry, format!("invalid output path: {error}"))
-                        }
-                    }
-                };
-                final_paths.push(destination.join(&output_relative).as_str().to_owned());
+                final_paths.push(output.as_str().to_owned());
             }
             let steps: Vec<String> = entry.transform_steps.clone();
             EntryOutcome::Success {
@@ -324,7 +303,7 @@ fn process_manifest_entry(
                 local_path: entry.local_path.as_str().to_owned(),
                 relative_path: entry.relative_path.as_str().to_owned(),
                 final_paths,
-                transform: (!steps.is_empty()).then_some(steps),
+                transform: Some(steps),
             }
         }
         Err(error) => failed_entry(entry, error),

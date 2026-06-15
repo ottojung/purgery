@@ -17,8 +17,10 @@ A successful upload to transform staging never authorizes cleanup.
 
 Transform runs move through `incoming -> ready -> processing -> done|failed`. `prepare-run` validates the plan while it is still incoming. `finish-run` is the only transition to ready.
 
-Processing uses staged sources and a run-local work area. Status files are published atomically before terminal phase publication. Recovery resumes processing runs from staged data and filesystem state, so repeated commits converge on the requested destination.
+Processing uses staged sources and a run-local work area. The server invokes transform subprocesses with `{target_directory}` pointing at the final destination parent. Transform programs are trusted to place outputs directly into `{target_directory}`; the server checks declared `expected_outputs` exist after each step. Status files are published atomically before terminal phase publication. Recovery resumes processing runs from staged data and filesystem state.
+
+Transform programs may intentionally perform deletion-only or no-output imports when `expected_outputs = []`. In this case, successful subprocess exit is sufficient and no final destination checks are performed.
 
 ## Storage separation
 
-`work_dir` owns incoming files, phase directories, manifests, leases, progress, status, and work areas. Final entries are committed only beneath the destination recorded in `run.toml`, whether that destination is absolute or relative.
+`work_dir` owns incoming files, phase directories, manifests, leases, progress, status, and work areas. Final entries are committed only beneath the destination recorded in `run.toml`, whether that destination is absolute or relative. For non-transform entries, the server moves the work entry to its final path. For transform entries, the transform program places outputs directly in `{target_directory}`; the server does not move or commit transform outputs.

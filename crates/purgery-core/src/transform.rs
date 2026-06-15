@@ -47,7 +47,6 @@ pub struct TransformStepDefinition {
     pub program: String,
     #[serde(default)]
     pub args: Vec<String>,
-    #[serde(default)]
     pub expected_outputs: Vec<String>,
     #[serde(default = "default_true")]
     pub keep_original: bool,
@@ -66,28 +65,28 @@ impl TransformStepDefinition {
             .replace("{stem}", file_stem)
     }
 
-    pub fn build_args(&self, work_path: &Utf8Path) -> Vec<String> {
+    pub fn build_args(&self, work_path: &Utf8Path, target_directory: &Utf8Path) -> Vec<String> {
         self.args
             .iter()
-            .map(|a| self.resolve_placeholders(work_path, a))
+            .map(|a| {
+                self.resolve_placeholders(work_path, a)
+                    .replace("{target_directory}", target_directory.as_str())
+            })
             .collect()
     }
 
     pub fn resolve_expected_outputs(
         &self,
         work_path: &Utf8Path,
+        target_directory: &Utf8Path,
     ) -> Result<Vec<Utf8PathBuf>, String> {
-        let parent = work_path
-            .parent()
-            .map(|p| p.to_owned())
-            .unwrap_or_else(|| Utf8PathBuf::from("."));
         let mut results = Vec::with_capacity(self.expected_outputs.len());
         for pat in &self.expected_outputs {
             validate_expected_output_name(pat)?;
             let resolved = self.resolve_placeholders(work_path, pat);
             let p = Utf8Path::new(&resolved);
             let fname = p.file_name().unwrap_or(resolved.as_str());
-            results.push(parent.join(fname));
+            results.push(target_directory.join(fname));
         }
         Ok(results)
     }
@@ -106,10 +105,11 @@ pub fn validate_expected_output_name(name: &str) -> Result<(), String> {
     if Utf8Path::new(name).is_absolute() {
         return Err("expected output name must not be absolute".into());
     }
-    if name.contains("{input}") || name.contains("{parent}") {
+    if name.contains("{input}") || name.contains("{parent}") || name.contains("{target_directory}")
+    {
         return Err(
-            "expected output name must not use {{input}} or {{parent}} placeholders; \
-             only {{file_name}}, {{file_stem}}, and {{stem}} are allowed"
+            "expected output name must not use {{input}}, {{parent}}, or {{target_directory}} \
+             placeholders; only {{file_name}}, {{file_stem}}, and {{stem}} are allowed"
                 .into(),
         );
     }

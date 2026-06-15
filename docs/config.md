@@ -32,7 +32,7 @@ heartbeat_interval_secs = 60
 [transform.steps.compress-video]
 kind = "subprocess"
 program = "/usr/local/bin/compress-video"
-args = ["--input", "{input}"]
+args = ["--input", "{input}", "--output-dir", "{target_directory}"]
 expected_outputs = ["{file_stem}.Z.webm"]
 keep_original = true
 ```
@@ -73,8 +73,8 @@ keep_original = true
 | `kind` | yes | Must be `"subprocess"` |
 | `program` | yes | Executable path or name (resolved via `PATH`) |
 | `args` | `[]` | Arguments with placeholders |
-| `expected_outputs` | `[]` | Output entry-root name patterns with placeholders |
-| `keep_original` | `true` | Whether to keep the original input entry/root as one committed output |
+| `expected_outputs` | yes | List of output entry-name patterns with placeholders. May be empty (`[]`) |
+| `keep_original` | `true` | Metadata for the transform program; Purgery does not use it to place or move files |
 
 ### Placeholders
 
@@ -85,10 +85,11 @@ keep_original = true
 | `{file_name}` | Input file name with extension |
 | `{file_stem}` | Input file name without extension |
 | `{stem}` | Deprecated alias for `{file_stem}` |
+| `{target_directory}` | Directory where this entry's non-transform final path would be placed |
 
-`args` may use `{input}`, `{parent}`, `{file_name}`, `{file_stem}`, and `{stem}`. `expected_outputs` may use only `{file_name}`, `{file_stem}`, and `{stem}`, and each resolved expected output must be a plain file name without directory components.
+`args` may use `{input}`, `{parent}`, `{file_name}`, `{file_stem}`, `{stem}`, and `{target_directory}`. `expected_outputs` may use only `{file_name}`, `{file_stem}`, and `{stem}`, and each resolved expected output must be a plain file name without directory components.
 
-A subprocess step must produce at least one committed output. If `keep_original = false`, then `expected_outputs` must be non-empty. This is validated at server boot time.
+Purgery does not move or commit transform outputs. The transform program is responsible for placing outputs into `{target_directory}`. After each step exits successfully, Purgery checks each declared expected output exists in `{target_directory}`. If `expected_outputs = []`, no output-existence checks are performed; successful subprocess exit is sufficient.
 
 ### Subprocess safety
 
@@ -118,9 +119,10 @@ The `destination` field is the client-supplied destination path. It may be absol
 Final path computation:
 
 - The source entry base final path is `<destination>/<source_entry_name>`.
-- If `keep_original = true`, the original work entry commits to that base path.
-- Each expected transform output commits under the same parent, using the output file name.
-- The server never places final files under `work_dir`.
+- `{target_directory}` is the parent directory of the base final path: `<destination>`.
+- For non-transform entries, the work entry is committed to the base final path.
+- For transform entries, the transform program places outputs in `{target_directory}`. Purgery does not move or commit outputs.
+- `work_dir` is never final storage.
 
 ## Config strictness
 
@@ -162,7 +164,7 @@ Purgery's security model assumes:
 
 1. **Server config** is trusted server admin configuration.
 2. **`--server-command`** is a trusted configuration value (not user input).
-3. **Transform programs and their argv** are trusted server-side configuration set by the server admin. Clients request steps by name but never upload arbitrary commands.
+3. **Transform programs and their argv** are trusted server-side configuration set by the server admin. Clients request steps by name but never upload arbitrary commands. Transform programs are trusted to place outputs in `{target_directory}` and may intentionally perform deletion-only/no-output imports when `expected_outputs = []`.
 4. **Source filenames and paths** may contain arbitrary characters (spaces, special characters, leading `-`) and must not become shell syntax or local subprocess options. Purgery uses argv-style invocation and shell-escaping for remote commands to prevent injection.
 5. **Local filesystem and server storage** are non-hostile unless documented otherwise.
 

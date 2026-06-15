@@ -981,7 +981,10 @@ unknown_field = "value"
             expected_outputs: vec![],
             keep_original: true,
         };
-        let built = step.build_args(camino::Utf8Path::new("/tmp/work/file.mp4"));
+        let built = step.build_args(
+            camino::Utf8Path::new("/tmp/work/file.mp4"),
+            camino::Utf8Path::new("/dest"),
+        );
         // build_args must resolve placeholders but not reorder or reject the argv
         assert_eq!(built.len(), 2, "argv length must be preserved");
         assert_eq!(built[0], "--input", "first arg must be unchanged");
@@ -1001,7 +1004,10 @@ unknown_field = "value"
             expected_outputs: vec![],
             keep_original: true,
         };
-        let built = step.build_args(camino::Utf8Path::new("/tmp/work/file.mp4"));
+        let built = step.build_args(
+            camino::Utf8Path::new("/tmp/work/file.mp4"),
+            camino::Utf8Path::new("/dest"),
+        );
         assert!(
             built.iter().any(|a| a.contains("/tmp/work")),
             "build_args must resolve placeholders, not reject them"
@@ -1133,7 +1139,7 @@ unknown_field = "value"
             keep_original: true,
         };
         let work_path = Utf8Path::new("/work/videos/video.mp4");
-        let args = step.build_args(work_path);
+        let args = step.build_args(work_path, Utf8Path::new("/dest"));
         assert_eq!(args, vec!["--input", "/work/videos/video.mp4"]);
     }
 
@@ -1147,9 +1153,12 @@ unknown_field = "value"
             keep_original: false,
         };
         let work_path = Utf8Path::new("/work/videos/video.mp4");
-        let outputs = step.resolve_expected_outputs(work_path).unwrap();
+        let target_dir = Utf8Path::new("/dest");
+        let outputs = step
+            .resolve_expected_outputs(work_path, target_dir)
+            .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].as_str(), "/work/videos/video.Z.webm");
+        assert_eq!(outputs[0].as_str(), "/dest/video.Z.webm");
     }
 
     #[test]
@@ -1162,7 +1171,8 @@ unknown_field = "value"
             keep_original: false,
         };
         let work_path = Utf8Path::new("/work/videos/video.mp4");
-        let args = step.build_args(work_path);
+        let target_dir = Utf8Path::new("/dest");
+        let args = step.build_args(work_path, target_dir);
         assert_eq!(args, vec!["--output-dir", "/work/videos"]);
     }
 
@@ -1229,6 +1239,30 @@ color = "never"
             err.contains("{parent}") || err.contains("separator"),
             "error must mention {{parent}} or separator: {err}"
         );
+    }
+
+    #[test]
+    fn validate_expected_output_rejects_target_directory_placeholder() {
+        let err = validate_expected_output_name("{target_directory}/out").unwrap_err();
+        assert!(
+            err.contains("{target_directory}") || err.contains("separator"),
+            "error must mention {{target_directory}} or separator: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_target_directory_placeholder() {
+        let step = TransformStepDefinition {
+            kind: TransformKind::Subprocess,
+            program: "ffmpeg".into(),
+            args: vec!["--output-dir".into(), "{target_directory}".into()],
+            expected_outputs: vec!["{stem}.Z.webm".into()],
+            keep_original: false,
+        };
+        let work_path = Utf8Path::new("/work/videos/video.mp4");
+        let target_dir = Utf8Path::new("/archive/videos");
+        let args = step.build_args(work_path, target_dir);
+        assert_eq!(args, vec!["--output-dir", "/archive/videos"]);
     }
 
     #[test]

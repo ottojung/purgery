@@ -12,6 +12,7 @@ const DEFAULT_HEARTBEAT_SECS: u64 = 5;
 pub fn apply_transforms(
     steps: &[ResolvedStep],
     work_path: &Utf8Path,
+    target_directory: &Utf8Path,
     progress_step: &mut dyn FnMut(&purgery_core::ProgressUpdate),
     entry_index: usize,
     entry_total: usize,
@@ -20,6 +21,7 @@ pub fn apply_transforms(
     apply_transforms_with_heartbeat(
         steps,
         work_path,
+        target_directory,
         std::time::Duration::from_secs(DEFAULT_HEARTBEAT_SECS),
         progress_step,
         entry_index,
@@ -32,6 +34,7 @@ pub fn apply_transforms(
 pub fn apply_transforms_with_heartbeat(
     steps: &[ResolvedStep],
     work_path: &Utf8Path,
+    target_directory: &Utf8Path,
     heartbeat_interval: std::time::Duration,
     progress_step: &mut dyn FnMut(&purgery_core::ProgressUpdate),
     entry_index: usize,
@@ -49,7 +52,7 @@ pub fn apply_transforms_with_heartbeat(
 
         match step_def.kind {
             purgery_core::TransformKind::Subprocess => {
-                let args = step_def.build_args(work_path);
+                let args = step_def.build_args(work_path, target_directory);
                 info!(step = %step.step_name, program = %step_def.program, "running transform step");
                 progress_step(&purgery_core::ProgressUpdate::new(
                     "step_started",
@@ -59,9 +62,6 @@ pub fn apply_transforms_with_heartbeat(
                     &step.step_name,
                 ));
 
-                // Run with cwd set to the work-area parent so that relative-path
-                // outputs land inside the work area, not in an arbitrary
-                // inherited server cwd.
                 let mut child = std::process::Command::new(&step_def.program)
                     .args(&args)
                     .current_dir(work_parent)
@@ -72,7 +72,6 @@ pub fn apply_transforms_with_heartbeat(
                     match child.try_wait() {
                         Ok(Some(status)) => break status,
                         Ok(None) => {
-                            // Still running — update progress heartbeat
                             progress_step(&purgery_core::ProgressUpdate::new(
                                 "step_running",
                                 entry_index,
@@ -105,16 +104,9 @@ pub fn apply_transforms_with_heartbeat(
                 ));
 
                 let expected = step_def
-                    .resolve_expected_outputs(work_path)
+                    .resolve_expected_outputs(work_path, target_directory)
                     .map_err(|e| format!("{}: {e}", step.step_name))?;
                 for exp in &expected {
-                    if !exp.starts_with(work_parent) {
-                        return Err(format!(
-                            "expected output '{}' is outside work area '{}'",
-                            exp.as_str(),
-                            work_parent.as_str()
-                        ));
-                    }
                     let metadata = fs::symlink_metadata(exp.as_std_path()).map_err(|error| {
                         if error.kind() == std::io::ErrorKind::NotFound {
                             format!("expected output not found: {}", exp.as_str())
@@ -137,9 +129,6 @@ pub fn apply_transforms_with_heartbeat(
                     }
                 }
 
-                if step_def.keep_original {
-                    results.push(work_path.to_owned());
-                }
                 results.extend(expected);
             }
         }
@@ -148,10 +137,6 @@ pub fn apply_transforms_with_heartbeat(
     {
         let mut seen = HashSet::new();
         results.retain(|p| seen.insert(p.as_str().to_owned()));
-    }
-
-    if results.is_empty() {
-        return Err("transforms produced zero outputs, but at least one is required".into());
     }
 
     Ok(results)
