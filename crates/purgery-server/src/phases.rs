@@ -53,23 +53,55 @@ pub(crate) fn write_progress_best_effort(
     }
 }
 
+/// Result of checking an existing progress file before writing.
+enum ExistingProgress {
+    /// Compatible progress file exists with a valid started_at value.
+    CompatibleStartedAt(u64),
+    /// No progress file exists.
+    Missing,
+    /// Progress file exists but has missing/incompatible purgery_version.
+    /// Must not be overwritten with current-version progress.
+    Incompatible,
+    /// Progress file exists but failed to parse (malformed).
+    /// May be overwritten (conservatively treating as current-format corruption).
+    Malformed,
+}
+
 /// Read `started_at_unix_secs` from an existing progress file, if present
 /// and the envelope (nickname, run_id) matches the current run.
 fn existing_progress_started_at(
     progress_path: &Utf8Path,
     nickname: &Nickname,
     run_id: &RunId,
-) -> Option<u64> {
-    let content = std::fs::read_to_string(progress_path.as_std_path()).ok()?;
-    let progress: ProcessingProgress = toml::from_str(&content).ok()?;
-    if purgery_core::require_compatible_purgery_version(&progress.purgery_version, "progress")
-        .is_err()
-        || progress.nickname != nickname.as_str()
-        || progress.run_id != run_id.as_str()
-    {
-        return None;
+) -> ExistingProgress {
+    let content = match std::fs::read_to_string(progress_path.as_std_path()) {
+        Ok(c) => c,
+        Err(_) => return ExistingProgress::Missing,
+    };
+    // Probe raw TOML for version before full parse
+    match purgery_core::probe_purgery_version_from_toml(&content) {
+        Err(purgery_core::VersionProbeError::MissingVersion) => {
+            return ExistingProgress::Incompatible;
+        }
+        Err(purgery_core::VersionProbeError::InvalidToml(_)) => {
+            // Invalid TOML — could be old corruption. Overwrite
+            // conservatively (treat as malformed current).
+            return ExistingProgress::Malformed;
+        }
+        Ok(version) => {
+            if purgery_core::require_compatible_purgery_version(&version, "progress").is_err() {
+                return ExistingProgress::Incompatible;
+            }
+        }
     }
-    Some(progress.started_at_unix_secs)
+    let progress: ProcessingProgress = match toml::from_str(&content) {
+        Ok(p) => p,
+        Err(_) => return ExistingProgress::Malformed,
+    };
+    if progress.nickname != nickname.as_str() || progress.run_id != run_id.as_str() {
+        return ExistingProgress::Malformed;
+    }
+    ExistingProgress::CompatibleStartedAt(progress.started_at_unix_secs)
 }
 
 /// Validate progress state semantics before writing.
@@ -149,7 +181,19 @@ pub(crate) fn write_progress(
         .unwrap_or_default()
         .as_secs();
     let final_path = processing_path.join("progress.toml");
-    let started_at = existing_progress_started_at(&final_path, nickname, run_id).unwrap_or(now);
+    let started_at = match existing_progress_started_at(&final_path, nickname, run_id) {
+        ExistingProgress::CompatibleStartedAt(v) => v,
+        ExistingProgress::Incompatible => {
+            warn!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                path = %final_path.as_str(),
+                "incompatible existing progress; not overwriting",
+            );
+            return Ok(());
+        }
+        ExistingProgress::Missing | ExistingProgress::Malformed => now,
+    };
     let progress = ProcessingProgress {
         protocol_version: 1,
         purgery_version: current_purgery_version().to_string(),
