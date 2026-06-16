@@ -1,6 +1,6 @@
 # Purgery
 
-Purgery imports a filesystem entry from a device into a destination, optionally transforms it on the server, and only removes the local original when doing so is explicitly configured and safe.
+Purgery imports a filesystem entry from a device into a destination and optionally transforms it on the server.
 
 ## Quick start
 
@@ -26,7 +26,7 @@ purgery-client sync \
   -- ~/Videos/trip user@server:/archive
 ```
 
-SOURCE may be a regular file, directory, or symlink. The destination is rsync-style: `USER@HOST:/absolute/path` or `USER@HOST:relative/path`. Both absolute and relative destinations are accepted. For transform runs, a relative destination is resolved against the server's working directory during `prepare-run` and the resolved absolute path persists in the run.
+SOURCE may be a regular file, directory, or symlink. The destination is rsync-style: `USER@HOST:/absolute/path` or `USER@HOST:relative/path`.
 
 ## How it works
 
@@ -40,9 +40,9 @@ purgery-client sync -- ./Photos user@server:/archive
   → /archive/Photos
 ```
 
-1. Without `--transform`, the client transfers directly to the destination with rsync; no server run or manifest exists.
-2. With passthrough cleanup, the client records local identity before rsync and removes only unchanged originals after rsync succeeds.
-3. With `--transform`, the client creates a server run for the source entry, waits for processing, and retires only unchanged originals that server status marks imported.
+1. Without `--transform` and `--delete-after-import`, the client transfers directly to the destination with rsync.
+2. With `--delete-after-import`, the client records local identity before rsync and removes unchanged originals after rsync succeeds.
+3. With `--transform`, the client creates a server run for the source entry, waits for processing, and deletes originals that server status marks imported.
 
 For multiple source entries under a common root, use `--split <PATTERN>`:
 
