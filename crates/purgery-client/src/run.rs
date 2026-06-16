@@ -55,6 +55,21 @@ fn derive_nickname(destination: &str) -> Result<Nickname> {
     Ok(Nickname::new(sanitized).or_else(|_| Nickname::new("default".to_owned()))?)
 }
 
+fn check_server_version(runner: &RemoteRunner, host: &str, server_cmd: &str) -> Result<()> {
+    let output = runner.server_cmd(host, server_cmd, &["version"])?;
+    let value: toml::Value =
+        toml::from_str(&output).with_context(|| "failed to parse server version response")?;
+    let server_purgery_version = value
+        .get("purgery_version")
+        .and_then(|v| v.as_str())
+        .with_context(|| "server version response missing purgery_version")?;
+    purgery_core::require_compatible_purgery_version(
+        server_purgery_version,
+        format_args!("server {host}"),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
 fn begin_run(
     runner: &RemoteRunner,
     host: &str,
@@ -178,7 +193,11 @@ fn read_status(
             run_id.as_str(),
         ],
     )?;
-    RunStatus::from_toml(output.trim()).with_context(|| "failed to parse status response")
+    let status =
+        RunStatus::from_toml(output.trim()).with_context(|| "failed to parse status response")?;
+    purgery_core::require_compatible_purgery_version(&status.purgery_version, "status")
+        .with_context(|| "server returned incompatible status version")?;
+    Ok(status)
 }
 
 fn wait_for_terminal(
@@ -261,6 +280,7 @@ fn persist_client_run_state(
 ) -> Result<()> {
     let run_state = ClientRunState {
         protocol_version: 1,
+        purgery_version: Some(purgery_core::current_purgery_version().to_string()),
         nickname: nickname.as_str().to_owned(),
         run_id: run_id.as_str().to_owned(),
         host: host.to_owned(),
@@ -360,8 +380,27 @@ fn resume_runs(runner: &RemoteRunner, state_dir: &str) -> Result<()> {
             Ok(c) => c,
             Err(_) => continue,
         };
-        let run_state: ClientRunState = match toml::from_str(&content) {
-            Ok(s) => s,
+        let run_state: ClientRunState = match toml::from_str::<ClientRunState>(&content) {
+            Ok(s) => {
+                if let Err(e) =
+                    purgery_core::check_durable_version(&s.purgery_version, "client run state")
+                {
+                    error!(
+                        "incompatible client run state version in {:?}: {e}",
+                        state_path
+                    );
+                    let corrupt_path = state_path.with_extension("toml.corrupt");
+                    if let Err(rename_err) = fs::rename(&state_path, &corrupt_path) {
+                        error!(
+                            "failed to rename corrupt state to {:?}: {rename_err}",
+                            corrupt_path
+                        );
+                    }
+                    any_error = true;
+                    continue;
+                }
+                s
+            }
             Err(e) => {
                 error!("failed to parse client run state {:?}: {e}", state_path);
                 let corrupt_path = state_path.with_extension("toml.corrupt");
@@ -407,8 +446,12 @@ fn drain_one(runner: &RemoteRunner, state_dir: &str, state: &ClientRunState) -> 
     let server_cmd = &state.server_command;
     let manifest: Manifest =
         toml::from_str(&state.manifest).with_context(|| "failed to parse persisted manifest")?;
+    purgery_core::check_durable_version(&manifest.purgery_version, "manifest")
+        .with_context(|| "incompatible persisted manifest version")?;
     let run_config: RunConfig = toml::from_str(&state.run_config)
         .with_context(|| "failed to parse persisted run config")?;
+    purgery_core::check_durable_version(&run_config.purgery_version, "run config")
+        .with_context(|| "incompatible persisted run config version")?;
 
     let mut phase = state.phase;
     let mut terminal_status: Option<String> = state.terminal_status.clone();
@@ -466,6 +509,11 @@ fn drain_one(runner: &RemoteRunner, state_dir: &str, state: &ClientRunState) -> 
                     Some(ts) => {
                         let s: purgery_core::RunStatus = toml::from_str(ts)
                             .with_context(|| "failed to parse persisted status")?;
+                        purgery_core::require_compatible_purgery_version(
+                            &s.purgery_version,
+                            "status",
+                        )
+                        .with_context(|| "incompatible persisted status version")?;
                         if s.nickname != nickname || s.run_id != run_id {
                             anyhow::bail!(
                                 "persisted terminal status envelope does not match: \
@@ -731,6 +779,7 @@ pub(crate) fn run_sync_with_run_id(
             None
         } else {
             let state = DurableCleanupState {
+                purgery_version: Some(purgery_core::current_purgery_version().to_string()),
                 nickname: nickname.as_str().to_owned(),
                 operation_id: run_id.as_str().to_owned(),
                 entries,
@@ -760,11 +809,14 @@ pub(crate) fn run_sync_with_run_id(
     // Transform: server run flow with heartbeat and crash-safe persistence
     let server_cmd = &args.server_command;
     let mut run_config = RunConfig {
+        purgery_version: Some(purgery_core::current_purgery_version().to_string()),
         nickname: nickname.clone(),
         destination: remote.path.clone(),
         delete_after_import: true,
     };
 
+    check_server_version(runner, &remote.host, server_cmd)
+        .with_context(|| "server version compatibility check failed")?;
     info!("starting server run");
     let begin_resp = begin_run(runner, &remote.host, server_cmd, &nickname, run_id)?;
 
@@ -794,6 +846,7 @@ pub(crate) fn run_sync_with_run_id(
 
         if let Some(ref dest) = prepare_resp.destination {
             run_config = RunConfig {
+                purgery_version: Some(purgery_core::current_purgery_version().to_string()),
                 nickname: nickname.clone(),
                 destination: DestinationPath::new(camino::Utf8PathBuf::from(dest))
                     .with_context(|| "server returned invalid resolved destination")?,
@@ -1003,7 +1056,12 @@ mod tests {
     use tempfile::tempdir;
 
     fn mk_runner() -> RemoteRunner {
-        RemoteRunner::fake()
+        let runner = RemoteRunner::fake();
+        runner.add_response(
+            "version",
+            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\n",
+        );
+        runner
     }
 
     fn mk_state_dir(tmp: &tempfile::TempDir) -> String {
@@ -1012,10 +1070,11 @@ mod tests {
 
     fn begin_resp_toml() -> String {
         r#"protocol_version = 1
+purgery_version = "0.1.0-test"
 nickname = "laptop"
 run_id = "test-run"
 incoming_dir = "/var/lib/purgery/work/laptop/incoming/test-run"
-files_dir = "/var/lib/purgery/work/laptop/incoming/test-run/files"
+files_dir = "/var/lib/purgery/work/laptop/incoming/test-run"
 run_config_path = "/var/lib/purgery/work/laptop/incoming/test-run/run.toml"
 manifest_path = "/var/lib/purgery/work/laptop/incoming/test-run/manifest.toml"
 heartbeat_interval_secs = 60
@@ -1025,6 +1084,7 @@ heartbeat_interval_secs = 60
 
     fn done_run_state_toml() -> String {
         r#"protocol_version = 1
+purgery_version = "0.1.0-test"
 nickname = "laptop"
 run_id = "test-run"
 phase = "done"
@@ -1037,7 +1097,8 @@ observed_at_unix_secs = 1000
     }
 
     fn done_status_toml() -> String {
-        r#"run_id = "test-run"
+        r#"purgery_version = "0.1.0-test"
+run_id = "test-run"
 nickname = "laptop"
 state = "done"
 "#
@@ -1177,11 +1238,13 @@ state = "done"
         );
 
         let manifest = Manifest {
+            purgery_version: Some("0.1.0-test".to_string()),
             run_id: RunId::new("test-drain".into()).unwrap(),
             nickname: Nickname::new("laptop".into()).unwrap(),
             entries: vec![],
         };
         let run_config = RunConfig {
+            purgery_version: Some("0.1.0-test".to_string()),
             nickname: Nickname::new("laptop".into()).unwrap(),
             destination: DestinationPath::new(camino::Utf8PathBuf::from("rel")).unwrap(),
             delete_after_import: true,
@@ -1221,11 +1284,13 @@ state = "done"
         // No scripted responses → all commands will fail with "no scripted response"
 
         let manifest = Manifest {
+            purgery_version: Some("0.1.0-test".to_string()),
             run_id: RunId::new("test-block".into()).unwrap(),
             nickname: Nickname::new("laptop".into()).unwrap(),
             entries: vec![],
         };
         let run_config = RunConfig {
+            purgery_version: Some("0.1.0-test".to_string()),
             nickname: Nickname::new("laptop".into()).unwrap(),
             destination: DestinationPath::new(camino::Utf8PathBuf::from("rel")).unwrap(),
             delete_after_import: true,
@@ -1263,17 +1328,20 @@ state = "done"
         // No SSH responses needed — terminal_status is persisted
 
         let manifest = Manifest {
+            purgery_version: Some("0.1.0-test".to_string()),
             run_id: RunId::new("test-tss".into()).unwrap(),
             nickname: Nickname::new("laptop".into()).unwrap(),
             entries: vec![],
         };
         let run_config = RunConfig {
+            purgery_version: Some("0.1.0-test".to_string()),
             nickname: Nickname::new("laptop".into()).unwrap(),
             destination: DestinationPath::new(camino::Utf8PathBuf::from("rel")).unwrap(),
             delete_after_import: true,
         };
 
         let status = RunStatus {
+            purgery_version: "0.1.0-test".to_string(),
             run_id: RunId::new("test-tss".into()).unwrap(),
             nickname: Nickname::new("laptop".into()).unwrap(),
             state: RunState::Done,
@@ -1312,11 +1380,13 @@ state = "done"
         // No scripted "status" response → re-read will fail
 
         let manifest = Manifest {
+            purgery_version: Some("0.1.0-test".to_string()),
             run_id: RunId::new("test-notss".into()).unwrap(),
             nickname: Nickname::new("laptop".into()).unwrap(),
             entries: vec![],
         };
         let run_config = RunConfig {
+            purgery_version: Some("0.1.0-test".to_string()),
             nickname: Nickname::new("laptop".into()).unwrap(),
             destination: DestinationPath::new(camino::Utf8PathBuf::from("rel")).unwrap(),
             delete_after_import: true,
@@ -1353,6 +1423,7 @@ state = "done"
         // not_found is non-terminal; wait_for_terminal treats it as error.
         let response = RunStateResponse {
             protocol_version: 1,
+            purgery_version: "0.1.0-test".to_string(),
             nickname: "laptop".to_string(),
             run_id: "test-nf".to_string(),
             phase: "not_found".to_string(),
@@ -1429,12 +1500,12 @@ state = "done"
         runner.add_response("begin-run", &begin);
         runner.add_response(
             "prepare-run",
-            "protocol_version = 1\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
         );
         runner.add_response("heartbeat-run", "");
         runner.add_response("run-state", &done_run_state_toml());
         let status_toml =
-            "run_id = \"test-run\"\nnickname = \"laptop\"\nstate = \"done\"\n".to_string();
+            "purgery_version = \"0.1.0-test\"\nrun_id = \"test-run\"\nnickname = \"laptop\"\nstate = \"done\"\n".to_string();
         runner.add_response("status", &status_toml);
         // Prove finish-run is called with heartbeat still alive: set a hook
         // that records when the guard is stopped, then verify the guard was
@@ -1528,7 +1599,7 @@ state = "done"
         runner.add_response("begin-run", &begin_resp_toml());
         runner.add_response(
             "prepare-run",
-            "protocol_version = 1\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
         );
         runner.add_rsync_error("laptop", "simulated rsync failure");
 
@@ -1550,7 +1621,7 @@ state = "done"
         runner.add_response("begin-run", &begin_resp_toml());
         runner.add_response(
             "prepare-run",
-            "protocol_version = 1\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
         );
         runner.add_rsync_error("laptop", "simulated rsync failure");
 
@@ -1592,7 +1663,7 @@ state = "done"
         runner.add_response("begin-run", &begin_resp_toml());
         runner.add_response(
             "prepare-run",
-            "protocol_version = 1\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
         );
         runner.add_error("finish-run", "simulated finish failure");
 
@@ -1630,7 +1701,7 @@ state = "done"
         runner.add_response("begin-run", &begin);
         runner.add_response(
             "prepare-run",
-            "protocol_version = 1\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
         );
         runner.add_error("heartbeat-run", "simulated heartbeat failure");
 
@@ -1689,12 +1760,12 @@ state = "done"
         runner.add_response("begin-run", &begin);
         runner.add_response(
             "prepare-run",
-            "protocol_version = 1\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
         );
         runner.add_response("heartbeat-run", "");
         runner.add_response("run-state", &done_run_state_toml());
         let status_toml =
-            "run_id = \"test-run\"\nnickname = \"laptop\"\nstate = \"done\"\n".to_string();
+            "purgery_version = \"0.1.0-test\"\nrun_id = \"test-run\"\nnickname = \"laptop\"\nstate = \"done\"\n".to_string();
         runner.add_response("status", &status_toml);
         runner.add_response("finish-run", "");
 
@@ -1779,7 +1850,7 @@ state = "done"
         // Server returns a resolved absolute destination.
         runner.add_response(
             "prepare-run",
-            "protocol_version = 1\nnickname = \"laptop\"\nrun_id = \"test-resolved-dest\"\n\
+            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-resolved-dest\"\n\
              destination = \"/server/resolved/absolute/path\"\n",
         );
         runner.add_response("heartbeat-run", "");
@@ -1911,7 +1982,7 @@ state = "done"
         runner.add_response("begin-run", &begin);
         runner.add_response(
             "prepare-run",
-            "protocol_version = 1\nnickname = \"host\"\nrun_id = \"test-run\"\n",
+            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"host\"\nrun_id = \"test-run\"\n",
         );
         runner.add_response("heartbeat-run", "");
         runner.add_response(
@@ -1919,7 +1990,7 @@ state = "done"
             &done_run_state_toml().replace("laptop", "host"),
         );
         let status_toml =
-            "run_id = \"test-run\"\nnickname = \"host\"\nstate = \"done\"\n".to_string();
+            "purgery_version = \"0.1.0-test\"\nrun_id = \"test-run\"\nnickname = \"host\"\nstate = \"done\"\n".to_string();
         runner.add_response("status", &status_toml);
         runner.add_response("finish-run", "");
 

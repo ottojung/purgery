@@ -63,7 +63,13 @@ pub fn run_gc(config: &ServerConfig) -> Result<()> {
                 match fs::read_to_string(lease_path.as_std_path()) {
                     Ok(content) => match toml::from_str::<purgery_core::LeaseFile>(&content) {
                         Ok(lease) => {
-                            let valid = lease.protocol_version == 1
+                            let version_ok = purgery_core::check_durable_version(
+                                &lease.purgery_version,
+                                "lease",
+                            )
+                            .is_ok();
+                            let valid = version_ok
+                                && lease.protocol_version == 1
                                 && lease.nickname == nickname.as_str()
                                 && lease.run_id == run_id.as_str();
                             if !valid {
@@ -121,6 +127,7 @@ pub fn run_gc(config: &ServerConfig) -> Result<()> {
                 }
                 if fs::rename(&run_path, quarantine_path.as_std_path()).is_ok() {
                     let status = RunStatus {
+                        purgery_version: purgery_core::current_purgery_version().to_string(),
                         run_id: run_id.clone(),
                         nickname: nickname.clone(),
                         state: RunState::Failed,
@@ -155,6 +162,7 @@ pub fn run_gc(config: &ServerConfig) -> Result<()> {
             }
 
             let status = RunStatus {
+                purgery_version: purgery_core::current_purgery_version().to_string(),
                 run_id: run_id.clone(),
                 nickname: nickname.clone(),
                 state: RunState::Failed,

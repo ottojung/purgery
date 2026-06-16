@@ -486,6 +486,7 @@ pub fn process_processing_run(
 
     info!(state = %run_state.as_str(), "run complete");
     let run_status = RunStatus {
+        purgery_version: purgery_core::current_purgery_version().to_string(),
         run_id: run_id.clone(),
         nickname: nickname.clone(),
         state: run_state.clone(),

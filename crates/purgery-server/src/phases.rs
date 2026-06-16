@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use camino::Utf8Path;
 use purgery_core::{
-    Nickname, ProcessingProgress, PurgeryRoot, RunId, RunPhase, RunState, RunStatus, ServerConfig,
+    current_purgery_version, Nickname, ProcessingProgress, PurgeryRoot, RunId, RunPhase, RunState,
+    RunStatus, ServerConfig,
 };
 use std::fs;
 use tracing::{info, warn};
@@ -61,7 +62,10 @@ fn existing_progress_started_at(
 ) -> Option<u64> {
     let content = std::fs::read_to_string(progress_path.as_std_path()).ok()?;
     let progress: ProcessingProgress = toml::from_str(&content).ok()?;
-    if progress.nickname != nickname.as_str() || progress.run_id != run_id.as_str() {
+    if purgery_core::check_durable_version(&progress.purgery_version, "progress").is_err()
+        || progress.nickname != nickname.as_str()
+        || progress.run_id != run_id.as_str()
+    {
         return None;
     }
     Some(progress.started_at_unix_secs)
@@ -147,6 +151,7 @@ pub(crate) fn write_progress(
     let started_at = existing_progress_started_at(&final_path, nickname, run_id).unwrap_or(now);
     let progress = ProcessingProgress {
         protocol_version: 1,
+        purgery_version: Some(current_purgery_version().to_string()),
         nickname: nickname.as_str().to_owned(),
         run_id: run_id.as_str().to_owned(),
         phase: "processing".to_string(),
@@ -176,6 +181,7 @@ pub(crate) fn write_run_failure(
 ) -> Result<()> {
     let processing_path = work_dir.run_dir(nickname, run_id, RunPhase::Processing);
     let status = RunStatus {
+        purgery_version: current_purgery_version().to_string(),
         run_id: run_id.clone(),
         nickname: nickname.clone(),
         state: RunState::Failed,
@@ -390,6 +396,7 @@ pub fn begin_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> 
 
     let lease = purgery_core::LeaseFile {
         protocol_version: 1,
+        purgery_version: Some(current_purgery_version().to_string()),
         nickname: nickname.as_str().to_owned(),
         run_id: run_id.as_str().to_owned(),
         created_at_unix_secs: now,
@@ -415,6 +422,7 @@ pub fn begin_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> 
 
     let response = purgery_core::BeginRunResponse {
         protocol_version: 1,
+        purgery_version: current_purgery_version().to_string(),
         nickname: nickname.as_str().to_owned(),
         run_id: run_id.as_str().to_owned(),
         incoming_dir: incoming_path.as_str().to_owned(),
@@ -471,6 +479,8 @@ pub fn finish_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) ->
             fs::read_to_string(&lease_path).with_context(|| "failed to read lease file")?;
         let lease: purgery_core::LeaseFile =
             toml::from_str(&lease_content).with_context(|| "failed to parse lease file")?;
+        purgery_core::check_durable_version(&lease.purgery_version, "lease")
+            .with_context(|| "incompatible lease version")?;
         if lease.protocol_version != 1 {
             anyhow::bail!(
                 "lease protocol version {} does not match expected 1",

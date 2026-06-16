@@ -793,6 +793,7 @@ transform = ["compress-video", "another"]
     #[test]
     fn parse_status_with_run_error() {
         let toml = r#"
+purgery_version = "0.1.0-test"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 state = "failed"
@@ -810,6 +811,7 @@ error = "failed to parse manifest.toml"
     #[test]
     fn status_rejects_unknown_top_level_field() {
         let toml = r#"
+purgery_version = "0.1.0-test"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 state = "done"
@@ -822,6 +824,7 @@ unknown_field = "value"
     #[test]
     fn status_entry_rejects_unknown_field() {
         let toml = r#"
+purgery_version = "0.1.0-test"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 state = "done"
@@ -842,6 +845,7 @@ covered_by = "parent"
     #[test]
     fn status_accepts_new_transform_field() {
         let toml = r#"
+purgery_version = "0.1.0-test"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 state = "done"
@@ -864,6 +868,7 @@ transform = "compress-video"
     #[test]
     fn status_rejects_transform_as_array() {
         let toml = r#"
+purgery_version = "0.1.0-test"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 state = "done"
@@ -1529,6 +1534,7 @@ color = "never"
         use crate::RunStateResponse;
         let response = RunStateResponse {
             protocol_version: 1,
+            purgery_version: "0.1.0-test".to_string(),
             nickname: "laptop".into(),
             run_id: "test-run".into(),
             phase: "processing".into(),
@@ -1561,6 +1567,7 @@ color = "never"
         // timestamp semantics. We verify the types carry the right fields.
         let response = RunStateResponse {
             protocol_version: 1,
+            purgery_version: "0.1.0-test".to_string(),
             nickname: "laptop".into(),
             run_id: "test-run".into(),
             phase: "processing".into(),

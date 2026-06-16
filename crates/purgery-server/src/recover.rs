@@ -18,22 +18,38 @@ pub fn recover_or_process_processing_run(
 
     match fs::read_to_string(&status_path) {
         Ok(content) => match RunStatus::from_toml(&content) {
-            Ok(status) if status.nickname != *nickname || status.run_id != *run_id => {
-                let error = "interrupted processing had mismatched status envelope";
-                warn!(
-                    nickname = %nickname.as_str(),
-                    run_id = %run_id.as_str(),
-                    status_nickname = %status.nickname.as_str(),
-                    status_run_id = %status.run_id.as_str(),
-                    phase = "processing",
-                    run_status = "failed",
-                    recovery_action = "replace_mismatched_status",
-                    error,
-                    "processing run recovery failed"
-                );
-                write_run_failure(&config.work_dir, nickname, run_id, error)
-            }
             Ok(status) => {
+                if let Err(e) = purgery_core::require_compatible_purgery_version(
+                    &status.purgery_version,
+                    "status",
+                ) {
+                    let error = format!("incompatible status version: {e}");
+                    warn!(
+                        nickname = %nickname.as_str(),
+                        run_id = %run_id.as_str(),
+                        phase = "processing",
+                        run_status = "failed",
+                        recovery_action = "replace_incompatible_status",
+                        error,
+                        "processing run recovery failed"
+                    );
+                    return write_run_failure(&config.work_dir, nickname, run_id, &error);
+                }
+                if status.nickname != *nickname || status.run_id != *run_id {
+                    let error = "interrupted processing had mismatched status envelope";
+                    warn!(
+                        nickname = %nickname.as_str(),
+                        run_id = %run_id.as_str(),
+                        status_nickname = %status.nickname.as_str(),
+                        status_run_id = %status.run_id.as_str(),
+                        phase = "processing",
+                        run_status = "failed",
+                        recovery_action = "replace_mismatched_status",
+                        error,
+                        "processing run recovery failed"
+                    );
+                    return write_run_failure(&config.work_dir, nickname, run_id, error);
+                }
                 info!(
                     nickname = %nickname.as_str(),
                     run_id = %run_id.as_str(),

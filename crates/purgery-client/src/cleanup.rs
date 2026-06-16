@@ -36,6 +36,8 @@ pub(crate) fn confirm_all_imports(state_path: &Utf8Path) -> Result<()> {
         .with_context(|| format!("failed to read cleanup state: {state_path}"))?;
     let mut state: DurableCleanupState = toml::from_str(&content)
         .map_err(|e| anyhow::anyhow!("failed to parse cleanup state: {e}"))?;
+    purgery_core::check_durable_version(&state.purgery_version, "cleanup state")
+        .map_err(|e| anyhow::anyhow!("incompatible cleanup state version: {e}"))?;
     for entry in &mut state.entries {
         if !entry.import_confirmed {
             entry.import_confirmed = true;
@@ -56,6 +58,8 @@ pub(crate) fn confirm_imports_from_status(state_path: &Utf8Path, status: &RunSta
         .with_context(|| format!("failed to read cleanup state: {state_path}"))?;
     let mut state: DurableCleanupState = toml::from_str(&content)
         .map_err(|e| anyhow::anyhow!("failed to parse cleanup state: {e}"))?;
+    purgery_core::check_durable_version(&state.purgery_version, "cleanup state")
+        .map_err(|e| anyhow::anyhow!("incompatible cleanup state version: {e}"))?;
 
     // First pass: match cleanup entries to status entries by exact path/kind.
     for cleanup_entry in &mut state.entries {
@@ -134,11 +138,25 @@ pub(crate) fn resume_pending_cleanups(state_dir: &str) -> Result<()> {
         };
         if let Ok(content) = fs::read_to_string(state_path.as_std_path()) {
             if let Ok(state) = toml::from_str::<DurableCleanupState>(&content) {
+                if purgery_core::check_durable_version(&state.purgery_version, "cleanup state")
+                    .is_err()
+                {
+                    warn!(path = %state_path, "skipping cleanup state with incompatible version");
+                    continue;
+                }
                 let before = state.entries.iter().filter(|e| e.cleaned).count();
                 if let Err(e) = process_cleanup_state_file(&state_path) {
                     warn!(path = %state_path, error = %e, "failed to process cleanup state");
                 } else if let Ok(new_content) = fs::read_to_string(state_path.as_std_path()) {
                     if let Ok(new_state) = toml::from_str::<DurableCleanupState>(&new_content) {
+                        if purgery_core::check_durable_version(
+                            &new_state.purgery_version,
+                            "cleanup state",
+                        )
+                        .is_err()
+                        {
+                            continue;
+                        }
                         let after = new_state.entries.iter().filter(|e| e.cleaned).count();
                         deleted_total += after - before;
                     }
@@ -174,6 +192,8 @@ pub(crate) fn process_cleanup_state_file(state_path: &Utf8Path) -> Result<()> {
         .with_context(|| format!("failed to read cleanup state: {state_path}"))?;
     let mut state: DurableCleanupState = toml::from_str(&content)
         .map_err(|e| anyhow::anyhow!("failed to parse cleanup state: {e}"))?;
+    purgery_core::check_durable_version(&state.purgery_version, "cleanup state")
+        .map_err(|e| anyhow::anyhow!("incompatible cleanup state version: {e}"))?;
 
     // Phase 1: clean non-directory entries (files and symlinks).
     // Keep the in-memory state mutable so directory checks in phase 2
@@ -367,6 +387,7 @@ mod tests {
 
     fn status_for(path: &Path, file_status: FileStatus) -> RunStatus {
         RunStatus {
+            purgery_version: "0.1.0-test".to_string(),
             run_id: RunId::new("run-1".to_owned()).unwrap(),
             nickname: Nickname::new("host".to_owned()).unwrap(),
             state: RunState::Done,
@@ -389,6 +410,7 @@ mod tests {
         let file = tmp.path().join("a.txt");
         fs::write(&file, "original").unwrap();
         let state = DurableCleanupState {
+            purgery_version: Some("0.1.0-test".to_string()),
             nickname: "host".to_owned(),
             operation_id: "run-1".to_owned(),
             entries: vec![cleanup_entry(&file)],
@@ -421,6 +443,7 @@ mod tests {
         }
 
         let state = DurableCleanupState {
+            purgery_version: Some("0.1.0-test".to_string()),
             nickname: "host".to_owned(),
             operation_id: "run-dir".to_owned(),
             entries,
@@ -453,6 +476,7 @@ mod tests {
         }
 
         let state = DurableCleanupState {
+            purgery_version: Some("0.1.0-test".to_string()),
             nickname: "host".to_owned(),
             operation_id: "run-extra".to_owned(),
             entries,
@@ -483,6 +507,7 @@ mod tests {
         fs::write(&file, "modified").unwrap();
 
         let state = DurableCleanupState {
+            purgery_version: Some("0.1.0-test".to_string()),
             nickname: "host".to_owned(),
             operation_id: "run-changed".to_owned(),
             entries,
@@ -569,6 +594,7 @@ mod tests {
         }
 
         let state = DurableCleanupState {
+            purgery_version: Some("0.1.0-test".to_string()),
             nickname: "host".to_owned(),
             operation_id: "run-nested".to_owned(),
             entries,
@@ -592,6 +618,7 @@ mod tests {
             let file = tmp.path().join("a.txt");
             fs::write(&file, "original").unwrap();
             let state = DurableCleanupState {
+                purgery_version: Some("0.1.0-test".to_string()),
                 nickname: "host".to_owned(),
                 operation_id: format!("run-{}", status.as_str()),
                 entries: vec![cleanup_entry(&file)],
@@ -647,6 +674,7 @@ mod tests {
         ];
 
         let state = DurableCleanupState {
+            purgery_version: Some("0.1.0-test".to_string()),
             nickname: "host".to_owned(),
             operation_id: "run-dir".to_owned(),
             entries,
@@ -655,6 +683,7 @@ mod tests {
 
         // Status only mentions the directory as imported — no individual descendant entry.
         let status = RunStatus {
+            purgery_version: "0.1.0-test".to_string(),
             run_id: RunId::new("run-dir".to_owned()).unwrap(),
             nickname: Nickname::new("host".to_owned()).unwrap(),
             state: RunState::Done,
@@ -725,6 +754,7 @@ mod tests {
         ];
 
         let state = DurableCleanupState {
+            purgery_version: Some("0.1.0-test".to_string()),
             nickname: "host".to_owned(),
             operation_id: "run-failed".to_owned(),
             entries,
@@ -732,6 +762,7 @@ mod tests {
         let state_path = write_cleanup_state(&state, tmp.path().to_str().unwrap()).unwrap();
 
         let status = RunStatus {
+            purgery_version: "0.1.0-test".to_string(),
             run_id: RunId::new("run-failed".to_owned()).unwrap(),
             nickname: Nickname::new("host".to_owned()).unwrap(),
             state: RunState::Done,
@@ -792,6 +823,7 @@ mod tests {
         ];
 
         let state = DurableCleanupState {
+            purgery_version: Some("0.1.0-test".to_string()),
             nickname: "host".to_owned(),
             operation_id: "run-missing".to_owned(),
             entries,
@@ -800,6 +832,7 @@ mod tests {
 
         // Status has no entry for the parent directory.
         let status = RunStatus {
+            purgery_version: "0.1.0-test".to_string(),
             run_id: RunId::new("run-missing".to_owned()).unwrap(),
             nickname: Nickname::new("host".to_owned()).unwrap(),
             state: RunState::Done,
@@ -908,6 +941,7 @@ mod tests {
         });
 
         let state = DurableCleanupState {
+            purgery_version: Some("0.1.0-test".to_string()),
             nickname: "host".to_owned(),
             operation_id: "run-dir-cleanup".to_owned(),
             entries,
@@ -979,6 +1013,7 @@ mod tests {
         fs::write(&file, "modified").unwrap();
 
         let state = DurableCleanupState {
+            purgery_version: Some("0.1.0-test".to_string()),
             nickname: "host".to_owned(),
             operation_id: "run-changed-dir".to_owned(),
             entries,

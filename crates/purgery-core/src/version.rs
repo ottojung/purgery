@@ -3,6 +3,11 @@ use thiserror::Error;
 
 pub const PURGERY_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The current protocol-level version. Used for communication
+/// between client and server. Increment when the wire format
+/// family (the shape of the protocol) changes.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PurgeryVersion {
     pub major: u64,
@@ -67,7 +72,11 @@ pub fn parse_purgery_version(input: &str) -> Result<PurgeryVersion, VersionError
         .parse()
         .map_err(|_| VersionError::InvalidFormat(input.to_owned()))?;
 
-    Ok(PurgeryVersion { major, minor, patch })
+    Ok(PurgeryVersion {
+        major,
+        minor,
+        patch,
+    })
 }
 
 /// Returns `true` if the producer and consumer have the same major
@@ -93,6 +102,21 @@ pub fn require_compatible_purgery_version(
         });
     }
     Ok(())
+}
+
+/// Like [`require_compatible_purgery_version`] but for durable state
+/// that carries an optional `purgery_version` field (files that did not
+/// always include the field). Missing `purgery_version` is treated as
+/// incompatible.
+pub fn check_durable_version(version: &Option<String>, label: &str) -> Result<(), VersionError> {
+    match version {
+        Some(v) => require_compatible_purgery_version(v, label),
+        None => Err(VersionError::Incompatible {
+            context: label.to_owned(),
+            producer: "(missing)".to_owned(),
+            current: current_purgery_version().to_owned(),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -141,13 +165,27 @@ mod tests {
     #[test]
     fn parse_with_prerelease() {
         let v = parse_purgery_version("0.1.0-alpha.1").unwrap();
-        assert_eq!(v, PurgeryVersion { major: 0, minor: 1, patch: 0 });
+        assert_eq!(
+            v,
+            PurgeryVersion {
+                major: 0,
+                minor: 1,
+                patch: 0
+            }
+        );
     }
 
     #[test]
     fn parse_with_build_metadata() {
         let v = parse_purgery_version("0.1.0+build.42").unwrap();
-        assert_eq!(v, PurgeryVersion { major: 0, minor: 1, patch: 0 });
+        assert_eq!(
+            v,
+            PurgeryVersion {
+                major: 0,
+                minor: 1,
+                patch: 0
+            }
+        );
     }
 
     #[test]
@@ -167,7 +205,11 @@ mod tests {
 
     #[test]
     fn version_display() {
-        let v = PurgeryVersion { major: 0, minor: 1, patch: 7 };
+        let v = PurgeryVersion {
+            major: 0,
+            minor: 1,
+            patch: 7,
+        };
         assert_eq!(v.to_string(), "0.1.7");
     }
 }
