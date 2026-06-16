@@ -350,7 +350,11 @@ fn process_manifest_entry(
     }
 }
 
-pub fn process_ready_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> std::result::Result<(), ProcessingError> {
+pub fn process_ready_run(
+    config: &ServerConfig,
+    nickname: &Nickname,
+    run_id: &RunId,
+) -> std::result::Result<(), ProcessingError> {
     let ready_path = config.work_dir.run_dir(nickname, run_id, RunPhase::Ready);
     let processing_path = config
         .work_dir

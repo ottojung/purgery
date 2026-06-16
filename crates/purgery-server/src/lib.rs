@@ -411,11 +411,8 @@ fn try_read_status(
     let version_probe = purgery_core::probe_purgery_version_from_toml(&content);
     match RunStatus::from_toml(&content) {
         Ok(status) => {
-            if purgery_core::require_compatible_purgery_version(
-                &status.purgery_version,
-                "status",
-            )
-            .is_err()
+            if purgery_core::require_compatible_purgery_version(&status.purgery_version, "status")
+                .is_err()
             {
                 return TerminalStatusOutcome::Incompatible {
                     path: status_path.to_owned(),
