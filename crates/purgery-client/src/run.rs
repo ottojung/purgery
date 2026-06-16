@@ -1343,6 +1343,59 @@ state = "done"
     }
 
     #[test]
+    fn recovery_checks_server_version_before_finish_run() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        // Set up a runner with everything needed to drain EXCEPT a
+        // "version" response. If check_server_version were not called,
+        // drain_one would succeed via these responses.  Since
+        // check_server_version IS called, it fails before reaching any
+        // remote command.
+        let runner = RemoteRunner::fake();
+        runner.add_response("finish-run", "");
+        runner.add_response(
+            "run-state",
+            &done_run_state_toml().replace("test-run", "test-version-check"),
+        );
+        runner.add_response(
+            "status",
+            &done_status_toml().replace("test-run", "test-version-check"),
+        );
+
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: RunId::new("test-version-check".into()).unwrap(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            entries: vec![],
+        };
+        let run_config = RunConfig {
+            purgery_version: "0.1.0-test".to_string(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            destination: DestinationPath::new(camino::Utf8PathBuf::from("rel")).unwrap(),
+            delete_after_import: true,
+        };
+
+        persist_client_run_state(
+            &state_dir,
+            &Nickname::new("laptop".into()).unwrap(),
+            &RunId::new("test-version-check".into()).unwrap(),
+            "host",
+            "purgery-server",
+            &manifest,
+            &run_config,
+            None,
+            ClientRunPhase::UploadCompleteFinishPending,
+        )
+        .unwrap();
+
+        let result = resume_runs(&runner, &state_dir);
+        assert!(
+            result.is_err(),
+            "resume must fail when no server version is available; drain would succeed otherwise"
+        );
+    }
+
+    #[test]
     fn terminal_status_seen_uses_persisted_terminal_status() {
         let tmp = tempdir().unwrap();
         let state_dir = mk_state_dir(&tmp);
