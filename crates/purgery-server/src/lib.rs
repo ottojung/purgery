@@ -4,7 +4,7 @@ compile_error!("Purgery is Unix-only — it requires rsync, SSH, and Unix filesy
 use anyhow::{Context, Result};
 use purgery_core::{Nickname, RunId, RunPhase, RunStatus, ServerConfig};
 use std::fs;
-use tracing::info;
+use tracing::{info, warn};
 
 #[cfg_attr(not(test), allow(unused_imports))]
 use camino::Utf8Path;
@@ -196,10 +196,18 @@ pub fn read_run_status(
         let version_probe = purgery_core::probe_purgery_version_from_toml(&content);
         match RunStatus::from_toml(&content) {
             Ok(status) => {
-                purgery_core::require_compatible_purgery_version(&status.purgery_version, "status")
-                    .with_context(|| {
-                        format!("incompatible status version in '{}'", status_path.as_str())
-                    })?;
+                if purgery_core::require_compatible_purgery_version(
+                    &status.purgery_version,
+                    "status",
+                )
+                .is_err()
+                {
+                    warn!(
+                        "incompatible status version in '{}'; skipping",
+                        status_path.as_str()
+                    );
+                    continue;
+                }
                 if status.nickname != *nickname || status.run_id != *run_id {
                     anyhow::bail!(
                         "status envelope mismatch in '{}': expected {}/{}, got {}/{}",
@@ -213,10 +221,13 @@ pub fn read_run_status(
                 return Ok(status);
             }
             Err(e) => match version_probe {
-                Err(purgery_core::VersionProbeError::MissingVersion) => anyhow::bail!(
-                    "status file '{}' has missing purgery_version (too old)",
-                    status_path.as_str()
-                ),
+                Err(purgery_core::VersionProbeError::MissingVersion) => {
+                    warn!(
+                        "status file '{}' has missing purgery_version (too old); skipping",
+                        status_path.as_str()
+                    );
+                    continue;
+                }
                 _ => {
                     anyhow::bail!("malformed status file '{}': {e}", status_path.as_str());
                 }
@@ -225,7 +236,7 @@ pub fn read_run_status(
     }
 
     anyhow::bail!(
-        "status not found for run {}/{} in done or failed",
+        "no compatible status found for run {}/{} in done or failed",
         nickname.as_str(),
         run_id.as_str()
     );
@@ -305,7 +316,7 @@ pub fn run_state(
         }
         let status_path = dir.join("status.toml");
         match try_read_status(&status_path, nickname, run_id) {
-            Ok(()) => {
+            TerminalStatusOutcome::Valid => {
                 return Ok(purgery_core::RunStateResponse {
                     protocol_version: 1,
                     purgery_version: purgery_core::current_purgery_version().to_string(),
@@ -324,7 +335,17 @@ pub fn run_state(
                     progress_status: None,
                 });
             }
-            Err(reason) => {
+            TerminalStatusOutcome::Incompatible { path } => {
+                warn!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    status_path = %path.as_str(),
+                    "{} directory has incompatible status; ignoring for run-state response",
+                    phase_str,
+                );
+                // Continue to check the next terminal phase
+            }
+            TerminalStatusOutcome::Malformed(reason) => {
                 return Ok(purgery_core::RunStateResponse {
                     protocol_version: 1,
                     purgery_version: purgery_core::current_purgery_version().to_string(),
@@ -366,41 +387,54 @@ pub fn run_state(
     })
 }
 
+/// Outcome of attempting to read a terminal status file.
+enum TerminalStatusOutcome {
+    /// Compatible status with matching envelope.
+    Valid,
+    /// File exists but purgery_version is missing or incompatible.
+    /// Must not be semantically reused.
+    Incompatible { path: camino::Utf8PathBuf },
+    /// File exists but is malformed current-format content.
+    Malformed(String),
+}
+
 /// Try to read and validate a terminal status file.
-/// Returns Ok(()) if the file exists, parses, and envelope matches.
-/// Returns an error string explaining why validation failed.
 fn try_read_status(
     status_path: &camino::Utf8Path,
     nickname: &Nickname,
     run_id: &RunId,
-) -> Result<(), String> {
-    let content = std::fs::read_to_string(status_path.as_std_path())
-        .map_err(|e| format!("missing/unreadable: {e}"))?;
+) -> TerminalStatusOutcome {
+    let content = match std::fs::read_to_string(status_path.as_std_path()) {
+        Ok(c) => c,
+        Err(_) => return TerminalStatusOutcome::Malformed("missing/unreadable".to_string()),
+    };
     let version_probe = purgery_core::probe_purgery_version_from_toml(&content);
-    let status =
-        purgery_core::RunStatus::from_toml(&content).map_err(|e| match &version_probe {
-            Err(purgery_core::VersionProbeError::MissingVersion) => {
-                "missing purgery_version (too old)".to_string()
+    match RunStatus::from_toml(&content) {
+        Ok(status) => {
+            if purgery_core::require_compatible_purgery_version(
+                &status.purgery_version,
+                "status",
+            )
+            .is_err()
+            {
+                return TerminalStatusOutcome::Incompatible {
+                    path: status_path.to_owned(),
+                };
             }
-            _ => format!("malformed: {e}"),
-        })?;
-    purgery_core::require_compatible_purgery_version(&status.purgery_version, "status")
-        .map_err(|e| format!("version: {e}"))?;
-    if status.nickname != *nickname {
-        return Err(format!(
-            "envelope mismatch: expected nickname '{}', got '{}'",
-            nickname.as_str(),
-            status.nickname.as_str()
-        ));
+            if status.nickname != *nickname || status.run_id != *run_id {
+                return TerminalStatusOutcome::Malformed("envelope mismatch".to_string());
+            }
+            TerminalStatusOutcome::Valid
+        }
+        Err(_) => match version_probe {
+            Err(purgery_core::VersionProbeError::MissingVersion) => {
+                TerminalStatusOutcome::Incompatible {
+                    path: status_path.to_owned(),
+                }
+            }
+            _ => TerminalStatusOutcome::Malformed("malformed".to_string()),
+        },
     }
-    if status.run_id != *run_id {
-        return Err(format!(
-            "envelope mismatch: expected run_id '{}', got '{}'",
-            run_id.as_str(),
-            status.run_id.as_str()
-        ));
-    }
-    Ok(())
 }
 
 /// Read progress.toml fields for a processing-phase response.
@@ -609,6 +643,14 @@ pub fn heartbeat_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId)
     let lease_path = incoming_path.join("lease.toml");
     let lease_content = fs::read_to_string(lease_path.as_std_path())
         .with_context(|| "failed to read lease file")?;
+    // Probe raw TOML for version before full deserialization
+    if let Err(e) = purgery_core::probe_purgery_version_from_toml(&lease_content) {
+        anyhow::bail!(
+            "cannot heartbeat run: lease is missing purgery_version or has invalid TOML \
+             (producer version cannot be established) at '{}': {e}",
+            lease_path.as_str(),
+        );
+    }
     let mut lease: purgery_core::LeaseFile =
         toml::from_str(&lease_content).with_context(|| "failed to parse lease file")?;
     purgery_core::require_compatible_purgery_version(&lease.purgery_version, "lease")

@@ -522,6 +522,14 @@ pub fn finish_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) ->
     if lease_path.exists() {
         let lease_content =
             fs::read_to_string(&lease_path).with_context(|| "failed to read lease file")?;
+        // Probe raw TOML for version before full deserialization
+        if let Err(e) = purgery_core::probe_purgery_version_from_toml(&lease_content) {
+            anyhow::bail!(
+                "cannot finish run: lease is missing purgery_version or has invalid TOML \
+                 (producer version cannot be established) at '{}': {e}",
+                lease_path.as_str(),
+            );
+        }
         let lease: purgery_core::LeaseFile =
             toml::from_str(&lease_content).with_context(|| "failed to parse lease file")?;
         purgery_core::require_compatible_purgery_version(&lease.purgery_version, "lease")
