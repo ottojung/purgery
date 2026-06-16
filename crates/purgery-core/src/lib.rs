@@ -13,6 +13,7 @@ mod manifest;
 mod path;
 mod status;
 mod transform;
+mod version;
 
 pub use cleanup_state::*;
 pub use config::*;
@@ -20,6 +21,7 @@ pub use manifest::*;
 pub use path::*;
 pub use status::*;
 pub use transform::*;
+pub use version::*;
 
 // ── Error Types ──────────────────────────────────────────────────────
 
