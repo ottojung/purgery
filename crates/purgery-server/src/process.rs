@@ -371,6 +371,15 @@ pub fn process_processing_run(
             anyhow::bail!("{msg}");
         }
     };
+    if let Err(e) = purgery_core::require_compatible_toml_version(
+        &run_config_content,
+        format_args!("run config {run_config_path}"),
+    ) {
+        let msg = format!("incompatible run config version: {e}");
+        warn!("{}", msg);
+        write_run_failure(&config.work_dir, nickname, run_id, &msg)?;
+        anyhow::bail!("{msg}");
+    }
     let run_config = match RunConfig::from_toml(&run_config_content) {
         Ok(run_config) => run_config,
         Err(error) => {
@@ -391,6 +400,15 @@ pub fn process_processing_run(
             anyhow::bail!("{msg}");
         }
     };
+    if let Err(e) = purgery_core::require_compatible_toml_version(
+        &manifest_content,
+        format_args!("manifest {manifest_path}"),
+    ) {
+        let msg = format!("incompatible manifest version: {e}");
+        warn!("{}", msg);
+        write_run_failure(&config.work_dir, nickname, run_id, &msg)?;
+        anyhow::bail!("{msg}");
+    }
     let manifest = match Manifest::from_toml(&manifest_content) {
         Ok(manifest) => manifest,
         Err(error) => {

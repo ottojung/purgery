@@ -136,34 +136,50 @@ pub(crate) fn resume_pending_cleanups(state_dir: &str) -> Result<()> {
             Ok(p) => p,
             Err(_) => continue,
         };
-        if let Ok(content) = fs::read_to_string(state_path.as_std_path()) {
-            if let Ok(state) = toml::from_str::<DurableCleanupState>(&content) {
+        let content = match fs::read_to_string(state_path.as_std_path()) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        // Probe purgery_version from raw TOML before full deserialization
+        // so we can distinguish old/incompatible from malformed current state.
+        let version = match purgery_core::probe_purgery_version_from_toml(&content) {
+            Err(purgery_core::VersionProbeError::MissingVersion) => {
+                warn!(path = %state_path, "cleanup state missing purgery_version (too old); skipping");
+                continue;
+            }
+            Err(purgery_core::VersionProbeError::InvalidToml(e)) => {
+                warn!(path = %state_path, error = %e, "cleanup state has malformed TOML; skipping");
+                continue;
+            }
+            Ok(v) => v,
+        };
+        if let Err(e) = purgery_core::require_compatible_purgery_version(&version, "cleanup state")
+        {
+            warn!(path = %state_path, error = %e, "cleanup state has incompatible purgery_version; skipping");
+            continue;
+        }
+        let state = match toml::from_str::<DurableCleanupState>(&content) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(path = %state_path, error = %e, "cleanup state has malformed current-version content; skipping");
+                continue;
+            }
+        };
+        let before = state.entries.iter().filter(|e| e.cleaned).count();
+        if let Err(e) = process_cleanup_state_file(&state_path) {
+            warn!(path = %state_path, error = %e, "failed to process cleanup state");
+        } else if let Ok(new_content) = fs::read_to_string(state_path.as_std_path()) {
+            if let Ok(new_state) = toml::from_str::<DurableCleanupState>(&new_content) {
                 if purgery_core::require_compatible_purgery_version(
-                    &state.purgery_version,
+                    &new_state.purgery_version,
                     "cleanup state",
                 )
                 .is_err()
                 {
-                    warn!(path = %state_path, "skipping cleanup state with incompatible version");
                     continue;
                 }
-                let before = state.entries.iter().filter(|e| e.cleaned).count();
-                if let Err(e) = process_cleanup_state_file(&state_path) {
-                    warn!(path = %state_path, error = %e, "failed to process cleanup state");
-                } else if let Ok(new_content) = fs::read_to_string(state_path.as_std_path()) {
-                    if let Ok(new_state) = toml::from_str::<DurableCleanupState>(&new_content) {
-                        if purgery_core::require_compatible_purgery_version(
-                            &new_state.purgery_version,
-                            "cleanup state",
-                        )
-                        .is_err()
-                        {
-                            continue;
-                        }
-                        let after = new_state.entries.iter().filter(|e| e.cleaned).count();
-                        deleted_total += after - before;
-                    }
-                }
+                let after = new_state.entries.iter().filter(|e| e.cleaned).count();
+                deleted_total += after - before;
             }
         }
     }

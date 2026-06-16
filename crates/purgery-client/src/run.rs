@@ -383,30 +383,19 @@ fn resume_runs(runner: &RemoteRunner, state_dir: &str) -> Result<()> {
             Ok(c) => c,
             Err(_) => continue,
         };
-        let run_state: ClientRunState = match toml::from_str::<ClientRunState>(&content) {
-            Ok(s) => {
-                if let Err(e) = purgery_core::require_compatible_purgery_version(
-                    &s.purgery_version,
-                    "client run state",
-                ) {
-                    error!(
-                        "incompatible client run state version in {:?}: {e}",
-                        state_path
-                    );
-                    let corrupt_path = state_path.with_extension("toml.corrupt");
-                    if let Err(rename_err) = fs::rename(&state_path, &corrupt_path) {
-                        error!(
-                            "failed to rename corrupt state to {:?}: {rename_err}",
-                            corrupt_path
-                        );
-                    }
-                    any_error = true;
-                    continue;
-                }
-                s
+        // Probe purgery_version from raw TOML before full deserialization
+        // so we can distinguish missing/incompatible version (old state)
+        // from malformed content (corrupt current state).
+        let run_state = match purgery_core::probe_purgery_version_from_toml(&content) {
+            Err(purgery_core::VersionProbeError::MissingVersion) => {
+                warn!(
+                    "client run state {:?} is missing purgery_version (too old); skipping",
+                    state_path
+                );
+                continue;
             }
-            Err(e) => {
-                error!("failed to parse client run state {:?}: {e}", state_path);
+            Err(purgery_core::VersionProbeError::InvalidToml(e)) => {
+                error!("client run state {:?} is not valid TOML: {e}", state_path);
                 let corrupt_path = state_path.with_extension("toml.corrupt");
                 if let Err(rename_err) = fs::rename(&state_path, &corrupt_path) {
                     error!(
@@ -416,6 +405,32 @@ fn resume_runs(runner: &RemoteRunner, state_dir: &str) -> Result<()> {
                 }
                 any_error = true;
                 continue;
+            }
+            Ok(version) => {
+                if let Err(e) =
+                    purgery_core::require_compatible_purgery_version(&version, "client run state")
+                {
+                    warn!(
+                        "client run state {:?} has incompatible purgery_version: {e}; skipping",
+                        state_path
+                    );
+                    continue;
+                }
+                match toml::from_str::<ClientRunState>(&content) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("failed to parse client run state {:?}: {e}", state_path);
+                        let corrupt_path = state_path.with_extension("toml.corrupt");
+                        if let Err(rename_err) = fs::rename(&state_path, &corrupt_path) {
+                            error!(
+                                "failed to rename corrupt state to {:?}: {rename_err}",
+                                corrupt_path
+                            );
+                        }
+                        any_error = true;
+                        continue;
+                    }
+                }
             }
         };
         let run_dir = entry.path();
@@ -456,6 +471,9 @@ fn drain_one(runner: &RemoteRunner, state_dir: &str, state: &ClientRunState) -> 
         .with_context(|| "failed to parse persisted run config")?;
     purgery_core::require_compatible_purgery_version(&run_config.purgery_version, "run config")
         .with_context(|| "incompatible persisted run config version")?;
+
+    check_server_version(runner, host, server_cmd)
+        .with_context(|| "server version check failed while resuming persisted run")?;
 
     let mut phase = state.phase;
     let mut terminal_status: Option<String> = state.terminal_status.clone();

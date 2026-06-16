@@ -28,12 +28,11 @@ pub fn recover_or_process_processing_run(
                         nickname = %nickname.as_str(),
                         run_id = %run_id.as_str(),
                         phase = "processing",
-                        run_status = "failed",
-                        recovery_action = "replace_incompatible_status",
+                        recovery_action = "refuse_incompatible_status",
                         error,
-                        "processing run recovery failed"
+                        "processing run has incompatible status; leaving in place for operator inspection"
                     );
-                    return write_run_failure(&config.work_dir, nickname, run_id, &error);
+                    return Err(anyhow::anyhow!("{error}"));
                 }
                 if status.nickname != *nickname || status.run_id != *run_id {
                     let error = "interrupted processing had mismatched status envelope";

@@ -69,6 +69,11 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
     let run_config_path = incoming_path.join("run.toml");
     let run_config_content =
         fs::read_to_string(&run_config_path).with_context(|| "failed to read run config")?;
+    purgery_core::require_compatible_toml_version(
+        &run_config_content,
+        format_args!("run config {run_config_path}"),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
     let run_config = purgery_core::RunConfig::from_toml(&run_config_content)
         .with_context(|| "failed to parse run config")?;
 
@@ -79,6 +84,11 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
     let manifest_path = incoming_path.join("manifest.toml");
     let manifest_content =
         fs::read_to_string(&manifest_path).with_context(|| "failed to read manifest")?;
+    purgery_core::require_compatible_toml_version(
+        &manifest_content,
+        format_args!("manifest {manifest_path}"),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
     let manifest = purgery_core::Manifest::from_toml(&manifest_content)
         .with_context(|| "failed to parse manifest")?;
 
@@ -395,43 +405,54 @@ fn read_progress_fields(
     let progress_path = dir.join("progress.toml");
     match std::fs::read_to_string(&progress_path) {
         Ok(content) => match toml::from_str::<purgery_core::ProcessingProgress>(&content) {
-            Ok(prog)
+            Ok(prog) => {
                 if purgery_core::require_compatible_purgery_version(
                     &prog.purgery_version,
                     "progress",
                 )
-                .is_ok()
-                    && prog.nickname == nickname.as_str()
-                    && prog.run_id == run_id.as_str() =>
-            {
-                let msg = format!(
-                    "processing: {}/{} entries, current: {} transform: {}",
-                    prog.entry_index + 1,
-                    prog.entry_total,
-                    prog.current_entry,
-                    prog.current_transform
-                );
-                (
-                    msg,
-                    prog.updated_at_unix_secs,
-                    Some(prog.state),
-                    Some(prog.entry_index),
-                    Some(prog.entry_total),
-                    Some(prog.current_entry),
-                    Some(prog.current_transform),
-                    Some("valid".to_string()),
-                )
+                .is_err()
+                {
+                    (
+                        "run phase: processing (incompatible progress version)".to_string(),
+                        dir_modified_at(dir).unwrap_or(0),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some("incompatible_version".to_string()),
+                    )
+                } else if prog.nickname == nickname.as_str() && prog.run_id == run_id.as_str() {
+                    let msg = format!(
+                        "processing: {}/{} entries, current: {} transform: {}",
+                        prog.entry_index + 1,
+                        prog.entry_total,
+                        prog.current_entry,
+                        prog.current_transform
+                    );
+                    (
+                        msg,
+                        prog.updated_at_unix_secs,
+                        Some(prog.state),
+                        Some(prog.entry_index),
+                        Some(prog.entry_total),
+                        Some(prog.current_entry),
+                        Some(prog.current_transform),
+                        Some("valid".to_string()),
+                    )
+                } else {
+                    (
+                        "run phase: processing (progress envelope mismatch)".to_string(),
+                        dir_modified_at(dir).unwrap_or(0),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some("envelope_mismatch".to_string()),
+                    )
+                }
             }
-            Ok(_) => (
-                "run phase: processing (progress envelope mismatch)".to_string(),
-                dir_modified_at(dir).unwrap_or(0),
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some("envelope_mismatch".to_string()),
-            ),
             Err(_) => (
                 "run phase: processing (malformed progress)".to_string(),
                 dir_modified_at(dir).unwrap_or(0),
@@ -1051,7 +1072,7 @@ delete_after_import = true
         let status_content = fs::read_to_string(&status_path).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
         assert_eq!(status.state, RunState::Failed);
-        assert!(status.error.unwrap().contains("failed to parse manifest"));
+        assert!(status.error.unwrap().contains("manifest"));
     }
 
     #[test]
@@ -1102,7 +1123,7 @@ delete_after_import = true
         let status_content = fs::read_to_string(&status_path).unwrap();
         let status = RunStatus::from_toml(&status_content).unwrap();
         assert_eq!(status.state, RunState::Failed);
-        assert!(status.error.unwrap().contains("failed to parse run config"));
+        assert!(status.error.unwrap().contains("run config"));
     }
 
     #[test]
