@@ -6597,4 +6597,258 @@ delete_after_import = true
             "output must NOT be inside destination directory"
         );
     }
+
+    // ── purgery-version rejection in prepare-run ─────────────────────
+
+    #[test]
+    fn prepare_run_rejects_missing_purgery_version_in_run_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let mut config = test_server_config(&work_dir);
+        config.transforms.insert(
+            "test-step".into(),
+            TransformDefinition {
+                name: "test-step".into(),
+                kind: TransformKind::Subprocess,
+                program: "/bin/true".to_string(),
+                args: Vec::new(),
+                expected_outputs: Vec::new(),
+            },
+        );
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("test-pv-missing-run".into()).unwrap();
+        let incoming = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Incoming);
+        fs::create_dir_all(&incoming).unwrap();
+
+        // Write run.toml WITHOUT purgery_version
+        fs::write(
+            incoming.join("run.toml"),
+            format!(
+                r#"nickname = "{}"
+destination = "/tmp/dest"
+delete_after_import = true
+"#,
+                nickname.as_str()
+            ),
+        )
+        .unwrap();
+
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![ManifestEntry {
+                local_path: ClientLocalPath::new("/source/file.txt".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/file.txt".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("file.txt".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
+                size: 13,
+                mtime_ns: 0,
+                sha256: None,
+                link_target: None,
+                transform: Some("test-step".into()),
+            }],
+        };
+        fs::write(incoming.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+
+        let error = prepare_run(&config, &nickname, &run_id).unwrap_err();
+        assert!(
+            error.to_string().contains("run config"),
+            "error must mention run config, got: {error}"
+        );
+    }
+
+    #[test]
+    fn prepare_run_rejects_incompatible_purgery_version_in_run_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let mut config = test_server_config(&work_dir);
+        config.transforms.insert(
+            "test-step".into(),
+            TransformDefinition {
+                name: "test-step".into(),
+                kind: TransformKind::Subprocess,
+                program: "/bin/true".to_string(),
+                args: Vec::new(),
+                expected_outputs: Vec::new(),
+            },
+        );
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("test-pv-incompat-run".into()).unwrap();
+        let incoming = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Incoming);
+        fs::create_dir_all(&incoming).unwrap();
+
+        // Write run.toml with incompatible purgery_version
+        fs::write(
+            incoming.join("run.toml"),
+            format!(
+                r#"purgery_version = "2.0.0"
+nickname = "{}"
+destination = "/tmp/dest"
+delete_after_import = true
+"#,
+                nickname.as_str()
+            ),
+        )
+        .unwrap();
+
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![ManifestEntry {
+                local_path: ClientLocalPath::new("/source/file.txt".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/file.txt".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("file.txt".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
+                size: 13,
+                mtime_ns: 0,
+                sha256: None,
+                link_target: None,
+                transform: Some("test-step".into()),
+            }],
+        };
+        fs::write(incoming.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+
+        let error = prepare_run(&config, &nickname, &run_id).unwrap_err();
+        assert!(
+            error.to_string().contains("run config"),
+            "error must mention run config, got: {error}"
+        );
+    }
+
+    #[test]
+    fn prepare_run_rejects_missing_purgery_version_in_manifest_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let mut config = test_server_config(&work_dir);
+        config.transforms.insert(
+            "test-step".into(),
+            TransformDefinition {
+                name: "test-step".into(),
+                kind: TransformKind::Subprocess,
+                program: "/bin/true".to_string(),
+                args: Vec::new(),
+                expected_outputs: Vec::new(),
+            },
+        );
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("test-pv-missing-manifest".into()).unwrap();
+        let incoming = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Incoming);
+        fs::create_dir_all(&incoming).unwrap();
+
+        write_run_toml_with_raw_destination(&incoming, &nickname, "/tmp/dest");
+
+        // Write manifest.toml WITHOUT purgery_version
+        fs::write(
+            incoming.join("manifest.toml"),
+            r#"run_id = "test-pv-missing-manifest"
+nickname = "laptop"
+[[entries]]
+local_path = "/source/file.txt"
+staged_path = "files/file.txt"
+relative_path = "file.txt"
+kind = "regular_file"
+size = 13
+mtime_ns = 0
+transform = "test-step"
+"#,
+        )
+        .unwrap();
+
+        let error = prepare_run(&config, &nickname, &run_id).unwrap_err();
+        assert!(
+            error.to_string().contains("manifest"),
+            "error must mention manifest, got: {error}"
+        );
+    }
+
+    #[test]
+    fn prepare_run_rejects_incompatible_purgery_version_in_manifest_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let mut config = test_server_config(&work_dir);
+        config.transforms.insert(
+            "test-step".into(),
+            TransformDefinition {
+                name: "test-step".into(),
+                kind: TransformKind::Subprocess,
+                program: "/bin/true".to_string(),
+                args: Vec::new(),
+                expected_outputs: Vec::new(),
+            },
+        );
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("test-pv-incompat-manifest".into()).unwrap();
+        let incoming = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Incoming);
+        fs::create_dir_all(&incoming).unwrap();
+
+        write_run_toml_with_raw_destination(&incoming, &nickname, "/tmp/dest");
+
+        // Write manifest.toml with incompatible purgery_version
+        fs::write(
+            incoming.join("manifest.toml"),
+            r#"purgery_version = "2.0.0"
+run_id = "test-pv-incompat-manifest"
+nickname = "laptop"
+[[entries]]
+local_path = "/source/file.txt"
+staged_path = "files/file.txt"
+relative_path = "file.txt"
+kind = "regular_file"
+size = 13
+mtime_ns = 0
+transform = "test-step"
+"#,
+        )
+        .unwrap();
+
+        let error = prepare_run(&config, &nickname, &run_id).unwrap_err();
+        assert!(
+            error.to_string().contains("manifest"),
+            "error must mention manifest, got: {error}"
+        );
+    }
+
+    // ── recovery with incompatible status.toml ──────────────────────
+
+    #[test]
+    fn recovery_refuses_incompatible_status_and_leaves_it_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("recover-incompat-status".into()).unwrap();
+        let processing = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        fs::create_dir_all(&processing).unwrap();
+
+        // Write status.toml with incompatible purgery_version
+        let original_content = r#"purgery_version = "2.0.0"
+run_id = "recover-incompat-status"
+nickname = "laptop"
+state = "done"
+"#;
+        fs::write(processing.join("status.toml"), original_content).unwrap();
+
+        let error = recover_or_process_processing_run(&config, &nickname, &run_id).unwrap_err();
+        assert!(
+            error.to_string().contains("incompatible"),
+            "error must describe version incompatibility, got: {error}"
+        );
+
+        // Verify the original status.toml is unchanged (not replaced)
+        let status_content = fs::read_to_string(processing.join("status.toml")).unwrap();
+        assert_eq!(status_content, original_content);
+    }
 }
