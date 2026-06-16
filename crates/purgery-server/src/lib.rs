@@ -1087,7 +1087,6 @@ delete_after_import = true
                     program: "true".to_owned(),
                     args: vec![],
                     expected_outputs: vec![],
-                    keep_original: true,
                 },
             ),
             logging: Default::default(),
@@ -1099,7 +1098,6 @@ delete_after_import = true
 
         let results = test_apply_transform(&server_config, &work_path);
         assert!(results.is_ok(), "transform with spaces should succeed");
-        // empty expected_outputs means zero outputs — this is valid
         assert!(results.unwrap().is_empty());
     }
 
@@ -1119,7 +1117,6 @@ delete_after_import = true
                     program: "false".to_owned(),
                     args: vec![],
                     expected_outputs: vec![],
-                    keep_original: true,
                 },
             ),
             logging: Default::default(),
@@ -1195,19 +1192,17 @@ delete_after_import = true
                     program: "true".to_owned(),
                     args: vec![],
                     expected_outputs: vec![],
-                    keep_original: true,
                 },
             ),
             logging: Default::default(),
         };
         let result = test_apply_transform(&server_config, &work_path);
         assert!(result.is_ok());
-        // empty expected_outputs means zero outputs
         assert!(result.unwrap().is_empty());
     }
 
     #[test]
-    fn test_keep_original_true_commits_both() {
+    fn test_transform_produces_only_expected_outputs() {
         let tmp = tempfile::tempdir().unwrap();
         let work_area = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
         let work_path = work_area.join("video.mp4");
@@ -1227,7 +1222,6 @@ delete_after_import = true
                     program: "true".to_owned(),
                     args: vec![],
                     expected_outputs: vec!["{stem}.Z.webm".into()],
-                    keep_original: true,
                 },
             ),
             logging: Default::default(),
@@ -1240,50 +1234,10 @@ delete_after_import = true
             outputs.contains(&compressed),
             "must include expected output"
         );
-        // keep_original is metadata only; server does not include work_path
+        // Server never includes the original work path — only expected outputs
         assert!(
             !outputs.contains(&work_path),
-            "server must not include work_path based on keep_original"
-        );
-    }
-
-    #[test]
-    fn test_keep_original_false_commits_only_compressed() {
-        let tmp = tempfile::tempdir().unwrap();
-        let work_area = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
-        let work_path = work_area.join("video.mp4");
-        fs::write(&work_path, b"video").unwrap();
-
-        let compressed = work_area.join("video.Z.webm");
-        fs::write(&compressed, b"compressed").unwrap();
-
-        let server_config = ServerConfig {
-            work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
-            gc: Default::default(),
-            transforms: single_transform(
-                "compress-video",
-                TransformDefinition {
-                    name: "compress-video".into(),
-                    kind: TransformKind::Subprocess,
-                    program: "true".to_owned(),
-                    args: vec![],
-                    expected_outputs: vec!["{stem}.Z.webm".into()],
-                    keep_original: false,
-                },
-            ),
-            logging: Default::default(),
-        };
-        let result = test_apply_transform(&server_config, &work_path);
-        assert!(result.is_ok());
-        let outputs = result.unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert!(
-            !outputs.contains(&work_path),
-            "keep_original=false must NOT include original"
-        );
-        assert!(
-            outputs.contains(&compressed),
-            "keep_original=false must include compressed"
+            "server must not include work_path as a transform output"
         );
     }
 
@@ -1655,7 +1609,6 @@ delete_after_import = true
                     program: "false".to_owned(),
                     args: vec![],
                     expected_outputs: vec![],
-                    keep_original: true,
                 },
             ),
             logging: Default::default(),
@@ -1708,10 +1661,10 @@ delete_after_import = true
         );
     }
 
-    // ── compress-video keep_original end-to-end ──
+    // ── Transform end-to-end: only expected outputs committed ──
 
     #[test]
-    fn test_compress_video_keep_original_records_expected_outputs() {
+    fn test_transform_commits_only_expected_outputs() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
 
@@ -1746,14 +1699,13 @@ delete_after_import = true
                         "{target_directory}".into(),
                     ],
                     expected_outputs: vec!["{stem}.Z.webm".into()],
-                    keep_original: true,
                 },
             ),
             logging: Default::default(),
         };
 
         let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_id = RunId::new("test-pp-both".into()).unwrap();
+        let run_id = RunId::new("test-pp-only-expected".into()).unwrap();
 
         let ready_path = server_config
             .work_dir
@@ -1810,7 +1762,7 @@ delete_after_import = true
     }
 
     #[test]
-    fn test_compress_video_keep_original_false_records_one_path() {
+    fn test_transform_commits_expected_output() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
 
@@ -1845,14 +1797,13 @@ delete_after_import = true
                         "{target_directory}".into(),
                     ],
                     expected_outputs: vec!["{stem}.Z.webm".into()],
-                    keep_original: false,
                 },
             ),
             logging: Default::default(),
         };
 
         let nickname = Nickname::new("laptop".into()).unwrap();
-        let run_id = RunId::new("test-pp-comp-only".into()).unwrap();
+        let run_id = RunId::new("test-pp-expected-only".into()).unwrap();
 
         let ready_path = server_config
             .work_dir
@@ -2753,7 +2704,6 @@ delete_after_import = true
                     program: "true".into(),
                     args: vec![],
                     expected_outputs: vec!["{stem}.out".into()],
-                    keep_original: false,
                 },
             ),
             logging: Default::default(),
@@ -2857,7 +2807,6 @@ delete_after_import = true
                 program: "/bin/true".to_string(),
                 args: Vec::new(),
                 expected_outputs: Vec::new(),
-                keep_original: true,
             },
         );
         let nickname = Nickname::new("laptop".into()).unwrap();
@@ -2928,7 +2877,6 @@ delete_after_import = true
                 program: "/bin/true".to_string(),
                 args: Vec::new(),
                 expected_outputs: Vec::new(),
-                keep_original: true,
             },
         );
         let nickname = Nickname::new("laptop".into()).unwrap();
@@ -2983,7 +2931,6 @@ delete_after_import = true
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
-        let config = test_server_config(&work_dir);
         let config = ServerConfig {
             transforms: single_transform(
                 "pack",
@@ -2993,10 +2940,9 @@ delete_after_import = true
                     program: "true".into(),
                     args: vec![],
                     expected_outputs: vec![],
-                    keep_original: true,
                 },
             ),
-            ..config
+            ..test_server_config(&work_dir)
         };
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("scoped-processing".into()).unwrap();
@@ -3097,7 +3043,6 @@ delete_after_import = true
                     program: "true".into(),
                     args: vec![],
                     expected_outputs: vec!["{stem}.out".into()],
-                    keep_original: false,
                 },
             ),
             logging: Default::default(),
@@ -3267,7 +3212,6 @@ delete_after_import = true
                     program: "true".into(),
                     args: vec![],
                     expected_outputs: vec!["{stem}.out".into()],
-                    keep_original: false,
                 },
             ),
             logging: Default::default(),
@@ -3297,36 +3241,28 @@ delete_after_import = true
             &resolved,
             &work_path,
             work_path.parent().unwrap(),
-            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(5),
             &mut callback,
-            0,
-            1,
-            "data/input.txt",
+            42,
+            99,
+            "test-entry.txt",
         )
         .unwrap();
 
         let updates = captured.lock().unwrap();
-        assert!(
-            !updates.is_empty(),
-            "must have at least one progress update"
-        );
+        assert!(!updates.is_empty(), "must have captured progress updates");
         for (state, ei, et, ce, cs) in updates.iter() {
-            assert!(*et > 0, "entry_total must be > 0 for '{state}', got {et}");
-            assert!(
-                *ei < *et,
-                "entry_index ({ei}) must be < entry_total ({et}) for '{state}'"
+            assert_eq!(*ei, 42, "transform '{state}' must pass entry_index through");
+            assert_eq!(*et, 99, "transform '{state}' must pass entry_total through");
+            assert_eq!(
+                ce.as_str(),
+                "test-entry.txt",
+                "transform '{state}' must pass current_entry"
             );
             assert!(
-                !ce.is_empty(),
-                "current_entry must be non-empty for '{state}'"
+                !cs.is_empty(),
+                "transform '{state}' must have current_transform"
             );
-            // transform_started/transform_running/transform_finished must have current_transform
-            if state.starts_with("transform_") {
-                assert!(
-                    !cs.is_empty(),
-                    "transform '{state}' must have current_transform"
-                );
-            }
         }
     }
     // ── Entry index and progress invariant tests ──
@@ -3370,7 +3306,6 @@ delete_after_import = true
                     program: "true".into(),
                     args: vec![],
                     expected_outputs: vec!["{stem}.out".into()],
-                    keep_original: false,
                 },
             ),
             logging: Default::default(),
@@ -4242,7 +4177,6 @@ delete_after_import = true
                     program: "false".to_owned(),
                     args: vec![],
                     expected_outputs: vec![],
-                    keep_original: true,
                 },
             ),
             logging: Default::default(),
@@ -4338,7 +4272,6 @@ delete_after_import = true
                         "{target_directory}".to_owned(),
                     ],
                     expected_outputs: vec!["_outputs".to_owned()],
-                    keep_original: false,
                 },
             ),
             logging: Default::default(),
@@ -4681,7 +4614,6 @@ delete_after_import = true
                         "{target_directory}".to_owned(),
                     ],
                     expected_outputs: vec!["the-link".to_owned()],
-                    keep_original: false,
                 },
             ),
             logging: Default::default(),
@@ -4970,7 +4902,6 @@ delete_after_import = true
                         "{target_directory}".to_owned(),
                     ],
                     expected_outputs: vec!["out".to_owned()],
-                    keep_original: false,
                 },
             ),
             logging: Default::default(),
@@ -5645,7 +5576,6 @@ delete_after_import = true
                         "{target_directory}".to_owned(),
                     ],
                     expected_outputs: vec!["{file_name}.out".to_owned()],
-                    keep_original: false,
                 },
             ),
             logging: Default::default(),
@@ -5770,7 +5700,6 @@ delete_after_import = true
                         "{target_directory}".to_owned(),
                     ],
                     expected_outputs: vec!["{file_name}.out".to_owned()],
-                    keep_original: false,
                 },
             ),
             logging: Default::default(),
@@ -5926,7 +5855,6 @@ delete_after_import = true
                     program: "true".to_owned(),
                     args: vec![],
                     expected_outputs: vec![],
-                    keep_original: true,
                 },
             ),
             logging: Default::default(),
@@ -6001,7 +5929,6 @@ delete_after_import = true
                     program: "true".to_owned(),
                     args: vec![],
                     expected_outputs: vec![],
-                    keep_original: true,
                 },
             ),
             logging: Default::default(),
@@ -6077,7 +6004,6 @@ delete_after_import = true
                     program: "true".to_owned(),
                     args: vec![],
                     expected_outputs: vec![],
-                    keep_original: true,
                 },
             ),
             logging: Default::default(),
@@ -6168,7 +6094,6 @@ delete_after_import = true
                         "{target_directory}".into(),
                     ],
                     expected_outputs: vec!["result".into()],
-                    keep_original: true,
                 },
             ),
             logging: Default::default(),
@@ -6298,7 +6223,6 @@ delete_after_import = true
                         "{target_directory}".into(),
                     ],
                     expected_outputs: vec!["{stem}.Z.webm".into()],
-                    keep_original: false,
                 },
             ),
             logging: Default::default(),
@@ -6348,7 +6272,7 @@ delete_after_import = true
             test_storage_root(config.work_dir.as_path()).join("univ/videos/video.Z.webm");
         assert!(
             !original_final.exists(),
-            "keep_original=false: original must not be committed"
+            "transform: original must not be committed"
         );
         assert!(
             compressed_final.exists(),
@@ -6372,7 +6296,6 @@ delete_after_import = true
                 program: "true".to_owned(),
                 args: vec![],
                 expected_outputs: vec!["{input}".into()], // INVALID: uses {input} placeholder
-                keep_original: true,
             },
         );
         let nickname = Nickname::new("laptop".into()).unwrap();
@@ -6437,7 +6360,6 @@ delete_after_import = true
                 program: "".to_owned(),
                 args: vec![],
                 expected_outputs: vec!["output.txt".into()],
-                keep_original: true,
             },
         );
 

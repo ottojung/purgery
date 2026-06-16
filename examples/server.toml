@@ -6,4 +6,3 @@ kind = "subprocess"
 program = "my-compress-video"
 args = ["--input", "{input}", "--output-dir", "{target_directory}"]
 expected_outputs = ["{file_stem}.Z.webm"]
-keep_original = true

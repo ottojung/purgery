@@ -19,7 +19,7 @@ Transform runs move through `incoming -> ready -> processing -> done|failed`. `p
 
 Processing uses staged sources and a run-local work area. The server invokes transform subprocesses with `{target_directory}` pointing at the final destination parent. Transform programs are trusted to place outputs directly into `{target_directory}`; the server checks declared `expected_outputs` exist after the transform. Status files are published atomically before terminal phase publication. Recovery resumes processing runs from staged data and filesystem state.
 
-Transform programs may intentionally perform deletion-only or no-output imports when `expected_outputs = []`. In this case, successful subprocess exit is sufficient and no final destination checks are performed.
+Transformed inputs are consumed by the transform flow and are never committed as final outputs. A transform produces exactly the declared `expected_outputs`. Transform programs may intentionally perform deletion-only or no-output imports when `expected_outputs = []`. In this case, successful subprocess exit is sufficient and no final destination checks are performed.
 
 ## Storage separation
 
