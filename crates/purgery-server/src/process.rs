@@ -13,7 +13,7 @@ use crate::gc::run_gc;
 use crate::phases::{
     finalize_processing_run, move_to_failed, write_progress_best_effort, write_run_failure,
 };
-use crate::recover::recover_or_process_processing_run;
+use crate::recover::{recover_or_process_processing_run, RecoveryError};
 use crate::transform::apply_transform;
 use crate::ResolvedTransform;
 
@@ -541,24 +541,35 @@ pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
     }
 
     for (nickname, run_id) in &processing_runs {
-        if let Err(error) = recover_or_process_processing_run(config, nickname, run_id) {
-            warn!(
-                nickname = %nickname.as_str(),
-                run_id = %run_id.as_str(),
-                phase = "processing",
-                error = %error,
-                "processing run recovery failed"
-            );
-            let processing_path = config
-                .work_dir
-                .run_dir(nickname, run_id, RunPhase::Processing);
-            if processing_path.exists() {
-                write_run_failure(
-                    &config.work_dir,
-                    nickname,
-                    run_id,
-                    &format!("processing recovery failed: {error}"),
-                )?;
+        match recover_or_process_processing_run(config, nickname, run_id) {
+            Ok(()) => {}
+            Err(RecoveryError::IncompatibleStatus { message }) => {
+                warn!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    error = %message,
+                    "processing run has incompatible status; leaving in place for operator inspection"
+                );
+            }
+            Err(RecoveryError::Other(error)) => {
+                warn!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    phase = "processing",
+                    error = %error,
+                    "processing run recovery failed"
+                );
+                let processing_path = config
+                    .work_dir
+                    .run_dir(nickname, run_id, RunPhase::Processing);
+                if processing_path.exists() {
+                    write_run_failure(
+                        &config.work_dir,
+                        nickname,
+                        run_id,
+                        &format!("processing recovery failed: {error}"),
+                    )?;
+                }
             }
         }
     }

@@ -1,16 +1,53 @@
-use anyhow::{Context, Result};
 use purgery_core::{Nickname, RunId, RunPhase, RunStatus, ServerConfig};
+use std::fmt;
 use std::fs;
 use tracing::{info, warn};
 
 use crate::phases::write_run_failure;
 use crate::process::process_processing_run;
 
+/// Outcome of attempting to recover a processing run.
+#[derive(Debug)]
+pub enum RecoveryError {
+    /// The processing directory has a status.toml with an incompatible
+    /// purgery_version. The run must be left in place for operator
+    /// inspection — no automatic migration, replacement, or move to failed.
+    IncompatibleStatus { message: String },
+    /// A real error occurred during recovery (IO, malformed current
+    /// status, failed replay, etc.). The outer loop should write a
+    /// failure status as usual.
+    Other(anyhow::Error),
+}
+
+impl fmt::Display for RecoveryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RecoveryError::IncompatibleStatus { message } => write!(f, "{message}"),
+            RecoveryError::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for RecoveryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            RecoveryError::IncompatibleStatus { .. } => None,
+            RecoveryError::Other(e) => Some(e.as_ref()),
+        }
+    }
+}
+
+impl From<anyhow::Error> for RecoveryError {
+    fn from(e: anyhow::Error) -> Self {
+        RecoveryError::Other(e)
+    }
+}
+
 pub fn recover_or_process_processing_run(
     config: &ServerConfig,
     nickname: &Nickname,
     run_id: &RunId,
-) -> Result<()> {
+) -> Result<(), RecoveryError> {
     let processing_path = config
         .work_dir
         .run_dir(nickname, run_id, RunPhase::Processing);
@@ -32,7 +69,7 @@ pub fn recover_or_process_processing_run(
                         error,
                         "processing run has incompatible status; leaving in place for operator inspection"
                     );
-                    return Err(anyhow::anyhow!("{error}"));
+                    return Err(RecoveryError::IncompatibleStatus { message: error });
                 }
                 if status.nickname != *nickname || status.run_id != *run_id {
                     let error = "interrupted processing had mismatched status envelope";
@@ -47,7 +84,8 @@ pub fn recover_or_process_processing_run(
                         error,
                         "processing run recovery failed"
                     );
-                    return write_run_failure(&config.work_dir, nickname, run_id, error);
+                    return write_run_failure(&config.work_dir, nickname, run_id, error)
+                        .map_err(RecoveryError::Other);
                 }
                 info!(
                     nickname = %nickname.as_str(),
@@ -80,6 +118,7 @@ pub fn recover_or_process_processing_run(
                     "processing run recovery failed"
                 );
                 write_run_failure(&config.work_dir, nickname, run_id, error)
+                    .map_err(RecoveryError::Other)
             }
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -100,7 +139,9 @@ pub fn recover_or_process_processing_run(
             );
             Ok(())
         }
-        Err(error) => Err(error)
-            .with_context(|| format!("failed to read processing status: {}", status_path.as_str())),
+        Err(error) => Err(RecoveryError::Other(anyhow::anyhow!(
+            "failed to read processing status: {}: {error}",
+            status_path.as_str()
+        ))),
     }
 }
