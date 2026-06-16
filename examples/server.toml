@@ -4,5 +4,5 @@ work_dir = "/var/lib/purgery/work"
 name = "compress-video"
 kind = "subprocess"
 program = "my-compress-video"
-args = ["--input", "{input}", "--output-dir", "{target_directory}"]
-expected_outputs = ["{file_stem}.Z.webm"]
+args = ["--input", "{input}", "--output", "{target_directory}/{file_stem}.Z.webm"]
+expected_outputs = ["{target_directory}/{file_stem}.Z.webm"]

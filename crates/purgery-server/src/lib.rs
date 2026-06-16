@@ -598,18 +598,24 @@ mod tests {
     }
 
     /// Call apply_transform with a no-op progress callback for testing.
-    /// Resolves expected outputs against the work path's parent directory.
     fn test_apply_transform(
         server_config: &ServerConfig,
         work_path: &Utf8Path,
     ) -> Result<Vec<Utf8PathBuf>, String> {
         let target_directory = work_path.parent().unwrap_or(work_path).to_owned();
-        test_apply_transform_with_target(server_config, work_path, &target_directory)
+        let destination_root = &target_directory;
+        test_apply_transform_with_target(
+            server_config,
+            work_path,
+            destination_root,
+            &target_directory,
+        )
     }
 
     fn test_apply_transform_with_target(
         server_config: &ServerConfig,
         work_path: &Utf8Path,
+        destination_root: &Utf8Path,
         target_directory: &Utf8Path,
     ) -> Result<Vec<Utf8PathBuf>, String> {
         let (name, _) = server_config
@@ -624,6 +630,7 @@ mod tests {
         apply_transform(
             &resolved,
             work_path,
+            destination_root,
             target_directory,
             &mut |_: &purgery_core::ProgressUpdate| {},
             0,
@@ -3068,10 +3075,12 @@ delete_after_import = true
             name: name.clone(),
             def: server_config.transforms[name].clone(),
         };
+        let parent = work_path.parent().unwrap();
         apply_transform_with_heartbeat(
             &resolved,
             &work_path,
-            work_path.parent().unwrap(),
+            parent,
+            parent,
             std::time::Duration::from_millis(1),
             &mut callback,
             0,
@@ -3237,10 +3246,12 @@ delete_after_import = true
             name: name.clone(),
             def: server_config.transforms[name].clone(),
         };
+        let parent = work_path.parent().unwrap();
         apply_transform_with_heartbeat(
             &resolved,
             &work_path,
-            work_path.parent().unwrap(),
+            parent,
+            parent,
             std::time::Duration::from_millis(5),
             &mut callback,
             42,
@@ -3331,10 +3342,12 @@ delete_after_import = true
             name: name.clone(),
             def: server_config.transforms[name].clone(),
         };
+        let parent = work_path.parent().unwrap();
         apply_transform_with_heartbeat(
             &resolved,
             &work_path,
-            work_path.parent().unwrap(),
+            parent,
+            parent,
             std::time::Duration::from_millis(1),
             &mut callback,
             0,
@@ -6376,6 +6389,106 @@ delete_after_import = true
         assert!(
             err.contains("definition is invalid") || err.contains("program is empty"),
             "error must indicate transform definition validation, got: {err}"
+        );
+    }
+
+    #[test]
+    fn transform_absolute_expected_output_outside_destination_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_path = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let work_dir = tmp_path.join("purgery");
+        let output_dir = tmp_path.join("other-output");
+        fs::create_dir_all(&output_dir).unwrap();
+
+        let script_path = tmp_path.join("write-abs.sh");
+        let output_path = output_dir.join("result.webm");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nmkdir -p {:?} && touch {:?}\n",
+                output_dir.as_str(),
+                output_path.as_str()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &script_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
+        let config = ServerConfig {
+            work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
+            gc: Default::default(),
+            transforms: single_transform(
+                "write-absolute",
+                TransformDefinition {
+                    name: "write-absolute".into(),
+                    kind: TransformKind::Subprocess,
+                    program: script_path.as_str().to_owned(),
+                    args: vec![],
+                    expected_outputs: vec![output_path.as_str().to_owned()],
+                },
+            ),
+            logging: Default::default(),
+        };
+
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("test-abs-outside".into()).unwrap();
+
+        let ready_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
+        fs::create_dir_all(ready_path.join("files")).unwrap();
+        fs::write(ready_path.join("files/data.bin"), b"payload").unwrap();
+
+        let destination_dir = tmp_path.join("archive");
+        let run_config_content = format!(
+            "nickname = \"{}\"\ndestination = \"{}\"\ndelete_after_import = true\n",
+            nickname.as_str(),
+            destination_dir.as_str()
+        );
+        fs::write(ready_path.join("run.toml"), &run_config_content).unwrap();
+
+        let manifest = Manifest {
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![ManifestEntry {
+                local_path: ClientLocalPath::new("/home/user/data.bin".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/data.bin".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("data.bin".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
+                size: 7,
+                mtime_ns: 1000000,
+                sha256: None,
+                link_target: None,
+                transform: Some("write-absolute".into()),
+            }],
+        };
+        fs::write(
+            ready_path.join("manifest.toml"),
+            manifest.to_toml().unwrap(),
+        )
+        .unwrap();
+
+        process_run(&config, &nickname, &run_id).unwrap();
+
+        let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
+        let status_content = fs::read_to_string(done_path.join("status.toml")).unwrap();
+        let status = RunStatus::from_toml(&status_content).unwrap();
+        assert_eq!(status.state, RunState::Done);
+        assert_eq!(status.entries[0].status, FileStatus::Imported);
+        assert_eq!(
+            status.entries[0].final_paths,
+            vec![output_path.as_str().to_owned()],
+            "final_paths must record the absolute expected output path"
+        );
+        assert!(
+            output_path.exists(),
+            "transform must create the output at the absolute path outside destination"
+        );
+        // Guard: the destination dir must NOT contain the output
+        assert!(
+            !destination_dir.join("result.webm").exists(),
+            "output must NOT be inside destination directory"
         );
     }
 }

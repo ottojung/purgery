@@ -292,6 +292,7 @@ fn process_manifest_entry(
     match apply_transform(
         &resolved,
         &work_path,
+        destination_root,
         &target_directory,
         &mut pp_helper,
         entry_index,
@@ -299,13 +300,7 @@ fn process_manifest_entry(
         entry.relative_path.as_str(),
     ) {
         Ok(outputs) => {
-            let mut final_paths: Vec<String> = Vec::new();
-            for output in outputs {
-                if !path_is_within_root(&output, destination_root) {
-                    return failed_entry(entry, "output escapes root");
-                }
-                final_paths.push(output.as_str().to_owned());
-            }
+            let final_paths: Vec<String> = outputs.iter().map(|o| o.as_str().to_owned()).collect();
             EntryOutcome::Success {
                 kind: entry.kind,
                 local_path: entry.local_path.as_str().to_owned(),

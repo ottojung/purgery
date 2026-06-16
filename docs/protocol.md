@@ -164,7 +164,7 @@ The `destination` field is the target parent directory. It may be absolute or re
 
 The source entry base final path is `<destination>/<source_entry_name>`. `{target_directory}` is `<destination>` (the parent of the base final path).
 
-Transform programs are responsible for placing outputs into `{target_directory}`. Purgery does not move or commit transform outputs. After the transform exits successfully, Purgery checks that each declared expected output exists in `{target_directory}`.
+Transform programs are responsible for placing outputs at the resolved expected output paths. Purgery does not move or commit transform outputs. After the transform exits successfully, Purgery checks that each declared expected output exists. `expected_outputs` are path patterns: relative patterns resolve against `<DESTINATION>`, absolute patterns are used as-is, and `{target_directory}` is allowed.
 
 For non-transform entries, the server commits the work entry directly to the base final path.
 
@@ -225,19 +225,21 @@ The source entry base final path is `<destination>/<source_entry_name>`. `{targe
 
 For non-transform entries, the server commits the work entry to the base final path.
 
-For transform entries, `final_paths` in the status records the resolved expected output paths that were checked (i.e., the paths under `{target_directory}` whose existence Purgery confirmed after the transform). If `expected_outputs = []`, no paths are checked and `final_paths` is empty. Purgery does not move or commit transform outputs; it only checks that declared expected outputs exist. Transformed inputs are consumed by the transform flow and are never committed as final outputs.
+For transform entries, `final_paths` in the status records the resolved expected output paths whose existence Purgery confirmed after the transform. Relative `expected_outputs` resolve against `<DESTINATION>`, absolute paths are used as-is, and `{target_directory}` is allowed. If `expected_outputs = []`, no paths are checked and `final_paths` is empty. Purgery does not move or commit transform outputs; it only checks that declared expected outputs exist. Transformed inputs are consumed by the transform flow and are never committed as final outputs.
 
 Examples:
 
 ```
 sync --transform compress -- ./video.mp4 host:/archive
-  {target_directory}: /archive
-  output video.Z.webm: /archive/video.Z.webm
+  expected_outputs = ["{target_directory}/{file_stem}.Z.webm"]
+  final_paths = ["/archive/video.Z.webm"]
 
 sync --transform compress -- ./Videos/2024/a.mp4 host:/archive/2024
-  {target_directory}: /archive/2024
-  output a.Z.webm: /archive/2024/a.Z.webm
+  expected_outputs = ["{target_directory}/{file_stem}.Z.webm"]
+  final_paths = ["/archive/2024/a.Z.webm"]
 ```
+
+The short relative form `expected_outputs = ["{file_stem}.Z.webm"]` is also valid and resolves against `<DESTINATION>`.
 
 The nickname is operational metadata and does not appear in final_paths.
 
