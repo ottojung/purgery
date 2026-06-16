@@ -88,8 +88,7 @@ pub fn run_gc(config: &ServerConfig) -> Result<()> {
                             }
                             Ok(version) => {
                                 let version_ok = purgery_core::require_compatible_purgery_version(
-                                    &version,
-                                    "lease",
+                                    &version, "lease",
                                 )
                                 .is_ok();
                                 if !version_ok {
@@ -138,7 +137,7 @@ pub fn run_gc(config: &ServerConfig) -> Result<()> {
                                 }
                             }
                         }
-                    },
+                    }
                     Err(_) => true,
                 }
             } else {

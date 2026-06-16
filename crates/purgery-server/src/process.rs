@@ -559,9 +559,10 @@ pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
                     error = %error,
                     "processing run recovery failed"
                 );
-                let processing_path = config
-                    .work_dir
-                    .run_dir(nickname, run_id, RunPhase::Processing);
+                let processing_path =
+                    config
+                        .work_dir
+                        .run_dir(nickname, run_id, RunPhase::Processing);
                 if processing_path.exists() {
                     write_run_failure(
                         &config.work_dir,

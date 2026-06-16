@@ -439,9 +439,7 @@ fn read_progress_fields(
                             None,
                             Some("incompatible_version".to_string()),
                         )
-                    } else if prog.nickname == nickname.as_str()
-                        && prog.run_id == run_id.as_str()
-                    {
+                    } else if prog.nickname == nickname.as_str() && prog.run_id == run_id.as_str() {
                         let msg = format!(
                             "processing: {}/{} entries, current: {} transform: {}",
                             prog.entry_index + 1,
@@ -7000,7 +6998,10 @@ updated_at_unix_secs = 1000
         .unwrap();
 
         let response = run_state(&config, &nickname, &run_id).unwrap();
-        assert_eq!(response.progress_status.as_deref(), Some("incompatible_version"));
+        assert_eq!(
+            response.progress_status.as_deref(),
+            Some("incompatible_version")
+        );
         assert!(response.message.contains("incompatible"));
     }
 
@@ -7035,7 +7036,10 @@ updated_at_unix_secs = 1000
         .unwrap();
 
         let response = run_state(&config, &nickname, &run_id).unwrap();
-        assert_eq!(response.progress_status.as_deref(), Some("incompatible_version"));
+        assert_eq!(
+            response.progress_status.as_deref(),
+            Some("incompatible_version")
+        );
         assert!(response.message.contains("missing"));
     }
 
