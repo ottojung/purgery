@@ -214,7 +214,7 @@ This is used for client `ssh`, `rsync`, and server transform `program` values.
 
 ## Final-storage overlay
 
-Each run overlays its uploaded source onto the destination with recursive archive-mode rsync semantics and no delete option. The source entry base final path is `<destination>/<source_entry_name>`. For non-transform entries, the work entry is committed to the base final path. For transform entries, only the expected outputs are committed; the original source is consumed by the transform flow. Each expected transform output commits under the same parent, using the output file name. Existing directories are merged, regular files and symlinks replace compatible destination entries.
+Each run overlays its uploaded source onto the destination with recursive archive-mode rsync semantics and no delete option. The source entry base final path is `<destination>/<source_entry_name>`. For non-transform entries, the work entry is committed to the base final path. For transform entries, only the expected outputs are committed; the original source is consumed by the transform flow. Each expected transform output resolves according to its pattern: relative patterns resolve against `<DESTINATION>`, absolute patterns are used as-is. `{target_directory}` is allowed and expands to the entry's target parent directory. Existing directories are merged, regular files and symlinks replace compatible destination entries.
 
 Symlink targets are stored and recreated literally. Neither staged symlinks nor destination symlinks are traversed as directories. Transforming applies to the source entry, regardless of kind.
 

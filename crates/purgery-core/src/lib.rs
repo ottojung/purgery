@@ -1261,8 +1261,11 @@ unknown_field = "value"
             expected_outputs: vec!["{stem}.Z.webm".into()],
         };
         let work_path = Utf8Path::new("/work/videos/video.mp4");
+        let dest_root = Utf8Path::new("/dest");
         let target_dir = Utf8Path::new("/dest");
-        let outputs = td.resolve_expected_outputs(work_path, target_dir).unwrap();
+        let outputs = td
+            .resolve_expected_outputs(work_path, dest_root, target_dir)
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].as_str(), "/dest/video.Z.webm");
     }
@@ -1342,33 +1345,9 @@ color = "never"
     fn validate_expected_output_rejects_parent_placeholder() {
         let err = validate_expected_output_name("{parent}/out").unwrap_err();
         assert!(
-            err.contains("{parent}") || err.contains("separator"),
-            "error must mention {{parent}} or separator: {err}"
+            err.contains("{parent}"),
+            "error must mention {{parent}}: {err}"
         );
-    }
-
-    #[test]
-    fn validate_expected_output_rejects_target_directory_placeholder() {
-        let err = validate_expected_output_name("{target_directory}/out").unwrap_err();
-        assert!(
-            err.contains("{target_directory}") || err.contains("separator"),
-            "error must mention {{target_directory}} or separator: {err}"
-        );
-    }
-
-    #[test]
-    fn resolve_target_directory_placeholder() {
-        let td = TransformDefinition {
-            name: "test".into(),
-            kind: TransformKind::Subprocess,
-            program: "ffmpeg".into(),
-            args: vec!["--output-dir".into(), "{target_directory}".into()],
-            expected_outputs: vec!["{stem}.Z.webm".into()],
-        };
-        let work_path = Utf8Path::new("/work/videos/video.mp4");
-        let target_dir = Utf8Path::new("/archive/videos");
-        let args = td.build_args(work_path, target_dir);
-        assert_eq!(args, vec!["--output-dir", "/archive/videos"]);
     }
 
     #[test]
@@ -1387,13 +1366,129 @@ color = "never"
     }
 
     #[test]
-    fn validate_expected_output_rejects_absolute() {
-        assert!(validate_expected_output_name("/tmp/out.webm").is_err());
+    fn validate_expected_output_accepts_target_directory() {
+        assert!(validate_expected_output_name("{target_directory}").is_ok());
+        assert!(validate_expected_output_name("{target_directory}/{file_stem}.ext").is_ok());
     }
 
     #[test]
-    fn validate_expected_output_rejects_path_separator() {
-        assert!(validate_expected_output_name("sub/out.webm").is_err());
+    fn validate_expected_output_accepts_absolute_path() {
+        assert!(validate_expected_output_name("/mnt/output/{file_stem}.out").is_ok());
+        assert!(validate_expected_output_name("/tmp/result").is_ok());
+    }
+
+    #[test]
+    fn validate_expected_output_accepts_subdirectory() {
+        assert!(validate_expected_output_name("subdir/{file_stem}.out").is_ok());
+        assert!(validate_expected_output_name("a/b/c/{stem}.ext").is_ok());
+    }
+
+    #[test]
+    fn validate_expected_output_rejects_dotdot_relative() {
+        assert!(validate_expected_output_name("../foo").is_err());
+        assert!(validate_expected_output_name("a/../b").is_err());
+        assert!(validate_expected_output_name("foo/..").is_err());
+    }
+
+    #[test]
+    fn validate_expected_output_rejects_dotdot_absolute() {
+        assert!(validate_expected_output_name("/tmp/../etc").is_err());
+    }
+
+    #[test]
+    fn validate_expected_output_rejects_dotdot_mixed() {
+        assert!(validate_expected_output_name("{target_directory}/../escape").is_err());
+    }
+
+    #[test]
+    fn resolve_target_directory_placeholder() {
+        let td = TransformDefinition {
+            name: "test".into(),
+            kind: TransformKind::Subprocess,
+            program: "ffmpeg".into(),
+            args: vec!["--output-dir".into(), "{target_directory}".into()],
+            expected_outputs: vec!["{stem}.Z.webm".into()],
+        };
+        let work_path = Utf8Path::new("/work/videos/video.mp4");
+        let target_dir = Utf8Path::new("/archive/videos");
+        let args = td.build_args(work_path, target_dir);
+        assert_eq!(args, vec!["--output-dir", "/archive/videos"]);
+    }
+
+    #[test]
+    fn resolve_expected_output_relative_to_destination_root() {
+        let td = TransformDefinition {
+            name: "test".into(),
+            kind: TransformKind::Subprocess,
+            program: "true".into(),
+            args: vec![],
+            expected_outputs: vec!["{stem}.Z.webm".into()],
+        };
+        let work_path = Utf8Path::new("/work/videos/video.mp4");
+        let dest_root = Utf8Path::new("/dest");
+        let target_dir = Utf8Path::new("/dest/subdir");
+        let outputs = td
+            .resolve_expected_outputs(work_path, dest_root, target_dir)
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].as_str(), "/dest/video.Z.webm");
+    }
+
+    #[test]
+    fn resolve_expected_output_absolute_used_as_is() {
+        let td = TransformDefinition {
+            name: "test".into(),
+            kind: TransformKind::Subprocess,
+            program: "true".into(),
+            args: vec![],
+            expected_outputs: vec!["/mnt/output/{stem}.out".into()],
+        };
+        let work_path = Utf8Path::new("/work/videos/video.mp4");
+        let dest_root = Utf8Path::new("/dest");
+        let target_dir = Utf8Path::new("/dest/subdir");
+        let outputs = td
+            .resolve_expected_outputs(work_path, dest_root, target_dir)
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].as_str(), "/mnt/output/video.out");
+    }
+
+    #[test]
+    fn resolve_expected_output_subdirectory_under_destination() {
+        let td = TransformDefinition {
+            name: "test".into(),
+            kind: TransformKind::Subprocess,
+            program: "true".into(),
+            args: vec![],
+            expected_outputs: vec!["compressed/{stem}.out".into()],
+        };
+        let work_path = Utf8Path::new("/work/videos/video.mp4");
+        let dest_root = Utf8Path::new("/dest");
+        let target_dir = Utf8Path::new("/dest/subdir");
+        let outputs = td
+            .resolve_expected_outputs(work_path, dest_root, target_dir)
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].as_str(), "/dest/compressed/video.out");
+    }
+
+    #[test]
+    fn resolve_expected_output_with_target_directory_placeholder() {
+        let td = TransformDefinition {
+            name: "test".into(),
+            kind: TransformKind::Subprocess,
+            program: "true".into(),
+            args: vec![],
+            expected_outputs: vec!["{target_directory}/{stem}.out".into()],
+        };
+        let work_path = Utf8Path::new("/work/videos/video.mp4");
+        let dest_root = Utf8Path::new("/dest");
+        let target_dir = Utf8Path::new("/dest/subdir");
+        let outputs = td
+            .resolve_expected_outputs(work_path, dest_root, target_dir)
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].as_str(), "/dest/subdir/video.out");
     }
 
     #[test]

@@ -12,6 +12,7 @@ const DEFAULT_HEARTBEAT_SECS: u64 = 5;
 pub fn apply_transform(
     resolved: &ResolvedTransform,
     work_path: &Utf8Path,
+    destination_root: &Utf8Path,
     target_directory: &Utf8Path,
     progress_cb: &mut dyn FnMut(&purgery_core::ProgressUpdate),
     entry_index: usize,
@@ -21,6 +22,7 @@ pub fn apply_transform(
     apply_transform_with_heartbeat(
         resolved,
         work_path,
+        destination_root,
         target_directory,
         std::time::Duration::from_secs(DEFAULT_HEARTBEAT_SECS),
         progress_cb,
@@ -34,6 +36,7 @@ pub fn apply_transform(
 pub fn apply_transform_with_heartbeat(
     resolved: &ResolvedTransform,
     work_path: &Utf8Path,
+    destination_root: &Utf8Path,
     target_directory: &Utf8Path,
     heartbeat_interval: std::time::Duration,
     progress_cb: &mut dyn FnMut(&purgery_core::ProgressUpdate),
@@ -104,7 +107,7 @@ pub fn apply_transform_with_heartbeat(
             ));
 
             let expected = def
-                .resolve_expected_outputs(work_path, target_directory)
+                .resolve_expected_outputs(work_path, destination_root, target_directory)
                 .map_err(|e| format!("{}: {e}", resolved.name))?;
             for exp in &expected {
                 let metadata = fs::symlink_metadata(exp.as_std_path()).map_err(|error| {

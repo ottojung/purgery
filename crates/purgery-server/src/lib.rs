@@ -598,18 +598,24 @@ mod tests {
     }
 
     /// Call apply_transform with a no-op progress callback for testing.
-    /// Resolves expected outputs against the work path's parent directory.
     fn test_apply_transform(
         server_config: &ServerConfig,
         work_path: &Utf8Path,
     ) -> Result<Vec<Utf8PathBuf>, String> {
         let target_directory = work_path.parent().unwrap_or(work_path).to_owned();
-        test_apply_transform_with_target(server_config, work_path, &target_directory)
+        let destination_root = &target_directory;
+        test_apply_transform_with_target(
+            server_config,
+            work_path,
+            destination_root,
+            &target_directory,
+        )
     }
 
     fn test_apply_transform_with_target(
         server_config: &ServerConfig,
         work_path: &Utf8Path,
+        destination_root: &Utf8Path,
         target_directory: &Utf8Path,
     ) -> Result<Vec<Utf8PathBuf>, String> {
         let (name, _) = server_config
@@ -624,6 +630,7 @@ mod tests {
         apply_transform(
             &resolved,
             work_path,
+            destination_root,
             target_directory,
             &mut |_: &purgery_core::ProgressUpdate| {},
             0,
@@ -3068,10 +3075,12 @@ delete_after_import = true
             name: name.clone(),
             def: server_config.transforms[name].clone(),
         };
+        let parent = work_path.parent().unwrap();
         apply_transform_with_heartbeat(
             &resolved,
             &work_path,
-            work_path.parent().unwrap(),
+            parent,
+            parent,
             std::time::Duration::from_millis(1),
             &mut callback,
             0,
@@ -3237,10 +3246,12 @@ delete_after_import = true
             name: name.clone(),
             def: server_config.transforms[name].clone(),
         };
+        let parent = work_path.parent().unwrap();
         apply_transform_with_heartbeat(
             &resolved,
             &work_path,
-            work_path.parent().unwrap(),
+            parent,
+            parent,
             std::time::Duration::from_millis(5),
             &mut callback,
             42,
@@ -3331,10 +3342,12 @@ delete_after_import = true
             name: name.clone(),
             def: server_config.transforms[name].clone(),
         };
+        let parent = work_path.parent().unwrap();
         apply_transform_with_heartbeat(
             &resolved,
             &work_path,
-            work_path.parent().unwrap(),
+            parent,
+            parent,
             std::time::Duration::from_millis(1),
             &mut callback,
             0,

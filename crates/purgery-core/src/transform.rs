@@ -72,15 +72,21 @@ impl TransformDefinition {
     pub fn resolve_expected_outputs(
         &self,
         work_path: &Utf8Path,
+        destination_root: &Utf8Path,
         target_directory: &Utf8Path,
     ) -> Result<Vec<Utf8PathBuf>, String> {
         let mut results = Vec::with_capacity(self.expected_outputs.len());
         for pat in &self.expected_outputs {
             validate_expected_output_name(pat)?;
-            let resolved = self.resolve_placeholders(work_path, pat);
-            let p = Utf8Path::new(&resolved);
-            let fname = p.file_name().unwrap_or(resolved.as_str());
-            results.push(target_directory.join(fname));
+            let expanded = self
+                .resolve_placeholders(work_path, pat)
+                .replace("{target_directory}", target_directory.as_str());
+            let path = if Utf8Path::new(&expanded).is_absolute() {
+                Utf8PathBuf::from(expanded)
+            } else {
+                destination_root.join(&expanded)
+            };
+            results.push(path);
         }
         Ok(results)
     }
@@ -108,19 +114,14 @@ pub fn validate_expected_output_name(name: &str) -> Result<(), String> {
     if name == "." || name == ".." {
         return Err(format!("expected output name must not be '{name}'"));
     }
-    if name.contains('/') || name.contains('\\') {
-        return Err("expected output name must not contain path separators".into());
+    if name.split('/').any(|c| c == "..") || name.split('\\').any(|c| c == "..") {
+        return Err("expected output path must not contain '..' components".into());
     }
-    if Utf8Path::new(name).is_absolute() {
-        return Err("expected output name must not be absolute".into());
-    }
-    if name.contains("{input}") || name.contains("{parent}") || name.contains("{target_directory}")
-    {
-        return Err(
-            "expected output name must not use {{input}}, {{parent}}, or {{target_directory}} \
-             placeholders; only {{file_name}}, {{file_stem}}, and {{stem}} are allowed"
-                .into(),
-        );
+    if name.contains("{input}") || name.contains("{parent}") {
+        return Err("expected output name must not use {{input}} or {{parent}} \
+             placeholders; only {{file_name}}, {{file_stem}}, {{stem}}, and \
+             {{target_directory}} are allowed"
+            .into());
     }
     Ok(())
 }

@@ -78,11 +78,13 @@ Transformations are defined on the server. Clients request a named transform via
 name = "compress-video"
 kind = "subprocess"
 program = "/usr/local/bin/compress"
-args = ["--input", "{input}", "--output-dir", "{target_directory}"]
-expected_outputs = ["{file_stem}.compressed.webm"]
+args = ["--input", "{input}", "--output", "{target_directory}/{file_stem}.compressed.webm"]
+expected_outputs = ["{target_directory}/{file_stem}.compressed.webm"]
 ```
 
-The server invokes the transform. After the subprocess exits successfully, the server checks that each declared `expected_output` exists in `{target_directory}` (the directory where the entry's normal non-transform final path would be placed). The transform program is responsible for placing outputs into `{target_directory}`; Purgery does not move or commit transform outputs.
+After the subprocess exits successfully, the server checks that each declared `expected_output` exists. `expected_outputs` are path patterns with placeholders. Relative patterns (e.g., `"{file_stem}.Z.webm"`) are resolved against `<DESTINATION>`. Absolute patterns (e.g., `"/mnt/output/{file_stem}.Z.webm"`) are used as-is. `{target_directory}` is allowed and expands to the entry's target parent path.
+
+Purgery does not move or commit transform outputs. The transform program is responsible for placing outputs at the resolved paths. Purgery does not sandbox transform output paths — the transform is trusted server-side configuration running with the server's OS permissions.
 
 Transformed inputs are consumed by the transform flow and are never committed as final outputs. A transform produces exactly the declared `expected_outputs`, which may be empty (e.g., for verification-only or deletion-only transforms).
 

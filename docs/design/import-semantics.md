@@ -20,14 +20,23 @@ For a directory source, the staging tree is the directory itself. The subprocess
 
 The run destination is final storage. `{target_directory}` is `<destination>` (the parent of the base final path `<destination>/<source_entry_name>`).
 
-Transform programs are responsible for placing outputs into `{target_directory}`. After the subprocess exits successfully, Purgery checks that each declared expected output exists in `{target_directory}`. Purgery does not move or commit transform outputs.
+`expected_outputs` are path patterns with placeholders. After placeholder expansion:
+
+- If the expanded path is absolute, it is used as-is.
+- If the expanded path is relative, it is resolved against `<DESTINATION>` (the run destination root).
+- `{target_directory}` is allowed and expands to the entry's target parent path.
+
+Transform programs are responsible for placing outputs at the resolved expected output paths. After the subprocess exits successfully, Purgery checks that each declared expected output exists. Purgery does not move or commit transform outputs.
+
+Purgery does not sandbox transform output paths. The transform program is trusted server configuration and runs with the server's OS permissions. Purgery only verifies and reports the paths configured by the server admin.
 
 Transformed inputs are consumed by the transform flow and are never committed as final outputs. A transform produces exactly the declared `expected_outputs`. If `expected_outputs = []`, no output-existence checks are performed; successful subprocess exit is sufficient for the entry to be marked `imported`. This allows intentionally deletion-only or verification-only transforms.
 
 Examples:
 
-- source `video.mp4` → transform writes `{target_directory}/video.Z.webm`; `final_paths` records `/archive/video.Z.webm`.
-- source `Videos/2024/a.mp4` → transform writes `{target_directory}/a.Z.webm`; `final_paths` records `/archive/2024/a.Z.webm`.
+- `expected_outputs = ["{target_directory}/{file_stem}.Z.webm"]` with source `video.mp4` → `final_paths` records `/archive/video.Z.webm`.
+- `expected_outputs = ["{target_directory}/{file_stem}.Z.webm"]` with source `Videos/2024/a.mp4` → `final_paths` records `/archive/2024/a.Z.webm`.
+- The short relative form `expected_outputs = ["{file_stem}.Z.webm"]` is also valid and resolves against `<DESTINATION>`.
 
 `work_dir` contains only Purgery state and work areas. It is never a final-storage root.
 
