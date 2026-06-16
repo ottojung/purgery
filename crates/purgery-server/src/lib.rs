@@ -40,7 +40,12 @@ pub struct ResolvedTransform {
 
 /// Process a ready run. Kept as the public single-run entry point.
 pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> Result<()> {
-    process_ready_run(config, nickname, run_id)
+    process_ready_run(config, nickname, run_id).map_err(|e| match e {
+        crate::process::ProcessingError::Incompatible { message, .. } => {
+            anyhow::anyhow!("{message}")
+        }
+        crate::process::ProcessingError::Other(e) => e,
+    })
 }
 
 /// Server-side subcommand: validate the run plan and resolve relative

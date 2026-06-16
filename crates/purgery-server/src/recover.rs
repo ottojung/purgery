@@ -4,7 +4,7 @@ use std::fs;
 use tracing::{info, warn};
 
 use crate::phases::write_run_failure;
-use crate::process::process_processing_run;
+use crate::process::{process_processing_run, ProcessingError};
 
 /// Outcome of attempting to recover a processing run.
 #[derive(Debug)]
@@ -40,6 +40,17 @@ impl std::error::Error for RecoveryError {
 impl From<anyhow::Error> for RecoveryError {
     fn from(e: anyhow::Error) -> Self {
         RecoveryError::Other(e)
+    }
+}
+
+impl From<ProcessingError> for RecoveryError {
+    fn from(e: crate::process::ProcessingError) -> Self {
+        match e {
+            crate::process::ProcessingError::Incompatible { message, .. } => {
+                RecoveryError::IncompatibleStatus { message }
+            }
+            crate::process::ProcessingError::Other(e) => RecoveryError::Other(e),
+        }
     }
 }
 
