@@ -21,7 +21,7 @@ mod transform;
 pub use gc::run_gc;
 pub use phases::{begin_run, find_processing_runs, find_ready_runs, finish_run, move_to_failed};
 pub use process::{process_once_raw, process_processing_run, process_ready_run};
-pub use recover::recover_or_process_processing_run;
+pub use recover::{recover_or_process_processing_run, RecoveryError};
 pub use transform::{apply_transform, apply_transform_with_heartbeat};
 
 #[cfg_attr(not(test), allow(unused_imports))]
@@ -2406,10 +2406,11 @@ delete_after_import = true
         let status =
             RunStatus::from_toml(&fs::read_to_string(failed.join("status.toml")).unwrap()).unwrap();
         assert_eq!(status.state, RunState::Failed);
-        assert_eq!(
-            status.error.as_deref(),
-            Some("interrupted processing had malformed status")
-        );
+        assert!(status
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("malformed status"));
     }
 
     #[test]
@@ -6952,15 +6953,113 @@ expires_at_unix_secs = 9999999999999
 "#,
         )
         .unwrap();
+        // Also put a file in the incoming dir to check it's not removed
+        fs::create_dir_all(incoming.join("files")).unwrap();
+        fs::write(incoming.join("files").join("staged.mp4"), b"content").unwrap();
 
-        // GC must run without error and must NOT collect the run
-        // (incompatible lease is not valid, but GC collects expired
-        // incoming runs via rename to failed — and may still do so if
-        // the lease is treated as expired. That is acceptable: we test
-        // that the warning is version-specific and the lease is not
-        // treated as valid, not that GC avoids collection entirely.)
+        // GC must NOT collect or move the incoming run when lease
+        // has incompatible version.
         let result = run_gc(&config);
         assert!(result.is_ok(), "run_gc must succeed: {result:?}");
+
+        // Incoming run must still be present
+        assert!(
+            incoming.exists(),
+            "incoming run must NOT be collected when lease version is incompatible"
+        );
+        assert!(
+            incoming.join("files").join("staged.mp4").exists(),
+            "staged files must NOT be removed when lease version is incompatible"
+        );
+        // No failed or quarantine directory should exist
+        let failed = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        assert!(!failed.exists(), "must NOT move to failed");
+    }
+
+    #[test]
+    fn gc_rejects_missing_lease_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("gc-lease-missing".into()).unwrap();
+
+        // Create incoming directory with old-style lease.toml that has
+        // NO purgery_version
+        let incoming = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Incoming);
+        fs::create_dir_all(&incoming).unwrap();
+        fs::write(
+            incoming.join("lease.toml"),
+            r#"protocol_version = 1
+nickname = "laptop"
+run_id = "gc-lease-missing"
+expires_at_unix_secs = 9999999999999
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(incoming.join("files")).unwrap();
+        fs::write(incoming.join("files").join("staged.mp4"), b"content").unwrap();
+
+        // GC must NOT collect when lease is missing purgery_version
+        let result = run_gc(&config);
+        assert!(result.is_ok(), "run_gc must succeed: {result:?}");
+
+        // Verify nothing was moved or removed
+        assert!(incoming.exists(), "incoming run must remain in place");
+        assert!(
+            incoming.join("files").join("staged.mp4").exists(),
+            "staged files must not be removed"
+        );
+        let failed = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        assert!(!failed.exists(), "must NOT move to failed");
+    }
+
+    #[test]
+    fn gc_still_collects_expired_compatible_lease() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("gc-lease-expired".into()).unwrap();
+
+        // Create incoming directory with compatible but expired lease
+        let incoming = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Incoming);
+        fs::create_dir_all(&incoming).unwrap();
+        fs::write(
+            incoming.join("lease.toml"),
+            r#"purgery_version = "0.1.0-test"
+protocol_version = 1
+nickname = "laptop"
+run_id = "gc-lease-expired"
+expires_at_unix_secs = 1
+"#,
+        )
+        .unwrap();
+
+        // GC must collect the expired compatible lease
+        let result = run_gc(&config);
+        assert!(result.is_ok(), "run_gc must succeed: {result:?}");
+
+        // Incoming run should be moved to failed
+        assert!(
+            !incoming.exists(),
+            "incoming run must be collected when lease is expired and compatible"
+        );
+        let failed = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        assert!(
+            failed.exists(),
+            "expired compatible lease must move to failed"
+        );
     }
 
     // ── progress/status version distinction in run-state ────────────
@@ -7060,5 +7159,77 @@ updated_at_unix_secs = 1000
 
         let response = run_state(&config, &nickname, &run_id).unwrap();
         assert_eq!(response.progress_status.as_deref(), Some("malformed"));
+    }
+
+    // ── recovery with missing-version status.toml ──────────────────
+
+    #[test]
+    fn recovery_refuses_missing_version_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("recover-missing-pv-status".into()).unwrap();
+        let processing = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        fs::create_dir_all(&processing).unwrap();
+
+        // Write status.toml WITHOUT purgery_version (old style)
+        let original_content = r#"run_id = "recover-missing-pv-status"
+nickname = "laptop"
+state = "done"
+"#;
+        fs::write(processing.join("status.toml"), original_content).unwrap();
+
+        // Call the recovery function directly
+        let error = recover_or_process_processing_run(&config, &nickname, &run_id).unwrap_err();
+        assert!(
+            matches!(&error, RecoveryError::IncompatibleStatus { .. }),
+            "must return IncompatibleStatus for missing version"
+        );
+
+        // Verify the original status.toml is unchanged (not replaced)
+        assert!(processing.exists());
+        let status_content = fs::read_to_string(processing.join("status.toml")).unwrap();
+        assert_eq!(status_content, original_content);
+        let failed = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        assert!(!failed.exists(), "must NOT move to failed");
+    }
+
+    #[test]
+    fn process_once_raw_preserves_missing_version_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("raw-missing-pv".into()).unwrap();
+        let processing = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        fs::create_dir_all(&processing).unwrap();
+
+        // Write status.toml WITHOUT purgery_version
+        let original_content = r#"run_id = "raw-missing-pv"
+nickname = "laptop"
+state = "done"
+"#;
+        fs::write(processing.join("status.toml"), original_content).unwrap();
+
+        // process_once_raw must not move the run to failed or overwrite
+        let result = process_once_raw(&config);
+        assert!(result.is_ok(), "process_once_raw must succeed: {result:?}");
+
+        assert!(processing.exists());
+        let status_content = fs::read_to_string(processing.join("status.toml")).unwrap();
+        assert_eq!(status_content, original_content);
+        let failed = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        assert!(!failed.exists(), "must NOT move to failed");
     }
 }

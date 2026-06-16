@@ -34,10 +34,15 @@ pub(crate) fn write_cleanup_state(
 pub(crate) fn confirm_all_imports(state_path: &Utf8Path) -> Result<()> {
     let content = fs::read_to_string(state_path.as_std_path())
         .with_context(|| format!("failed to read cleanup state: {state_path}"))?;
+    // Probe raw TOML for version to distinguish old/incompatible state
+    // from malformed current state before full deserialization.
+    purgery_core::require_compatible_toml_version(
+        &content,
+        format_args!("cleanup state {state_path}"),
+    )
+    .map_err(|e| anyhow::anyhow!("incompatible cleanup state version: {e}"))?;
     let mut state: DurableCleanupState = toml::from_str(&content)
         .map_err(|e| anyhow::anyhow!("failed to parse cleanup state: {e}"))?;
-    purgery_core::require_compatible_purgery_version(&state.purgery_version, "cleanup state")
-        .map_err(|e| anyhow::anyhow!("incompatible cleanup state version: {e}"))?;
     for entry in &mut state.entries {
         if !entry.import_confirmed {
             entry.import_confirmed = true;
@@ -56,10 +61,15 @@ pub(crate) fn confirm_all_imports(state_path: &Utf8Path) -> Result<()> {
 pub(crate) fn confirm_imports_from_status(state_path: &Utf8Path, status: &RunStatus) -> Result<()> {
     let content = fs::read_to_string(state_path.as_std_path())
         .with_context(|| format!("failed to read cleanup state: {state_path}"))?;
+    // Probe raw TOML for version to distinguish old/incompatible state
+    // from malformed current state before full deserialization.
+    purgery_core::require_compatible_toml_version(
+        &content,
+        format_args!("cleanup state {state_path}"),
+    )
+    .map_err(|e| anyhow::anyhow!("incompatible cleanup state version: {e}"))?;
     let mut state: DurableCleanupState = toml::from_str(&content)
         .map_err(|e| anyhow::anyhow!("failed to parse cleanup state: {e}"))?;
-    purgery_core::require_compatible_purgery_version(&state.purgery_version, "cleanup state")
-        .map_err(|e| anyhow::anyhow!("incompatible cleanup state version: {e}"))?;
 
     // First pass: match cleanup entries to status entries by exact path/kind.
     for cleanup_entry in &mut state.entries {
@@ -209,10 +219,15 @@ pub(crate) fn compute_sha256(path: &Path) -> Result<String> {
 pub(crate) fn process_cleanup_state_file(state_path: &Utf8Path) -> Result<()> {
     let content = fs::read_to_string(state_path.as_std_path())
         .with_context(|| format!("failed to read cleanup state: {state_path}"))?;
+    // Probe raw TOML for version to distinguish old/incompatible state
+    // from malformed current state before full deserialization.
+    purgery_core::require_compatible_toml_version(
+        &content,
+        format_args!("cleanup state {state_path}"),
+    )
+    .map_err(|e| anyhow::anyhow!("incompatible cleanup state version: {e}"))?;
     let mut state: DurableCleanupState = toml::from_str(&content)
         .map_err(|e| anyhow::anyhow!("failed to parse cleanup state: {e}"))?;
-    purgery_core::require_compatible_purgery_version(&state.purgery_version, "cleanup state")
-        .map_err(|e| anyhow::anyhow!("incompatible cleanup state version: {e}"))?;
 
     // Phase 1: clean non-directory entries (files and symlinks).
     // Keep the in-memory state mutable so directory checks in phase 2
