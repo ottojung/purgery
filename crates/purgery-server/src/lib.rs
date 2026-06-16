@@ -188,6 +188,7 @@ pub fn read_run_status(
         }
         let content = fs::read_to_string(&status_path)
             .with_context(|| format!("failed to read status from '{}'", status_path.as_str()))?;
+        let version_probe = purgery_core::probe_purgery_version_from_toml(&content);
         match RunStatus::from_toml(&content) {
             Ok(status) => {
                 purgery_core::require_compatible_purgery_version(&status.purgery_version, "status")
@@ -206,9 +207,15 @@ pub fn read_run_status(
                 }
                 return Ok(status);
             }
-            Err(e) => {
-                anyhow::bail!("malformed status file '{}': {e}", status_path.as_str());
-            }
+            Err(e) => match version_probe {
+                Err(purgery_core::VersionProbeError::MissingVersion) => anyhow::bail!(
+                    "status file '{}' has missing purgery_version (too old)",
+                    status_path.as_str()
+                ),
+                _ => {
+                    anyhow::bail!("malformed status file '{}': {e}", status_path.as_str());
+                }
+            },
         }
     }
 
@@ -364,8 +371,14 @@ fn try_read_status(
 ) -> Result<(), String> {
     let content = std::fs::read_to_string(status_path.as_std_path())
         .map_err(|e| format!("missing/unreadable: {e}"))?;
+    let version_probe = purgery_core::probe_purgery_version_from_toml(&content);
     let status =
-        purgery_core::RunStatus::from_toml(&content).map_err(|e| format!("malformed: {e}"))?;
+        purgery_core::RunStatus::from_toml(&content).map_err(|e| match &version_probe {
+            Err(purgery_core::VersionProbeError::MissingVersion) => {
+                "missing purgery_version (too old)".to_string()
+            }
+            _ => format!("malformed: {e}"),
+        })?;
     purgery_core::require_compatible_purgery_version(&status.purgery_version, "status")
         .map_err(|e| format!("version: {e}"))?;
     if status.nickname != *nickname {
@@ -404,16 +417,64 @@ fn read_progress_fields(
 ) {
     let progress_path = dir.join("progress.toml");
     match std::fs::read_to_string(&progress_path) {
-        Ok(content) => match toml::from_str::<purgery_core::ProcessingProgress>(&content) {
-            Ok(prog) => {
-                if purgery_core::require_compatible_purgery_version(
-                    &prog.purgery_version,
-                    "progress",
-                )
-                .is_err()
-                {
-                    (
-                        "run phase: processing (incompatible progress version)".to_string(),
+        Ok(content) => {
+            // Probe purgery_version from raw TOML so we can distinguish
+            // missing/incompatible version from malformed current content.
+            let version_probe = purgery_core::probe_purgery_version_from_toml(&content);
+            match toml::from_str::<purgery_core::ProcessingProgress>(&content) {
+                Ok(prog) => {
+                    if purgery_core::require_compatible_purgery_version(
+                        &prog.purgery_version,
+                        "progress",
+                    )
+                    .is_err()
+                    {
+                        (
+                            "run phase: processing (incompatible progress version)".to_string(),
+                            dir_modified_at(dir).unwrap_or(0),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some("incompatible_version".to_string()),
+                        )
+                    } else if prog.nickname == nickname.as_str()
+                        && prog.run_id == run_id.as_str()
+                    {
+                        let msg = format!(
+                            "processing: {}/{} entries, current: {} transform: {}",
+                            prog.entry_index + 1,
+                            prog.entry_total,
+                            prog.current_entry,
+                            prog.current_transform
+                        );
+                        (
+                            msg,
+                            prog.updated_at_unix_secs,
+                            Some(prog.state),
+                            Some(prog.entry_index),
+                            Some(prog.entry_total),
+                            Some(prog.current_entry),
+                            Some(prog.current_transform),
+                            Some("valid".to_string()),
+                        )
+                    } else {
+                        (
+                            "run phase: processing (progress envelope mismatch)".to_string(),
+                            dir_modified_at(dir).unwrap_or(0),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some("envelope_mismatch".to_string()),
+                        )
+                    }
+                }
+                Err(_) => match version_probe {
+                    Err(purgery_core::VersionProbeError::MissingVersion) => (
+                        "run phase: processing (progress missing purgery_version)".to_string(),
                         dir_modified_at(dir).unwrap_or(0),
                         None,
                         None,
@@ -421,49 +482,20 @@ fn read_progress_fields(
                         None,
                         None,
                         Some("incompatible_version".to_string()),
-                    )
-                } else if prog.nickname == nickname.as_str() && prog.run_id == run_id.as_str() {
-                    let msg = format!(
-                        "processing: {}/{} entries, current: {} transform: {}",
-                        prog.entry_index + 1,
-                        prog.entry_total,
-                        prog.current_entry,
-                        prog.current_transform
-                    );
-                    (
-                        msg,
-                        prog.updated_at_unix_secs,
-                        Some(prog.state),
-                        Some(prog.entry_index),
-                        Some(prog.entry_total),
-                        Some(prog.current_entry),
-                        Some(prog.current_transform),
-                        Some("valid".to_string()),
-                    )
-                } else {
-                    (
-                        "run phase: processing (progress envelope mismatch)".to_string(),
+                    ),
+                    _ => (
+                        "run phase: processing (malformed progress)".to_string(),
                         dir_modified_at(dir).unwrap_or(0),
                         None,
                         None,
                         None,
                         None,
                         None,
-                        Some("envelope_mismatch".to_string()),
-                    )
-                }
+                        Some("malformed".to_string()),
+                    ),
+                },
             }
-            Err(_) => (
-                "run phase: processing (malformed progress)".to_string(),
-                dir_modified_at(dir).unwrap_or(0),
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some("malformed".to_string()),
-            ),
-        },
+        }
         Err(_) => (
             "run phase: processing".to_string(),
             dir_modified_at(dir).unwrap_or(0),
