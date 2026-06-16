@@ -399,9 +399,18 @@ impl RemoteRunner {
     pub(crate) fn parse_begin_response(toml: &str) -> Result<BeginRunResponse> {
         let resp: BeginRunResponse =
             toml::from_str(toml).with_context(|| "failed to parse begin-run response")?;
-        if resp.protocol_version != 1 {
-            anyhow::bail!("unsupported protocol version");
+        if resp.protocol_version != purgery_core::PROTOCOL_VERSION {
+            anyhow::bail!(
+                "begin-run response has protocol_version {}; expected {}",
+                resp.protocol_version,
+                purgery_core::PROTOCOL_VERSION,
+            );
         }
+        purgery_core::require_compatible_purgery_version(
+            &resp.purgery_version,
+            "begin-run response",
+        )
+        .with_context(|| "incompatible purgery_version in begin-run response")?;
         Ok(resp)
     }
 
@@ -409,15 +418,38 @@ impl RemoteRunner {
     pub(crate) fn parse_prepare_response(toml: &str) -> Result<PrepareRunResponse> {
         let resp: PrepareRunResponse =
             toml::from_str(toml).with_context(|| "failed to parse prepare-run response")?;
-        if resp.protocol_version != 1 {
-            anyhow::bail!("unsupported protocol version");
+        if resp.protocol_version != purgery_core::PROTOCOL_VERSION {
+            anyhow::bail!(
+                "prepare-run response has protocol_version {}; expected {}",
+                resp.protocol_version,
+                purgery_core::PROTOCOL_VERSION,
+            );
         }
+        purgery_core::require_compatible_purgery_version(
+            &resp.purgery_version,
+            "prepare-run response",
+        )
+        .with_context(|| "incompatible purgery_version in prepare-run response")?;
         Ok(resp)
     }
 
     /// Parse a RunStateResponse from the given TOML string.
     pub(crate) fn parse_run_state_response(toml: &str) -> Result<RunStateResponse> {
-        toml::from_str(toml).with_context(|| "failed to parse run-state response")
+        let resp: RunStateResponse =
+            toml::from_str(toml).with_context(|| "failed to parse run-state response")?;
+        if resp.protocol_version != purgery_core::PROTOCOL_VERSION {
+            anyhow::bail!(
+                "run-state response has protocol_version {}; expected {}",
+                resp.protocol_version,
+                purgery_core::PROTOCOL_VERSION,
+            );
+        }
+        purgery_core::require_compatible_purgery_version(
+            &resp.purgery_version,
+            "run-state response",
+        )
+        .with_context(|| "incompatible purgery_version in run-state response")?;
+        Ok(resp)
     }
 }
 
@@ -428,14 +460,26 @@ mod tests {
     #[test]
     fn fake_runner_returns_scripted_responses() {
         let runner = RemoteRunner::fake();
-        runner.add_response("begin-run", "protocol_version = 1\n");
-        runner.add_response("prepare-run", "protocol_version = 1\n");
+        runner.add_response(
+            "begin-run",
+            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\n",
+        );
+        runner.add_response(
+            "prepare-run",
+            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\n",
+        );
 
         let out = runner.server_cmd("host", "ps", &["begin-run"]).unwrap();
-        assert_eq!(out, "protocol_version = 1\n");
+        assert_eq!(
+            out,
+            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\n"
+        );
 
         let out = runner.server_cmd("host", "ps", &["prepare-run"]).unwrap();
-        assert_eq!(out, "protocol_version = 1\n");
+        assert_eq!(
+            out,
+            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\n"
+        );
 
         let log = runner.command_log();
         assert!(log.iter().any(|c| c.contains("begin-run")));
@@ -452,7 +496,10 @@ mod tests {
     #[test]
     fn fake_runner_add_error_overrides_response() {
         let runner = RemoteRunner::fake();
-        runner.add_response("begin-run", "ok");
+        runner.add_response(
+            "begin-run",
+            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\n",
+        );
         runner.add_error("begin-run", "simulated failure");
         let result = runner.server_cmd("host", "ps", &["begin-run"]);
         assert!(result.is_err());

@@ -57,14 +57,17 @@ fn derive_nickname(destination: &str) -> Result<Nickname> {
 
 fn check_server_version(runner: &RemoteRunner, host: &str, server_cmd: &str) -> Result<()> {
     let output = runner.server_cmd(host, server_cmd, &["version"])?;
-    let value: toml::Value =
+    let resp: purgery_core::VersionResponse =
         toml::from_str(&output).with_context(|| "failed to parse server version response")?;
-    let server_purgery_version = value
-        .get("purgery_version")
-        .and_then(|v| v.as_str())
-        .with_context(|| "server version response missing purgery_version")?;
+    if resp.protocol_version != purgery_core::PROTOCOL_VERSION {
+        anyhow::bail!(
+            "server {host} has protocol_version {}; client expects {}",
+            resp.protocol_version,
+            purgery_core::PROTOCOL_VERSION,
+        );
+    }
     purgery_core::require_compatible_purgery_version(
-        server_purgery_version,
+        &resp.purgery_version,
         format_args!("server {host}"),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
