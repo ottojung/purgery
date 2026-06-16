@@ -63,7 +63,7 @@ pub fn run_gc(config: &ServerConfig) -> Result<()> {
                 match fs::read_to_string(lease_path.as_std_path()) {
                     Ok(content) => match toml::from_str::<purgery_core::LeaseFile>(&content) {
                         Ok(lease) => {
-                            let version_ok = purgery_core::check_durable_version(
+                            let version_ok = purgery_core::require_compatible_purgery_version(
                                 &lease.purgery_version,
                                 "lease",
                             )

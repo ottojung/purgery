@@ -104,19 +104,47 @@ pub fn require_compatible_purgery_version(
     Ok(())
 }
 
-/// Like [`require_compatible_purgery_version`] but for durable state
-/// that carries an optional `purgery_version` field (files that did not
-/// always include the field). Missing `purgery_version` is treated as
-/// incompatible.
-pub fn check_durable_version(version: &Option<String>, label: &str) -> Result<(), VersionError> {
-    match version {
-        Some(v) => require_compatible_purgery_version(v, label),
-        None => Err(VersionError::Incompatible {
-            context: label.to_owned(),
+/// Error returned when probing a TOML document for its `purgery_version`.
+#[derive(Error, Debug)]
+pub enum VersionProbeError {
+    /// Input is not valid TOML.
+    #[error("invalid TOML: {0}")]
+    InvalidToml(String),
+    /// The `purgery_version` field is missing from the document.
+    #[error("missing purgery_version")]
+    MissingVersion,
+}
+
+/// Extract the `purgery_version` string from raw TOML input without
+/// requiring full deserialization.  Returns an error if the input is
+/// not valid TOML or if the field is absent.
+pub fn probe_purgery_version_from_toml(input: &str) -> Result<String, VersionProbeError> {
+    let value: toml::Value =
+        toml::from_str(input).map_err(|e| VersionProbeError::InvalidToml(e.to_string()))?;
+    match value.get("purgery_version").and_then(|v| v.as_str()) {
+        Some(v) => Ok(v.to_owned()),
+        None => Err(VersionProbeError::MissingVersion),
+    }
+}
+
+/// Parse raw TOML, extract `purgery_version`, and check it is
+/// major/minor-compatible with the current package version.
+///
+/// Returns an error if the TOML is invalid, the field is missing, or
+/// the producer version is incompatible.
+pub fn require_compatible_toml_version(
+    input: &str,
+    context: impl fmt::Display,
+) -> Result<(), VersionError> {
+    let version = probe_purgery_version_from_toml(input).map_err(|e| match e {
+        VersionProbeError::MissingVersion => VersionError::Incompatible {
+            context: context.to_string(),
             producer: "(missing)".to_owned(),
             current: current_purgery_version().to_owned(),
-        }),
-    }
+        },
+        VersionProbeError::InvalidToml(msg) => VersionError::InvalidFormat(msg),
+    })?;
+    require_compatible_purgery_version(&version, context)
 }
 
 #[cfg(test)]

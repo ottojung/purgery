@@ -652,6 +652,7 @@ work_dir = "/universe/tmp/purgery"
     #[test]
     fn manifest_empty_entries_is_error() {
         let toml = r#"
+purgery_version = "0.1.0-test"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 "#;
@@ -662,6 +663,7 @@ nickname = "laptop"
     #[test]
     fn manifest_rejects_unknown_top_level_field() {
         let toml = r#"
+purgery_version = "0.1.0-test"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 unknown_field = "value"
@@ -679,6 +681,7 @@ kind = "regular_file"
     #[test]
     fn manifest_entry_rejects_unknown_field() {
         let toml = r#"
+purgery_version = "0.1.0-test"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 
@@ -696,6 +699,7 @@ unknown_entry_field = "value"
     #[test]
     fn manifest_rejects_mode_field() {
         let toml = r#"
+purgery_version = "0.1.0-test"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 
@@ -713,6 +717,7 @@ mode = "covered"
     #[test]
     fn manifest_rejects_covered_by_field() {
         let toml = r#"
+purgery_version = "0.1.0-test"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 
@@ -730,6 +735,7 @@ covered_by = "Videos"
     #[test]
     fn manifest_rejects_old_transform_steps_field() {
         let toml = r#"
+purgery_version = "0.1.0-test"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 
@@ -750,6 +756,7 @@ transform_steps = ["compress-video"]
     #[test]
     fn manifest_accepts_new_transform_field() {
         let toml = r#"
+purgery_version = "0.1.0-test"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 
@@ -771,6 +778,7 @@ transform = "compress-video"
     #[test]
     fn manifest_rejects_transform_as_array() {
         let toml = r#"
+purgery_version = "0.1.0-test"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 

@@ -129,7 +129,7 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
         // Atomically rewrite run.toml with the resolved destination so that
         // later process-once does not depend on cwd.
         let updated = purgery_core::RunConfig {
-            purgery_version: Some(purgery_core::current_purgery_version().to_string()),
+            purgery_version: purgery_core::current_purgery_version().to_string(),
             nickname: run_config.nickname.clone(),
             destination: resolved_dest.clone(),
             delete_after_import: run_config.delete_after_import,
@@ -396,8 +396,11 @@ fn read_progress_fields(
     match std::fs::read_to_string(&progress_path) {
         Ok(content) => match toml::from_str::<purgery_core::ProcessingProgress>(&content) {
             Ok(prog)
-                if purgery_core::check_durable_version(&prog.purgery_version, "progress")
-                    .is_ok()
+                if purgery_core::require_compatible_purgery_version(
+                    &prog.purgery_version,
+                    "progress",
+                )
+                .is_ok()
                     && prog.nickname == nickname.as_str()
                     && prog.run_id == run_id.as_str() =>
             {
@@ -552,7 +555,7 @@ pub fn heartbeat_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId)
         .with_context(|| "failed to read lease file")?;
     let mut lease: purgery_core::LeaseFile =
         toml::from_str(&lease_content).with_context(|| "failed to parse lease file")?;
-    purgery_core::check_durable_version(&lease.purgery_version, "lease")
+    purgery_core::require_compatible_purgery_version(&lease.purgery_version, "lease")
         .with_context(|| "incompatible lease version")?;
 
     if lease.protocol_version != 1 {
@@ -691,7 +694,8 @@ mod tests {
     fn write_run_toml(dir: &Utf8Path, nickname: &Nickname) {
         let destination = test_destination_from_run_dir(dir, "univ/default");
         let content = format!(
-            r#"nickname = "{}"
+            r#"purgery_version = "0.1.0-test"
+nickname = "{}"
 destination = "{}"
 delete_after_import = true
 "#,
@@ -713,7 +717,8 @@ delete_after_import = true
         };
         let destination = test_destination_from_run_dir(dir, &requested);
         let content = format!(
-            r#"nickname = "{}"
+            r#"purgery_version = "0.1.0-test"
+nickname = "{}"
 destination = "{}"
 delete_after_import = true
 "#,
@@ -729,7 +734,8 @@ delete_after_import = true
         destination_raw: &str,
     ) {
         let content = format!(
-            r#"nickname = "{}"
+            r#"purgery_version = "0.1.0-test"
+nickname = "{}"
 destination = "{}"
 delete_after_import = true
 "#,
@@ -763,7 +769,7 @@ delete_after_import = true
         write_run_toml_with_destination(&ready_path, nickname, destination_path);
 
         let manifest = Manifest {
-            purgery_version: None,
+            purgery_version: "0.1.0-test".to_string(),
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
@@ -887,7 +893,7 @@ delete_after_import = true
         write_run_toml_with_destination(&ready_path, &nickname, "videos");
 
         let manifest = Manifest {
-            purgery_version: None,
+            purgery_version: "0.1.0-test".to_string(),
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
@@ -975,14 +981,15 @@ delete_after_import = true
         fs::create_dir_all(&ready_path).unwrap();
 
         // Run config has different nickname than the directory
-        let run_config_content = r#"nickname = "other-machine"
+        let run_config_content = r#"purgery_version = "0.1.0-test"
+nickname = "other-machine"
 destination = "univ/default"
 delete_after_import = true
 "#;
         fs::write(ready_path.join("run.toml"), run_config_content).unwrap();
 
         let manifest = Manifest {
-            purgery_version: None,
+            purgery_version: "0.1.0-test".to_string(),
             run_id: run_id.clone(),
             nickname: Nickname::new("other-machine".into()).unwrap(),
             entries: vec![ManifestEntry {
@@ -1062,7 +1069,7 @@ delete_after_import = true
         fs::write(ready_path.join("run.toml"), "not valid toml {{{").unwrap();
 
         let manifest = Manifest {
-            purgery_version: None,
+            purgery_version: "0.1.0-test".to_string(),
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
@@ -1176,7 +1183,7 @@ delete_after_import = true
         write_run_toml_with_destination(&ready_path, &nickname, "univ/videos");
 
         let manifest = Manifest {
-            purgery_version: None,
+            purgery_version: "0.1.0-test".to_string(),
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
@@ -1439,7 +1446,7 @@ delete_after_import = true
         write_run_toml_with_destination(&ready_path, &nickname, "univ/videos");
 
         let manifest = Manifest {
-            purgery_version: None,
+            purgery_version: "0.1.0-test".to_string(),
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
@@ -1493,7 +1500,7 @@ delete_after_import = true
         write_run_toml_with_destination(&ready_path, &nickname, "videos");
 
         let manifest = Manifest {
-            purgery_version: None,
+            purgery_version: "0.1.0-test".to_string(),
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
@@ -1573,7 +1580,7 @@ delete_after_import = true
         write_run_toml_with_destination(&ready_path, &nickname, "videos");
 
         let manifest = Manifest {
-            purgery_version: None,
+            purgery_version: "0.1.0-test".to_string(),
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
@@ -1670,7 +1677,7 @@ delete_after_import = true
         write_run_toml_with_destination(&ready_path, &nickname, "univ/videos");
 
         let manifest = Manifest {
-            purgery_version: None,
+            purgery_version: "0.1.0-test".to_string(),
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
@@ -1761,7 +1768,7 @@ delete_after_import = true
         write_run_toml_with_destination(&ready_path, &nickname, "univ/videos");
 
         let manifest = Manifest {
-            purgery_version: None,
+            purgery_version: "0.1.0-test".to_string(),
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
@@ -1860,7 +1867,7 @@ delete_after_import = true
         write_run_toml_with_destination(&ready_path, &nickname, "univ/videos");
 
         let manifest = Manifest {
-            purgery_version: None,
+            purgery_version: "0.1.0-test".to_string(),
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
@@ -2678,7 +2685,7 @@ delete_after_import = true
             transform: None,
         };
         let manifest = Manifest {
-            purgery_version: None,
+            purgery_version: "0.1.0-test".to_string(),
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![
@@ -2872,7 +2879,7 @@ delete_after_import = true
         write_run_toml_with_raw_destination(&incoming, &nickname, "relative/path");
 
         let manifest = Manifest {
-            purgery_version: None,
+            purgery_version: "0.1.0-test".to_string(),
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
@@ -2947,7 +2954,7 @@ delete_after_import = true
         let original_dest = run_config.destination.as_str().to_owned();
 
         let manifest = Manifest {
-            purgery_version: None,
+            purgery_version: "0.1.0-test".to_string(),
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
@@ -3009,7 +3016,7 @@ delete_after_import = true
         write_run_toml_with_destination(&ready, &nickname, "univ/videos");
 
         let manifest = Manifest {
-            purgery_version: None,
+            purgery_version: "0.1.0-test".to_string(),
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
@@ -3170,7 +3177,7 @@ delete_after_import = true
         write_run_toml_with_destination(&ready_path, &nickname, "univ/data");
 
         let manifest = Manifest {
-            purgery_version: None,
+            purgery_version: "0.1.0-test".to_string(),
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
@@ -3659,7 +3666,7 @@ delete_after_import = true
         // Write an existing progress file with matching envelope
         let old_progress = purgery_core::ProcessingProgress {
             protocol_version: 1,
-            purgery_version: Some("0.1.0-test".to_string()),
+            purgery_version: "0.1.0-test".to_string(),
             nickname: "laptop".into(),
             run_id: "ts-envelope".into(),
             phase: "processing".into(),
@@ -3705,7 +3712,7 @@ delete_after_import = true
         // Write existing progress with DIFFERENT nickname
         let old_progress = purgery_core::ProcessingProgress {
             protocol_version: 1,
-            purgery_version: Some("0.1.0-test".to_string()),
+            purgery_version: "0.1.0-test".to_string(),
             nickname: "other-machine".into(), // different nickname
             run_id: "ts-mismatch".into(),
             phase: "processing".into(),
@@ -3850,7 +3857,7 @@ delete_after_import = true
         // Manually write a progress file with a specific started_at
         let old_progress = purgery_core::ProcessingProgress {
             protocol_version: 1,
-            purgery_version: Some("0.1.0-test".to_string()),
+            purgery_version: "0.1.0-test".to_string(),
             nickname: "laptop".into(),
             run_id: run_id.as_str().into(),
             phase: "processing".into(),
@@ -4191,7 +4198,7 @@ delete_after_import = true
 
         write_run_toml_with_destination(&ready_path, &nickname, "videos");
         let manifest = Manifest {
-            purgery_version: None,
+            purgery_version: "0.1.0-test".to_string(),
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
@@ -4258,7 +4265,7 @@ delete_after_import = true
         write_run_toml_with_destination(&ready_path, &nickname, "univ/videos");
 
         let manifest = Manifest {
-            purgery_version: None,
+            purgery_version: "0.1.0-test".to_string(),
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![
@@ -4356,7 +4363,7 @@ delete_after_import = true
         write_run_toml_with_destination(&ready_path, &nickname, "univ/data");
 
         let manifest = Manifest {
-            purgery_version: None,
+            purgery_version: "0.1.0-test".to_string(),
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
@@ -4699,7 +4706,7 @@ delete_after_import = true
         write_run_toml_with_destination(&ready_path, &nickname, "univ/data");
 
         let manifest = Manifest {
-            purgery_version: None,
+            purgery_version: "0.1.0-test".to_string(),
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
@@ -4988,7 +4995,7 @@ delete_after_import = true
         write_run_toml_with_destination(&ready_path, &nickname, "univ/data");
 
         let manifest = Manifest {
-            purgery_version: None,
+            purgery_version: "0.1.0-test".to_string(),
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
@@ -5217,7 +5224,7 @@ delete_after_import = true
         write_run_toml_with_destination(&ready_path, &nickname, "data");
 
         let manifest = Manifest {
-            purgery_version: None,
+            purgery_version: "0.1.0-test".to_string(),
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![
@@ -5534,7 +5541,7 @@ delete_after_import = true
         write_run_toml_with_destination(&ready_path, &nickname, "data");
 
         let manifest = Manifest {
-            purgery_version: None,
+            purgery_version: "0.1.0-test".to_string(),
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
@@ -5665,7 +5672,7 @@ delete_after_import = true
         write_run_toml_with_destination(&ready_path, &nickname, "univ/data");
 
         let manifest = Manifest {
-            purgery_version: None,
+            purgery_version: "0.1.0-test".to_string(),
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
@@ -5790,7 +5797,7 @@ delete_after_import = true
         write_run_toml_with_destination(&ready_path, &nickname, "univ/data");
 
         let manifest = Manifest {
-            purgery_version: None,
+            purgery_version: "0.1.0-test".to_string(),
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
@@ -5884,7 +5891,7 @@ delete_after_import = true
         let incoming = Utf8PathBuf::from(response.incoming_dir);
         write_run_toml_with_destination(&incoming, &nickname, "univ/data");
         let manifest = Manifest {
-            purgery_version: None,
+            purgery_version: "0.1.0-test".to_string(),
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
@@ -5944,7 +5951,7 @@ delete_after_import = true
         write_run_toml_with_destination(&ready_path, &nickname, "univ/data");
 
         let manifest = Manifest {
-            purgery_version: None,
+            purgery_version: "0.1.0-test".to_string(),
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
@@ -6021,7 +6028,7 @@ delete_after_import = true
         write_run_toml_with_destination(&ready_path, &nickname, "univ/data");
 
         let manifest = Manifest {
-            purgery_version: None,
+            purgery_version: "0.1.0-test".to_string(),
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
@@ -6096,7 +6103,7 @@ delete_after_import = true
         write_run_toml_with_destination(&ready_path, &nickname, "univ/output");
 
         let manifest = Manifest {
-            purgery_version: None,
+            purgery_version: "0.1.0-test".to_string(),
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
@@ -6187,7 +6194,7 @@ delete_after_import = true
         write_run_toml_with_destination(&ready_path, &nickname, "univ/output");
 
         let manifest = Manifest {
-            purgery_version: None,
+            purgery_version: "0.1.0-test".to_string(),
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
@@ -6317,7 +6324,7 @@ delete_after_import = true
         write_run_toml_with_destination(&ready_path, &nickname, "univ/videos");
 
         let manifest = Manifest {
-            purgery_version: None,
+            purgery_version: "0.1.0-test".to_string(),
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
@@ -6389,14 +6396,18 @@ delete_after_import = true
 
         let dest = storage.join("univ/videos");
         let run_config_content = format!(
-            "nickname = \"{}\"\ndestination = \"{}\"\ndelete_after_import = true\n",
+            r#"purgery_version = "0.1.0-test"
+nickname = "{}"
+destination = "{}"
+delete_after_import = true
+"#,
             nickname.as_str(),
             dest.as_str()
         );
         fs::write(incoming_path.join("run.toml"), &run_config_content).unwrap();
 
         let manifest = Manifest {
-            purgery_version: None,
+            purgery_version: "0.1.0-test".to_string(),
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {
@@ -6511,14 +6522,18 @@ delete_after_import = true
 
         let destination_dir = tmp_path.join("archive");
         let run_config_content = format!(
-            "nickname = \"{}\"\ndestination = \"{}\"\ndelete_after_import = true\n",
+            r#"purgery_version = "0.1.0-test"
+nickname = "{}"
+destination = "{}"
+delete_after_import = true
+"#,
             nickname.as_str(),
             destination_dir.as_str()
         );
         fs::write(ready_path.join("run.toml"), &run_config_content).unwrap();
 
         let manifest = Manifest {
-            purgery_version: None,
+            purgery_version: "0.1.0-test".to_string(),
             run_id: run_id.clone(),
             nickname: nickname.clone(),
             entries: vec![ManifestEntry {

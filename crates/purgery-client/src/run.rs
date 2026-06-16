@@ -280,7 +280,7 @@ fn persist_client_run_state(
 ) -> Result<()> {
     let run_state = ClientRunState {
         protocol_version: 1,
-        purgery_version: Some(purgery_core::current_purgery_version().to_string()),
+        purgery_version: purgery_core::current_purgery_version().to_string(),
         nickname: nickname.as_str().to_owned(),
         run_id: run_id.as_str().to_owned(),
         host: host.to_owned(),
@@ -382,9 +382,10 @@ fn resume_runs(runner: &RemoteRunner, state_dir: &str) -> Result<()> {
         };
         let run_state: ClientRunState = match toml::from_str::<ClientRunState>(&content) {
             Ok(s) => {
-                if let Err(e) =
-                    purgery_core::check_durable_version(&s.purgery_version, "client run state")
-                {
+                if let Err(e) = purgery_core::require_compatible_purgery_version(
+                    &s.purgery_version,
+                    "client run state",
+                ) {
                     error!(
                         "incompatible client run state version in {:?}: {e}",
                         state_path
@@ -446,11 +447,11 @@ fn drain_one(runner: &RemoteRunner, state_dir: &str, state: &ClientRunState) -> 
     let server_cmd = &state.server_command;
     let manifest: Manifest =
         toml::from_str(&state.manifest).with_context(|| "failed to parse persisted manifest")?;
-    purgery_core::check_durable_version(&manifest.purgery_version, "manifest")
+    purgery_core::require_compatible_purgery_version(&manifest.purgery_version, "manifest")
         .with_context(|| "incompatible persisted manifest version")?;
     let run_config: RunConfig = toml::from_str(&state.run_config)
         .with_context(|| "failed to parse persisted run config")?;
-    purgery_core::check_durable_version(&run_config.purgery_version, "run config")
+    purgery_core::require_compatible_purgery_version(&run_config.purgery_version, "run config")
         .with_context(|| "incompatible persisted run config version")?;
 
     let mut phase = state.phase;
@@ -779,7 +780,7 @@ pub(crate) fn run_sync_with_run_id(
             None
         } else {
             let state = DurableCleanupState {
-                purgery_version: Some(purgery_core::current_purgery_version().to_string()),
+                purgery_version: purgery_core::current_purgery_version().to_string(),
                 nickname: nickname.as_str().to_owned(),
                 operation_id: run_id.as_str().to_owned(),
                 entries,
@@ -809,7 +810,7 @@ pub(crate) fn run_sync_with_run_id(
     // Transform: server run flow with heartbeat and crash-safe persistence
     let server_cmd = &args.server_command;
     let mut run_config = RunConfig {
-        purgery_version: Some(purgery_core::current_purgery_version().to_string()),
+        purgery_version: purgery_core::current_purgery_version().to_string(),
         nickname: nickname.clone(),
         destination: remote.path.clone(),
         delete_after_import: true,
@@ -846,7 +847,7 @@ pub(crate) fn run_sync_with_run_id(
 
         if let Some(ref dest) = prepare_resp.destination {
             run_config = RunConfig {
-                purgery_version: Some(purgery_core::current_purgery_version().to_string()),
+                purgery_version: purgery_core::current_purgery_version().to_string(),
                 nickname: nickname.clone(),
                 destination: DestinationPath::new(camino::Utf8PathBuf::from(dest))
                     .with_context(|| "server returned invalid resolved destination")?,
@@ -1238,13 +1239,13 @@ state = "done"
         );
 
         let manifest = Manifest {
-            purgery_version: Some("0.1.0-test".to_string()),
+            purgery_version: "0.1.0-test".to_string(),
             run_id: RunId::new("test-drain".into()).unwrap(),
             nickname: Nickname::new("laptop".into()).unwrap(),
             entries: vec![],
         };
         let run_config = RunConfig {
-            purgery_version: Some("0.1.0-test".to_string()),
+            purgery_version: "0.1.0-test".to_string(),
             nickname: Nickname::new("laptop".into()).unwrap(),
             destination: DestinationPath::new(camino::Utf8PathBuf::from("rel")).unwrap(),
             delete_after_import: true,
@@ -1284,13 +1285,13 @@ state = "done"
         // No scripted responses → all commands will fail with "no scripted response"
 
         let manifest = Manifest {
-            purgery_version: Some("0.1.0-test".to_string()),
+            purgery_version: "0.1.0-test".to_string(),
             run_id: RunId::new("test-block".into()).unwrap(),
             nickname: Nickname::new("laptop".into()).unwrap(),
             entries: vec![],
         };
         let run_config = RunConfig {
-            purgery_version: Some("0.1.0-test".to_string()),
+            purgery_version: "0.1.0-test".to_string(),
             nickname: Nickname::new("laptop".into()).unwrap(),
             destination: DestinationPath::new(camino::Utf8PathBuf::from("rel")).unwrap(),
             delete_after_import: true,
@@ -1328,13 +1329,13 @@ state = "done"
         // No SSH responses needed — terminal_status is persisted
 
         let manifest = Manifest {
-            purgery_version: Some("0.1.0-test".to_string()),
+            purgery_version: "0.1.0-test".to_string(),
             run_id: RunId::new("test-tss".into()).unwrap(),
             nickname: Nickname::new("laptop".into()).unwrap(),
             entries: vec![],
         };
         let run_config = RunConfig {
-            purgery_version: Some("0.1.0-test".to_string()),
+            purgery_version: "0.1.0-test".to_string(),
             nickname: Nickname::new("laptop".into()).unwrap(),
             destination: DestinationPath::new(camino::Utf8PathBuf::from("rel")).unwrap(),
             delete_after_import: true,
@@ -1380,13 +1381,13 @@ state = "done"
         // No scripted "status" response → re-read will fail
 
         let manifest = Manifest {
-            purgery_version: Some("0.1.0-test".to_string()),
+            purgery_version: "0.1.0-test".to_string(),
             run_id: RunId::new("test-notss".into()).unwrap(),
             nickname: Nickname::new("laptop".into()).unwrap(),
             entries: vec![],
         };
         let run_config = RunConfig {
-            purgery_version: Some("0.1.0-test".to_string()),
+            purgery_version: "0.1.0-test".to_string(),
             nickname: Nickname::new("laptop".into()).unwrap(),
             destination: DestinationPath::new(camino::Utf8PathBuf::from("rel")).unwrap(),
             delete_after_import: true,

@@ -62,7 +62,8 @@ fn existing_progress_started_at(
 ) -> Option<u64> {
     let content = std::fs::read_to_string(progress_path.as_std_path()).ok()?;
     let progress: ProcessingProgress = toml::from_str(&content).ok()?;
-    if purgery_core::check_durable_version(&progress.purgery_version, "progress").is_err()
+    if purgery_core::require_compatible_purgery_version(&progress.purgery_version, "progress")
+        .is_err()
         || progress.nickname != nickname.as_str()
         || progress.run_id != run_id.as_str()
     {
@@ -151,7 +152,7 @@ pub(crate) fn write_progress(
     let started_at = existing_progress_started_at(&final_path, nickname, run_id).unwrap_or(now);
     let progress = ProcessingProgress {
         protocol_version: 1,
-        purgery_version: Some(current_purgery_version().to_string()),
+        purgery_version: current_purgery_version().to_string(),
         nickname: nickname.as_str().to_owned(),
         run_id: run_id.as_str().to_owned(),
         phase: "processing".to_string(),
@@ -396,7 +397,7 @@ pub fn begin_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> 
 
     let lease = purgery_core::LeaseFile {
         protocol_version: 1,
-        purgery_version: Some(current_purgery_version().to_string()),
+        purgery_version: current_purgery_version().to_string(),
         nickname: nickname.as_str().to_owned(),
         run_id: run_id.as_str().to_owned(),
         created_at_unix_secs: now,
@@ -479,7 +480,7 @@ pub fn finish_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) ->
             fs::read_to_string(&lease_path).with_context(|| "failed to read lease file")?;
         let lease: purgery_core::LeaseFile =
             toml::from_str(&lease_content).with_context(|| "failed to parse lease file")?;
-        purgery_core::check_durable_version(&lease.purgery_version, "lease")
+        purgery_core::require_compatible_purgery_version(&lease.purgery_version, "lease")
             .with_context(|| "incompatible lease version")?;
         if lease.protocol_version != 1 {
             anyhow::bail!(

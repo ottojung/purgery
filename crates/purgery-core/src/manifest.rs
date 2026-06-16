@@ -28,8 +28,7 @@ pub(crate) fn is_zero_i64(value: &i64) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub purgery_version: Option<String>,
+    pub purgery_version: String,
     pub run_id: RunId,
     pub nickname: Nickname,
     #[serde(default)]
