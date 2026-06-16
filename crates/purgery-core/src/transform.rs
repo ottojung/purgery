@@ -34,10 +34,6 @@ impl Serialize for TransformKind {
     }
 }
 
-fn default_true() -> bool {
-    true
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TransformDefinition {
@@ -48,8 +44,6 @@ pub struct TransformDefinition {
     #[serde(default)]
     pub args: Vec<String>,
     pub expected_outputs: Vec<String>,
-    #[serde(default = "default_true")]
-    pub keep_original: bool,
 }
 
 impl TransformDefinition {

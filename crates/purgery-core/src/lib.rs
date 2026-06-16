@@ -1088,7 +1088,6 @@ unknown_field = "value"
             program: "true".to_owned(),
             args: configured_args.clone(),
             expected_outputs: vec![],
-            keep_original: true,
         };
         let built = td.build_args(
             camino::Utf8Path::new("/tmp/work/file.mp4"),
@@ -1112,7 +1111,6 @@ unknown_field = "value"
             program: "ffmpeg".to_owned(),
             args: vec!["--input".to_string(), "{input}".to_string()],
             expected_outputs: vec![],
-            keep_original: true,
         };
         let built = td.build_args(
             camino::Utf8Path::new("/tmp/work/file.mp4"),
@@ -1247,7 +1245,6 @@ unknown_field = "value"
             program: "ffmpeg".into(),
             args: vec!["--input".into(), "{input}".into()],
             expected_outputs: vec!["{stem}.Z.webm".into()],
-            keep_original: true,
         };
         let work_path = Utf8Path::new("/work/videos/video.mp4");
         let args = td.build_args(work_path, Utf8Path::new("/dest"));
@@ -1262,7 +1259,6 @@ unknown_field = "value"
             program: "ffmpeg".into(),
             args: vec![],
             expected_outputs: vec!["{stem}.Z.webm".into()],
-            keep_original: false,
         };
         let work_path = Utf8Path::new("/work/videos/video.mp4");
         let target_dir = Utf8Path::new("/dest");
@@ -1279,7 +1275,6 @@ unknown_field = "value"
             program: "ffmpeg".into(),
             args: vec!["--output-dir".into(), "{parent}".into()],
             expected_outputs: vec![],
-            keep_original: false,
         };
         let work_path = Utf8Path::new("/work/videos/video.mp4");
         let target_dir = Utf8Path::new("/dest");
@@ -1369,7 +1364,6 @@ color = "never"
             program: "ffmpeg".into(),
             args: vec!["--output-dir".into(), "{target_directory}".into()],
             expected_outputs: vec!["{stem}.Z.webm".into()],
-            keep_original: false,
         };
         let work_path = Utf8Path::new("/work/videos/video.mp4");
         let target_dir = Utf8Path::new("/archive/videos");
@@ -1567,7 +1561,6 @@ kind = "subprocess"
 program = "my-compress-video"
 args = ["--input", "{input}"]
 expected_outputs = ["{file_stem}.Z.webm"]
-keep_original = true
 "#;
         assert!(
             ServerConfig::from_toml(config).is_err(),
@@ -1586,7 +1579,6 @@ kind = "subprocess"
 program = "my-compress-video"
 args = ["--input", "{input}", "--output-dir", "{target_directory}"]
 expected_outputs = ["{file_stem}.Z.webm"]
-keep_original = true
 "#;
         let result = ServerConfig::from_toml(config);
         assert!(
@@ -1650,7 +1642,6 @@ kind = "subprocess"
 program = "my-compress-video"
 args = ["--input", "{input}"]
 expected_outputs = ["{input}"]
-keep_original = true
 "#;
         let result = ServerConfig::from_toml(config);
         assert!(
@@ -1684,7 +1675,6 @@ kind = "subprocess"
 program = ""
 args = ["--input", "{input}"]
 expected_outputs = ["{file_stem}.Z.webm"]
-keep_original = true
 "#;
         let result = ServerConfig::from_toml(config);
         assert!(
@@ -1712,10 +1702,31 @@ keep_original = true
         let toml = r#"
 kind = "subprocess"
 program = "my-compress-video"
-expected_outputs = []
+expected_outputs = ["out"]
 "#;
         let result: Result<TransformDefinition, _> = toml::from_str(toml);
         assert!(result.is_err(), "missing 'name' field must be rejected");
+    }
+
+    #[test]
+    fn server_config_rejects_keep_original_field() {
+        let config = r#"
+work_dir = "/var/lib/purgery/work"
+
+[[transform]]
+name = "compress-video"
+kind = "subprocess"
+program = "my-compress-video"
+args = ["--input", "{input}"]
+expected_outputs = ["{file_stem}.Z.webm"]
+keep_original = true
+"#;
+        let result = ServerConfig::from_toml(config);
+        assert!(
+            result.is_err(),
+            "keep_original must be rejected, got: {:?}",
+            result.ok()
+        );
     }
 
     // ── Terminology regression tests ──────────────────────────────

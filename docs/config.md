@@ -33,7 +33,6 @@ kind = "subprocess"
 program = "/usr/local/bin/compress-video"
 args = ["--input", "{input}", "--output-dir", "{target_directory}"]
 expected_outputs = ["{file_stem}.Z.webm"]
-keep_original = true
 ```
 
 ### Fields
@@ -71,7 +70,6 @@ Transforms are defined as an array of tables using `[[transform]]`. Each named t
 | `program` | yes | Executable path or name (resolved via `PATH`) |
 | `args` | `[]` | Arguments with placeholders |
 | `expected_outputs` | yes | List of output entry-name patterns with placeholders. May be empty (`[]`) |
-| `keep_original` | `true` | Metadata for the transform program; Purgery does not use it to place or move files |
 
 ### Placeholders
 
@@ -86,7 +84,7 @@ Transforms are defined as an array of tables using `[[transform]]`. Each named t
 
 `args` may use `{input}`, `{parent}`, `{file_name}`, `{file_stem}`, `{stem}`, and `{target_directory}`. `expected_outputs` may use only `{file_name}`, `{file_stem}`, and `{stem}`, and each resolved expected output must be a plain file name without directory components.
 
-Purgery does not move or commit transform outputs. The transform program is responsible for placing outputs into `{target_directory}`. After the transform exits successfully, Purgery checks each declared expected output exists in `{target_directory}`. If `expected_outputs = []`, no output-existence checks are performed; successful subprocess exit is sufficient.
+Purgery does not move or commit transform outputs. The transform program is responsible for placing outputs into `{target_directory}`. After the transform exits successfully, Purgery checks each declared expected output exists in `{target_directory}`. Transformed inputs are consumed by the transform flow and are never committed as final outputs. `expected_outputs` may be empty (for verification-only or deletion-only transforms).
 
 ### Subprocess safety
 

@@ -22,7 +22,7 @@ The run destination is final storage. `{target_directory}` is `<destination>` (t
 
 Transform programs are responsible for placing outputs into `{target_directory}`. After the subprocess exits successfully, Purgery checks that each declared expected output exists in `{target_directory}`. Purgery does not move or commit transform outputs.
 
-If `expected_outputs = []`, no output-existence checks are performed. Successful subprocess exit is sufficient for the entry to be marked `imported`. This allows intentionally deletion-only or verification-only transforms.
+Transformed inputs are consumed by the transform flow and are never committed as final outputs. A transform produces exactly the declared `expected_outputs`. If `expected_outputs = []`, no output-existence checks are performed; successful subprocess exit is sufficient for the entry to be marked `imported`. This allows intentionally deletion-only or verification-only transforms.
 
 Examples:
 

@@ -80,12 +80,11 @@ kind = "subprocess"
 program = "/usr/local/bin/compress"
 args = ["--input", "{input}", "--output-dir", "{target_directory}"]
 expected_outputs = ["{file_stem}.compressed.webm"]
-keep_original = true
 ```
 
 The server invokes the transform. After the subprocess exits successfully, the server checks that each declared `expected_output` exists in `{target_directory}` (the directory where the entry's normal non-transform final path would be placed). The transform program is responsible for placing outputs into `{target_directory}`; Purgery does not move or commit transform outputs.
 
-`expected_outputs` is required but may be empty (`[]`). When empty, no output-existence checks are performed — successful subprocess exit is sufficient for the entry to be marked `imported`. This allows intentionally deletion-only or verification-only transforms.
+Transformed inputs are consumed by the transform flow and are never committed as final outputs. A transform produces exactly the declared `expected_outputs`, which may be empty (e.g., for verification-only or deletion-only transforms).
 
 ## Transform and cleanup coupling
 

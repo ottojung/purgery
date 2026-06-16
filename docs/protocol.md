@@ -225,7 +225,7 @@ The source entry base final path is `<destination>/<source_entry_name>`. `{targe
 
 For non-transform entries, the server commits the work entry to the base final path.
 
-For transform entries, `final_paths` in the status records the resolved expected output paths that were checked (i.e., the paths under `{target_directory}` whose existence Purgery confirmed after the transform). If `expected_outputs = []`, no paths are checked and `final_paths` is empty. Purgery does not move or commit transform outputs; it only checks that declared expected outputs exist.
+For transform entries, `final_paths` in the status records the resolved expected output paths that were checked (i.e., the paths under `{target_directory}` whose existence Purgery confirmed after the transform). If `expected_outputs = []`, no paths are checked and `final_paths` is empty. Purgery does not move or commit transform outputs; it only checks that declared expected outputs exist. Transformed inputs are consumed by the transform flow and are never committed as final outputs.
 
 Examples:
 
