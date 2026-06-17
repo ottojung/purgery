@@ -125,11 +125,21 @@ impl RemoteCommandHandle {
     /// returns the scripted exit immediately (the first time the exit
     /// is available).
     pub(crate) fn wait(&mut self) -> Result<RemoteCommandExit> {
+        // If this is a fake command with no scripted exit, return
+        // immediately — the command was never expected to finish.
+        if let RemoteCommandHandleKind::Fake {
+            remaining_polls,
+            exit,
+        } = &self.kind
+        {
+            if remaining_polls.lock().unwrap().is_none() && exit.lock().unwrap().is_none() {
+                return Ok(RemoteCommandExit::Killed);
+            }
+        }
         loop {
             match self.try_wait()? {
                 Some(exit) => return Ok(exit),
                 None => {
-                    // Small delay to avoid busy-waiting on a real process.
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
             }
