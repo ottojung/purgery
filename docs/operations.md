@@ -56,9 +56,9 @@ purgery-client sync \
   -- ~/Videos user@server:/archive
 ```
 
-When `purgery-client sync` is invoked with `--transform`, the client uploads the run and finishes it, then automatically invokes remote `purgery-server process-run --nickname <nickname> --run-id <run-id>` on the server.
+When `purgery-client sync` is invoked with `--transform`, the client uploads the run and finishes it, then spawns a foreground remote `purgery-server process-run --nickname <nickname> --run-id <run-id>` in a local supervised handle while concurrently polling `run-state`. The client restarts `process-run` on SSH transport failure when needed, and reads status after terminal `run-state`.
 
-`process-run` starts a global GC attempt as part of the command and waits for that GC attempt before returning. This is intentional: Purgery does not require a daemon, cron job, or timer for routine cleanup, so client-triggered server work is also a maintenance opportunity. GC may affect unrelated expired incoming runs. GC failure is logged but does not prevent target-run processing.
+`process-run` does not run GC. The client starts `purgery-server gc` separately as a concurrent foreground remote command immediately after connecting to the server. GC failure is logged and does not fail the transform sync. The client settles the GC command before returning.
 
 The target run is driven independently of unrelated ready/processing runs. `process-run` may claim the target from `ready`, recover an abandoned target in `processing`, observe that another processor is actively handling it, or observe that it is already terminal. It does not process unrelated ready/processing runs.
 

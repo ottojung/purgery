@@ -1025,19 +1025,15 @@ pub(crate) fn recover_processing_run_if_unlocked(
 
 /// Process a specific run by nickname and run_id.
 ///
-/// Starts a global GC attempt as part of the command (in a concurrent
-/// thread) and waits for that GC attempt before returning.  GC failure
-/// is logged but does not block target processing.
-///
-/// Then drives only the target run:
+/// Foreground targeted processor:
 /// - ready: claim with processor lock and process
-/// - processing: try to acquire processor lock; if busy, another
-///   processor is active (no-op); if acquired, abandoned run is
-///   recovered via `recover_or_process_processing_run`
+/// - processing: recover if lock is free; no-op if actively locked
 /// - terminal: idempotent success
 /// - not found: error
 ///
 /// Does not process unrelated runs.
+/// Does not run GC.
+/// Does not detach.
 pub fn process_run_target(
     config: &ServerConfig,
     nickname: &Nickname,
