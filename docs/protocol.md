@@ -282,3 +282,93 @@ Fields:
 - `terminal_status` — optional serialized `RunStatus` TOML, set when the phase becomes `terminal_status_seen`. Enables recovery without re-reading from the server.
 
 Phases: `upload_complete_finish_pending`, `waiting_for_terminal_state`, `terminal_status_seen`, `cleanup_complete`, `abandoned`, `corrupt`.
+
+## Version compatibility
+
+Purgery uses two independent version concepts.
+
+### `protocol_version`
+
+The protocol version describes the shape or family of machine-readable protocol messages and durable file envelopes. It must match exactly for client–server communication and for durable-file deserialization. Increment it when the wire format or durable-file structure changes.
+
+Current value: `1`.
+
+### `purgery_version`
+
+The `purgery_version` field records which Purgery application version produced a protocol message or durable file. It is a semver string (`MAJOR.MINOR.PATCH`).
+
+Two versions are compatible when their major **and** minor components are equal. Patch versions may differ.
+
+Examples:
+
+```
+0.1.0 client with 0.1.7 server: compatible
+0.1.7 client with 0.1.0 server: compatible
+0.1.x with 0.2.x: incompatible
+0.1.x with 1.0.x: incompatible
+0.1.x with 0.1.x: compatible
+```
+
+### Client–server compatibility check
+
+Before starting or resuming a server-backed operation, the client calls the server `version` command. The response is TOML:
+
+```toml
+protocol_version = 1
+purgery_version = "0.1.0"
+```
+
+The client validates both fields:
+
+- `protocol_version` must equal the client’s `PROTOCOL_VERSION`.
+- `purgery_version` must be major/minor-compatible with the client’s package version.
+
+If either check fails, the client refuses the operation. Direct passthrough rsync (without `purgery-server`) does not perform this check.
+
+### Durable file version policy
+
+Every durable Purgery-owned TOML file carries `purgery_version`. The current domain structs require the field — old files that lack it do not deserialize as current types.
+
+Durable files include:
+
+- `run.toml`, `manifest.toml` — client-written input for a server run.
+- `lease.toml` — incoming run lease.
+- `status.toml` — terminal or failure status.
+- `progress.toml` — processing-phase progress.
+- `state.toml` — client-side persisted run state.
+- `cleanup-*.toml` — durable cleanup state.
+- Protocol response TOML from server subcommands.
+
+Atomic temporary files (e.g. `*.toml.tmp`) are implementation details and are not subject to version policy.
+
+### Incompatible file policy
+
+When Purgery encounters a standalone durable file whose `purgery_version` is missing, malformed, or major/minor-incompatible, it must:
+
+- warn with the file path and version context;
+- leave the file exactly where it is;
+- **not** rename or delete the file;
+- **not** overwrite it with current-version state;
+- **not** move its containing run to `failed`;
+- **not** write a replacement status;
+- continue as if that file or run does not exist.
+
+This is a safety rule. Purgery must not reinterpret old state as current state, and must not automatically migrate or destroy files it cannot safely interpret. Operator intervention or an explicit future migration tool can handle old state.
+
+### Malformed current-version files
+
+A file with a compatible `purgery_version` but malformed content, wrong envelope, or otherwise invalid current-version structure is **not** an incompatibility problem. Purgery may treat it according to the relevant command’s normal error handling (write a failure status, report corruption, etc.). Do not confuse malformed current-version files with old-version incompatibility.
+
+### ClientRunState embedded-field exception
+
+`ClientRunState` may embed serialized `manifest`, `run_config`, or `terminal_status`. These embedded values are not independently discovered files — they are part of the same durable state object, written by the same client version. The client treats incompatible embedded data as malformed current state, not as standalone incompatible files. This exception exists so that the scan of `state.toml` files does not need to recursively version-check each embedded blob.
+
+### Rationale
+
+- Avoid cross-version semantic reuse of producer metadata.
+- Avoid deleting or rewriting state that the current binary cannot safely interpret.
+- Allow patch-version interoperability so security fixes and minor improvements do not break compatibility.
+- Leave old state in place for operator inspection and manual cleanup.
+- Keep cleanup and deletion authority conservative by refusing to act on incompatible cleanup state.
+
+

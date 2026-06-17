@@ -117,7 +117,7 @@ Purgery targets Unix/POSIX filesystem semantics and is conservative about data l
 ## More documentation
 
 - [Config reference](docs/config.md) — server config, transform definitions, run configuration
-- [Protocol](docs/protocol.md) — lifecycle, subcommands, run states, status format
+- [Protocol](docs/protocol.md) — lifecycle, subcommands, run states, status format, version compatibility
 - [Operations](docs/operations.md) — check, GC, heartbeat, leases, split
 - [Import semantics](docs/design/import-semantics.md) — one-source-entry model, work areas, and per-entry safety rules
 - [Crash safety and idempotence](docs/design/crash-safety-and-idempotence.md) — durable phases, replay recovery, atomic replacement, and deletion authority
