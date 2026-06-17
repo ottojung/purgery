@@ -20,9 +20,7 @@ mod transform;
 
 pub use gc::run_gc;
 pub use phases::{begin_run, find_processing_runs, find_ready_runs, finish_run, move_to_failed};
-pub use process::{
-    process_once_raw, process_processing_run, process_ready_run, process_run_target,
-};
+pub use process::{process_once_raw, process_processing_run, process_run_target};
 pub use recover::{recover_or_process_processing_run, RecoveryError};
 pub use transform::{apply_transform, apply_transform_with_heartbeat};
 
@@ -42,12 +40,27 @@ pub struct ResolvedTransform {
 
 /// Process a ready run. Kept as the public single-run entry point.
 pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> Result<()> {
-    process_ready_run(config, nickname, run_id).map_err(|e| match e {
-        crate::process::ProcessingError::Incompatible { message, .. } => {
-            anyhow::anyhow!("{message}")
+    match crate::process::claim_ready_run(config, nickname, run_id) {
+        crate::process::ReadyClaimOutcome::Claimed => {
+            crate::process::process_processing_run(config, nickname, run_id).map_err(
+                |e| match e {
+                    crate::process::ProcessingError::Incompatible { message, .. } => {
+                        anyhow::anyhow!("{message}")
+                    }
+                    crate::process::ProcessingError::Other(e) => e,
+                },
+            )?;
+            Ok(())
         }
-        crate::process::ProcessingError::Other(e) => e,
-    })
+        crate::process::ReadyClaimOutcome::AlreadyProcessing => Ok(()),
+        crate::process::ReadyClaimOutcome::AlreadyTerminal => Ok(()),
+        crate::process::ReadyClaimOutcome::IncompatibleReady { message } => {
+            Err(anyhow::anyhow!("{message}"))
+        }
+        crate::process::ReadyClaimOutcome::MalformedReadyMovedToFailed { error } => Err(error),
+        crate::process::ReadyClaimOutcome::NotFound => Err(anyhow::anyhow!("run not found")),
+        crate::process::ReadyClaimOutcome::ClaimFailed { error } => Err(error),
+    }
 }
 
 /// Server-side subcommand: validate the run plan and resolve relative
