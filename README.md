@@ -30,14 +30,6 @@ Examples:
 * Send project build outputs to a shared archive; remove the local build directory afterward.
 * Mirror a directory tree to a remote location one-way without removing local files.
 
-## What Purgery is not
-
-* **Not a backup system.** Purgery sends files in one direction. It does not track versions, maintain an index, or restore previous states.
-* **Not bidirectional synchronization.** Flows are one-way. Changes at the destination are not propagated back to the source.
-* **Not a live directory watcher.** Purgery runs on demand for a single source entry. It does not continuously monitor directories.
-* **Not a general-purpose file organizer.** Every flow handles exactly one source entry. Multi-entry trees must be sent explicitly or via the `--split` pattern.
-* **Not primarily a media conversion tool.** Processing is optional and server-defined. The tool does not ship built-in encoders or converters.
-
 ## Basic usage
 
 Send a file as-is and keep the source:
@@ -64,6 +56,14 @@ purgery-client sync \
 The source may be a regular file, directory, or symlink. The destination is specified as `USER@HOST:ABSOLUTE_OR_RELATIVE_PATH`.
 
 For advanced use cases such as splitting a source tree into individual entries or filtering by pattern, see the operations documentation linked below.
+
+## What Purgery is not
+
+* **Not a backup system.** Purgery sends files in one direction. It does not track versions, maintain an index, or restore previous states.
+* **Not bidirectional synchronization.** Flows are one-way. Changes at the destination are not propagated back to the source.
+* **Not a live directory watcher.** Purgery runs on demand for a single source entry. It does not continuously monitor directories.
+* **Not a general-purpose file organizer.** Every flow handles exactly one source entry. Multi-entry trees must be sent explicitly or via the `--split` pattern.
+* **Not primarily a media conversion tool.** Processing is optional and server-defined. The tool does not ship built-in encoders or converters.
 
 ## Build and test
 
