@@ -18,13 +18,9 @@ mod process;
 mod recover;
 mod transform;
 
-pub use gc::gc_worker;
-pub use gc::{run_gc, start_gc, GcWorkerResult, StartGcResult};
+pub use gc::run_gc;
 pub use phases::{begin_run, find_processing_runs, find_ready_runs, finish_run, move_to_failed};
-pub use process::{
-    process_once_raw, process_processing_run, process_run_target, start_run, worker_run,
-    StartRunResult,
-};
+pub use process::{process_once_raw, process_processing_run, process_run_target};
 pub use recover::{recover_or_process_processing_run, RecoveryError};
 pub use transform::{apply_transform, apply_transform_with_heartbeat};
 

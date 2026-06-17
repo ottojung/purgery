@@ -1043,21 +1043,7 @@ pub fn process_run_target(
     nickname: &Nickname,
     run_id: &RunId,
 ) -> Result<()> {
-    // Start opportunistic GC concurrently with target-run processing.
-    let gc_config = config.clone();
-    let gc_handle = std::thread::spawn(move || {
-        if let Err(error) = run_gc(&gc_config) {
-            warn!(error = %error, "opportunistic GC failed");
-        }
-    });
-
-    let target_result = process_run_target_inner(config, nickname, run_id);
-
-    if let Err(_panic) = gc_handle.join() {
-        warn!("opportunistic GC thread panicked");
-    }
-
-    target_result
+    process_run_target_inner(config, nickname, run_id)
 }
 
 /// Inner implementation of `process_run_target` without GC.

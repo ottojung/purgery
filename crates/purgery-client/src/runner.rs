@@ -4,6 +4,122 @@ use std::collections::HashMap;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
+/// Result of a spawned remote command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RemoteCommandExit {
+    /// Command exited with status 0.
+    Success,
+    /// Command exited with nonzero status (remote semantic failure).
+    RemoteFailure {
+        exit_code: Option<i32>,
+        stderr: String,
+    },
+    /// SSH transport failure (exit code 255, local spawn error, etc.).
+    TransportFailure {
+        exit_code: Option<i32>,
+        details: String,
+    },
+    /// Locally killed.
+    Killed,
+}
+
+/// A handle to a remotely spawned server command that may be long-running.
+pub(crate) struct RemoteCommandHandle {
+    kind: RemoteCommandHandleKind,
+    spawned_cmd_contains: String,
+}
+
+enum RemoteCommandHandleKind {
+    Real {
+        child: Option<std::process::Child>,
+    },
+    Fake {
+        /// How many polls before the fake command "finishes".
+        /// None = never finishes (busy), Some(n) = finishes after n polls with given exit.
+        remaining_polls: Arc<Mutex<Option<(u64, RemoteCommandExit)>>>,
+        exit: Arc<Mutex<Option<RemoteCommandExit>>>,
+    },
+}
+
+impl RemoteCommandHandle {
+    /// Try to check if the command has exited. Returns `Ok(None)` if still running,
+    /// `Ok(Some(exit))` if finished, or `Err` on waitpid failure.
+    pub(crate) fn try_wait(&mut self) -> Result<Option<RemoteCommandExit>> {
+        match &mut self.kind {
+            RemoteCommandHandleKind::Real { child } => {
+                if let Some(child) = child.as_mut() {
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            let exit_code = status.code();
+                            if status.success() {
+                                Ok(Some(RemoteCommandExit::Success))
+                            } else if exit_code == Some(255) {
+                                Ok(Some(RemoteCommandExit::TransportFailure {
+                                    exit_code,
+                                    details: "SSH exit code 255".to_string(),
+                                }))
+                            } else {
+                                // Read stderr
+                                let stderr = child.stderr.take()
+                                    .map(|mut s| {
+                                        let mut buf = String::new();
+                                        use std::io::Read;
+                                        let _ = s.read_to_string(&mut buf);
+                                        buf
+                                    })
+                                    .unwrap_or_default();
+                                Ok(Some(RemoteCommandExit::RemoteFailure {
+                                    exit_code,
+                                    stderr: stderr.trim().to_string(),
+                                }))
+                            }
+                        }
+                        Ok(None) => Ok(None),
+                        Err(e) => Ok(Some(RemoteCommandExit::TransportFailure {
+                            exit_code: None,
+                            details: format!("waitpid error: {e}"),
+                        })),
+                    }
+                } else {
+                    Ok(Some(RemoteCommandExit::Killed))
+                }
+            }
+            RemoteCommandHandleKind::Fake { remaining_polls, exit } => {
+                // Decrement the poll counter.
+                let mut rem = remaining_polls.lock().unwrap();
+                if let Some((count, ref result)) = rem.as_mut() {
+                    if *count == 0 {
+                        let res = result.clone();
+                        exit.lock().unwrap().get_or_insert(res);
+                        *rem = None;
+                    } else {
+                        *count -= 1;
+                    }
+                }
+                Ok(exit.lock().unwrap().clone())
+            }
+        }
+    }
+
+    /// Kill the command.
+    pub(crate) fn kill(&mut self) -> Result<()> {
+        match &mut self.kind {
+            RemoteCommandHandleKind::Real { child } => {
+                if let Some(child) = child.as_mut() {
+                    child.kill()?;
+                }
+                Ok(())
+            }
+            RemoteCommandHandleKind::Fake { .. } => Ok(()),
+        }
+    }
+}
+
+/// Information about a simulated spawned command for tests.
+pub(crate) struct SpawnedCommandInfo {
+    pub cmd_contains: String,
+}
+
 /// Pre-scripted response for a remote server command.
 /// The `cmd_contains` string must be a substring of the full SSH command.
 #[derive(Debug, Clone)]
