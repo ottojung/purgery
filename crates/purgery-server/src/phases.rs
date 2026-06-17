@@ -350,6 +350,10 @@ pub(crate) fn write_run_failure(
         )
     })?;
 
+    // Clean up the processor lock file from the terminal directory.
+    let lock_path = failed_path.join("processor.lock");
+    let _ = fs::remove_file(lock_path.as_std_path());
+
     Ok(())
 }
 
@@ -470,6 +474,10 @@ pub fn move_to_failed(work_dir: &PurgeryRoot, nickname: &Nickname, run_id: &RunI
                 failed_path.as_str()
             )
         })?;
+
+        // Clean up the processor lock file from the terminal directory.
+        let lock_path = failed_path.join("processor.lock");
+        let _ = fs::remove_file(lock_path.as_std_path());
     }
 
     Ok(())

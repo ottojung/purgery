@@ -399,12 +399,16 @@ fn trigger_process_run_and_recheck(
         }
         (Ok(_), Ok(after)) => {
             if after.phase == "ready" {
-                anyhow::bail!(
-                    "process-run completed for run {}/{} but run is still ready; \
-                     server may have incompatible or corrupt state",
-                    nickname.as_str(),
-                    run_id.as_str(),
+                // Still ready after process-run: another processor may be
+                // claiming the run.  Keep polling rather than failing
+                // immediately — the lock contention is transient.
+                info!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    "run still ready after process-run (another processor may be claiming); \
+                     continuing to poll",
                 );
+                return Ok(None);
             }
             if after.phase != "processing" {
                 anyhow::bail!(
