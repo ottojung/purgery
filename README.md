@@ -1,6 +1,6 @@
 # Purgery
 
-Purgery runs configured one-way file flows: send filesystem entries to a destination, optionally store processed outputs, and optionally remove the source entries afterward.
+Purgery runs configured one-way file flows: send files to a server, optionally process them there, and optionally remove the local copies afterward.
 
 ## Problem
 
