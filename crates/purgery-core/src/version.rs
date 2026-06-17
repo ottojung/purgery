@@ -7,7 +7,7 @@ pub const PURGERY_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The current protocol-level version. Used for communication
 /// between client and server. Increment when the wire format
 /// family (the shape of the protocol) changes.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Typed representation of the `purgery-server version` response.
 #[derive(Debug, Clone, Deserialize)]
