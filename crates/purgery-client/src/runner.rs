@@ -122,11 +122,14 @@ impl RemoteCommandHandle {
 
     /// Block until the remote command exits.  For the real runner this
     /// polls `try_wait` with a small delay.  For the fake runner it
-    /// returns the scripted exit immediately (the first time the exit
-    /// is available).
+    /// returns the scripted exit.
+    ///
+    /// Fake-only escape hatch: if no exit was ever scripted (the
+    /// command was created without a matching
+    /// `add_spawned_cmd_exit`), we return `Killed` immediately so
+    /// callers like `finish_best_effort_wait` do not hang on
+    /// fire-and-forget handles that tests never configured.
     pub(crate) fn wait(&mut self) -> Result<RemoteCommandExit> {
-        // If this is a fake command with no scripted exit, return
-        // immediately — the command was never expected to finish.
         if let RemoteCommandHandleKind::Fake {
             remaining_polls,
             exit,
