@@ -26,6 +26,7 @@ pub(crate) enum RemoteCommandExit {
 /// A handle to a remotely spawned server command that may be long-running.
 pub(crate) struct RemoteCommandHandle {
     kind: RemoteCommandHandleKind,
+    #[allow(dead_code)]
     spawned_cmd_contains: String,
 }
 
@@ -60,7 +61,9 @@ impl RemoteCommandHandle {
                                 }))
                             } else {
                                 // Read stderr
-                                let stderr = child.stderr.take()
+                                let stderr = child
+                                    .stderr
+                                    .take()
                                     .map(|mut s| {
                                         let mut buf = String::new();
                                         use std::io::Read;
@@ -84,7 +87,10 @@ impl RemoteCommandHandle {
                     Ok(Some(RemoteCommandExit::Killed))
                 }
             }
-            RemoteCommandHandleKind::Fake { remaining_polls, exit } => {
+            RemoteCommandHandleKind::Fake {
+                remaining_polls,
+                exit,
+            } => {
                 // Decrement the poll counter.
                 let mut rem = remaining_polls.lock().unwrap();
                 if let Some((count, ref result)) = rem.as_mut() {
@@ -116,6 +122,7 @@ impl RemoteCommandHandle {
 }
 
 /// Information about a simulated spawned command for tests.
+#[allow(dead_code)]
 pub(crate) struct SpawnedCommandInfo {
     pub cmd_contains: String,
 }
@@ -256,11 +263,11 @@ impl RemoteRunner {
     ) {
         match self {
             RemoteRunner::Fake { inner } => {
-                inner
-                    .spawned_cmd_exits
-                    .lock()
-                    .unwrap()
-                    .push((cmd_contains.to_owned(), polls_before_exit, exit));
+                inner.spawned_cmd_exits.lock().unwrap().push((
+                    cmd_contains.to_owned(),
+                    polls_before_exit,
+                    exit,
+                ));
             }
             _ => unreachable!(),
         }
@@ -415,9 +422,7 @@ impl RemoteRunner {
                     .spawn()
                     .with_context(|| format!("failed to spawn SSH command on {host}"))?;
                 Ok(RemoteCommandHandle {
-                    kind: RemoteCommandHandleKind::Real {
-                        child: Some(child),
-                    },
+                    kind: RemoteCommandHandleKind::Real { child: Some(child) },
                     spawned_cmd_contains: ssh_cmd,
                 })
             }

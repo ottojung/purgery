@@ -265,7 +265,9 @@ fn drive_server_until_terminal(
                         RemoteCommandExit::RemoteFailure { stderr, .. } => {
                             let err_msg = format!(
                                 "process-run remote failure for run {}/{}: {}",
-                                nickname.as_str(), run_id.as_str(), stderr,
+                                nickname.as_str(),
+                                run_id.as_str(),
+                                stderr,
                             );
                             if state.phase == "ready"
                                 || (state.phase == "processing"
@@ -1200,6 +1202,7 @@ mod tests {
             "{}nickname = \"laptop\"\nrun_id = \"{run_id}\"\n\
              phase = \"processing\"\nterminal = false\n\
              message = \"run phase: processing\"\n\
+             processor_state = \"idle\"\n\
              updated_at_unix_secs = {ts}\nobserved_at_unix_secs = {ts}\n",
             resp_header()
         )
@@ -1764,7 +1767,7 @@ observed_at_unix_secs = 1000
         // First run-state returns ready → triggers start-run
         runner.add_response("run-state", &ready_run_state_toml());
         // start-run response (empty on success)
-        runner.add_response("start-run", "");
+        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
         // After start-run: run-state returns done
         runner.add_response("run-state", &done_run_state_toml());
         let status_toml =
@@ -1776,7 +1779,7 @@ observed_at_unix_secs = 1000
 
         let log = runner.command_log();
         assert!(
-            log.iter().any(|c| c.contains("start-run")),
+            log.iter().any(|c| c.contains("process-run")),
             "command log must contain start-run: {log:?}"
         );
         assert!(
@@ -1786,13 +1789,13 @@ observed_at_unix_secs = 1000
         // The start-run command must include the targeted nickname and run-id
         assert!(
             log.iter()
-                .filter(|c| c.contains("start-run"))
+                .filter(|c| c.contains("process-run"))
                 .any(|c| c.contains("--nickname") && c.contains("laptop")),
             "start-run must include --nickname laptop: {log:?}"
         );
         assert!(
             log.iter()
-                .filter(|c| c.contains("start-run"))
+                .filter(|c| c.contains("process-run"))
                 .any(|c| c.contains("--run-id") && c.contains("test-run")),
             "start-run must include --run-id test-run: {log:?}"
         );
@@ -1827,7 +1830,14 @@ observed_at_unix_secs = 1000
         // run-state returns ready
         runner.add_response("run-state", &ready_run_state_toml());
         // start-run returns an error
-        runner.add_error("start-run", "simulated start-run failure");
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::RemoteFailure {
+                exit_code: Some(1),
+                stderr: "simulated process-run failure".to_string(),
+            },
+        );
         // After start-run error, re-check: run is still ready
         runner.add_response("run-state", &ready_run_state_toml());
 
@@ -1835,8 +1845,8 @@ observed_at_unix_secs = 1000
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("automatic server processing failed"),
-            "error must mention automatic server processing, got: {err}"
+            err.contains("process-run remote failure"),
+            "error must mention process-run remote failure, got: {err}"
         );
     }
 
@@ -1861,7 +1871,14 @@ observed_at_unix_secs = 1000
         // run-state returns ready
         runner.add_response("run-state", &ready_run_state_toml());
         // start-run returns an error
-        runner.add_error("start-run", "simulated start-run failure");
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::RemoteFailure {
+                exit_code: Some(1),
+                stderr: "simulated process-run failure".to_string(),
+            },
+        );
         // After start-run error, re-check: run is now terminal
         runner.add_response("run-state", &done_run_state_toml());
         let status_toml =
@@ -1893,33 +1910,26 @@ observed_at_unix_secs = 1000
         );
         runner.add_response("heartbeat-run", "");
         runner.add_response("finish-run", "");
-        // run-state returns ready
+        // run-state returns ready (consumed by loop)
         runner.add_response("run-state", &ready_run_state_toml());
-        // start-run returns an error
-        runner.add_error("start-run", "simulated start-run failure");
-        // Follow-up run-state fails to parse
-        runner.add_response(
-            "run-state",
-            &format!(
-                "protocol_version = {}\nnickname = \"laptop\"\nrun_id = \"test-run\"\nphase = \"done\"\nterminal = true\n",
-                purgery_core::PROTOCOL_VERSION
-            ),
+        // process-run returns an error (consumed by try_wait)
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::RemoteFailure {
+                exit_code: Some(1),
+                stderr: "simulated process-run failure".to_string(),
+            },
         );
+        // Loop polls run-state again → still ready (non-terminal)
+        runner.add_response("run-state", &ready_run_state_toml());
 
         let result = run_sync_with_run_id(&runner, &args, &run_id);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("re-check") || err.contains("run-state"),
-            "error must mention run-state recheck failure, got: {err}"
-        );
-        assert!(
-            err.contains("simulated start-run failure"),
-            "error must include start-run error, got: {err}"
-        );
-        assert!(
-            err.contains("re-check") || err.contains("run-state"),
-            "error must mention run-state recheck failure, got: {err}"
+            err.contains("process-run remote failure"),
+            "error must mention process-run remote failure, got: {err}"
         );
     }
 
@@ -1944,7 +1954,7 @@ observed_at_unix_secs = 1000
         // run-state returns ready → triggers start-run
         runner.add_response("run-state", &ready_run_state_toml());
         // start-run succeeds
-        runner.add_response("start-run", "");
+        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
         // But another processor already claimed it — run-state shows processing
         runner.add_response(
             "run-state",
@@ -1964,7 +1974,7 @@ observed_at_unix_secs = 1000
 
         let log = runner.command_log();
         assert!(
-            log.iter().any(|c| c.contains("start-run")),
+            log.iter().any(|c| c.contains("process-run")),
             "command log must contain start-run: {log:?}"
         );
         assert!(
@@ -1986,7 +1996,7 @@ observed_at_unix_secs = 1000
             "run-state",
             &ready_run_state_toml().replace("test-run", "test-resume-drive"),
         );
-        runner.add_response("start-run", "");
+        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
         runner.add_response(
             "run-state",
             &done_run_state_toml().replace("test-run", "test-resume-drive"),
@@ -2027,7 +2037,7 @@ observed_at_unix_secs = 1000
 
         let log = runner.command_log();
         assert!(
-            log.iter().any(|c| c.contains("start-run")),
+            log.iter().any(|c| c.contains("process-run")),
             "resume must call start-run: {log:?}"
         );
     }
@@ -2043,7 +2053,7 @@ observed_at_unix_secs = 1000
         // on it and then poll until terminal.
         runner.add_response("run-state", &processing_state("test-resume-proc", 1000));
         // start-run succeeds
-        runner.add_response("start-run", "");
+        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
         // After start-run, run-state returns done
         runner.add_response(
             "run-state",
@@ -2085,7 +2095,7 @@ observed_at_unix_secs = 1000
 
         let log = runner.command_log();
         assert!(
-            log.iter().any(|c| c.contains("start-run")),
+            log.iter().any(|c| c.contains("process-run")),
             "resume must call start-run for processing run: {log:?}"
         );
     }
@@ -2099,10 +2109,10 @@ observed_at_unix_secs = 1000
         let state_dir = mk_state_dir(&tmp);
         let runner = mk_runner();
 
-        // First run-state call returns processing → triggers start-run
+        // First run-state call returns processing (idle) → triggers process-run
         runner.add_response("run-state", &processing_state("test-backoff", 1000));
-        // start-run succeeds
-        runner.add_response("start-run", "");
+        // process-run stays running forever (no add_spawned_cmd_exit).
+        // The supervisor keeps the same worker handle and does not respawn.
         // trigger_start_run_and_recheck calls run-state again → still processing
         runner.add_response("run-state", &processing_state("test-backoff", 1001));
         // Second poll: run-state returns processing again
@@ -2148,7 +2158,7 @@ observed_at_unix_secs = 1000
         assert!(result.is_ok(), "resume must succeed: {result:?}");
 
         let log = runner.command_log();
-        let pr_count = log.iter().filter(|c| c.contains("start-run")).count();
+        let pr_count = log.iter().filter(|c| c.contains("process-run")).count();
         assert_eq!(
             pr_count, 1,
             "must call start-run exactly once (first processing poll, not subsequent): {log:?}"
@@ -2166,7 +2176,7 @@ observed_at_unix_secs = 1000
             "run-state",
             &ready_run_state_toml().replace("test-run", "test-always-ready"),
         );
-        runner.add_response("start-run", "");
+        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
         // After start-run: processing (another processor claimed it)
         runner.add_response("run-state", &processing_state("test-always-ready", 1000));
         // Poll again: still processing (within drive interval, no start-run)
@@ -2212,7 +2222,7 @@ observed_at_unix_secs = 1000
 
         let log = runner.command_log();
         assert!(
-            log.iter().any(|c| c.contains("start-run")),
+            log.iter().any(|c| c.contains("process-run")),
             "ready state must call start-run: {log:?}"
         );
     }
@@ -2225,7 +2235,7 @@ observed_at_unix_secs = 1000
 
         // First run-state call returns processing → must drive immediately
         runner.add_response("run-state", &processing_state("test-resume-imm", 1000));
-        runner.add_response("start-run", "");
+        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
         runner.add_response(
             "run-state",
             &done_run_state_toml().replace("test-run", "test-resume-imm"),
@@ -2266,7 +2276,7 @@ observed_at_unix_secs = 1000
 
         let log = runner.command_log();
         assert!(
-            log.iter().any(|c| c.contains("start-run")),
+            log.iter().any(|c| c.contains("process-run")),
             "must call start-run immediately on first processing observation: {log:?}"
         );
     }
@@ -2280,7 +2290,14 @@ observed_at_unix_secs = 1000
         // First run-state returns processing
         runner.add_response("run-state", &processing_state("test-prerr", 1000));
         // start-run fails
-        runner.add_error("start-run", "simulated start-run failure");
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::RemoteFailure {
+                exit_code: Some(1),
+                stderr: "simulated process-run failure".to_string(),
+            },
+        );
         // Follow-up run-state is non-terminal (still processing)
         runner.add_response("run-state", &processing_state("test-prerr", 1001));
 
@@ -2328,7 +2345,14 @@ observed_at_unix_secs = 1000
         // First run-state returns processing
         runner.add_response("run-state", &processing_state("test-prterm", 1000));
         // start-run fails
-        runner.add_error("start-run", "simulated start-run failure");
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::RemoteFailure {
+                exit_code: Some(1),
+                stderr: "simulated process-run failure".to_string(),
+            },
+        );
         // But follow-up run-state is terminal (another processor finished it)
         runner.add_response(
             "run-state",
