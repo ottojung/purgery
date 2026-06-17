@@ -1,4 +1,3 @@
-# Purgery
 
 Purgery runs configured one-way file flows: send files to a server, optionally process them there, and optionally remove the local copies afterward.
 
