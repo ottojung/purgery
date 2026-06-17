@@ -268,6 +268,9 @@ pub struct RunStateResponse {
     pub current_transform: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress_status: Option<String>,
+    /// Processing liveness: `"none"`, `"active"`, `"idle"`, or `"unknown"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processor_state: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

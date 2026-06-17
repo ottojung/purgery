@@ -1693,6 +1693,7 @@ state = "done"
             current_entry: None,
             current_transform: None,
             progress_status: None,
+            processor_state: None,
         };
         match response.phase.as_str() {
             "not_found" => {} // expected path

@@ -20,7 +20,9 @@ mod transform;
 
 pub use gc::run_gc;
 pub use phases::{begin_run, find_processing_runs, find_ready_runs, finish_run, move_to_failed};
-pub use process::{process_once_raw, process_processing_run, process_run_target};
+pub use process::{
+    process_once_raw, process_processing_run, process_run_target, start_run, worker_run,
+};
 pub use recover::{recover_or_process_processing_run, RecoveryError};
 pub use transform::{apply_transform, apply_transform_with_heartbeat};
 
@@ -270,8 +272,29 @@ pub fn run_state(
             current_entry,
             current_transform,
             progress_status,
+            processor_state,
         ) = if *phase == RunPhase::Processing {
-            read_progress_fields(&dir, nickname, run_id, now)
+            let progress_data = read_progress_fields(&dir, nickname, run_id, now);
+            // Determine processor state without blocking.
+            let proc_state = match crate::phases::try_lock_existing_run_dir_processor(&dir) {
+                Ok(crate::phases::ProcessorLockAttempt::Busy) => Some("active".to_string()),
+                Ok(crate::phases::ProcessorLockAttempt::Acquired(_lock)) => {
+                    // Lock was free — we acquired it. Release immediately.
+                    Some("idle".to_string())
+                }
+                _ => Some("unknown".to_string()),
+            };
+            (
+                progress_data.0,
+                progress_data.1,
+                progress_data.2,
+                progress_data.3,
+                progress_data.4,
+                progress_data.5,
+                progress_data.6,
+                progress_data.7,
+                proc_state,
+            )
         } else {
             (
                 format!("run phase: {}", phase_str),
@@ -279,6 +302,7 @@ pub fn run_state(
                 None::<String>,
                 None::<usize>,
                 None::<usize>,
+                None::<String>,
                 None::<String>,
                 None::<String>,
                 None::<String>,
@@ -300,6 +324,7 @@ pub fn run_state(
             current_entry,
             current_transform,
             progress_status,
+            processor_state,
         });
     }
 
@@ -329,6 +354,7 @@ pub fn run_state(
                     current_entry: None,
                     current_transform: None,
                     progress_status: None,
+                    processor_state: None,
                 });
             }
             TerminalStatusOutcome::Incompatible { path } => {
@@ -358,6 +384,7 @@ pub fn run_state(
                     current_entry: None,
                     current_transform: None,
                     progress_status: None,
+                    processor_state: None,
                 });
             }
         }
@@ -380,6 +407,7 @@ pub fn run_state(
         current_entry: None,
         current_transform: None,
         progress_status: None,
+        processor_state: None,
     })
 }
 

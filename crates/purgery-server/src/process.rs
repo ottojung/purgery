@@ -1200,3 +1200,314 @@ fn handle_process_run_processing(
         Err(e) => Err(e),
     }
 }
+
+/// Start or restart a detached worker for the target run.
+///
+/// Short-running and nonblocking — does not execute transforms.
+/// Returns quickly after ensuring a worker is or will be active.
+///
+/// Use this from the client or from synchronous CLI tools.
+/// Do not use this to run transforms inline.
+pub fn start_run(
+    config: &ServerConfig,
+    nickname: &Nickname,
+    run_id: &RunId,
+    config_path_for_worker: &str,
+) -> Result<StartRunResult> {
+    // 1. Try to claim from ready.
+    let ready_path = config.work_dir.run_dir(nickname, run_id, RunPhase::Ready);
+    if ready_path.exists() {
+        // Validate compatibility before claiming.
+        match read_compatible_run_inputs(&ready_path, nickname, run_id) {
+            Err(ProcessingError::Incompatible { message, .. }) => {
+                return Ok(StartRunResult::IncompatibleLeftInPlace { message });
+            }
+            Err(ProcessingError::Other(e)) => {
+                return handle_malformed_ready_start(config, nickname, run_id, e);
+            }
+            Ok(_) => {}
+        }
+
+        // Acquire lock inside ready, then rename ready → processing.
+        let lock = match crate::phases::try_lock_existing_run_dir_processor(&ready_path) {
+            Ok(crate::phases::ProcessorLockAttempt::Acquired(l)) => l,
+            Ok(_) => {
+                // Lock busy or missing — re-check state.
+                let outcome = recheck_state(config, nickname, run_id);
+                return Ok(StartRunResult::from_recheck(outcome));
+            }
+            Err(e) => {
+                return Ok(StartRunResult::SpawnFailed {
+                    message: format!("failed to acquire processor lock: {e}"),
+                });
+            }
+        };
+
+        let processing_path = config
+            .work_dir
+            .run_dir(nickname, run_id, RunPhase::Processing);
+        if let Some(parent) = processing_path.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                return Ok(StartRunResult::SpawnFailed {
+                    message: format!("failed to create processing parent: {e}"),
+                });
+            }
+        }
+        if let Err(e) = fs::rename(&ready_path, &processing_path) {
+            warn!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                error = %e,
+                "claim rename failed (race); dropping lock",
+            );
+            drop(lock);
+            let outcome = recheck_state(config, nickname, run_id);
+            return Ok(StartRunResult::from_recheck(outcome));
+        }
+        drop(lock);
+
+        spawn_worker_process(config_path_for_worker, nickname, run_id);
+        return Ok(StartRunResult::WorkerSpawned);
+    }
+
+    // 2. Processing.
+    let processing_path = config
+        .work_dir
+        .run_dir(nickname, run_id, RunPhase::Processing);
+    if processing_path.exists() {
+        match crate::phases::try_lock_existing_run_dir_processor(&processing_path) {
+            Ok(crate::phases::ProcessorLockAttempt::Busy) => {
+                return Ok(StartRunResult::AlreadyActive);
+            }
+            Ok(crate::phases::ProcessorLockAttempt::Acquired(_lock)) => {
+                // Lock was free — abandoned or not yet started. Spawn worker.
+                spawn_worker_process(config_path_for_worker, nickname, run_id);
+                return Ok(StartRunResult::WorkerSpawned);
+            }
+            _ => {
+                return Ok(StartRunResult::SpawnFailed {
+                    message: "failed to check processor lock on processing run".to_string(),
+                });
+            }
+        }
+    }
+
+    // 3. Terminal.
+    for phase in &[RunPhase::Done, RunPhase::Failed] {
+        let dir = config.work_dir.run_dir(nickname, run_id, *phase);
+        if dir.exists() {
+            return Ok(StartRunResult::AlreadyTerminal);
+        }
+    }
+
+    // 4. Not found.
+    Ok(StartRunResult::NotFound)
+}
+
+/// Worker-run: long-running processing inside a detached process.
+///
+/// Acquires the processor lock, then processes or recovers the run.
+/// If the lock is busy, exits without doing work (another worker is
+/// active).
+pub fn worker_run(
+    config: &ServerConfig,
+    nickname: &Nickname,
+    run_id: &RunId,
+) -> Result<WorkerRunOutcome> {
+    let processing_path = config
+        .work_dir
+        .run_dir(nickname, run_id, RunPhase::Processing);
+
+    let lock = match crate::phases::try_lock_existing_run_dir_processor(&processing_path) {
+        Ok(crate::phases::ProcessorLockAttempt::Acquired(l)) => l,
+        Ok(crate::phases::ProcessorLockAttempt::Busy) => {
+            info!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                "processor lock busy; another worker is active",
+            );
+            return Ok(WorkerRunOutcome::SkippedLockBusy);
+        }
+        Ok(crate::phases::ProcessorLockAttempt::Missing) => {
+            info!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                "processing directory missing; run may have been finalized already",
+            );
+            return Ok(WorkerRunOutcome::SkippedMissing);
+        }
+        Err(e) => {
+            warn!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                error = %e,
+                "failed to acquire processor lock",
+            );
+            // Return error so the outer loop can handle it.
+            return Err(e).context("worker failed to acquire processor lock");
+        }
+    };
+
+    info!(
+        nickname = %nickname.as_str(),
+        run_id = %run_id.as_str(),
+        "worker acquired processor lock; starting processing",
+    );
+
+    // Try to recover/process the run.
+    match recover_or_process_processing_run(config, nickname, run_id) {
+        Ok(()) => {
+            drop(lock);
+            Ok(WorkerRunOutcome::Processed)
+        }
+        Err(recover_error) => {
+            warn!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                error = %recover_error,
+                "worker processing failed while holding lock",
+            );
+            // The recovery path may have already published a failure status.
+            // Bail with the error.
+            drop(lock);
+            Err(anyhow::anyhow!("worker processing failed: {recover_error}"))
+        }
+    }
+}
+
+/// Spawn a detached `worker-run` process for the given target run.
+fn spawn_worker_process(config_path: &str, nickname: &Nickname, run_id: &RunId) {
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                error = %e,
+                "cannot determine current executable; cannot spawn worker",
+            );
+            return;
+        }
+    };
+
+    let worker_stdout = std::process::Stdio::null();
+    let worker_stderr = std::process::Stdio::null();
+
+    match std::process::Command::new(&exe)
+        .arg("--config")
+        .arg(config_path)
+        .arg("worker-run")
+        .arg("--nickname")
+        .arg(nickname.as_str())
+        .arg("--run-id")
+        .arg(run_id.as_str())
+        .stdin(std::process::Stdio::null())
+        .stdout(worker_stdout)
+        .stderr(worker_stderr)
+        .spawn()
+    {
+        Ok(child) => {
+            info!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                pid = child.id(),
+                "spawned worker-run process",
+            );
+            // Detached — do not wait.
+        }
+        Err(e) => {
+            warn!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                error = %e,
+                "failed to spawn worker-run process",
+            );
+        }
+    }
+}
+
+/// Handle a malformed ready run in the start-run context.
+fn handle_malformed_ready_start(
+    config: &ServerConfig,
+    nickname: &Nickname,
+    run_id: &RunId,
+    original_error: anyhow::Error,
+) -> Result<StartRunResult> {
+    let outcome = handle_malformed_ready(config, nickname, run_id, original_error);
+    match outcome {
+        ReadyClaimOutcome::MalformedReadyMovedToFailed { .. } => {
+            Ok(StartRunResult::MalformedMovedToFailed)
+        }
+        ReadyClaimOutcome::MalformedReadyMoveFailed {
+            original_error,
+            publish_error,
+        } => Ok(StartRunResult::SpawnFailed {
+            message: format!(
+                "malformed ready could not be moved to failed: {original_error}; \
+                 publication error: {publish_error}"
+            ),
+        }),
+        _ => unreachable!(),
+    }
+}
+
+/// Outcome of `start_run`.
+#[derive(Debug)]
+pub enum StartRunResult {
+    WorkerSpawned,
+    AlreadyActive,
+    AlreadyTerminal,
+    NotFound,
+    IncompatibleLeftInPlace { message: String },
+    MalformedMovedToFailed,
+    SpawnFailed { message: String },
+}
+
+impl StartRunResult {
+    /// Serialize as simple TOML for the CLI response.
+    pub fn to_toml(&self) -> String {
+        let (action, message) = match self {
+            StartRunResult::WorkerSpawned => ("spawned_worker", "worker process started"),
+            StartRunResult::AlreadyActive => ("already_active", "another worker is active"),
+            StartRunResult::AlreadyTerminal => ("already_terminal", "run already terminal"),
+            StartRunResult::NotFound => ("not_found", "run not found"),
+            StartRunResult::IncompatibleLeftInPlace { message } => {
+                ("incompatible_left_in_place", message.as_str())
+            }
+            StartRunResult::MalformedMovedToFailed => (
+                "malformed_moved_to_failed",
+                "malformed ready run moved to failed",
+            ),
+            StartRunResult::SpawnFailed { message } => {
+                ("spawn_failed_recoverable", message.as_str())
+            }
+        };
+        format!(
+            r#"action = {action:?}
+message = {message:?}
+"#,
+        )
+    }
+
+    fn from_recheck(outcome: ReadyClaimOutcome) -> Self {
+        match outcome {
+            ReadyClaimOutcome::AlreadyProcessing => StartRunResult::AlreadyActive,
+            ReadyClaimOutcome::AlreadyTerminal => StartRunResult::AlreadyTerminal,
+            ReadyClaimOutcome::NotFound => StartRunResult::NotFound,
+            ReadyClaimOutcome::ClaimFailed { error } => StartRunResult::SpawnFailed {
+                message: error.to_string(),
+            },
+            _ => StartRunResult::SpawnFailed {
+                message: "unexpected re-check outcome".to_string(),
+            },
+        }
+    }
+}
+
+/// Outcome of `worker_run`.
+#[derive(Debug)]
+pub enum WorkerRunOutcome {
+    Processed,
+    SkippedLockBusy,
+    SkippedMissing,
+}
