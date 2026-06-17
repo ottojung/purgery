@@ -767,26 +767,25 @@ pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
                     "processing run disappeared before recovery",
                 );
             }
-            Ok(ProcessingTargetOutcome::Error(error)) => {
+            Ok(ProcessingTargetOutcome::FailedPublished { error }) => {
                 warn!(
                     nickname = %nickname.as_str(),
                     run_id = %run_id.as_str(),
-                    phase = "processing",
                     error = %error,
-                    "processing run recovery failed"
+                    "processing run recovery failed; failure status published while holding processor lock",
                 );
-                let processing_path =
-                    config
-                        .work_dir
-                        .run_dir(nickname, run_id, RunPhase::Processing);
-                if processing_path.exists() {
-                    write_run_failure(
-                        &config.work_dir,
-                        nickname,
-                        run_id,
-                        &format!("processing recovery failed: {error}"),
-                    )?;
-                }
+            }
+            Ok(ProcessingTargetOutcome::FailurePublishFailed {
+                recovery_error,
+                publish_error,
+            }) => {
+                warn!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    recovery_error = %recovery_error,
+                    publish_error = %publish_error,
+                    "processing run recovery failed and failure status could not be published while holding processor lock",
+                );
             }
             Err(e) => {
                 warn!(
@@ -910,8 +909,15 @@ pub(crate) enum ProcessingTargetOutcome {
     /// Processing directory does not exist (race: it was removed
     /// between discovery and lock attempt).
     NotFound,
-    /// A real error occurred during recovery.
-    Error(anyhow::Error),
+    /// Recovery failed; failure status was published while the
+    /// processor lock was still held.
+    FailedPublished { error: anyhow::Error },
+    /// Recovery failed and publishing the failure status also
+    /// failed. Both happened while the lock was still held.
+    FailurePublishFailed {
+        recovery_error: anyhow::Error,
+        publish_error: anyhow::Error,
+    },
 }
 
 /// Try to recover a processing run, but only if the processor lock is
@@ -962,15 +968,47 @@ pub(crate) fn recover_processing_run_if_unlocked(
     );
 
     let result = recover_or_process_processing_run(config, nickname, run_id);
-    drop(lock);
 
-    match result {
-        Ok(()) => Ok(ProcessingTargetOutcome::Recovered),
+    let outcome = match result {
+        Ok(()) => ProcessingTargetOutcome::Recovered,
+
         Err(RecoveryError::IncompatibleStatus { message }) => {
-            Ok(ProcessingTargetOutcome::Incompatible { message })
+            ProcessingTargetOutcome::Incompatible { message }
         }
-        Err(RecoveryError::Other(e)) => Ok(ProcessingTargetOutcome::Error(e)),
-    }
+
+        Err(RecoveryError::Other(recovery_error)) => {
+            // Still holding the processor lock here.  Failure
+            // publication must complete before the lock is dropped
+            // so no other process sees an unlocked processing run.
+            let processing_path = config
+                .work_dir
+                .run_dir(nickname, run_id, RunPhase::Processing);
+
+            if processing_path.exists() {
+                match write_run_failure(
+                    &config.work_dir,
+                    nickname,
+                    run_id,
+                    &format!("processing recovery failed: {recovery_error}"),
+                ) {
+                    Ok(()) => ProcessingTargetOutcome::FailedPublished {
+                        error: recovery_error,
+                    },
+                    Err(publish_error) => ProcessingTargetOutcome::FailurePublishFailed {
+                        recovery_error,
+                        publish_error,
+                    },
+                }
+            } else {
+                ProcessingTargetOutcome::FailedPublished {
+                    error: recovery_error,
+                }
+            }
+        }
+    };
+
+    drop(lock);
+    Ok(outcome)
 }
 
 /// Process a specific run by nickname and run_id.
@@ -1127,7 +1165,16 @@ fn handle_process_run_processing(
             );
             Ok(())
         }
-        Ok(ProcessingTargetOutcome::Error(e)) => Err(e),
+        Ok(ProcessingTargetOutcome::FailedPublished { error }) => Err(anyhow::anyhow!(
+            "processing recovery failed and run was moved to failed: {error}"
+        )),
+        Ok(ProcessingTargetOutcome::FailurePublishFailed {
+            recovery_error,
+            publish_error,
+        }) => Err(anyhow::anyhow!(
+            "processing recovery failed: {recovery_error}; \
+             failed to publish failure while holding processor lock: {publish_error}"
+        )),
         Err(e) => Err(e),
     }
 }
