@@ -34,15 +34,8 @@ Examples:
 Send a file as-is and keep the source:
 
 ```
-purgery-client sync -- ~/photo.mp4 user@server:/archive
+purgery-client sync -- ~/photo.jpeg user@server:/archive
 ```
-
-Send a file as-is and remove the source after successful transfer:
-
-```
-purgery-client sync --delete-after-import -- ~/photo.mp4 user@server:/archive
-```
-
 Send a file, request remote processing, and remove the source:
 
 ```
@@ -52,9 +45,17 @@ purgery-client sync \
   -- ~/Videos/trip.mp4 user@server:/archive
 ```
 
-The source may be a regular file, directory, or symlink. The destination is specified as `USER@HOST:ABSOLUTE_OR_RELATIVE_PATH`.
+Send a whole directory:
 
-For advanced use cases such as splitting a source tree into individual entries or filtering by pattern, see the operations documentation linked below.
+```
+purgery-client sync \
+  --transform compress-video \
+  --delete-after-import \
+  --split '**/*.mp4'
+  -- ~/Videos user@server:/archive
+```
+
+The above will match all files in `~/Videos` and send them one-by-one, compressing on the server, and then deleting the originals.
 
 ## What Purgery is not
 
