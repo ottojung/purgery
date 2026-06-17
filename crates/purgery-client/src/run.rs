@@ -290,8 +290,8 @@ fn drive_server_until_terminal(
                     }
                     (Ok(_), Ok(after)) => {
                         // process-once succeeded but this run is still not terminal.
-                        // If another ready run was processed, try again (bounded).
                         if after.phase == "ready" {
+                            // Another ready run may have been processed; retry (bounded).
                             ready_retries += 1;
                             if ready_retries >= max_ready_retries {
                                 anyhow::bail!(
@@ -309,7 +309,16 @@ fn drive_server_until_terminal(
                             );
                             continue;
                         }
-                        // Run is now processing — continue to poll.
+                        if after.phase != "processing" {
+                            anyhow::bail!(
+                                "unexpected run-state phase {:?} after process-once \
+                                 for run {}/{}",
+                                after.phase,
+                                nickname.as_str(),
+                                run_id.as_str(),
+                            );
+                        }
+                        // Run is processing — continue to poll below.
                     }
                 }
             }
