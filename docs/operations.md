@@ -62,7 +62,7 @@ purgery-client sync \
 
 When `purgery-client sync` is invoked with `--transform`, the client uploads the run and then automatically invokes remote `purgery-server process-once` on the server. This makes a single client-triggered transform sync self-contained: the server processing happens during the client invocation. The client does not require a separately running daemon, cron job, or timer for the normal transform path.
 
-Operators may still run `purgery-server process-once` independently (e.g., as a systemd timer). When another processor is already active, the client observes the run transitioning to `processing` and waits for the terminal state.
+Operators may still run `purgery-server process-once` independently (e.g., as a systemd timer). When another processor is already active, the client observes the run transitioning to `processing` and waits for the terminal state. If automatic server processing fails and the run has not reached a terminal state, the client reports the processing error.
 
 Passthrough syncs (without `--transform`) use direct rsync and do not call `process-once`.
 

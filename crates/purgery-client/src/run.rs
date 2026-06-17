@@ -249,47 +249,69 @@ fn drive_server_until_terminal(
                     "triggering server processing via process-once",
                 );
                 let po_result = runner.server_cmd(host, server_cmd, &["process-once"]);
-                // Immediately re-check run-state after process-once.
-                let after = run_state(runner, host, server_cmd, nickname, run_id)?;
-                if after.terminal {
-                    info!(
-                        nickname = %nickname.as_str(),
-                        run_id = %run_id.as_str(),
-                        phase = %after.phase,
-                        "run reached terminal phase after process-once"
-                    );
-                    return Ok(after);
-                }
-                // process-once failed and the run did not become terminal —
-                // surface the error.
-                if let Err(e) = po_result {
-                    anyhow::bail!(
-                        "automatic server processing failed for run {}/{}: {e}",
-                        nickname.as_str(),
-                        run_id.as_str(),
-                    );
-                }
-                // process-once succeeded but this run is still not terminal.
-                // If another ready run was processed, try again (bounded).
-                if after.phase == "ready" {
-                    ready_retries += 1;
-                    if ready_retries > max_ready_retries {
+                // Capture follow-up run-state before inspecting po_result so
+                // a failed run-state does not mask the original process-once error.
+                let after_result = run_state(runner, host, server_cmd, nickname, run_id);
+
+                match (po_result, after_result) {
+                    (_, Ok(after)) if after.terminal => {
+                        info!(
+                            nickname = %nickname.as_str(),
+                            run_id = %run_id.as_str(),
+                            phase = %after.phase,
+                            "run reached terminal phase after process-once"
+                        );
+                        return Ok(after);
+                    }
+                    (Err(po_err), Ok(nonterminal)) => {
                         anyhow::bail!(
-                            "automatic server processing did not claim run {}/{} \
-                             after {max_ready_retries} attempts; run is still ready",
+                            "automatic server processing failed for run {}/{}: \
+                             {po_err}; re-checked run-state but run is still {}",
+                            nickname.as_str(),
+                            run_id.as_str(),
+                            nonterminal.phase,
+                        );
+                    }
+                    (Err(po_err), Err(rs_err)) => {
+                        anyhow::bail!(
+                            "automatic server processing failed for run {}/{}: \
+                             {po_err}; failed to re-check run-state: {rs_err}",
                             nickname.as_str(),
                             run_id.as_str(),
                         );
                     }
-                    debug!(
-                        nickname = %nickname.as_str(),
-                        run_id = %run_id.as_str(),
-                        ready_retries,
-                        "process-once returned but our run is still ready; retrying",
-                    );
-                    continue;
+                    (Ok(_), Err(rs_err)) => {
+                        anyhow::bail!(
+                            "failed to re-check run state after process-once \
+                             for run {}/{}: {rs_err}",
+                            nickname.as_str(),
+                            run_id.as_str(),
+                        );
+                    }
+                    (Ok(_), Ok(after)) => {
+                        // process-once succeeded but this run is still not terminal.
+                        // If another ready run was processed, try again (bounded).
+                        if after.phase == "ready" {
+                            ready_retries += 1;
+                            if ready_retries >= max_ready_retries {
+                                anyhow::bail!(
+                                    "automatic server processing did not claim run {}/{} \
+                                     after {max_ready_retries} attempts; run is still ready",
+                                    nickname.as_str(),
+                                    run_id.as_str(),
+                                );
+                            }
+                            debug!(
+                                nickname = %nickname.as_str(),
+                                run_id = %run_id.as_str(),
+                                ready_retries,
+                                "process-once returned but our run is still ready; retrying",
+                            );
+                            continue;
+                        }
+                        // Run is now processing — continue to poll.
+                    }
                 }
-                // Run is now processing — continue to poll.
             }
             "processing" => {
                 if response.phase != last_phase {
@@ -1788,6 +1810,49 @@ observed_at_unix_secs = 1000
     }
 
     #[test]
+    fn process_once_error_is_preserved_when_followup_run_state_fails() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        // run-state returns ready
+        runner.add_response("run-state", &ready_run_state_toml());
+        // process-once returns an error
+        runner.add_error("process-once", "simulated process-once failure");
+        // Follow-up run-state returns a response that fails to parse
+        // (missing purgery_version), simulating a corrupted transport response.
+        runner.add_response(
+            "run-state",
+            "protocol_version = 1\nnickname = \"laptop\"\nrun_id = \"test-run\"\nphase = \"done\"\nterminal = true\n",
+        );
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("automatic server processing failed"),
+            "error must mention automatic server processing, got: {err}"
+        );
+        assert!(
+            err.contains("simulated process-once failure"),
+            "error must include process-once error, got: {err}"
+        );
+        assert!(
+            err.contains("re-check") || err.contains("run-state"),
+            "error must mention run-state recheck failure, got: {err}"
+        );
+    }
+
+    #[test]
     fn transform_sync_repeated_ready_is_bounded() {
         let tmp = tempdir().unwrap();
         let state_dir = mk_state_dir(&tmp);
@@ -1802,8 +1867,8 @@ observed_at_unix_secs = 1000
         );
         runner.add_response("heartbeat-run", "");
         runner.add_response("finish-run", "");
-        // 4 rounds of ready → process-once (exceeds the 3 limit)
-        for _ in 0..4 {
+        // 3 rounds of ready → process-once (hits the 3-attempt limit)
+        for _ in 0..3 {
             runner.add_response("run-state", &ready_run_state_toml());
             runner.add_response("process-once", "");
             runner.add_response("run-state", &ready_run_state_toml());
