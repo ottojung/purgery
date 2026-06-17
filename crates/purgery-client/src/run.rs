@@ -12,7 +12,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::classify;
 use crate::cleanup;
-use crate::runner::RemoteRunner;
+use crate::runner::{RemoteCommandExit, RemoteCommandHandle, RemoteRunner};
 use crate::split;
 use crate::SyncArgs;
 
@@ -203,22 +203,15 @@ fn read_status(
     Ok(status)
 }
 
-/// Poll `run-state` until the run reaches a terminal phase, actively
-/// driving server processing when the run is `ready` or `processing`.
+/// Supervise a foreground `process-run` SSH command while concurrently
+/// polling `run-state` until the run reaches a terminal phase.
 ///
-/// For `ready`: calls `start-run` immediately every time `ready` is
-/// observed, because that is the only way to transition the run to
-/// `processing`.
-///
-/// For `processing`: calls `start-run` immediately the first time
-/// `processing` is observed, and then at most once per
-/// `processing_drive_interval` to avoid running global GC too often.
-/// If the phase changes back to `processing` later, the counter resets
-/// and it drives immediately again.
-///
-/// This makes a single `purgery-client sync --transform ...`
-/// invocation self-contained: the client uploads, finishes, and then
-/// drives server processing instead of requiring a separate daemon.
+/// The `process-run` is spawned in the background via `spawn_server_cmd`.
+/// The client polls `run-state` using short `server_cmd` calls.
+/// If the SSH transport fails, `run-state` decides whether to restart.
+/// If the command exits with a remote semantic error, the client fails
+/// immediately unless `run-state` reports that the run is terminal or
+/// that another processor is still actively handling it.
 fn drive_server_until_terminal(
     runner: &RemoteRunner,
     host: &str,
@@ -227,96 +220,81 @@ fn drive_server_until_terminal(
     run_id: &RunId,
 ) -> Result<RunStateResponse> {
     let poll_interval = Duration::from_secs(5);
-    let start_run_cooldown = Duration::from_secs(60);
+    let mut worker: Option<RemoteCommandHandle> = None;
     let mut last_phase = String::new();
     let mut attempts_since_report = 0u64;
-    let mut last_start_run: Option<std::time::Instant> = None;
 
     loop {
-        let response = run_state(runner, host, server_cmd, nickname, run_id)?;
+        let state = run_state(runner, host, server_cmd, nickname, run_id)?;
 
-        if response.terminal {
+        if state.terminal {
+            stop_worker_best_effort(&mut worker);
             info!(
                 nickname = %nickname.as_str(),
                 run_id = %run_id.as_str(),
-                phase = %response.phase,
+                phase = %state.phase,
                 "run reached terminal phase"
             );
-            return Ok(response);
+            return Ok(state);
         }
 
-        match response.phase.as_str() {
-            "ready" => {
-                if response.phase != last_phase {
-                    info!(
-                        nickname = %nickname.as_str(),
-                        run_id = %run_id.as_str(),
-                        phase = %response.phase,
-                        "run phase changed"
-                    );
-                    last_phase = response.phase.clone();
-                    attempts_since_report = 0;
-                }
-                // Ready: always drive immediately — start-run is needed
-                // to claim the run.
-                if let Some(terminal) =
-                    trigger_start_run_and_recheck(runner, host, server_cmd, nickname, run_id)?
-                {
-                    return Ok(terminal);
-                }
-                attempts_since_report += 1;
-                if attempts_since_report.is_multiple_of(12) {
-                    info!(
-                        nickname = %nickname.as_str(),
-                        run_id = %run_id.as_str(),
-                        phase = %last_phase,
-                        "still waiting for server to process run"
-                    );
+        let mut restart_worker = false;
+
+        // Check if the worker has exited.
+        if let Some(w) = worker.as_mut() {
+            match w.try_wait()? {
+                None => { /* still running */ }
+                Some(exit) => {
+                    worker = None;
+                    match exit {
+                        RemoteCommandExit::Success => {
+                            debug!(
+                                nickname = %nickname.as_str(),
+                                run_id = %run_id.as_str(),
+                                "process-run exited successfully; re-checking run-state",
+                            );
+                        }
+                        RemoteCommandExit::TransportFailure { details, .. } => {
+                            warn!(
+                                nickname = %nickname.as_str(),
+                                run_id = %run_id.as_str(),
+                                details,
+                                "process-run SSH transport failed",
+                            );
+                        }
+                        RemoteCommandExit::RemoteFailure { stderr, .. } => {
+                            let err_msg = format!(
+                                "process-run remote failure for run {}/{}: {}",
+                                nickname.as_str(), run_id.as_str(), stderr,
+                            );
+                            if state.phase == "ready"
+                                || (state.phase == "processing"
+                                    && state.processor_state.as_deref() != Some("active"))
+                            {
+                                anyhow::bail!("{err_msg}");
+                            }
+                            warn!("{}", err_msg);
+                        }
+                        RemoteCommandExit::Killed => {}
+                    }
                 }
             }
+        }
+
+        // Decide whether to start/restart the process-run worker.
+        let processor_active = state
+            .processor_state
+            .as_deref()
+            .map(|s| s == "active")
+            .unwrap_or(false);
+
+        match state.phase.as_str() {
+            "ready" => {
+                restart_worker = true;
+            }
             "processing" => {
-                if response.phase != last_phase {
-                    info!(
-                        nickname = %nickname.as_str(),
-                        run_id = %run_id.as_str(),
-                        phase = %response.phase,
-                        "run phase changed"
-                    );
-                    last_phase = response.phase.clone();
-                    attempts_since_report = 0;
-                }
-                // Only call start-run if the processor is not active.
-                // If another worker holds the lock, polling is sufficient.
-                // Also throttle start-run calls when processing is idle
-                // to avoid hammering SSH every poll interval.
-                let processor_active = response
-                    .processor_state
-                    .as_deref()
-                    .map(|s| s == "active")
-                    .unwrap_or(false);
-                let should_start = if processor_active {
-                    false
-                } else {
-                    last_start_run
-                        .map(|t| t.elapsed() >= start_run_cooldown)
-                        .unwrap_or(true)
-                };
-                if should_start {
-                    if let Some(terminal) =
-                        trigger_start_run_and_recheck(runner, host, server_cmd, nickname, run_id)?
-                    {
-                        return Ok(terminal);
-                    }
-                    last_start_run = Some(std::time::Instant::now());
-                }
-                attempts_since_report += 1;
-                if attempts_since_report.is_multiple_of(12) {
-                    info!(
-                        nickname = %nickname.as_str(),
-                        run_id = %run_id.as_str(),
-                        phase = %last_phase,
-                        "still waiting for server to process run"
-                    );
+                if !processor_active && worker.is_none() {
+                    restart_worker = true;
                 }
             }
             "not_found" => {
@@ -335,99 +313,52 @@ fn drive_server_until_terminal(
             }
         }
 
+        if restart_worker {
+            worker = Some(runner.spawn_server_cmd(
+                host,
+                server_cmd,
+                &[
+                    "process-run",
+                    "--nickname",
+                    nickname.as_str(),
+                    "--run-id",
+                    run_id.as_str(),
+                ],
+            )?);
+            info!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                "spawned foreground process-run",
+            );
+        }
+
+        if state.phase != last_phase {
+            info!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                phase = %state.phase,
+                "run phase changed"
+            );
+            last_phase = state.phase.clone();
+            attempts_since_report = 0;
+        }
+        attempts_since_report += 1;
+        if attempts_since_report.is_multiple_of(12) {
+            info!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                phase = %last_phase,
+                "still waiting for server to process run"
+            );
+        }
+
         std::thread::sleep(poll_interval);
     }
 }
 
-/// Call `start-run` on the remote server and re-check the run state.
-///
-/// Returns `Ok(Some(terminal_state))` if the run is now terminal.
-/// Returns `Ok(None)` if the run is still non-terminal.
-/// Returns `Err` if start-run failed and the follow-up state is also
-/// non-terminal (or failed), ensuring errors are surfaced rather than
-/// swallowed.
-fn trigger_start_run_and_recheck(
-    runner: &RemoteRunner,
-    host: &str,
-    server_cmd: &str,
-    nickname: &Nickname,
-    run_id: &RunId,
-) -> Result<Option<RunStateResponse>> {
-    let sr_result = runner.server_cmd(
-        host,
-        server_cmd,
-        &[
-            "start-run",
-            "--nickname",
-            nickname.as_str(),
-            "--run-id",
-            run_id.as_str(),
-        ],
-    );
-
-    // Capture follow-up run-state before inspecting sr_result so
-    // a failed run-state does not mask the start-run error.
-    let after_result = run_state(runner, host, server_cmd, nickname, run_id);
-
-    match (sr_result, after_result) {
-        (_, Ok(after)) if after.terminal => {
-            info!(
-                nickname = %nickname.as_str(),
-                run_id = %run_id.as_str(),
-                phase = %after.phase,
-                "run reached terminal phase after start-run"
-            );
-            Ok(Some(after))
-        }
-        (Err(sr_err), Ok(nonterminal)) => {
-            anyhow::bail!(
-                "automatic server processing failed for run {}/{}: \
-                 {sr_err}; re-checked run-state but run is still {}",
-                nickname.as_str(),
-                run_id.as_str(),
-                nonterminal.phase,
-            );
-        }
-        (Err(sr_err), Err(rs_err)) => {
-            anyhow::bail!(
-                "automatic server processing failed for run {}/{}: \
-                 {sr_err}; failed to re-check run-state: {rs_err}",
-                nickname.as_str(),
-                run_id.as_str(),
-            );
-        }
-        (Ok(_), Err(rs_err)) => {
-            anyhow::bail!(
-                "failed to re-check run state after start-run \
-                 for run {}/{}: {rs_err}",
-                nickname.as_str(),
-                run_id.as_str(),
-            );
-        }
-        (Ok(_), Ok(after)) => {
-            if after.phase == "ready" {
-                // Still ready after start-run: another processor may be
-                // claiming the run.  Keep polling rather than failing
-                // immediately — the lock contention is transient.
-                info!(
-                    nickname = %nickname.as_str(),
-                    run_id = %run_id.as_str(),
-                    "run still ready after start-run (another processor may be claiming); \
-                     continuing to poll",
-                );
-                return Ok(None);
-            }
-            if after.phase != "processing" {
-                anyhow::bail!(
-                    "unexpected run-state phase {:?} after start-run \
-                     for run {}/{}",
-                    after.phase,
-                    nickname.as_str(),
-                    run_id.as_str(),
-                );
-            }
-            Ok(None)
-        }
+fn stop_worker_best_effort(worker: &mut Option<RemoteCommandHandle>) {
+    if let Some(w) = worker.as_mut() {
+        let _ = w.kill();
     }
 }
 
@@ -666,15 +597,6 @@ fn drain_one(runner: &RemoteRunner, state_dir: &str, state: &ClientRunState) -> 
                 phase = ClientRunPhase::WaitingForTerminalState;
             }
             ClientRunPhase::WaitingForTerminalState => {
-                // Initiate background GC best-effort in resume path too.
-                if let Err(e) = runner.server_cmd(host, server_cmd, &["start-gc"]) {
-                    warn!(
-                        nickname = %nickname.as_str(),
-                        run_id = %run_id.as_str(),
-                        error = %e,
-                        "failed to initiate background GC during resume",
-                    );
-                }
                 debug!("driving server processing to terminal");
                 drive_server_until_terminal(runner, host, server_cmd, &nickname, &run_id)?;
                 let status = read_status(runner, host, server_cmd, &nickname, &run_id)?;
@@ -1098,17 +1020,6 @@ pub(crate) fn run_sync_with_run_id(
         None,
         ClientRunPhase::WaitingForTerminalState,
     )?;
-
-    // Initiate background GC best-effort.  This is a short-running command
-    // that spawns a detached GC worker.  We do not wait for it.
-    if let Err(e) = runner.server_cmd(&remote.host, server_cmd, &["start-gc"]) {
-        warn!(
-            nickname = %nickname.as_str(),
-            run_id = %run_id.as_str(),
-            error = %e,
-            "failed to initiate background GC",
-        );
-    }
 
     info!("driving server processing");
     drive_server_until_terminal(runner, &remote.host, server_cmd, &nickname, run_id)?;

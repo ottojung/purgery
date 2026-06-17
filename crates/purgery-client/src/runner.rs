@@ -146,6 +146,7 @@ pub(crate) enum RemoteRunner {
 pub(crate) struct FakeState {
     responses: Mutex<Vec<ScriptedResponse>>,
     errors: Mutex<Vec<(String, String)>>,
+    spawned_cmd_exits: Mutex<Vec<(String, usize, RemoteCommandExit)>>,
     write_errors: Mutex<Vec<(String, String)>>,
     rsync_errors: Mutex<Vec<(String, String)>>,
     log: Mutex<Vec<String>>,
@@ -180,6 +181,7 @@ impl RemoteRunner {
             inner: Arc::new(FakeState {
                 responses: Mutex::new(Vec::new()),
                 errors: Mutex::new(Vec::new()),
+                spawned_cmd_exits: Mutex::new(Vec::new()),
                 write_errors: Mutex::new(Vec::new()),
                 rsync_errors: Mutex::new(Vec::new()),
                 log: Mutex::new(Vec::new()),
@@ -237,6 +239,28 @@ impl RemoteRunner {
         match self {
             RemoteRunner::Fake { inner } => {
                 inner.finish_run_hook.lock().unwrap().replace(hook);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Script a spawned command exit.  cmd_contains matches the command
+    /// substring, polls_before_exit is how many try_wait calls before
+    /// the command returns the given exit.
+    #[allow(dead_code)]
+    pub(crate) fn add_spawned_cmd_exit(
+        &self,
+        cmd_contains: &str,
+        polls_before_exit: usize,
+        exit: RemoteCommandExit,
+    ) {
+        match self {
+            RemoteRunner::Fake { inner } => {
+                inner
+                    .spawned_cmd_exits
+                    .lock()
+                    .unwrap()
+                    .push((cmd_contains.to_owned(), polls_before_exit, exit));
             }
             _ => unreachable!(),
         }
@@ -354,6 +378,85 @@ impl RemoteRunner {
                     "no scripted response for command (did you forget add_response?), \
                      cmd was: {ssh_cmd}"
                 )
+            }
+        }
+    }
+
+    /// Spawn a long-running remote command and return a handle for
+    /// concurrent supervision.  Used for `process-run`.
+    ///
+    /// The caller must poll `try_wait()` on the returned handle.
+    /// Do not use `.output()` — that blocks until the remote command exits.
+    pub(crate) fn spawn_server_cmd(
+        &self,
+        host: &str,
+        server_cmd: &str,
+        args: &[&str],
+    ) -> Result<RemoteCommandHandle> {
+        let full_cmd = {
+            let mut cmd = server_cmd.to_owned();
+            for a in args {
+                cmd.push(' ');
+                cmd.push_str(&shell_escape(a));
+            }
+            cmd
+        };
+        let ssh_cmd = format!("ssh -- {host} {full_cmd}");
+
+        match self {
+            RemoteRunner::Real => {
+                let child = Command::new("ssh")
+                    .arg("--")
+                    .arg(host)
+                    .arg(&full_cmd)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .with_context(|| format!("failed to spawn SSH command on {host}"))?;
+                Ok(RemoteCommandHandle {
+                    kind: RemoteCommandHandleKind::Real {
+                        child: Some(child),
+                    },
+                    spawned_cmd_contains: ssh_cmd,
+                })
+            }
+            RemoteRunner::Fake { inner } => {
+                inner.log.lock().unwrap().push(ssh_cmd.clone());
+                // Check for errors first.
+                for (ec, err) in inner.errors.lock().unwrap().iter() {
+                    if ssh_cmd.contains(ec.as_str()) {
+                        anyhow::bail!("{err}");
+                    }
+                }
+                // Find the next matching spawned command exit script.
+                let mut exits = inner.spawned_cmd_exits.lock().unwrap();
+                let idx = exits.iter().position(|(ec, _, _)| ssh_cmd.contains(ec));
+                if let Some(idx) = idx {
+                    let (_, polls, exit) = exits.remove(idx);
+                    let remaining = if exit == RemoteCommandExit::Killed {
+                        None
+                    } else {
+                        Some((polls as u64, exit))
+                    };
+                    let exit_cell = Arc::new(Mutex::new(None::<RemoteCommandExit>));
+                    Ok(RemoteCommandHandle {
+                        kind: RemoteCommandHandleKind::Fake {
+                            remaining_polls: Arc::new(Mutex::new(remaining)),
+                            exit: Arc::clone(&exit_cell),
+                        },
+                        spawned_cmd_contains: ssh_cmd,
+                    })
+                } else {
+                    // No exit scripted — command stays running forever.
+                    Ok(RemoteCommandHandle {
+                        kind: RemoteCommandHandleKind::Fake {
+                            remaining_polls: Arc::new(Mutex::new(None)),
+                            exit: Arc::new(Mutex::new(None)),
+                        },
+                        spawned_cmd_contains: ssh_cmd,
+                    })
+                }
             }
         }
     }
