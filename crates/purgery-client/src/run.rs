@@ -1252,6 +1252,17 @@ mod tests {
         )
     }
 
+    /// Helper for repeated processing-state TOML responses.
+    fn processing_state(run_id: &str, ts: u64) -> String {
+        format!(
+            "{}nickname = \"laptop\"\nrun_id = \"{run_id}\"\n\
+             phase = \"processing\"\nterminal = false\n\
+             message = \"run phase: processing\"\n\
+             updated_at_unix_secs = {ts}\nobserved_at_unix_secs = {ts}\n",
+            resp_header()
+        )
+    }
+
     fn begin_resp_toml() -> String {
         format!(
             r#"protocol_version = {}
@@ -1741,7 +1752,7 @@ state = "done"
         runner.add_response("begin-run", &begin);
         runner.add_response(
             "prepare-run",
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+            &format!("{}nickname = \"laptop\"\nrun_id = \"test-run\"\n", resp_header()),
         );
         runner.add_response("heartbeat-run", "");
         runner.add_response("run-state", &done_run_state_toml());
@@ -1797,7 +1808,7 @@ observed_at_unix_secs = 1000
         runner.add_response("begin-run", &begin_resp_toml());
         runner.add_response(
             "prepare-run",
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+            &format!("{}nickname = \"laptop\"\nrun_id = \"test-run\"\n", resp_header()),
         );
         runner.add_response("heartbeat-run", "");
         runner.add_response("finish-run", "");
@@ -1857,7 +1868,7 @@ observed_at_unix_secs = 1000
         runner.add_response("begin-run", &begin_resp_toml());
         runner.add_response(
             "prepare-run",
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+            &format!("{}nickname = \"laptop\"\nrun_id = \"test-run\"\n", resp_header()),
         );
         runner.add_response("heartbeat-run", "");
         runner.add_response("finish-run", "");
@@ -1888,7 +1899,7 @@ observed_at_unix_secs = 1000
         runner.add_response("begin-run", &begin_resp_toml());
         runner.add_response(
             "prepare-run",
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+            &format!("{}nickname = \"laptop\"\nrun_id = \"test-run\"\n", resp_header()),
         );
         runner.add_response("heartbeat-run", "");
         runner.add_response("finish-run", "");
@@ -1920,7 +1931,7 @@ observed_at_unix_secs = 1000
         runner.add_response("begin-run", &begin_resp_toml());
         runner.add_response(
             "prepare-run",
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+            &format!("{}nickname = \"laptop\"\nrun_id = \"test-run\"\n", resp_header()),
         );
         runner.add_response("heartbeat-run", "");
         runner.add_response("finish-run", "");
@@ -1962,7 +1973,7 @@ observed_at_unix_secs = 1000
         runner.add_response("begin-run", &begin_resp_toml());
         runner.add_response(
             "prepare-run",
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+            &format!("{}nickname = \"laptop\"\nrun_id = \"test-run\"\n", resp_header()),
         );
         runner.add_response("heartbeat-run", "");
         runner.add_response("finish-run", "");
@@ -1973,7 +1984,7 @@ observed_at_unix_secs = 1000
         // But another processor already claimed it — run-state shows processing
         runner.add_response(
             "run-state",
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-run\"\nphase = \"processing\"\nterminal = false\nmessage = \"run phase: processing\"\nupdated_at_unix_secs = 1000\nobserved_at_unix_secs = 1000\n",
+            &format!("{}nickname = \"laptop\"\nrun_id = \"test-run\"\nphase = \"processing\"\nterminal = false\nmessage = \"run phase: processing\"\nupdated_at_unix_secs = 1000\nobserved_at_unix_secs = 1000\n", resp_header()),
         );
         // After polling, it becomes terminal
         runner.add_response("run-state", &done_run_state_toml());
@@ -2068,7 +2079,7 @@ observed_at_unix_secs = 1000
         // on it and then poll until terminal.
         runner.add_response(
             "run-state",
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-resume-proc\"\nphase = \"processing\"\nterminal = false\nmessage = \"run phase: processing\"\nupdated_at_unix_secs = 1000\nobserved_at_unix_secs = 1000\n",
+            &processing_state("test-resume-proc", 1000),
         );
         // process-run succeeds
         runner.add_response("process-run", "");
@@ -2130,20 +2141,20 @@ observed_at_unix_secs = 1000
         // First run-state call returns processing → triggers process-run
         runner.add_response(
             "run-state",
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-backoff\"\nphase = \"processing\"\nterminal = false\nmessage = \"run phase: processing\"\nupdated_at_unix_secs = 1000\nobserved_at_unix_secs = 1000\n",
+            &processing_state("test-backoff", 1000),
         );
         // process-run succeeds
         runner.add_response("process-run", "");
         // trigger_process_run_and_recheck calls run-state again → still processing
         runner.add_response(
             "run-state",
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-backoff\"\nphase = \"processing\"\nterminal = false\nmessage = \"run phase: processing\"\nupdated_at_unix_secs = 1001\nobserved_at_unix_secs = 1001\n",
+            &processing_state("test-backoff", 1001),
         );
         // Second poll: run-state returns processing again
         // (should NOT call process-run, just poll)
         runner.add_response(
             "run-state",
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-backoff\"\nphase = \"processing\"\nterminal = false\nmessage = \"run phase: processing\"\nupdated_at_unix_secs = 1002\nobserved_at_unix_secs = 1002\n",
+            &processing_state("test-backoff", 1002),
         );
         // Third poll: finally terminal
         runner.add_response(
@@ -2497,7 +2508,7 @@ observed_at_unix_secs = 1000
         runner.add_response("begin-run", &begin_resp_toml());
         runner.add_response(
             "prepare-run",
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+            &format!("{}nickname = \"laptop\"\nrun_id = \"test-run\"\n", resp_header()),
         );
         runner.add_rsync_error("laptop", "simulated rsync failure");
 
@@ -2519,7 +2530,7 @@ observed_at_unix_secs = 1000
         runner.add_response("begin-run", &begin_resp_toml());
         runner.add_response(
             "prepare-run",
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+            &format!("{}nickname = \"laptop\"\nrun_id = \"test-run\"\n", resp_header()),
         );
         runner.add_rsync_error("laptop", "simulated rsync failure");
 
@@ -2561,7 +2572,7 @@ observed_at_unix_secs = 1000
         runner.add_response("begin-run", &begin_resp_toml());
         runner.add_response(
             "prepare-run",
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+            &format!("{}nickname = \"laptop\"\nrun_id = \"test-run\"\n", resp_header()),
         );
         runner.add_error("finish-run", "simulated finish failure");
 
@@ -2599,7 +2610,7 @@ observed_at_unix_secs = 1000
         runner.add_response("begin-run", &begin);
         runner.add_response(
             "prepare-run",
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+            &format!("{}nickname = \"laptop\"\nrun_id = \"test-run\"\n", resp_header()),
         );
         runner.add_error("heartbeat-run", "simulated heartbeat failure");
 
@@ -2658,7 +2669,7 @@ observed_at_unix_secs = 1000
         runner.add_response("begin-run", &begin);
         runner.add_response(
             "prepare-run",
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+            &format!("{}nickname = \"laptop\"\nrun_id = \"test-run\"\n", resp_header()),
         );
         runner.add_response("heartbeat-run", "");
         runner.add_response("run-state", &done_run_state_toml());
