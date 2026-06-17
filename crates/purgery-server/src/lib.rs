@@ -7826,6 +7826,60 @@ not valid toml {{{"#,
         );
     }
 
+    #[test]
+    fn process_once_processing_recovery_failure_publishes_failure_before_unlock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("recover-fail-lock".into()).unwrap();
+
+        // Create a processing run with a version-compatible but
+        // malformed manifest (valid TOML, fails Manifest::from_toml).
+        // This will cause process_processing_run to error and call
+        // write_run_failure internally before returning the error.
+        let processing = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        fs::create_dir_all(&processing).unwrap();
+
+        // Valid run.toml
+        write_run_toml(&processing, &nickname);
+
+        // Malformed manifest: compatible version but missing required
+        // fields (no entries), causing Manifest::from_toml to error.
+        fs::write(
+            processing.join("manifest.toml"),
+            r#"purgery_version = "0.1.0-test"
+run_id = "recover-fail-lock"
+nickname = "laptop"
+"#,
+        )
+        .unwrap();
+
+        // process_once_raw must handle this without mutating after
+        // dropping the processor lock.
+        let result = process_once_raw(&config);
+        assert!(result.is_ok(), "process_once_raw must succeed: {result:?}");
+
+        // The processing directory must be gone — failure was published
+        // while the lock was held.
+        assert!(
+            !processing.exists(),
+            "processing dir must be moved to failed while lock was held"
+        );
+
+        // Run must end up in failed with a status
+        let failed = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        assert!(failed.exists(), "failed run must be in failed directory");
+        assert!(
+            failed.join("status.toml").exists(),
+            "failed run must have status.toml"
+        );
+    }
+
     // ── progress/status version distinction in run-state ────────────
 
     #[test]
