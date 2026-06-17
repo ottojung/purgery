@@ -433,7 +433,7 @@ fn persist_client_run_state(
     phase: ClientRunPhase,
 ) -> Result<()> {
     let run_state = ClientRunState {
-        protocol_version: purgery_core::PROTOCOL_VERSION,
+        protocol_version: purgery_core::CLIENT_RUN_STATE_VERSION,
         purgery_version: purgery_core::current_purgery_version().to_string(),
         nickname: nickname.as_str().to_owned(),
         run_id: run_id.as_str().to_owned(),

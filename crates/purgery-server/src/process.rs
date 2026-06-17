@@ -422,6 +422,9 @@ pub(crate) enum ReadyClaimOutcome {
     AlreadyProcessing,
     /// Ready did not exist and a terminal phase was found.
     AlreadyTerminal,
+    /// Ready exists but its processor lock is held by another process.
+    /// This is a normal concurrent-claim race, not corruption.
+    ActiveClaimer,
     /// Ready exists but has incompatible version metadata. Left in place.
     IncompatibleReady { message: String },
     /// Ready exists but is malformed current-format state. Successfully
@@ -474,7 +477,9 @@ pub(crate) fn claim_ready_run(
     let lock = match crate::phases::try_lock_existing_run_dir_processor(&ready_path) {
         Ok(crate::phases::ProcessorLockAttempt::Acquired(l)) => l,
         Ok(crate::phases::ProcessorLockAttempt::Busy) => {
-            return recheck_state(config, nickname, run_id);
+            // Another process is actively trying to claim this ready run.
+            // This is a normal race, not corruption.
+            return ReadyClaimOutcome::ActiveClaimer;
         }
         Ok(crate::phases::ProcessorLockAttempt::Missing) => {
             return recheck_state(config, nickname, run_id);
@@ -879,6 +884,13 @@ pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
                     "ready run disappeared before we could claim it",
                 );
             }
+            ReadyClaimOutcome::ActiveClaimer => {
+                info!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    "ready run is being claimed by another processor; skipping",
+                );
+            }
             ReadyClaimOutcome::ClaimFailed { error } => {
                 warn!(
                     nickname = %nickname.as_str(),
@@ -1082,6 +1094,14 @@ fn process_run_target_inner(
             };
             drop(lock);
             return final_result;
+        }
+        ReadyClaimOutcome::ActiveClaimer => {
+            info!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                "ready run is being claimed by another processor; treating as active",
+            );
+            return Ok(());
         }
         ReadyClaimOutcome::AlreadyProcessing => {
             return handle_process_run_processing(config, nickname, run_id);

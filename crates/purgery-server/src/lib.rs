@@ -38,35 +38,10 @@ pub struct ResolvedTransform {
     pub def: purgery_core::TransformDefinition,
 }
 
-/// Process a ready run. Kept as the public single-run entry point.
+/// Process a ready run.  Delegates to `process_run_target` so all
+/// single-run processing shares the same implementation.
 pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> Result<()> {
-    match crate::process::claim_ready_run(config, nickname, run_id) {
-        crate::process::ReadyClaimOutcome::Claimed(lock) => {
-            let result = crate::process::process_processing_run(config, nickname, run_id);
-            drop(lock);
-            result.map_err(|e| match e {
-                crate::process::ProcessingError::Incompatible { message, .. } => {
-                    anyhow::anyhow!("{message}")
-                }
-                crate::process::ProcessingError::Other(e) => e,
-            })
-        }
-        crate::process::ReadyClaimOutcome::AlreadyProcessing => Ok(()),
-        crate::process::ReadyClaimOutcome::AlreadyTerminal => Ok(()),
-        crate::process::ReadyClaimOutcome::IncompatibleReady { message } => {
-            Err(anyhow::anyhow!("{message}"))
-        }
-        crate::process::ReadyClaimOutcome::MalformedReadyMovedToFailed { error } => Err(error),
-        crate::process::ReadyClaimOutcome::MalformedReadyMoveFailed {
-            original_error,
-            publish_error,
-        } => Err(anyhow::anyhow!(
-            "malformed ready could not be moved to failed: \
-             {original_error}; publication error: {publish_error}"
-        )),
-        crate::process::ReadyClaimOutcome::NotFound => Err(anyhow::anyhow!("run not found")),
-        crate::process::ReadyClaimOutcome::ClaimFailed { error } => Err(error),
-    }
+    process_run_target(config, nickname, run_id)
 }
 
 /// Server-side subcommand: validate the run plan and resolve relative
@@ -674,11 +649,11 @@ pub fn heartbeat_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId)
     purgery_core::require_compatible_purgery_version(&lease.purgery_version, "lease")
         .with_context(|| "incompatible lease version")?;
 
-    if lease.protocol_version != purgery_core::PROTOCOL_VERSION {
+    if lease.protocol_version != purgery_core::LEASE_FILE_VERSION {
         anyhow::bail!(
             "lease protocol version {} does not match expected {}",
             lease.protocol_version,
-            purgery_core::PROTOCOL_VERSION
+            purgery_core::LEASE_FILE_VERSION
         );
     }
     if lease.nickname != nickname.as_str() {
