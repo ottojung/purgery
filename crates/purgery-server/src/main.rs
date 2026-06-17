@@ -131,7 +131,7 @@ enum Command {
         #[arg(long)]
         run_id: String,
     },
-    /// Claim and process the target ready run; no-op if already processing or terminal
+    /// Claim/process the target run, recover it if abandoned, or no-op if actively processed or terminal
     ProcessRun {
         #[arg(long)]
         nickname: String,
