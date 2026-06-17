@@ -60,6 +60,12 @@ purgery-client sync \
 
 `process-once` runs side-effect-free server validation first, then GC opportunistically, then recovers processing runs and processes ready runs.
 
+When `purgery-client sync` is invoked with `--transform`, the client uploads the run and then automatically invokes remote `purgery-server process-once` on the server. This makes a single client-triggered transform sync self-contained: the server processing happens during the client invocation. The client does not require a separately running daemon, cron job, or timer for the normal transform path.
+
+Operators may still run `purgery-server process-once` independently (e.g., as a systemd timer). When another processor is already active, the client observes the run transitioning to `processing` and waits for the terminal state.
+
+Passthrough syncs (without `--transform`) use direct rsync and do not call `process-once`.
+
 ### Source entry model
 
 The `SOURCE` operand may be a regular file, directory, or symlink. The target is a destination parent. The source entry is imported under the target using the source entry name.

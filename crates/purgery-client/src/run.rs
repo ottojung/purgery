@@ -203,7 +203,19 @@ fn read_status(
     Ok(status)
 }
 
-fn wait_for_terminal(
+/// Poll `run-state` until the run reaches a terminal phase, actively
+/// driving server processing when the run is `ready`.
+///
+/// When the run is `ready`, this function invokes remote
+/// `purgery-server process-once` on the remote host using the
+/// configured server command.  If another processor is already
+/// handling the run and it transitions to `processing`, this function
+/// waits like the original `wait_for_terminal`.
+///
+/// This makes a single `purgery-client sync --transform ...`
+/// invocation self-contained: the client uploads, finishes, and then
+/// drives server processing instead of requiring a separate daemon.
+fn drive_server_until_terminal(
     runner: &RemoteRunner,
     host: &str,
     server_cmd: &str,
@@ -228,7 +240,18 @@ fn wait_for_terminal(
         }
 
         match response.phase.as_str() {
-            "ready" | "processing" => {
+            "ready" => {
+                info!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    "triggering server processing via process-once",
+                );
+                let _ = runner.server_cmd(host, server_cmd, &["process-once"]);
+                // After process-once, check run-state again.  process-once
+                // may have processed another ready run, so we re-check
+                // our own run state.
+            }
+            "processing" => {
                 if response.phase != last_phase {
                     info!(
                         nickname = %nickname.as_str(),
@@ -504,8 +527,8 @@ fn drain_one(runner: &RemoteRunner, state_dir: &str, state: &ClientRunState) -> 
                 phase = ClientRunPhase::WaitingForTerminalState;
             }
             ClientRunPhase::WaitingForTerminalState => {
-                debug!("waiting for terminal state");
-                wait_for_terminal(runner, host, server_cmd, &nickname, &run_id)?;
+                debug!("driving server processing to terminal");
+                drive_server_until_terminal(runner, host, server_cmd, &nickname, &run_id)?;
                 let status = read_status(runner, host, server_cmd, &nickname, &run_id)?;
                 if status.nickname != nickname || status.run_id != run_id {
                     anyhow::bail!("server status envelope does not match persisted run");
@@ -928,8 +951,8 @@ pub(crate) fn run_sync_with_run_id(
         ClientRunPhase::WaitingForTerminalState,
     )?;
 
-    info!("waiting for server processing");
-    wait_for_terminal(runner, &remote.host, server_cmd, &nickname, run_id)?;
+    info!("driving server processing");
+    drive_server_until_terminal(runner, &remote.host, server_cmd, &nickname, run_id)?;
 
     info!("reading run status");
     let status = read_status(runner, &remote.host, server_cmd, &nickname, run_id)?;
@@ -1602,6 +1625,162 @@ state = "done"
         // have rejected it before finish-run
         let log = runner.command_log();
         assert!(log.iter().any(|c| c.contains("heartbeat-run")));
+    }
+
+    fn ready_run_state_toml() -> String {
+        r#"protocol_version = 1
+purgery_version = "0.1.0-test"
+nickname = "laptop"
+run_id = "test-run"
+phase = "ready"
+terminal = false
+message = "run phase: ready"
+updated_at_unix_secs = 1000
+observed_at_unix_secs = 1000
+"#
+        .to_string()
+    }
+
+    #[test]
+    fn transform_sync_calls_process_once_after_finish_run() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        // First run-state returns ready (non-terminal) → triggers process-once
+        runner.add_response("run-state", &ready_run_state_toml());
+        // process-once response (empty on success)
+        runner.add_response("process-once", "");
+        // After process-once: run-state returns done
+        runner.add_response("run-state", &done_run_state_toml());
+        let status_toml =
+            "purgery_version = \"0.1.0-test\"\nrun_id = \"test-run\"\nnickname = \"laptop\"\nstate = \"done\"\n".to_string();
+        runner.add_response("status", &status_toml);
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        assert!(result.is_ok(), "sync must succeed");
+
+        let log = runner.command_log();
+        assert!(
+            log.iter().any(|c| c.contains("process-once")),
+            "command log must contain process-once: {log:?}"
+        );
+        assert!(
+            log.iter().any(|c| c.contains("finish-run")),
+            "command log must contain finish-run: {log:?}"
+        );
+        assert!(
+            log.iter().any(|c| c.contains("run-state")),
+            "command log must contain run-state: {log:?}"
+        );
+    }
+
+    #[test]
+    fn transform_sync_drives_ready_to_terminal() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        // Two rounds of ready → process-once before terminal
+        runner.add_response("run-state", &ready_run_state_toml());
+        runner.add_response("process-once", "");
+        runner.add_response("run-state", &ready_run_state_toml());
+        runner.add_response("process-once", "");
+        // Finally terminal
+        runner.add_response("run-state", &done_run_state_toml());
+        let status_toml =
+            "purgery_version = \"0.1.0-test\"\nrun_id = \"test-run\"\nnickname = \"laptop\"\nstate = \"done\"\n".to_string();
+        runner.add_response("status", &status_toml);
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        assert!(
+            result.is_ok(),
+            "sync must succeed even when process-once needs multiple calls"
+        );
+
+        let log = runner.command_log();
+        let process_once_count = log.iter().filter(|c| c.contains("process-once")).count();
+        assert!(
+            process_once_count >= 2,
+            "expected at least 2 process-once calls, got {process_once_count}: {log:?}"
+        );
+    }
+
+    #[test]
+    fn resume_drives_processing_when_run_is_ready() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        // Provide responses for drain_one path:
+        // 1. finish-run (already called during persistence below → drain skips it)
+        // Actually the persisted state will be WaitingForTerminalState,
+        // so drain_one goes straight to drive_server_until_terminal.
+        runner.add_response(
+            "run-state",
+            &ready_run_state_toml().replace("test-run", "test-resume-drive"),
+        );
+        runner.add_response("process-once", "");
+        runner.add_response(
+            "run-state",
+            &done_run_state_toml().replace("test-run", "test-resume-drive"),
+        );
+        runner.add_response(
+            "status",
+            &done_status_toml().replace("test-run", "test-resume-drive"),
+        );
+
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: RunId::new("test-resume-drive".into()).unwrap(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            entries: vec![],
+        };
+        let run_config = RunConfig {
+            purgery_version: "0.1.0-test".to_string(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            destination: DestinationPath::new(camino::Utf8PathBuf::from("rel")).unwrap(),
+            delete_after_import: true,
+        };
+
+        persist_client_run_state(
+            &state_dir,
+            &Nickname::new("laptop".into()).unwrap(),
+            &RunId::new("test-resume-drive".into()).unwrap(),
+            "host",
+            "purgery-server",
+            &manifest,
+            &run_config,
+            None,
+            ClientRunPhase::WaitingForTerminalState,
+        )
+        .unwrap();
+
+        let result = resume_runs(&runner, &state_dir);
+        assert!(result.is_ok(), "resume must drive processing and succeed");
+
+        let log = runner.command_log();
+        assert!(
+            log.iter().any(|c| c.contains("process-once")),
+            "resume must call process-once: {log:?}"
+        );
     }
 
     fn src_with_file(tmp: &tempfile::TempDir) -> String {

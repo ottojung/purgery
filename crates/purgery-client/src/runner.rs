@@ -226,10 +226,14 @@ impl RemoteRunner {
                         hook();
                     }
                 }
-                for resp in inner.responses.lock().unwrap().iter().rev() {
-                    if ssh_cmd.contains(&resp.cmd_contains) {
-                        return Ok(resp.stdout.clone());
-                    }
+                let mut responses = inner.responses.lock().unwrap();
+                let matched_idx = responses
+                    .iter()
+                    .position(|resp| ssh_cmd.contains(&resp.cmd_contains));
+                if let Some(idx) = matched_idx {
+                    let resp = responses.remove(idx);
+                    drop(responses);
+                    return Ok(resp.stdout);
                 }
                 anyhow::bail!(
                     "no scripted response for command (did you forget add_response?), \
