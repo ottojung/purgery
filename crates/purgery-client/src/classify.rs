@@ -202,6 +202,7 @@ pub(crate) fn build_manifest(
     };
 
     Ok(Manifest {
+        purgery_version: purgery_core::current_purgery_version().to_string(),
         run_id: run_id.clone(),
         nickname: nickname.clone(),
         entries: vec![entry],

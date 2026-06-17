@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use purgery_core::{ColorMode, LogFormat, LogLevel, Nickname, RunId, ServerConfig};
 use purgery_server::{
     begin_run, bootstrap, finish_run, heartbeat_run, prepare_run, process_once_raw,
-    read_run_status, run_gc, run_state, server_check,
+    read_run_status, run_gc, run_state, server_check, version_response,
 };
 use std::fs;
 
@@ -79,6 +79,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Print protocol and package version information
+    Version,
     /// Recover processing runs, process ready runs, and exit
     ProcessOnce,
     /// Begin a new run: create incoming directory and print paths
@@ -160,6 +162,12 @@ fn apply_cli_overrides(log_cfg: &mut purgery_core::LoggingConfig, cli: &Cli) -> 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // The `version` subcommand does not require config loading.
+    if matches!(cli.command, Command::Version) {
+        print!("{}", version_response());
+        return Ok(());
+    }
+
     // Resolve config path before dispatch so we can load config once.
     let config_path = cli.config.as_deref().unwrap_or("");
     let path = if config_path.is_empty() {
@@ -176,6 +184,9 @@ fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to initialize logging: {e}"))?;
 
     match cli.command {
+        Command::Version => {
+            unreachable!("Version is handled before config loading")
+        }
         Command::ProcessOnce => {
             server_check(&server_config)?;
             process_once_raw(&server_config)?;

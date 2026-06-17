@@ -41,6 +41,7 @@ fn default_heartbeat_interval_secs() -> u64 {
 #[serde(deny_unknown_fields)]
 pub struct LeaseFile {
     pub protocol_version: u32,
+    pub purgery_version: String,
     pub nickname: String,
     pub run_id: String,
     pub created_at_unix_secs: u64,
@@ -199,6 +200,7 @@ impl ServerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunConfig {
+    pub purgery_version: String,
     pub nickname: Nickname,
     pub destination: DestinationPath,
     #[serde(default)]
@@ -221,6 +223,7 @@ impl RunConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BeginRunResponse {
     pub protocol_version: u32,
+    pub purgery_version: String,
     pub nickname: String,
     pub run_id: String,
     pub incoming_dir: String,
@@ -233,6 +236,7 @@ pub struct BeginRunResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrepareRunResponse {
     pub protocol_version: u32,
+    pub purgery_version: String,
     pub nickname: String,
     pub run_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -244,6 +248,7 @@ pub struct PrepareRunResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunStateResponse {
     pub protocol_version: u32,
+    pub purgery_version: String,
     pub nickname: String,
     pub run_id: String,
     pub phase: String,
@@ -266,8 +271,10 @@ pub struct RunStateResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessingProgress {
     pub protocol_version: u32,
+    pub purgery_version: String,
     pub nickname: String,
     pub run_id: String,
     pub phase: String,
@@ -327,6 +334,7 @@ pub enum ClientRunPhase {
 #[serde(deny_unknown_fields)]
 pub struct ClientRunState {
     pub protocol_version: u32,
+    pub purgery_version: String,
     pub nickname: String,
     pub run_id: String,
     pub host: String,

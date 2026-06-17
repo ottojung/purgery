@@ -13,6 +13,7 @@ mod manifest;
 mod path;
 mod status;
 mod transform;
+mod version;
 
 pub use cleanup_state::*;
 pub use config::*;
@@ -20,6 +21,7 @@ pub use manifest::*;
 pub use path::*;
 pub use status::*;
 pub use transform::*;
+pub use version::*;
 
 // ── Error Types ──────────────────────────────────────────────────────
 
@@ -650,6 +652,7 @@ work_dir = "/universe/tmp/purgery"
     #[test]
     fn manifest_empty_entries_is_error() {
         let toml = r#"
+purgery_version = "0.1.0-test"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 "#;
@@ -660,6 +663,7 @@ nickname = "laptop"
     #[test]
     fn manifest_rejects_unknown_top_level_field() {
         let toml = r#"
+purgery_version = "0.1.0-test"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 unknown_field = "value"
@@ -677,6 +681,7 @@ kind = "regular_file"
     #[test]
     fn manifest_entry_rejects_unknown_field() {
         let toml = r#"
+purgery_version = "0.1.0-test"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 
@@ -694,6 +699,7 @@ unknown_entry_field = "value"
     #[test]
     fn manifest_rejects_mode_field() {
         let toml = r#"
+purgery_version = "0.1.0-test"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 
@@ -711,6 +717,7 @@ mode = "covered"
     #[test]
     fn manifest_rejects_covered_by_field() {
         let toml = r#"
+purgery_version = "0.1.0-test"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 
@@ -728,6 +735,7 @@ covered_by = "Videos"
     #[test]
     fn manifest_rejects_old_transform_steps_field() {
         let toml = r#"
+purgery_version = "0.1.0-test"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 
@@ -748,6 +756,7 @@ transform_steps = ["compress-video"]
     #[test]
     fn manifest_accepts_new_transform_field() {
         let toml = r#"
+purgery_version = "0.1.0-test"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 
@@ -769,6 +778,7 @@ transform = "compress-video"
     #[test]
     fn manifest_rejects_transform_as_array() {
         let toml = r#"
+purgery_version = "0.1.0-test"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 
@@ -791,6 +801,7 @@ transform = ["compress-video", "another"]
     #[test]
     fn parse_status_with_run_error() {
         let toml = r#"
+purgery_version = "0.1.0-test"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 state = "failed"
@@ -808,6 +819,7 @@ error = "failed to parse manifest.toml"
     #[test]
     fn status_rejects_unknown_top_level_field() {
         let toml = r#"
+purgery_version = "0.1.0-test"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 state = "done"
@@ -820,6 +832,7 @@ unknown_field = "value"
     #[test]
     fn status_entry_rejects_unknown_field() {
         let toml = r#"
+purgery_version = "0.1.0-test"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 state = "done"
@@ -840,6 +853,7 @@ covered_by = "parent"
     #[test]
     fn status_accepts_new_transform_field() {
         let toml = r#"
+purgery_version = "0.1.0-test"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 state = "done"
@@ -862,6 +876,7 @@ transform = "compress-video"
     #[test]
     fn status_rejects_transform_as_array() {
         let toml = r#"
+purgery_version = "0.1.0-test"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 state = "done"
@@ -1527,6 +1542,7 @@ color = "never"
         use crate::RunStateResponse;
         let response = RunStateResponse {
             protocol_version: 1,
+            purgery_version: "0.1.0-test".to_string(),
             nickname: "laptop".into(),
             run_id: "test-run".into(),
             phase: "processing".into(),
@@ -1559,6 +1575,7 @@ color = "never"
         // timestamp semantics. We verify the types carry the right fields.
         let response = RunStateResponse {
             protocol_version: 1,
+            purgery_version: "0.1.0-test".to_string(),
             nickname: "laptop".into(),
             run_id: "test-run".into(),
             phase: "processing".into(),

@@ -7,6 +7,7 @@ use crate::ManifestEntryKind;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DurableCleanupState {
+    pub purgery_version: String,
     pub nickname: String,
     pub operation_id: String,
     pub entries: Vec<CleanupEntry>,

@@ -93,6 +93,7 @@ impl<'de> Deserialize<'de> for RunState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunStatus {
+    pub purgery_version: String,
     pub run_id: RunId,
     pub nickname: Nickname,
     pub state: RunState,

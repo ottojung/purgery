@@ -61,25 +61,87 @@ pub fn run_gc(config: &ServerConfig) -> Result<()> {
 
             let expired = if lease_path.exists() {
                 match fs::read_to_string(lease_path.as_std_path()) {
-                    Ok(content) => match toml::from_str::<purgery_core::LeaseFile>(&content) {
-                        Ok(lease) => {
-                            let valid = lease.protocol_version == 1
-                                && lease.nickname == nickname.as_str()
-                                && lease.run_id == run_id.as_str();
-                            if !valid {
+                    Ok(content) => {
+                        // Probe purgery_version from raw TOML before full
+                        // deserialization so we can distinguish old/incompatible
+                        // leases from malformed current leases.
+                        // Old/incompatible leases must be skipped entirely —
+                        // they must NOT be collected, quarantined, or moved
+                        // to failed.
+                        match purgery_core::probe_purgery_version_from_toml(&content) {
+                            Err(purgery_core::VersionProbeError::MissingVersion) => {
                                 warn!(
                                     nickname = %nickname.as_str(),
                                     run_id = %run_id.as_str(),
-                                    protocol = lease.protocol_version,
-                                    lease_nickname = %lease.nickname,
-                                    lease_run_id = %lease.run_id,
-                                    "gc: lease envelope mismatch",
+                                    lease_path = %lease_path.as_str(),
+                                    "gc: lease missing purgery_version (too old); \
+                                     skipping — not collecting",
                                 );
+                                continue;
                             }
-                            !valid || now >= lease.expires_at_unix_secs
+                            Err(purgery_core::VersionProbeError::InvalidToml(e)) => {
+                                warn!(
+                                    nickname = %nickname.as_str(),
+                                    run_id = %run_id.as_str(),
+                                    lease_path = %lease_path.as_str(),
+                                    error = %e,
+                                    "gc: lease has invalid TOML (cannot determine version); \
+                                     skipping — not collecting",
+                                );
+                                continue;
+                            }
+                            Ok(version) => {
+                                let version_ok = purgery_core::require_compatible_purgery_version(
+                                    &version, "lease",
+                                )
+                                .is_ok();
+                                if !version_ok {
+                                    warn!(
+                                        nickname = %nickname.as_str(),
+                                        run_id = %run_id.as_str(),
+                                        lease_path = %lease_path.as_str(),
+                                        lease_version = %version,
+                                        current_version =
+                                            %purgery_core::current_purgery_version(),
+                                        "gc: lease has incompatible purgery_version; \
+                                         skipping — not collecting",
+                                    );
+                                    continue;
+                                }
+                                match toml::from_str::<purgery_core::LeaseFile>(&content) {
+                                    Ok(lease) => {
+                                        if lease.protocol_version != 1
+                                            || lease.nickname != nickname.as_str()
+                                            || lease.run_id != run_id.as_str()
+                                        {
+                                            warn!(
+                                                nickname = %nickname.as_str(),
+                                                run_id = %run_id.as_str(),
+                                                lease_path = %lease_path.as_str(),
+                                                lease_protocol = lease.protocol_version,
+                                                lease_nickname = %lease.nickname,
+                                                lease_run_id = %lease.run_id,
+                                                "gc: lease envelope mismatch",
+                                            );
+                                            true
+                                        } else {
+                                            now >= lease.expires_at_unix_secs
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            nickname = %nickname.as_str(),
+                                            run_id = %run_id.as_str(),
+                                            lease_path = %lease_path.as_str(),
+                                            error = %e,
+                                            "gc: failed to parse lease; treating as expired",
+                                        );
+                                        true
+                                    }
+                                }
+                            }
                         }
-                        Err(_) => true,
-                    },
+                    }
                     Err(_) => true,
                 }
             } else {
@@ -121,6 +183,7 @@ pub fn run_gc(config: &ServerConfig) -> Result<()> {
                 }
                 if fs::rename(&run_path, quarantine_path.as_std_path()).is_ok() {
                     let status = RunStatus {
+                        purgery_version: purgery_core::current_purgery_version().to_string(),
                         run_id: run_id.clone(),
                         nickname: nickname.clone(),
                         state: RunState::Failed,
@@ -155,6 +218,7 @@ pub fn run_gc(config: &ServerConfig) -> Result<()> {
             }
 
             let status = RunStatus {
+                purgery_version: purgery_core::current_purgery_version().to_string(),
                 run_id: run_id.clone(),
                 nickname: nickname.clone(),
                 state: RunState::Failed,

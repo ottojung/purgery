@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use camino::Utf8Path;
 use purgery_core::{
-    Nickname, ProcessingProgress, PurgeryRoot, RunId, RunPhase, RunState, RunStatus, ServerConfig,
+    current_purgery_version, Nickname, ProcessingProgress, PurgeryRoot, RunId, RunPhase, RunState,
+    RunStatus, ServerConfig,
 };
 use std::fs;
 use tracing::{info, warn};
@@ -52,19 +53,55 @@ pub(crate) fn write_progress_best_effort(
     }
 }
 
+/// Result of checking an existing progress file before writing.
+enum ExistingProgress {
+    /// Compatible progress file exists with a valid started_at value.
+    CompatibleStartedAt(u64),
+    /// No progress file exists.
+    Missing,
+    /// Progress file exists but has missing/incompatible purgery_version.
+    /// Must not be overwritten with current-version progress.
+    Incompatible,
+    /// Progress file exists but failed to parse (malformed).
+    /// May be overwritten (conservatively treating as current-format corruption).
+    Malformed,
+}
+
 /// Read `started_at_unix_secs` from an existing progress file, if present
 /// and the envelope (nickname, run_id) matches the current run.
 fn existing_progress_started_at(
     progress_path: &Utf8Path,
     nickname: &Nickname,
     run_id: &RunId,
-) -> Option<u64> {
-    let content = std::fs::read_to_string(progress_path.as_std_path()).ok()?;
-    let progress: ProcessingProgress = toml::from_str(&content).ok()?;
-    if progress.nickname != nickname.as_str() || progress.run_id != run_id.as_str() {
-        return None;
+) -> ExistingProgress {
+    let content = match std::fs::read_to_string(progress_path.as_std_path()) {
+        Ok(c) => c,
+        Err(_) => return ExistingProgress::Missing,
+    };
+    // Probe raw TOML for version before full parse
+    match purgery_core::probe_purgery_version_from_toml(&content) {
+        Err(purgery_core::VersionProbeError::MissingVersion) => {
+            return ExistingProgress::Incompatible;
+        }
+        Err(purgery_core::VersionProbeError::InvalidToml(_)) => {
+            // Invalid TOML — could be old corruption. Overwrite
+            // conservatively (treat as malformed current).
+            return ExistingProgress::Malformed;
+        }
+        Ok(version) => {
+            if purgery_core::require_compatible_purgery_version(&version, "progress").is_err() {
+                return ExistingProgress::Incompatible;
+            }
+        }
     }
-    Some(progress.started_at_unix_secs)
+    let progress: ProcessingProgress = match toml::from_str(&content) {
+        Ok(p) => p,
+        Err(_) => return ExistingProgress::Malformed,
+    };
+    if progress.nickname != nickname.as_str() || progress.run_id != run_id.as_str() {
+        return ExistingProgress::Malformed;
+    }
+    ExistingProgress::CompatibleStartedAt(progress.started_at_unix_secs)
 }
 
 /// Validate progress state semantics before writing.
@@ -144,9 +181,22 @@ pub(crate) fn write_progress(
         .unwrap_or_default()
         .as_secs();
     let final_path = processing_path.join("progress.toml");
-    let started_at = existing_progress_started_at(&final_path, nickname, run_id).unwrap_or(now);
+    let started_at = match existing_progress_started_at(&final_path, nickname, run_id) {
+        ExistingProgress::CompatibleStartedAt(v) => v,
+        ExistingProgress::Incompatible => {
+            warn!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                path = %final_path.as_str(),
+                "incompatible existing progress; not overwriting",
+            );
+            return Ok(());
+        }
+        ExistingProgress::Missing | ExistingProgress::Malformed => now,
+    };
     let progress = ProcessingProgress {
         protocol_version: 1,
+        purgery_version: current_purgery_version().to_string(),
         nickname: nickname.as_str().to_owned(),
         run_id: run_id.as_str().to_owned(),
         phase: "processing".to_string(),
@@ -176,6 +226,7 @@ pub(crate) fn write_run_failure(
 ) -> Result<()> {
     let processing_path = work_dir.run_dir(nickname, run_id, RunPhase::Processing);
     let status = RunStatus {
+        purgery_version: current_purgery_version().to_string(),
         run_id: run_id.clone(),
         nickname: nickname.clone(),
         state: RunState::Failed,
@@ -390,6 +441,7 @@ pub fn begin_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> 
 
     let lease = purgery_core::LeaseFile {
         protocol_version: 1,
+        purgery_version: current_purgery_version().to_string(),
         nickname: nickname.as_str().to_owned(),
         run_id: run_id.as_str().to_owned(),
         created_at_unix_secs: now,
@@ -415,6 +467,7 @@ pub fn begin_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> 
 
     let response = purgery_core::BeginRunResponse {
         protocol_version: 1,
+        purgery_version: current_purgery_version().to_string(),
         nickname: nickname.as_str().to_owned(),
         run_id: run_id.as_str().to_owned(),
         incoming_dir: incoming_path.as_str().to_owned(),
@@ -469,8 +522,18 @@ pub fn finish_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) ->
     if lease_path.exists() {
         let lease_content =
             fs::read_to_string(&lease_path).with_context(|| "failed to read lease file")?;
+        // Probe raw TOML for version before full deserialization
+        if let Err(e) = purgery_core::probe_purgery_version_from_toml(&lease_content) {
+            anyhow::bail!(
+                "cannot finish run: lease is missing purgery_version or has invalid TOML \
+                 (producer version cannot be established) at '{}': {e}",
+                lease_path.as_str(),
+            );
+        }
         let lease: purgery_core::LeaseFile =
             toml::from_str(&lease_content).with_context(|| "failed to parse lease file")?;
+        purgery_core::require_compatible_purgery_version(&lease.purgery_version, "lease")
+            .with_context(|| "incompatible lease version")?;
         if lease.protocol_version != 1 {
             anyhow::bail!(
                 "lease protocol version {} does not match expected 1",

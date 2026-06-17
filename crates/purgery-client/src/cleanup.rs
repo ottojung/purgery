@@ -34,6 +34,13 @@ pub(crate) fn write_cleanup_state(
 pub(crate) fn confirm_all_imports(state_path: &Utf8Path) -> Result<()> {
     let content = fs::read_to_string(state_path.as_std_path())
         .with_context(|| format!("failed to read cleanup state: {state_path}"))?;
+    // Probe raw TOML for version to distinguish old/incompatible state
+    // from malformed current state before full deserialization.
+    purgery_core::require_compatible_toml_version(
+        &content,
+        format_args!("cleanup state {state_path}"),
+    )
+    .map_err(|e| anyhow::anyhow!("incompatible cleanup state version: {e}"))?;
     let mut state: DurableCleanupState = toml::from_str(&content)
         .map_err(|e| anyhow::anyhow!("failed to parse cleanup state: {e}"))?;
     for entry in &mut state.entries {
@@ -54,6 +61,13 @@ pub(crate) fn confirm_all_imports(state_path: &Utf8Path) -> Result<()> {
 pub(crate) fn confirm_imports_from_status(state_path: &Utf8Path, status: &RunStatus) -> Result<()> {
     let content = fs::read_to_string(state_path.as_std_path())
         .with_context(|| format!("failed to read cleanup state: {state_path}"))?;
+    // Probe raw TOML for version to distinguish old/incompatible state
+    // from malformed current state before full deserialization.
+    purgery_core::require_compatible_toml_version(
+        &content,
+        format_args!("cleanup state {state_path}"),
+    )
+    .map_err(|e| anyhow::anyhow!("incompatible cleanup state version: {e}"))?;
     let mut state: DurableCleanupState = toml::from_str(&content)
         .map_err(|e| anyhow::anyhow!("failed to parse cleanup state: {e}"))?;
 
@@ -132,17 +146,50 @@ pub(crate) fn resume_pending_cleanups(state_dir: &str) -> Result<()> {
             Ok(p) => p,
             Err(_) => continue,
         };
-        if let Ok(content) = fs::read_to_string(state_path.as_std_path()) {
-            if let Ok(state) = toml::from_str::<DurableCleanupState>(&content) {
-                let before = state.entries.iter().filter(|e| e.cleaned).count();
-                if let Err(e) = process_cleanup_state_file(&state_path) {
-                    warn!(path = %state_path, error = %e, "failed to process cleanup state");
-                } else if let Ok(new_content) = fs::read_to_string(state_path.as_std_path()) {
-                    if let Ok(new_state) = toml::from_str::<DurableCleanupState>(&new_content) {
-                        let after = new_state.entries.iter().filter(|e| e.cleaned).count();
-                        deleted_total += after - before;
-                    }
+        let content = match fs::read_to_string(state_path.as_std_path()) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        // Probe purgery_version from raw TOML before full deserialization
+        // so we can distinguish old/incompatible from malformed current state.
+        let version = match purgery_core::probe_purgery_version_from_toml(&content) {
+            Err(purgery_core::VersionProbeError::MissingVersion) => {
+                warn!(path = %state_path, "cleanup state missing purgery_version (too old); skipping");
+                continue;
+            }
+            Err(purgery_core::VersionProbeError::InvalidToml(e)) => {
+                warn!(path = %state_path, error = %e, "cleanup state has malformed TOML; skipping");
+                continue;
+            }
+            Ok(v) => v,
+        };
+        if let Err(e) = purgery_core::require_compatible_purgery_version(&version, "cleanup state")
+        {
+            warn!(path = %state_path, error = %e, "cleanup state has incompatible purgery_version; skipping");
+            continue;
+        }
+        let state = match toml::from_str::<DurableCleanupState>(&content) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(path = %state_path, error = %e, "cleanup state has malformed current-version content; skipping");
+                continue;
+            }
+        };
+        let before = state.entries.iter().filter(|e| e.cleaned).count();
+        if let Err(e) = process_cleanup_state_file(&state_path) {
+            warn!(path = %state_path, error = %e, "failed to process cleanup state");
+        } else if let Ok(new_content) = fs::read_to_string(state_path.as_std_path()) {
+            if let Ok(new_state) = toml::from_str::<DurableCleanupState>(&new_content) {
+                if purgery_core::require_compatible_purgery_version(
+                    &new_state.purgery_version,
+                    "cleanup state",
+                )
+                .is_err()
+                {
+                    continue;
                 }
+                let after = new_state.entries.iter().filter(|e| e.cleaned).count();
+                deleted_total += after - before;
             }
         }
     }
@@ -172,6 +219,13 @@ pub(crate) fn compute_sha256(path: &Path) -> Result<String> {
 pub(crate) fn process_cleanup_state_file(state_path: &Utf8Path) -> Result<()> {
     let content = fs::read_to_string(state_path.as_std_path())
         .with_context(|| format!("failed to read cleanup state: {state_path}"))?;
+    // Probe raw TOML for version to distinguish old/incompatible state
+    // from malformed current state before full deserialization.
+    purgery_core::require_compatible_toml_version(
+        &content,
+        format_args!("cleanup state {state_path}"),
+    )
+    .map_err(|e| anyhow::anyhow!("incompatible cleanup state version: {e}"))?;
     let mut state: DurableCleanupState = toml::from_str(&content)
         .map_err(|e| anyhow::anyhow!("failed to parse cleanup state: {e}"))?;
 
@@ -367,6 +421,7 @@ mod tests {
 
     fn status_for(path: &Path, file_status: FileStatus) -> RunStatus {
         RunStatus {
+            purgery_version: "0.1.0-test".to_string(),
             run_id: RunId::new("run-1".to_owned()).unwrap(),
             nickname: Nickname::new("host".to_owned()).unwrap(),
             state: RunState::Done,
@@ -389,6 +444,7 @@ mod tests {
         let file = tmp.path().join("a.txt");
         fs::write(&file, "original").unwrap();
         let state = DurableCleanupState {
+            purgery_version: "0.1.0-test".to_string(),
             nickname: "host".to_owned(),
             operation_id: "run-1".to_owned(),
             entries: vec![cleanup_entry(&file)],
@@ -421,6 +477,7 @@ mod tests {
         }
 
         let state = DurableCleanupState {
+            purgery_version: "0.1.0-test".to_string(),
             nickname: "host".to_owned(),
             operation_id: "run-dir".to_owned(),
             entries,
@@ -453,6 +510,7 @@ mod tests {
         }
 
         let state = DurableCleanupState {
+            purgery_version: "0.1.0-test".to_string(),
             nickname: "host".to_owned(),
             operation_id: "run-extra".to_owned(),
             entries,
@@ -483,6 +541,7 @@ mod tests {
         fs::write(&file, "modified").unwrap();
 
         let state = DurableCleanupState {
+            purgery_version: "0.1.0-test".to_string(),
             nickname: "host".to_owned(),
             operation_id: "run-changed".to_owned(),
             entries,
@@ -569,6 +628,7 @@ mod tests {
         }
 
         let state = DurableCleanupState {
+            purgery_version: "0.1.0-test".to_string(),
             nickname: "host".to_owned(),
             operation_id: "run-nested".to_owned(),
             entries,
@@ -592,6 +652,7 @@ mod tests {
             let file = tmp.path().join("a.txt");
             fs::write(&file, "original").unwrap();
             let state = DurableCleanupState {
+                purgery_version: "0.1.0-test".to_string(),
                 nickname: "host".to_owned(),
                 operation_id: format!("run-{}", status.as_str()),
                 entries: vec![cleanup_entry(&file)],
@@ -647,6 +708,7 @@ mod tests {
         ];
 
         let state = DurableCleanupState {
+            purgery_version: "0.1.0-test".to_string(),
             nickname: "host".to_owned(),
             operation_id: "run-dir".to_owned(),
             entries,
@@ -655,6 +717,7 @@ mod tests {
 
         // Status only mentions the directory as imported — no individual descendant entry.
         let status = RunStatus {
+            purgery_version: "0.1.0-test".to_string(),
             run_id: RunId::new("run-dir".to_owned()).unwrap(),
             nickname: Nickname::new("host".to_owned()).unwrap(),
             state: RunState::Done,
@@ -725,6 +788,7 @@ mod tests {
         ];
 
         let state = DurableCleanupState {
+            purgery_version: "0.1.0-test".to_string(),
             nickname: "host".to_owned(),
             operation_id: "run-failed".to_owned(),
             entries,
@@ -732,6 +796,7 @@ mod tests {
         let state_path = write_cleanup_state(&state, tmp.path().to_str().unwrap()).unwrap();
 
         let status = RunStatus {
+            purgery_version: "0.1.0-test".to_string(),
             run_id: RunId::new("run-failed".to_owned()).unwrap(),
             nickname: Nickname::new("host".to_owned()).unwrap(),
             state: RunState::Done,
@@ -792,6 +857,7 @@ mod tests {
         ];
 
         let state = DurableCleanupState {
+            purgery_version: "0.1.0-test".to_string(),
             nickname: "host".to_owned(),
             operation_id: "run-missing".to_owned(),
             entries,
@@ -800,6 +866,7 @@ mod tests {
 
         // Status has no entry for the parent directory.
         let status = RunStatus {
+            purgery_version: "0.1.0-test".to_string(),
             run_id: RunId::new("run-missing".to_owned()).unwrap(),
             nickname: Nickname::new("host".to_owned()).unwrap(),
             state: RunState::Done,
@@ -908,6 +975,7 @@ mod tests {
         });
 
         let state = DurableCleanupState {
+            purgery_version: "0.1.0-test".to_string(),
             nickname: "host".to_owned(),
             operation_id: "run-dir-cleanup".to_owned(),
             entries,
@@ -979,6 +1047,7 @@ mod tests {
         fs::write(&file, "modified").unwrap();
 
         let state = DurableCleanupState {
+            purgery_version: "0.1.0-test".to_string(),
             nickname: "host".to_owned(),
             operation_id: "run-changed-dir".to_owned(),
             entries,

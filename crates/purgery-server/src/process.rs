@@ -5,6 +5,7 @@ use purgery_core::{
     FileStatus, Manifest, ManifestEntry, ManifestEntryKind, Nickname, NormalizedRelativePath,
     RunConfig, RunId, RunPhase, RunState, RunStatus, ServerConfig,
 };
+use std::fmt;
 use std::fs;
 use tracing::{info, span, warn, Level};
 
@@ -13,9 +14,45 @@ use crate::gc::run_gc;
 use crate::phases::{
     finalize_processing_run, move_to_failed, write_progress_best_effort, write_run_failure,
 };
-use crate::recover::recover_or_process_processing_run;
+use crate::recover::{recover_or_process_processing_run, RecoveryError};
 use crate::transform::apply_transform;
 use crate::ResolvedTransform;
+
+/// Outcome of attempting to process a run (ready → processing → done/failed).
+#[derive(Debug)]
+pub enum ProcessingError {
+    /// The run has incompatible state (missing or incompatible purgery_version
+    /// in run.toml, manifest.toml, etc.). Must be left in place — no failure
+    /// status, no move to failed, no other mutation.
+    Incompatible { path: Utf8PathBuf, message: String },
+    /// A real processing error (IO, malformed current-version data, etc.).
+    /// The outer loop should write a failure status and move the run to failed.
+    Other(anyhow::Error),
+}
+
+impl fmt::Display for ProcessingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProcessingError::Incompatible { message, .. } => write!(f, "{message}"),
+            ProcessingError::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for ProcessingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ProcessingError::Incompatible { .. } => None,
+            ProcessingError::Other(e) => Some(e.as_ref()),
+        }
+    }
+}
+
+impl From<anyhow::Error> for ProcessingError {
+    fn from(e: anyhow::Error) -> Self {
+        ProcessingError::Other(e)
+    }
+}
 
 pub(crate) enum EntryOutcome {
     Success {
@@ -313,17 +350,150 @@ fn process_manifest_entry(
     }
 }
 
-pub fn process_ready_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> Result<()> {
+/// Read and validate run.toml and manifest.toml from a run directory,
+/// checking version compatibility before any mutation.
+///
+/// Returns `Incompatible` if purgery_version is missing, malformed, or
+/// major/minor-incompatible. Returns `Other` for IO errors or current-
+/// version parse failures.
+fn read_compatible_run_inputs(
+    run_dir: &Utf8Path,
+    nickname: &Nickname,
+    run_id: &RunId,
+) -> std::result::Result<(RunConfig, Manifest), ProcessingError> {
+    let run_config_path = run_dir.join("run.toml");
+    let run_config_content = fs::read_to_string(&run_config_path)
+        .map_err(|e| ProcessingError::Other(anyhow::anyhow!("failed to read run config: {e}")))?;
+    match purgery_core::check_toml_version(&run_config_content) {
+        purgery_core::TomlVersionCheck::Compatible => {}
+        purgery_core::TomlVersionCheck::Incompatible { reason, .. } => {
+            return Err(ProcessingError::Incompatible {
+                path: run_config_path,
+                message: format!("incompatible run config version: {reason}"),
+            });
+        }
+        purgery_core::TomlVersionCheck::InvalidToml { error } => {
+            return Err(ProcessingError::Other(anyhow::anyhow!(
+                "invalid run config TOML: {error}"
+            )));
+        }
+    }
+    let run_config = RunConfig::from_toml(&run_config_content)
+        .map_err(|e| ProcessingError::Other(anyhow::anyhow!("failed to parse run config: {e}")))?;
+
+    let manifest_path = run_dir.join("manifest.toml");
+    let manifest_content = fs::read_to_string(&manifest_path)
+        .map_err(|e| ProcessingError::Other(anyhow::anyhow!("failed to read manifest: {e}")))?;
+    match purgery_core::check_toml_version(&manifest_content) {
+        purgery_core::TomlVersionCheck::Compatible => {}
+        purgery_core::TomlVersionCheck::Incompatible { reason, .. } => {
+            return Err(ProcessingError::Incompatible {
+                path: manifest_path,
+                message: format!("incompatible manifest version: {reason}"),
+            });
+        }
+        purgery_core::TomlVersionCheck::InvalidToml { error } => {
+            return Err(ProcessingError::Other(anyhow::anyhow!(
+                "invalid manifest TOML: {error}"
+            )));
+        }
+    }
+    let manifest = Manifest::from_toml(&manifest_content)
+        .map_err(|e| ProcessingError::Other(anyhow::anyhow!("failed to parse manifest: {e}")))?;
+
+    if let Err(e) = validate_envelope(nickname, run_id, &run_config, &manifest) {
+        return Err(ProcessingError::Other(anyhow::anyhow!(
+            "envelope validation failed: {e}"
+        )));
+    }
+
+    Ok((run_config, manifest))
+}
+
+pub fn process_ready_run(
+    config: &ServerConfig,
+    nickname: &Nickname,
+    run_id: &RunId,
+) -> std::result::Result<(), ProcessingError> {
     let ready_path = config.work_dir.run_dir(nickname, run_id, RunPhase::Ready);
+
+    // Preflight: check version compatibility before moving.
+    // Incompatible ready runs stay in ready — no rename, no move to failed.
+    if let Err(e) = read_compatible_run_inputs(&ready_path, nickname, run_id) {
+        match &e {
+            ProcessingError::Incompatible { .. } => return Err(e),
+            // Malformed current-format TOML or IO error: move ready → failed
+            // and write a failure status for operator visibility.
+            ProcessingError::Other(_) => {
+                let msg = format!("{e}");
+                let failed_path = config.work_dir.run_dir(nickname, run_id, RunPhase::Failed);
+                if let Some(parent) = failed_path.parent() {
+                    if let Err(err) = fs::create_dir_all(parent.as_std_path()) {
+                        warn!(
+                            nickname = %nickname.as_str(),
+                            run_id = %run_id.as_str(),
+                            error = %err,
+                            "failed to create failed directory",
+                        );
+                    }
+                }
+                if let Err(rename_err) = fs::rename(&ready_path, failed_path.as_std_path()) {
+                    warn!(
+                        nickname = %nickname.as_str(),
+                        run_id = %run_id.as_str(),
+                        error = %rename_err,
+                        "failed to move ready run to failed",
+                    );
+                }
+                // Write failure status directly in the failed directory
+                let status = purgery_core::RunStatus {
+                    purgery_version: purgery_core::current_purgery_version().to_string(),
+                    run_id: run_id.clone(),
+                    nickname: nickname.clone(),
+                    state: purgery_core::RunState::Failed,
+                    entries: vec![],
+                    error: Some(msg.clone()),
+                };
+                let status_toml = match status.to_toml() {
+                    Ok(t) => t,
+                    Err(ser_err) => {
+                        warn!(
+                            nickname = %nickname.as_str(),
+                            run_id = %run_id.as_str(),
+                            error = %ser_err,
+                            "failed to serialize failure status",
+                        );
+                        return Err(e);
+                    }
+                };
+                let final_status_path = failed_path.join("status.toml");
+                let tmp_status_path = failed_path.join("status.toml.tmp");
+                if let Some(parent) = final_status_path.parent() {
+                    let _ = fs::create_dir_all(parent.as_std_path());
+                }
+                if let Err(write_err) = fs::write(&tmp_status_path, &status_toml) {
+                    warn!(
+                        nickname = %nickname.as_str(),
+                        run_id = %run_id.as_str(),
+                        error = %write_err,
+                        "failed to write failure status",
+                    );
+                    return Err(e);
+                }
+                let _ = fs::rename(&tmp_status_path, &final_status_path);
+                return Err(e);
+            }
+        }
+    }
+
+    // Compatible — claim the run by moving ready → processing.
     let processing_path = config
         .work_dir
         .run_dir(nickname, run_id, RunPhase::Processing);
-
     if let Some(parent) = processing_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create processing parent: {}", parent.as_str()))?;
     }
-
     fs::rename(&ready_path, &processing_path).with_context(|| {
         format!(
             "failed to claim run: {} -> {}",
@@ -339,13 +509,27 @@ pub fn process_processing_run(
     config: &ServerConfig,
     nickname: &Nickname,
     run_id: &RunId,
-) -> Result<()> {
+) -> std::result::Result<(), ProcessingError> {
     let _span = span!(Level::INFO, "run", nickname = %nickname.as_str(), run_id = %run_id.as_str())
         .entered();
     let processing_path = config
         .work_dir
         .run_dir(nickname, run_id, RunPhase::Processing);
 
+    // Phase 1 — check version compatibility before any mutation
+    let (run_config, manifest) =
+        match read_compatible_run_inputs(&processing_path, nickname, run_id) {
+            Ok(v) => v,
+            Err(e @ ProcessingError::Incompatible { .. }) => return Err(e),
+            Err(ProcessingError::Other(e)) => {
+                let msg = format!("{e}");
+                warn!("{}", msg);
+                write_run_failure(&config.work_dir, nickname, run_id, &msg)?;
+                return Err(ProcessingError::Other(e));
+            }
+        };
+
+    // Phase 2 — version is compatible, mutate work area
     let work_area = work_dir(&config.work_dir, nickname, run_id);
     if let Err(error) = fs::remove_dir_all(&work_area) {
         if error.kind() != std::io::ErrorKind::NotFound {
@@ -360,53 +544,6 @@ pub fn process_processing_run(
     }
     fs::create_dir_all(&work_area)
         .with_context(|| format!("failed to create work area: {}", work_area.as_str()))?;
-
-    let run_config_path = processing_path.join("run.toml");
-    let run_config_content = match fs::read_to_string(&run_config_path) {
-        Ok(content) => content,
-        Err(error) => {
-            let msg = format!("failed to read run config: {error}");
-            warn!("{}", msg);
-            write_run_failure(&config.work_dir, nickname, run_id, &msg)?;
-            anyhow::bail!("{msg}");
-        }
-    };
-    let run_config = match RunConfig::from_toml(&run_config_content) {
-        Ok(run_config) => run_config,
-        Err(error) => {
-            let msg = format!("failed to parse run config: {error}");
-            warn!("{}", msg);
-            write_run_failure(&config.work_dir, nickname, run_id, &msg)?;
-            anyhow::bail!("{msg}");
-        }
-    };
-
-    let manifest_path = processing_path.join("manifest.toml");
-    let manifest_content = match fs::read_to_string(&manifest_path) {
-        Ok(content) => content,
-        Err(error) => {
-            let msg = format!("failed to read manifest: {error}");
-            warn!("{}", msg);
-            write_run_failure(&config.work_dir, nickname, run_id, &msg)?;
-            anyhow::bail!("{msg}");
-        }
-    };
-    let manifest = match Manifest::from_toml(&manifest_content) {
-        Ok(manifest) => manifest,
-        Err(error) => {
-            let msg = format!("failed to parse manifest: {error}");
-            warn!("{}", msg);
-            write_run_failure(&config.work_dir, nickname, run_id, &msg)?;
-            anyhow::bail!("{msg}");
-        }
-    };
-
-    if let Err(error) = validate_envelope(nickname, run_id, &run_config, &manifest) {
-        let msg = format!("envelope validation failed: {error}");
-        warn!("{}", msg);
-        write_run_failure(&config.work_dir, nickname, run_id, &msg)?;
-        anyhow::bail!("{msg}");
-    }
 
     // Write initial progress before processing entries
     write_progress_best_effort(
@@ -486,6 +623,7 @@ pub fn process_processing_run(
 
     info!(state = %run_state.as_str(), "run complete");
     let run_status = RunStatus {
+        purgery_version: purgery_core::current_purgery_version().to_string(),
         run_id: run_id.clone(),
         nickname: nickname.clone(),
         state: run_state.clone(),
@@ -506,7 +644,7 @@ pub fn process_processing_run(
     fs::rename(&status_tmp_path, &status_path)
         .with_context(|| format!("failed to finalize status: {}", status_path.as_str()))?;
 
-    finalize_processing_run(config, nickname, run_id, &run_state)
+    finalize_processing_run(config, nickname, run_id, &run_state).map_err(ProcessingError::Other)
 }
 
 pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
@@ -522,24 +660,36 @@ pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
     }
 
     for (nickname, run_id) in &processing_runs {
-        if let Err(error) = recover_or_process_processing_run(config, nickname, run_id) {
-            warn!(
-                nickname = %nickname.as_str(),
-                run_id = %run_id.as_str(),
-                phase = "processing",
-                error = %error,
-                "processing run recovery failed"
-            );
-            let processing_path = config
-                .work_dir
-                .run_dir(nickname, run_id, RunPhase::Processing);
-            if processing_path.exists() {
-                write_run_failure(
-                    &config.work_dir,
-                    nickname,
-                    run_id,
-                    &format!("processing recovery failed: {error}"),
-                )?;
+        match recover_or_process_processing_run(config, nickname, run_id) {
+            Ok(()) => {}
+            Err(RecoveryError::IncompatibleStatus { message }) => {
+                warn!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    error = %message,
+                    "processing run has incompatible status; leaving in place for operator inspection"
+                );
+            }
+            Err(RecoveryError::Other(error)) => {
+                warn!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    phase = "processing",
+                    error = %error,
+                    "processing run recovery failed"
+                );
+                let processing_path =
+                    config
+                        .work_dir
+                        .run_dir(nickname, run_id, RunPhase::Processing);
+                if processing_path.exists() {
+                    write_run_failure(
+                        &config.work_dir,
+                        nickname,
+                        run_id,
+                        &format!("processing recovery failed: {error}"),
+                    )?;
+                }
             }
         }
     }
@@ -551,15 +701,26 @@ pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
             phase = "ready",
             "processing run"
         );
-        if let Err(error) = process_ready_run(config, nickname, run_id) {
-            warn!(
-                nickname = %nickname.as_str(),
-                run_id = %run_id.as_str(),
-                phase = "processing",
-                error = %error,
-                "run failed"
-            );
-            move_to_failed(&config.work_dir, nickname, run_id)?;
+        match process_ready_run(config, nickname, run_id) {
+            Ok(()) => {}
+            Err(ProcessingError::Incompatible { message, .. }) => {
+                warn!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    error = %message,
+                    "ready run has incompatible state; leaving in place",
+                );
+            }
+            Err(ProcessingError::Other(error)) => {
+                warn!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    phase = "processing",
+                    error = %error,
+                    "run failed"
+                );
+                move_to_failed(&config.work_dir, nickname, run_id)?;
+            }
         }
     }
 

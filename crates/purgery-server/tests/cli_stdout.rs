@@ -51,6 +51,7 @@ fn debug_logging_does_not_contaminate_status_stdout() {
     let failed = temp.path().join("purgery/laptop/failed/stdout-status");
     fs::create_dir_all(&failed).unwrap();
     let status = RunStatus {
+        purgery_version: "0.1.0-test".to_string(),
         run_id,
         nickname,
         state: RunState::Failed,
