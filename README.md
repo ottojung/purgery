@@ -19,7 +19,6 @@ Depending on how you configure it:
 
 * **Send as-is and keep the source** — the source entry is copied to the destination unchanged. The original remains in place.
 * **Send as-is and remove the source** — the source entry is copied unchanged; after a successful transfer the original is removed.
-* **Send processed output and keep the source** — the source entry is sent to the destination in a generated or processed form. The original remains in place.
 * **Send processed output and remove the source** — processed output is placed at the destination; after confirmation the original is removed.
 
 Examples:
