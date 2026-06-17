@@ -207,7 +207,7 @@ fn read_status(
 /// driving server processing when the run is `ready`.
 ///
 /// When the run is `ready`, this function invokes remote
-/// `purgery-server process-run <nickname> <run-id>` on the remote host using the
+/// `purgery-server process-run --nickname <nickname> --run-id <run-id>` on the remote host using the
 /// configured server command.  If another processor is already
 /// handling the run and it transitions to `processing`, this function
 /// waits like the original `wait_for_terminal`.

@@ -7256,6 +7256,108 @@ delete_after_import = true
         );
     }
 
+    #[test]
+    fn process_run_target_ready_normal_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("tgt-normal".into()).unwrap();
+
+        // Create a ready run with valid inputs and a transform defined
+        let mut config_with_transform = config.clone();
+        config_with_transform.transforms.insert(
+            "test-step".into(),
+            TransformDefinition {
+                name: "test-step".into(),
+                kind: TransformKind::Subprocess,
+                program: "/bin/true".to_string(),
+                args: Vec::new(),
+                expected_outputs: Vec::new(),
+            },
+        );
+        let ready = config_with_transform
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        fs::create_dir_all(&ready).unwrap();
+        write_run_toml_with_raw_destination(&ready, &nickname, "/tmp/dest");
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![ManifestEntry {
+                local_path: ClientLocalPath::new("/source/file.txt".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/file.txt".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("file.txt".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
+                size: 13,
+                mtime_ns: 0,
+                sha256: None,
+                link_target: None,
+                transform: Some("test-step".into()),
+            }],
+        };
+        fs::write(ready.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+
+        let result = process_run_target(&config_with_transform, &nickname, &run_id);
+        assert!(
+            result.is_ok(),
+            "normal ready run should be processed successfully"
+        );
+
+        // Run should end up in done or failed
+        assert!(!ready.exists(), "ready run must be claimed");
+        let failed = config_with_transform
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        let done = config_with_transform
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Done);
+        assert!(
+            failed.exists() || done.exists(),
+            "processed run must end up in done or failed"
+        );
+    }
+
+    #[test]
+    fn process_run_target_processing_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("tgt-processing".into()).unwrap();
+
+        // Create a processing run with no terminal status (simulating
+        // an active transform that has not yet completed).
+        let processing = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        fs::create_dir_all(&processing).unwrap();
+        // No status.toml — this simulates an actively processing run.
+        // process_run_target must NOT recover or replay it.
+
+        let result = process_run_target(&config, &nickname, &run_id);
+        assert!(
+            result.is_ok(),
+            "processing run must be a no-op, not an error: {result:?}"
+        );
+
+        // Processing directory unchanged
+        assert!(processing.exists(), "processing directory must remain");
+        // No terminal status written
+        assert!(
+            !processing.join("status.toml").exists(),
+            "must not write status for processing run"
+        );
+        // Not moved to failed
+        let failed = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        assert!(!failed.exists(), "must NOT move processing run to failed");
+    }
+
     // ── progress/status version distinction in run-state ────────────
 
     #[test]

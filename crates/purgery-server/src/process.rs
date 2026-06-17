@@ -734,12 +734,13 @@ pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
 /// to finish before returning.
 ///
 /// Then dispatches based on the run's current phase:
-/// - `ready`: process via `process_ready_run`
-/// - `processing`: recover via `recover_or_process_processing_run`
+/// - `ready`: claim and process the target run
+/// - `processing`: no-op (another processor is handling it) — does not
+///   recover or replay
 /// - terminal: idempotent success
 /// - not found: error
 ///
-/// Does not process unrelated runs.
+/// Does not process unrelated runs. Does not recover processing runs.
 pub fn process_run_target(
     config: &ServerConfig,
     nickname: &Nickname,
@@ -768,26 +769,38 @@ fn process_run_target_inner(
     nickname: &Nickname,
     run_id: &RunId,
 ) -> Result<()> {
-    // Check run phases in order: ready, processing, then terminal.
     let ready_path = config.work_dir.run_dir(nickname, run_id, RunPhase::Ready);
+
+    // Try to claim the ready run.  If it vanished by the time we act,
+    // re-check the current state instead of bailing.
     if ready_path.exists() {
-        return match process_ready_run(config, nickname, run_id) {
+        return match try_claim_ready(config, nickname, run_id) {
             Ok(()) => Ok(()),
-            Err(ProcessingError::Incompatible { message, .. }) => {
-                Err(anyhow::anyhow!("incompatible run left in place: {message}"))
+            Err(e) if e.to_string().contains("failed to claim run") => {
+                // Race: another process claimed ready → processing.
+                // Determine the run's current state.
+                let processing_path =
+                    config
+                        .work_dir
+                        .run_dir(nickname, run_id, RunPhase::Processing);
+                if processing_path.exists() {
+                    info!(
+                        nickname = %nickname.as_str(),
+                        run_id = %run_id.as_str(),
+                        "run was claimed by another processor; observing as processing",
+                    );
+                    return Ok(());
+                }
+                // Check terminal phases.
+                for phase in &[RunPhase::Done, RunPhase::Failed] {
+                    let dir = config.work_dir.run_dir(nickname, run_id, *phase);
+                    if dir.exists() {
+                        return Ok(());
+                    }
+                }
+                Err(anyhow::anyhow!("{e}"))
             }
-            Err(ProcessingError::Other(error)) => {
-                warn!(
-                    nickname = %nickname.as_str(),
-                    run_id = %run_id.as_str(),
-                    phase = "processing",
-                    error = %error,
-                    "run failed",
-                );
-                move_to_failed(&config.work_dir, nickname, run_id)
-                    .with_context(|| "failed to move target run to failed")?;
-                Err(error)
-            }
+            Err(e) => Err(anyhow::anyhow!("{e}")),
         };
     }
 
@@ -795,17 +808,16 @@ fn process_run_target_inner(
         .work_dir
         .run_dir(nickname, run_id, RunPhase::Processing);
     if processing_path.exists() {
-        return recover_or_process_processing_run(config, nickname, run_id).map_err(|e| match e {
-            RecoveryError::IncompatibleStatus { message } => {
-                anyhow::anyhow!("incompatible run left in place: {message}")
-            }
-            RecoveryError::Other(e) => e,
-        });
+        info!(
+            nickname = %nickname.as_str(),
+            run_id = %run_id.as_str(),
+            "run is already processing; skipping",
+        );
+        return Ok(());
     }
 
     // Check terminal phases.
-    let terminal_phases = [RunPhase::Done, RunPhase::Failed];
-    for phase in &terminal_phases {
+    for phase in &[RunPhase::Done, RunPhase::Failed] {
         let dir = config.work_dir.run_dir(nickname, run_id, *phase);
         if dir.exists() {
             info!(
@@ -823,4 +835,82 @@ fn process_run_target_inner(
         nickname.as_str(),
         run_id.as_str(),
     )
+}
+
+/// Try to claim and process a ready run.  Returns `Ok(())` on success,
+/// or a `ProcessingError`-derived error on failure.
+///
+/// Version compatibility is checked before the rename so that
+/// incompatible runs are left in `ready`.
+///
+/// If the ready directory has been claimed by another process in the
+/// meantime, the error from `fs::rename` propagates up so the caller
+/// can re-check the run state gracefully.
+fn try_claim_ready(
+    config: &ServerConfig,
+    nickname: &Nickname,
+    run_id: &RunId,
+) -> std::result::Result<(), ProcessingError> {
+    let ready_path = config.work_dir.run_dir(nickname, run_id, RunPhase::Ready);
+
+    // Check compatibility before claiming so incompatible runs stay in ready.
+    let (_run_config, _manifest) = match read_compatible_run_inputs(&ready_path, nickname, run_id) {
+        Ok(v) => v,
+        Err(e @ ProcessingError::Incompatible { .. }) => return Err(e),
+        Err(ProcessingError::Other(e)) => {
+            // Malformed current-format state: write failure, move to failed.
+            let msg = format!("{e}");
+            let failed_path = config.work_dir.run_dir(nickname, run_id, RunPhase::Failed);
+            if let Some(parent) = failed_path.parent() {
+                let _ = fs::create_dir_all(parent.as_std_path());
+            }
+            if let Err(rename_err) = fs::rename(&ready_path, failed_path.as_std_path()) {
+                warn!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    error = %rename_err,
+                    "failed to move malformed ready run to failed",
+                );
+            }
+            let status = purgery_core::RunStatus {
+                purgery_version: purgery_core::current_purgery_version().to_string(),
+                run_id: run_id.clone(),
+                nickname: nickname.clone(),
+                state: purgery_core::RunState::Failed,
+                entries: vec![],
+                error: Some(msg.clone()),
+            };
+            if let Ok(status_toml) = status.to_toml() {
+                let final_status_path = failed_path.join("status.toml");
+                let tmp_status_path = failed_path.join("status.toml.tmp");
+                if let Some(parent) = final_status_path.parent() {
+                    let _ = fs::create_dir_all(parent.as_std_path());
+                }
+                let _ = fs::write(&tmp_status_path, &status_toml);
+                let _ = fs::rename(&tmp_status_path, &final_status_path);
+            }
+            return Err(ProcessingError::Other(e));
+        }
+    };
+
+    // Claim the run by moving ready → processing.
+    let processing_path = config
+        .work_dir
+        .run_dir(nickname, run_id, RunPhase::Processing);
+    if let Some(parent) = processing_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create processing parent: {}", parent.as_str()))?;
+    }
+    fs::rename(&ready_path, &processing_path).with_context(|| {
+        format!(
+            "failed to claim run: {} -> {}",
+            ready_path.as_str(),
+            processing_path.as_str()
+        )
+    })?;
+
+    // Now process via the existing processing pipeline (version was already
+    // checked, but the pipeline re-checks at the start of process_processing_run
+    // for safety; that will be compatible since we already verified).
+    process_processing_run(config, nickname, run_id)
 }

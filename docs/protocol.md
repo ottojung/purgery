@@ -124,7 +124,8 @@ Source trailing slashes, `.`, and `..` are normalized before split discovery. `<
 | `heartbeat-run --nickname N --run-id R` | Extends incoming lease | (none) |
 | `run-state --nickname N --run-id R` | None | `RunStateResponse` TOML |
 | `status --nickname N --run-id R` | None | `RunStatus` TOML |
-| `process-once` | GC + recover + process one ready run | (none) |
+| `process-run --nickname N --run-id R` | Claims and processes the target ready run; no-op if already processing or terminal; does not process unrelated runs | (none) |
+| `process-once` | GC + recover + process all ready runs | (none) |
 | `check` | None | (none) |
 | `gc` | Collects expired runs | (none) |
 
@@ -135,7 +136,7 @@ incoming → ready → processing → done
                             ↘ failed
 ```
 
-A run moves from incoming to ready when the client calls `finish-run`. The server moves ready runs to processing internally during `process-once`. On completion, runs move to done or failed.
+A run moves from incoming to ready when the client calls `finish-run`. The server moves ready runs to processing via targeted `process-run` (triggered by the client) or batch `process-once` (operator/daemon). On completion, runs move to done or failed.
 
 All protocol output goes to stdout as TOML. Logs go to stderr.
 
