@@ -1746,6 +1746,19 @@ observed_at_unix_secs = 1000
             !log.iter().any(|c| c.contains("process-once")),
             "command log must NOT contain process-once: {log:?}"
         );
+        // The process-run command must include the targeted nickname and run-id
+        assert!(
+            log.iter()
+                .filter(|c| c.contains("process-run"))
+                .any(|c| c.contains("--nickname") && c.contains("laptop")),
+            "process-run must include --nickname laptop: {log:?}"
+        );
+        assert!(
+            log.iter()
+                .filter(|c| c.contains("process-run"))
+                .any(|c| c.contains("--run-id") && c.contains("test-run")),
+            "process-run must include --run-id test-run: {log:?}"
+        );
         assert!(
             log.iter().any(|c| c.contains("finish-run")),
             "command log must contain finish-run: {log:?}"
