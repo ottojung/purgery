@@ -7371,6 +7371,53 @@ delete_after_import = true
         assert!(!failed.exists(), "must NOT move processing run to failed");
     }
 
+    #[test]
+    fn process_once_loses_claim_race_does_not_move_processing_to_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("race-loser".into()).unwrap();
+
+        // Simulate the race: process-once lists this as ready...
+        let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
+        fs::create_dir_all(&ready).unwrap();
+        write_run_toml(&ready, &nickname);
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![],
+        };
+        fs::write(ready.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+
+        // ...but process-run claimed it before process-once could.
+        // Remove ready and create processing to simulate the race loss.
+        let processing = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        fs::create_dir_all(&processing).unwrap();
+        fs::remove_dir_all(&ready).unwrap();
+
+        // process-once calls claim_ready_run which sees processing, not ready.
+        let outcome = crate::process::claim_ready_run(&config, &nickname, &run_id);
+        assert!(
+            matches!(
+                outcome,
+                crate::process::ReadyClaimOutcome::AlreadyProcessing
+            ),
+            "claim must return AlreadyProcessing when processing exists: {outcome:?}"
+        );
+
+        // Processing run must remain intact
+        assert!(processing.exists(), "processing directory must remain");
+        let failed = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        assert!(!failed.exists(), "must NOT move processing run to failed");
+    }
+
     // ── progress/status version distinction in run-state ────────────
 
     #[test]

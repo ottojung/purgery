@@ -1875,6 +1875,53 @@ observed_at_unix_secs = 1000
     }
 
     #[test]
+    fn client_sees_ready_process_run_observes_processing_then_polls() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        // run-state returns ready → triggers process-run
+        runner.add_response("run-state", &ready_run_state_toml());
+        // process-run succeeds
+        runner.add_response("process-run", "");
+        // But another processor already claimed it — run-state shows processing
+        runner.add_response(
+            "run-state",
+            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-run\"\nphase = \"processing\"\nterminal = false\nmessage = \"run phase: processing\"\nupdated_at_unix_secs = 1000\nobserved_at_unix_secs = 1000\n",
+        );
+        // After polling, it becomes terminal
+        runner.add_response("run-state", &done_run_state_toml());
+        let status_toml =
+            "purgery_version = \"0.1.0-test\"\nrun_id = \"test-run\"\nnickname = \"laptop\"\nstate = \"done\"\n".to_string();
+        runner.add_response("status", &status_toml);
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        assert!(
+            result.is_ok(),
+            "sync must succeed even when process-run race loses: {result:?}"
+        );
+
+        let log = runner.command_log();
+        assert!(
+            log.iter().any(|c| c.contains("process-run")),
+            "command log must contain process-run: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|c| c.contains("process-once")),
+            "command log must NOT contain process-once: {log:?}"
+        );
+    }
+
+    #[test]
     fn resume_drives_processing_when_run_is_ready() {
         let tmp = tempdir().unwrap();
         let state_dir = mk_state_dir(&tmp);
