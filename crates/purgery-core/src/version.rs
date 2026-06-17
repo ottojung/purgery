@@ -10,16 +10,16 @@ pub const PURGERY_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Schema version for persisted lease files (`lease.toml`).
-/// Bump only when the lease file format changes.
-pub const LEASE_FILE_VERSION: u32 = 1;
+/// Bump when the lease file format changes.
+pub const LEASE_FILE_VERSION: u32 = PROTOCOL_VERSION;
 
 /// Schema version for persisted progress files (`progress.toml`).
-/// Bump only when the progress file format changes.
-pub const PROGRESS_FILE_VERSION: u32 = 1;
+/// Bump when the progress file format changes.
+pub const PROGRESS_FILE_VERSION: u32 = PROTOCOL_VERSION;
 
 /// Schema version for client-persisted run state (`state.toml`).
-/// Bump only when the client state file format changes.
-pub const CLIENT_RUN_STATE_VERSION: u32 = 1;
+/// Bump when the client state file format changes.
+pub const CLIENT_RUN_STATE_VERSION: u32 = PROTOCOL_VERSION;
 
 /// Typed representation of the `purgery-server version` response.
 #[derive(Debug, Clone, Deserialize)]
