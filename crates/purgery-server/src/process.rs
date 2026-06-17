@@ -471,9 +471,14 @@ pub(crate) fn claim_ready_run(
     }
 
     // Acquire the processor lock inside the ready directory BEFORE rename.
-    let lock = match crate::phases::try_lock_run_dir_processor(&ready_path) {
-        Ok(Some(l)) => l,
-        Ok(None) => return recheck_state(config, nickname, run_id),
+    let lock = match crate::phases::try_lock_existing_run_dir_processor(&ready_path) {
+        Ok(crate::phases::ProcessorLockAttempt::Acquired(l)) => l,
+        Ok(crate::phases::ProcessorLockAttempt::Busy) => {
+            return recheck_state(config, nickname, run_id);
+        }
+        Ok(crate::phases::ProcessorLockAttempt::Missing) => {
+            return recheck_state(config, nickname, run_id);
+        }
         Err(e) => {
             return ReadyClaimOutcome::ClaimFailed {
                 error: anyhow::anyhow!("failed to acquire processor lock: {e}"),
@@ -738,9 +743,16 @@ pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
     }
 
     for (nickname, run_id) in &processing_runs {
-        match recover_or_process_processing_run(config, nickname, run_id) {
-            Ok(()) => {}
-            Err(RecoveryError::IncompatibleStatus { message }) => {
+        match recover_processing_run_if_unlocked(config, nickname, run_id) {
+            Ok(ProcessingTargetOutcome::Recovered) => {}
+            Ok(ProcessingTargetOutcome::ActiveProcessor) => {
+                info!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    "processing run is locked by another processor; skipping",
+                );
+            }
+            Ok(ProcessingTargetOutcome::Incompatible { message }) => {
                 warn!(
                     nickname = %nickname.as_str(),
                     run_id = %run_id.as_str(),
@@ -748,7 +760,14 @@ pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
                     "processing run has incompatible status; leaving in place for operator inspection"
                 );
             }
-            Err(RecoveryError::Other(error)) => {
+            Ok(ProcessingTargetOutcome::NotFound) => {
+                info!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    "processing run disappeared before recovery",
+                );
+            }
+            Ok(ProcessingTargetOutcome::Error(error)) => {
                 warn!(
                     nickname = %nickname.as_str(),
                     run_id = %run_id.as_str(),
@@ -768,6 +787,16 @@ pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
                         &format!("processing recovery failed: {error}"),
                     )?;
                 }
+            }
+            Err(e) => {
+                warn!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    error = %e,
+                    "failed to check processor lock for processing run",
+                );
+                // Lock setup/check error is not a recovery error — do not
+                // move the run to failed.  Log and skip.
             }
         }
     }
@@ -832,7 +861,8 @@ pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
                     run_id = %run_id.as_str(),
                     original_error = %original_error,
                     publish_error = %publish_error,
-                    "malformed ready run could not be moved to failed; leaving for operator inspection",
+                    "malformed ready run could not be fully published as failed; \
+                     run may require operator inspection",
                 );
             }
             ReadyClaimOutcome::NotFound => {
@@ -854,6 +884,85 @@ pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Outcome of attempting to recover a processing run via the shared
+/// lock-aware helper.
+///
+/// Used by both targeted `process-run` and batch `process-once`.
+#[derive(Debug)]
+pub(crate) enum ProcessingTargetOutcome {
+    /// Processing run was successfully recovered to terminal.
+    Recovered,
+    /// Processing run is locked by another active processor.
+    ActiveProcessor,
+    /// Processing directory has an incompatible status that must be
+    /// left in place.
+    Incompatible { message: String },
+    /// Processing directory does not exist (race: it was removed
+    /// between discovery and lock attempt).
+    NotFound,
+    /// A real error occurred during recovery.
+    Error(anyhow::Error),
+}
+
+/// Try to recover a processing run, but only if the processor lock is
+/// free.
+///
+/// If the lock is busy, another process owns the run and we must not
+/// touch it (`ActiveProcessor`).  If the lock is acquired, recovery
+/// proceeds while the lock is held.  Lock setup/check errors are
+/// returned as errors, not swallowed.
+///
+/// This is the single shared helper for:
+/// - `process_run_target` (targeted processing)
+/// - `process_once_raw` (batch processing)
+pub(crate) fn recover_processing_run_if_unlocked(
+    config: &ServerConfig,
+    nickname: &Nickname,
+    run_id: &RunId,
+) -> Result<ProcessingTargetOutcome> {
+    let processing_path = config
+        .work_dir
+        .run_dir(nickname, run_id, RunPhase::Processing);
+
+    if !processing_path.exists() {
+        return Ok(ProcessingTargetOutcome::NotFound);
+    }
+
+    let lock = match crate::phases::try_lock_existing_run_dir_processor(&processing_path) {
+        Ok(crate::phases::ProcessorLockAttempt::Acquired(l)) => l,
+        Ok(crate::phases::ProcessorLockAttempt::Busy) => {
+            return Ok(ProcessingTargetOutcome::ActiveProcessor);
+        }
+        Ok(crate::phases::ProcessorLockAttempt::Missing) => {
+            return Ok(ProcessingTargetOutcome::NotFound);
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "failed to check processor lock on processing run {}/{}: {e}",
+                nickname.as_str(),
+                run_id.as_str(),
+            ));
+        }
+    };
+
+    info!(
+        nickname = %nickname.as_str(),
+        run_id = %run_id.as_str(),
+        "acquired processing run lock; recovering",
+    );
+
+    let result = recover_or_process_processing_run(config, nickname, run_id);
+    drop(lock);
+
+    match result {
+        Ok(()) => Ok(ProcessingTargetOutcome::Recovered),
+        Err(RecoveryError::IncompatibleStatus { message }) => {
+            Ok(ProcessingTargetOutcome::Incompatible { message })
+        }
+        Err(RecoveryError::Other(e)) => Ok(ProcessingTargetOutcome::Error(e)),
+    }
 }
 
 /// Process a specific run by nickname and run_id.
@@ -924,7 +1033,7 @@ fn process_run_target_inner(
             };
         }
         ReadyClaimOutcome::AlreadyProcessing => {
-            return handle_processing_target(config, nickname, run_id);
+            return handle_process_run_processing(config, nickname, run_id);
         }
         ReadyClaimOutcome::AlreadyTerminal => return Ok(()),
         ReadyClaimOutcome::IncompatibleReady { message } => {
@@ -951,7 +1060,7 @@ fn process_run_target_inner(
         .work_dir
         .run_dir(nickname, run_id, RunPhase::Processing);
     if processing_path.exists() {
-        return handle_processing_target(config, nickname, run_id);
+        return handle_process_run_processing(config, nickname, run_id);
     }
 
     // 3. Check terminal phases.
@@ -975,54 +1084,37 @@ fn process_run_target_inner(
     )
 }
 
-/// Handle a target run that is already in `processing`.
+/// Handle a target run that is in `processing` phase.
 ///
-/// Tries to acquire the processor lock.  If busy, another processor is
-/// active — return `Ok(())`.  If acquired, the run is abandoned and
-/// is recovered via `recover_or_process_processing_run`.
-fn handle_processing_target(
+/// Uses the shared `recover_processing_run_if_unlocked` helper so
+/// that lock-ownership invariants are the same as for `process-once`.
+fn handle_process_run_processing(
     config: &ServerConfig,
     nickname: &Nickname,
     run_id: &RunId,
 ) -> Result<()> {
-    let processing_path = config
-        .work_dir
-        .run_dir(nickname, run_id, RunPhase::Processing);
-
-    let lock = match crate::phases::try_lock_run_dir_processor(&processing_path) {
-        Ok(Some(l)) => l,
-        Ok(None) => {
+    match recover_processing_run_if_unlocked(config, nickname, run_id) {
+        Ok(ProcessingTargetOutcome::Recovered) => Ok(()),
+        Ok(ProcessingTargetOutcome::ActiveProcessor) => {
             info!(
                 nickname = %nickname.as_str(),
                 run_id = %run_id.as_str(),
                 "processing run is locked by another processor; skipping",
             );
-            return Ok(());
+            Ok(())
         }
-        Err(e) => {
-            warn!(
-                nickname = %nickname.as_str(),
-                run_id = %run_id.as_str(),
-                error = %e,
-                "failed to check processor lock on processing run",
-            );
-            return Ok(());
-        }
-    };
-
-    info!(
-        nickname = %nickname.as_str(),
-        run_id = %run_id.as_str(),
-        "acquired abandoned processing run lock; recovering",
-    );
-    let result = recover_or_process_processing_run(config, nickname, run_id);
-    drop(lock);
-
-    match result {
-        Ok(()) => Ok(()),
-        Err(RecoveryError::IncompatibleStatus { message }) => Err(anyhow::anyhow!(
+        Ok(ProcessingTargetOutcome::Incompatible { message }) => Err(anyhow::anyhow!(
             "abandoned processing run is incompatible: {message}"
         )),
-        Err(RecoveryError::Other(e)) => Err(e),
+        Ok(ProcessingTargetOutcome::NotFound) => {
+            info!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                "processing run disappeared before recovery",
+            );
+            Ok(())
+        }
+        Ok(ProcessingTargetOutcome::Error(e)) => Err(e),
+        Err(e) => Err(e),
     }
 }

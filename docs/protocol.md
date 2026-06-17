@@ -124,8 +124,8 @@ Source trailing slashes, `.`, and `..` are normalized before split discovery. `<
 | `heartbeat-run --nickname N --run-id R` | Extends incoming lease | (none) |
 | `run-state --nickname N --run-id R` | None | `RunStateResponse` TOML |
 | `status --nickname N --run-id R` | None | `RunStatus` TOML |
-| `process-run --nickname N --run-id R` | Claims/processes the target ready run; no-op if already processing or terminal; does not recover/replay processing runs; does not process unrelated runs | (none) |
-| `process-once` | GC + recover + process all ready runs | (none) |
+| `process-run --nickname N --run-id R` | Run global GC, then claim/process/recover the target run; if target processing is locked by another processor, no-op; does not process unrelated ready/processing runs | (none) |
+| `process-once` | Run global GC, recover unlocked processing runs (respecting active processor locks), process ready runs | (none) |
 | `check` | None | (none) |
 | `gc` | Collects expired runs | (none) |
 
@@ -137,6 +137,8 @@ incoming → ready → processing → done
 ```
 
 A run moves from incoming to ready when the client calls `finish-run`. The server moves ready runs to processing via targeted `process-run` (triggered by the client) or batch `process-once` (operator/daemon). On completion, runs move to done or failed.
+
+A processing run may be actively mutated only by a process holding the run's `processor.lock`. If `process-run` or `process-once` observes a processing run and the lock is busy, it treats that run as actively owned and does not recover or replay it. If the lock is free, the run is considered abandoned and may be recovered.
 
 All protocol output goes to stdout as TOML. Logs go to stderr.
 

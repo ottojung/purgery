@@ -8,6 +8,19 @@ use std::fs;
 use std::os::unix::io::AsRawFd;
 use tracing::{info, warn};
 
+/// Outcome of attempting to acquire a processor lock on an existing run
+/// directory.
+#[derive(Debug)]
+pub(crate) enum ProcessorLockAttempt {
+    /// Lock acquired. The caller may safely mutate the run.
+    Acquired(ProcessingRunLock),
+    /// Lock is held by another process. The caller must not mutate the run.
+    Busy,
+    /// The run directory does not exist. The caller should re-check state
+    /// (the run may have been claimed, completed, or cleaned up already).
+    Missing,
+}
+
 /// An exclusive file lock held on a processing run's `processor.lock` file.
 ///
 /// The lock is automatically released when the `ProcessingRunLock` is dropped
@@ -23,49 +36,43 @@ pub(crate) struct ProcessingRunLock {
 }
 
 impl ProcessingRunLock {
-    /// Try to acquire an exclusive advisory lock on the given directory's
+    /// Try to acquire an exclusive advisory lock on an existing directory's
     /// `processor.lock` file.
     ///
-    /// Returns `Ok(None)` if the lock is already held by another process.
-    /// Returns `Ok(Some(lock))` if this process now owns the lock.
+    /// Returns `Missing` if the run directory does not exist — the caller
+    /// must re-check state rather than recreating the directory.
+    /// Returns `Acquired` if the lock is obtained.
+    /// Returns `Busy` if another process holds the lock.
     /// Returns `Err` on IO errors or lock setup failures.
-    fn try_lock_dir(run_dir: &Utf8Path) -> Result<Option<Self>> {
+    fn try_lock_existing_dir(run_dir: &Utf8Path) -> Result<ProcessorLockAttempt> {
+        if !run_dir.exists() {
+            return Ok(ProcessorLockAttempt::Missing);
+        }
         let lock_path = run_dir.join("processor.lock");
         let file = match std::fs::OpenOptions::new()
             .create(true)
-            .truncate(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(lock_path.as_std_path())
         {
             Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let _ = fs::create_dir_all(run_dir.as_std_path());
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .truncate(true)
-                    .read(true)
-                    .write(true)
-                    .open(lock_path.as_std_path())
-                    .with_context(|| format!("failed to create processor lock: {lock_path}"))?
-            }
             Err(e) => {
                 anyhow::bail!("failed to open processor lock file {lock_path}: {e}")
             }
         };
 
         let fd = file.as_raw_fd();
-        // LOCK_EX | LOCK_NB = try exclusive lock without blocking
         let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
         if ret == 0 {
-            Ok(Some(ProcessingRunLock {
+            Ok(ProcessorLockAttempt::Acquired(ProcessingRunLock {
                 _file: file,
                 _path: lock_path,
             }))
         } else {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::WouldBlock {
-                Ok(None)
+                Ok(ProcessorLockAttempt::Busy)
             } else {
                 Err(err).with_context(|| format!("failed to lock processor: {lock_path}"))
             }
@@ -73,8 +80,16 @@ impl ProcessingRunLock {
     }
 }
 
-pub(crate) fn try_lock_run_dir_processor(run_dir: &Utf8Path) -> Result<Option<ProcessingRunLock>> {
-    ProcessingRunLock::try_lock_dir(run_dir)
+/// Try to acquire the processor lock on an existing run directory.
+///
+/// The directory must already exist — the caller must have confirmed it
+/// exists before calling this function.  If the directory has been removed
+/// between the check and the lock attempt, `Missing` is returned and the
+/// caller should re-check state.
+pub(crate) fn try_lock_existing_run_dir_processor(
+    run_dir: &Utf8Path,
+) -> Result<ProcessorLockAttempt> {
+    ProcessingRunLock::try_lock_existing_dir(run_dir)
 }
 
 pub(crate) fn publish_status_atomic(directory: &Utf8Path, status: &RunStatus) -> Result<()> {

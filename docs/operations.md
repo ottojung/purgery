@@ -56,9 +56,13 @@ purgery-client sync \
   -- ~/Videos user@server:/archive
 ```
 
-When `purgery-client sync` is invoked with `--transform`, the client uploads the run and finishes it, then automatically invokes remote `purgery-server process-run --nickname <nickname> --run-id <run-id>` on the server. This processes only the requested run — it does not touch other users' or other runs. This makes a single client-triggered transform sync self-contained: the server processing happens during the client invocation. The client does not require a separately running daemon, cron job, or timer for the normal transform path.
+When `purgery-client sync` is invoked with `--transform`, the client uploads the run and finishes it, then automatically invokes remote `purgery-server process-run --nickname <nickname> --run-id <run-id>` on the server.
 
-During `purgery-server process-run`, the server also starts opportunistic garbage collection in a concurrent thread. The command waits for that GC attempt to complete before returning. GC failure does not block target-run processing.
+`process-run` always attempts global GC first. This is intentional: Purgery does not require a daemon, cron job, or timer for routine cleanup, so client-triggered server work is also a maintenance opportunity. GC may affect unrelated expired incoming runs. GC failure is logged but does not prevent target-run processing.
+
+After GC, `process-run` only drives the requested run. It may claim the target from `ready`, recover an abandoned target in `processing`, observe that another processor is actively handling it, or observe that it is already terminal. It does not process unrelated ready/processing runs.
+
+This makes a single client-triggered transform sync self-contained: the server processing happens during the client invocation. The client does not require a separately running daemon, cron job, or timer for the normal transform path.
 
 Operators who want a daemon or timer to process all queued runs may run:
 
@@ -66,7 +70,7 @@ Operators who want a daemon or timer to process all queued runs may run:
 purgery-server process-once --config server.toml
 ```
 
-This recovers processing runs and processes all ready runs. It is independent of client-triggered `process-run`.
+This runs global GC, recovers unlocked processing runs (respecting active processor locks), and processes all ready runs. It is independent of client-triggered `process-run`.
 
 Passthrough syncs (without `--transform`) use direct rsync and do not call any server processing command.
 

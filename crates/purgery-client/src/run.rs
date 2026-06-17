@@ -240,86 +240,7 @@ fn drive_server_until_terminal(
         }
 
         match response.phase.as_str() {
-            "ready" => {
-                info!(
-                    nickname = %nickname.as_str(),
-                    run_id = %run_id.as_str(),
-                    "triggering server processing via process-run",
-                );
-                let pr_result = runner.server_cmd(
-                    host,
-                    server_cmd,
-                    &[
-                        "process-run",
-                        "--nickname",
-                        nickname.as_str(),
-                        "--run-id",
-                        run_id.as_str(),
-                    ],
-                );
-                // Capture follow-up run-state before inspecting pr_result so
-                // a failed run-state does not mask the process-run error.
-                let after_result = run_state(runner, host, server_cmd, nickname, run_id);
-
-                match (pr_result, after_result) {
-                    (_, Ok(after)) if after.terminal => {
-                        info!(
-                            nickname = %nickname.as_str(),
-                            run_id = %run_id.as_str(),
-                            phase = %after.phase,
-                            "run reached terminal phase after process-run"
-                        );
-                        return Ok(after);
-                    }
-                    (Err(pr_err), Ok(nonterminal)) => {
-                        anyhow::bail!(
-                            "automatic server processing failed for run {}/{}: \
-                             {pr_err}; re-checked run-state but run is still {}",
-                            nickname.as_str(),
-                            run_id.as_str(),
-                            nonterminal.phase,
-                        );
-                    }
-                    (Err(pr_err), Err(rs_err)) => {
-                        anyhow::bail!(
-                            "automatic server processing failed for run {}/{}: \
-                             {pr_err}; failed to re-check run-state: {rs_err}",
-                            nickname.as_str(),
-                            run_id.as_str(),
-                        );
-                    }
-                    (Ok(_), Err(rs_err)) => {
-                        anyhow::bail!(
-                            "failed to re-check run state after process-run \
-                             for run {}/{}: {rs_err}",
-                            nickname.as_str(),
-                            run_id.as_str(),
-                        );
-                    }
-                    (Ok(_), Ok(after)) => {
-                        // process-run succeeded but run is still not terminal.
-                        if after.phase == "ready" {
-                            anyhow::bail!(
-                                "process-run completed for run {}/{} but run is still ready; \
-                                 server may have incompatible or corrupt state",
-                                nickname.as_str(),
-                                run_id.as_str(),
-                            );
-                        }
-                        if after.phase != "processing" {
-                            anyhow::bail!(
-                                "unexpected run-state phase {:?} after process-run \
-                                 for run {}/{}",
-                                after.phase,
-                                nickname.as_str(),
-                                run_id.as_str(),
-                            );
-                        }
-                        // Run is processing — continue to poll below.
-                    }
-                }
-            }
-            "processing" => {
+            "ready" | "processing" => {
                 if response.phase != last_phase {
                     info!(
                         nickname = %nickname.as_str(),
@@ -330,20 +251,12 @@ fn drive_server_until_terminal(
                     last_phase = response.phase.clone();
                     attempts_since_report = 0;
                 }
-                // Call process-run for processing runs too — if the lock is
-                // free (abandoned), the server will recover the run; if busy,
-                // it returns quickly and we keep polling.
-                let _ = runner.server_cmd(
-                    host,
-                    server_cmd,
-                    &[
-                        "process-run",
-                        "--nickname",
-                        nickname.as_str(),
-                        "--run-id",
-                        run_id.as_str(),
-                    ],
-                );
+                if let Some(terminal) =
+                    trigger_process_run_and_recheck(runner, host, server_cmd, nickname, run_id)?
+                {
+                    return Ok(terminal);
+                }
+                // Non-terminal after process-run: poll again.
                 attempts_since_report += 1;
                 if attempts_since_report.is_multiple_of(12) {
                     info!(
@@ -371,6 +284,94 @@ fn drive_server_until_terminal(
         }
 
         std::thread::sleep(poll_interval);
+    }
+}
+
+/// Call `process-run` on the remote server and re-check the run state.
+///
+/// Returns `Ok(Some(terminal_state))` if the run is now terminal.
+/// Returns `Ok(None)` if the run is still non-terminal.
+/// Returns `Err` if process-run failed and the follow-up state is also
+/// non-terminal (or failed), ensuring errors are surfaced rather than
+/// swallowed.
+fn trigger_process_run_and_recheck(
+    runner: &RemoteRunner,
+    host: &str,
+    server_cmd: &str,
+    nickname: &Nickname,
+    run_id: &RunId,
+) -> Result<Option<RunStateResponse>> {
+    let pr_result = runner.server_cmd(
+        host,
+        server_cmd,
+        &[
+            "process-run",
+            "--nickname",
+            nickname.as_str(),
+            "--run-id",
+            run_id.as_str(),
+        ],
+    );
+
+    // Capture follow-up run-state before inspecting pr_result so
+    // a failed run-state does not mask the process-run error.
+    let after_result = run_state(runner, host, server_cmd, nickname, run_id);
+
+    match (pr_result, after_result) {
+        (_, Ok(after)) if after.terminal => {
+            info!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                phase = %after.phase,
+                "run reached terminal phase after process-run"
+            );
+            Ok(Some(after))
+        }
+        (Err(pr_err), Ok(nonterminal)) => {
+            anyhow::bail!(
+                "automatic server processing failed for run {}/{}: \
+                 {pr_err}; re-checked run-state but run is still {}",
+                nickname.as_str(),
+                run_id.as_str(),
+                nonterminal.phase,
+            );
+        }
+        (Err(pr_err), Err(rs_err)) => {
+            anyhow::bail!(
+                "automatic server processing failed for run {}/{}: \
+                 {pr_err}; failed to re-check run-state: {rs_err}",
+                nickname.as_str(),
+                run_id.as_str(),
+            );
+        }
+        (Ok(_), Err(rs_err)) => {
+            anyhow::bail!(
+                "failed to re-check run state after process-run \
+                 for run {}/{}: {rs_err}",
+                nickname.as_str(),
+                run_id.as_str(),
+            );
+        }
+        (Ok(_), Ok(after)) => {
+            if after.phase == "ready" {
+                anyhow::bail!(
+                    "process-run completed for run {}/{} but run is still ready; \
+                     server may have incompatible or corrupt state",
+                    nickname.as_str(),
+                    run_id.as_str(),
+                );
+            }
+            if after.phase != "processing" {
+                anyhow::bail!(
+                    "unexpected run-state phase {:?} after process-run \
+                     for run {}/{}",
+                    after.phase,
+                    nickname.as_str(),
+                    run_id.as_str(),
+                );
+            }
+            Ok(None)
+        }
     }
 }
 
@@ -1991,6 +1992,177 @@ observed_at_unix_secs = 1000
         assert!(
             log.iter().any(|c| c.contains("process-run")),
             "resume must call process-run: {log:?}"
+        );
+    }
+
+    #[test]
+    fn resume_drives_processing_when_run_is_processing() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+
+        // First run-state call returns processing (run is already being
+        // processed by another server).  The client should call process-run
+        // on it and then poll until terminal.
+        runner.add_response(
+            "run-state",
+            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-resume-proc\"\nphase = \"processing\"\nterminal = false\nmessage = \"run phase: processing\"\nupdated_at_unix_secs = 1000\nobserved_at_unix_secs = 1000\n",
+        );
+        // process-run succeeds
+        runner.add_response("process-run", "");
+        // After process-run, run-state returns done
+        runner.add_response(
+            "run-state",
+            &done_run_state_toml().replace("test-run", "test-resume-proc"),
+        );
+        runner.add_response(
+            "status",
+            &done_status_toml().replace("test-run", "test-resume-proc"),
+        );
+
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: RunId::new("test-resume-proc".into()).unwrap(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            entries: vec![],
+        };
+        let run_config = RunConfig {
+            purgery_version: "0.1.0-test".to_string(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            destination: DestinationPath::new(camino::Utf8PathBuf::from("rel")).unwrap(),
+            delete_after_import: true,
+        };
+
+        persist_client_run_state(
+            &state_dir,
+            &Nickname::new("laptop".into()).unwrap(),
+            &RunId::new("test-resume-proc".into()).unwrap(),
+            "host",
+            "purgery-server",
+            &manifest,
+            &run_config,
+            None,
+            ClientRunPhase::WaitingForTerminalState,
+        )
+        .unwrap();
+
+        let result = resume_runs(&runner, &state_dir);
+        assert!(result.is_ok(), "resume must drive processing and succeed");
+
+        let log = runner.command_log();
+        assert!(
+            log.iter().any(|c| c.contains("process-run")),
+            "resume must call process-run for processing run: {log:?}"
+        );
+    }
+
+    #[test]
+    fn processing_state_process_run_error_is_surfaced() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+
+        // First run-state returns processing
+        runner.add_response(
+            "run-state",
+            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-prerr\"\nphase = \"processing\"\nterminal = false\nmessage = \"run phase: processing\"\nupdated_at_unix_secs = 1000\nobserved_at_unix_secs = 1000\n",
+        );
+        // process-run fails
+        runner.add_error("process-run", "simulated process-run failure");
+        // Follow-up run-state is non-terminal (still processing)
+        runner.add_response(
+            "run-state",
+            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-prerr\"\nphase = \"processing\"\nterminal = false\nmessage = \"run phase: processing\"\nupdated_at_unix_secs = 1001\nobserved_at_unix_secs = 1001\n",
+        );
+
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: RunId::new("test-prerr".into()).unwrap(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            entries: vec![],
+        };
+        let run_config = RunConfig {
+            purgery_version: "0.1.0-test".to_string(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            destination: DestinationPath::new(camino::Utf8PathBuf::from("rel")).unwrap(),
+            delete_after_import: true,
+        };
+
+        persist_client_run_state(
+            &state_dir,
+            &Nickname::new("laptop".into()).unwrap(),
+            &RunId::new("test-prerr".into()).unwrap(),
+            "host",
+            "purgery-server",
+            &manifest,
+            &run_config,
+            None,
+            ClientRunPhase::WaitingForTerminalState,
+        )
+        .unwrap();
+
+        let result = resume_runs(&runner, &state_dir);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("failed to resume"),
+            "must fail to resume due to process-run error: {err}"
+        );
+    }
+
+    #[test]
+    fn processing_state_process_run_error_ignored_only_if_followup_terminal() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+
+        // First run-state returns processing
+        runner.add_response(
+            "run-state",
+            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-prterm\"\nphase = \"processing\"\nterminal = false\nmessage = \"run phase: processing\"\nupdated_at_unix_secs = 1000\nobserved_at_unix_secs = 1000\n",
+        );
+        // process-run fails
+        runner.add_error("process-run", "simulated process-run failure");
+        // But follow-up run-state is terminal (another processor finished it)
+        runner.add_response(
+            "run-state",
+            &done_run_state_toml().replace("test-run", "test-prterm"),
+        );
+        runner.add_response(
+            "status",
+            &done_status_toml().replace("test-run", "test-prterm"),
+        );
+
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: RunId::new("test-prterm".into()).unwrap(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            entries: vec![],
+        };
+        let run_config = RunConfig {
+            purgery_version: "0.1.0-test".to_string(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            destination: DestinationPath::new(camino::Utf8PathBuf::from("rel")).unwrap(),
+            delete_after_import: true,
+        };
+
+        persist_client_run_state(
+            &state_dir,
+            &Nickname::new("laptop".into()).unwrap(),
+            &RunId::new("test-prterm".into()).unwrap(),
+            "host",
+            "purgery-server",
+            &manifest,
+            &run_config,
+            None,
+            ClientRunPhase::WaitingForTerminalState,
+        )
+        .unwrap();
+
+        let result = resume_runs(&runner, &state_dir);
+        assert!(
+            result.is_ok(),
+            "must succeed even when process-run fails if follow-up is terminal: {result:?}"
         );
     }
 
