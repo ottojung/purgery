@@ -135,6 +135,87 @@ pub fn probe_purgery_version_from_toml(input: &str) -> Result<String, VersionPro
     }
 }
 
+/// Outcome of checking a TOML document's `purgery_version` compatibility.
+///
+/// Three distinct outcomes so callers can distinguish:
+/// - Valid current-version content (Compatible)
+/// - Old/incompatible producer metadata — leave in place, do not mutate (Incompatible)
+/// - Syntactically invalid TOML — may be malformed current-state (InvalidToml)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TomlVersionCheck {
+    Compatible,
+    Incompatible {
+        producer: Option<String>,
+        reason: String,
+    },
+    InvalidToml {
+        error: String,
+    },
+}
+
+/// Check a TOML document's `purgery_version` without requiring full
+/// domain-struct deserialization.
+///
+/// Returns:
+/// - `Compatible` — version is present and major/minor-compatible
+/// - `Incompatible { producer, reason }` — version is missing,
+///   malformed, or incompatible; caller should warn, skip, leave in place
+/// - `InvalidToml { error }` — document is not valid TOML; caller may
+///   treat as malformed current-state
+pub fn check_toml_version(input: &str) -> TomlVersionCheck {
+    let value: toml::Value = match toml::from_str(input) {
+        Ok(v) => v,
+        Err(e) => {
+            return TomlVersionCheck::InvalidToml {
+                error: e.to_string(),
+            }
+        }
+    };
+    let version_str = match value.get("purgery_version").and_then(|v| v.as_str()) {
+        Some(v) => v.to_owned(),
+        None => {
+            return TomlVersionCheck::Incompatible {
+                producer: None,
+                reason: format!(
+                    "missing purgery_version (current is {})",
+                    current_purgery_version()
+                ),
+            }
+        }
+    };
+    match parse_purgery_version(&version_str) {
+        Err(VersionError::InvalidFormat(e)) => TomlVersionCheck::Incompatible {
+            producer: Some(version_str.clone()),
+            reason: format!("invalid purgery_version string {version_str:?}: {e}"),
+        },
+        Err(VersionError::Incompatible { .. }) => {
+            // parse_purgery_version never returns Incompatible, but handle for completeness
+            TomlVersionCheck::Incompatible {
+                producer: Some(version_str.clone()),
+                reason: format!(
+                    "producer {version_str}, current {}; major/minor must match",
+                    current_purgery_version()
+                ),
+            }
+        }
+        Ok(parsed) => {
+            let current = parse_purgery_version(current_purgery_version())
+                .expect("current package version is always valid");
+            if parsed.major == current.major && parsed.minor == current.minor {
+                TomlVersionCheck::Compatible
+            } else {
+                TomlVersionCheck::Incompatible {
+                    producer: Some(version_str.clone()),
+                    reason: format!(
+                        "producer {version_str}, current {}; major/minor must match",
+                        current_purgery_version()
+                    ),
+                }
+            }
+        }
+    }
+}
+
 /// Parse raw TOML, extract `purgery_version`, and check it is
 /// major/minor-compatible with the current package version.
 ///
