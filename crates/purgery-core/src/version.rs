@@ -11,15 +11,15 @@ pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Schema version for persisted lease files (`lease.toml`).
 /// Bump when the lease file format changes.
-pub const LEASE_FILE_VERSION: u32 = PROTOCOL_VERSION;
+pub const LEASE_FILE_VERSION: u32 = 1;
 
 /// Schema version for persisted progress files (`progress.toml`).
 /// Bump when the progress file format changes.
-pub const PROGRESS_FILE_VERSION: u32 = PROTOCOL_VERSION;
+pub const PROGRESS_FILE_VERSION: u32 = 1;
 
 /// Schema version for client-persisted run state (`state.toml`).
 /// Bump when the client state file format changes.
-pub const CLIENT_RUN_STATE_VERSION: u32 = PROTOCOL_VERSION;
+pub const CLIENT_RUN_STATE_VERSION: u32 = 1;
 
 /// Typed representation of the `purgery-server version` response.
 #[derive(Debug, Clone, Deserialize)]
