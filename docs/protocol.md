@@ -290,11 +290,13 @@ Phases: `upload_complete_finish_pending`, `waiting_for_terminal_state`, `termina
 
 Purgery uses two independent version concepts.
 
-### `protocol_version`
+### `protocol_version` (wire protocol)
 
-The protocol version describes the shape or family of machine-readable protocol messages and durable file envelopes. It must match exactly for client–server communication and for durable-file deserialization. Increment it when the wire format or durable-file structure changes.
+The `protocol_version` in server command responses describes the client/server wire protocol family. It must match exactly for client–server communication; the client validates it against its own `PROTOCOL_VERSION` constant.
 
-Current value: `1`.
+Current value: `2`.
+
+Persisted internal files (`lease.toml`, `progress.toml`, `state.toml`) carry their own independent schema version constants — they are not affected by wire protocol bumps unless their on-disk format actually changes.
 
 ### `purgery_version`
 

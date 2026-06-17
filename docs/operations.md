@@ -72,6 +72,8 @@ purgery-server process-once --config server.toml
 
 This runs global GC, recovers unlocked processing runs (respecting active processor locks), and processes all ready runs. It is independent of client-triggered `process-run`.
 
+Each processing run has a `processor.lock` file (using `flock`) that prevents concurrent mutation. A run may be mutated only by a process holding its lock. If the lock is held by another process, the run is considered actively owned and will not be recovered or replayed. A busy lock is normal concurrency, not an error. Terminal directories do not retain `processor.lock`.
+
 Passthrough syncs (without `--transform`) use direct rsync and do not call any server processing command.
 
 ### Source entry model
