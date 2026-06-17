@@ -7705,6 +7705,127 @@ not valid toml {{{"#,
         );
     }
 
+    // ── Lock held through failure mutation ─────────────────────────
+
+    #[test]
+    fn process_run_target_failure_keeps_lock_until_failed_move_complete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("lock-fail-tgt".into()).unwrap();
+
+        // Create a ready run — it will be claimed and processed.  The
+        // entries will fail (missing staged file), so the run ends up
+        // in failed state.  The processor lock must be held from claim
+        // through the final move to failed.
+        let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
+        fs::create_dir_all(&ready).unwrap();
+        write_run_toml(&ready, &nickname);
+
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![ManifestEntry {
+                local_path: ClientLocalPath::new("/source/missing.txt".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/missing.txt".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("missing.txt".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
+                size: 4,
+                mtime_ns: 1000000,
+                sha256: None,
+                link_target: None,
+                transform: None,
+            }],
+        };
+        fs::write(ready.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+
+        // process_run_target succeeds because the failed entries are
+        // handled gracefully (written as Failed status, moved to failed).
+        let result = process_run_target(&config, &nickname, &run_id);
+        assert!(result.is_ok(), "run processing must complete: {result:?}");
+
+        // Ready must be gone (claimed)
+        assert!(!ready.exists(), "ready dir must be claimed");
+
+        // Processing must be gone — the lock was held until after the
+        // move to failed completed.
+        let processing = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        assert!(
+            !processing.exists(),
+            "processing dir must be moved to failed while lock was held"
+        );
+
+        // Run must end up in failed
+        let failed = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        assert!(failed.exists(), "failed run must be in failed directory");
+        assert!(
+            failed.join("status.toml").exists(),
+            "failed run must have status.toml"
+        );
+    }
+
+    #[test]
+    fn process_once_ready_failure_keeps_lock_until_failed_move_complete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("lock-fail-once".into()).unwrap();
+
+        // Create a ready run that will fail during processing
+        let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
+        fs::create_dir_all(&ready).unwrap();
+        write_run_toml(&ready, &nickname);
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![ManifestEntry {
+                local_path: ClientLocalPath::new("/source/missing.txt".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/missing.txt".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("missing.txt".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
+                size: 4,
+                mtime_ns: 1000000,
+                sha256: None,
+                link_target: None,
+                transform: None,
+            }],
+        };
+        fs::write(ready.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+
+        let result = process_once_raw(&config);
+        assert!(result.is_ok(), "process_once_raw must complete: {result:?}");
+
+        // Ready must be gone (claimed)
+        assert!(!ready.exists(), "ready dir must be claimed");
+
+        // Processing must be gone (moved to failed while lock was held)
+        let processing = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        assert!(
+            !processing.exists(),
+            "processing dir must be moved to failed while lock was held"
+        );
+
+        // Run must end up in failed
+        let failed = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        assert!(failed.exists(), "failed run must be in failed directory");
+        assert!(
+            failed.join("status.toml").exists(),
+            "failed run must have status.toml"
+        );
+    }
+
     // ── progress/status version distinction in run-state ────────────
 
     #[test]

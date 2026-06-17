@@ -811,7 +811,6 @@ pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
         match claim_ready_run(config, nickname, run_id) {
             ReadyClaimOutcome::Claimed(lock) => {
                 let result = process_processing_run(config, nickname, run_id);
-                drop(lock);
                 if let Err(e) = result {
                     warn!(
                         nickname = %nickname.as_str(),
@@ -820,8 +819,17 @@ pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
                         error = %e,
                         "run failed"
                     );
-                    move_to_failed(&config.work_dir, nickname, run_id)?;
+                    // Lock is still held here — must not drop before mutation is complete.
+                    if let Err(move_err) = move_to_failed(&config.work_dir, nickname, run_id) {
+                        warn!(
+                            nickname = %nickname.as_str(),
+                            run_id = %run_id.as_str(),
+                            error = %move_err,
+                            "also failed to move run to failed",
+                        );
+                    }
                 }
+                drop(lock);
             }
             ReadyClaimOutcome::AlreadyProcessing => {
                 info!(
@@ -967,9 +975,9 @@ pub(crate) fn recover_processing_run_if_unlocked(
 
 /// Process a specific run by nickname and run_id.
 ///
-/// Always attempts global GC first.  This is intentional: without a daemon
-/// or timer, client-triggered server commands are also maintenance
-/// opportunities.  GC failure does not block target processing.
+/// Starts a global GC attempt as part of the command (in a concurrent
+/// thread) and waits for that GC attempt before returning.  GC failure
+/// is logged but does not block target processing.
 ///
 /// Then drives only the target run:
 /// - ready: claim with processor lock and process
@@ -1012,8 +1020,7 @@ fn process_run_target_inner(
     match claim_ready_run(config, nickname, run_id) {
         ReadyClaimOutcome::Claimed(lock) => {
             let result = process_processing_run(config, nickname, run_id);
-            drop(lock);
-            return match result {
+            let final_result = match result {
                 Ok(()) => Ok(()),
                 Err(ProcessingError::Incompatible { message, .. }) => {
                     Err(anyhow::anyhow!("incompatible run in processing: {message}"))
@@ -1026,11 +1033,17 @@ fn process_run_target_inner(
                         error = %error,
                         "run failed",
                     );
-                    move_to_failed(&config.work_dir, nickname, run_id)
-                        .with_context(|| "failed to move target run to failed")?;
-                    Err(error)
+                    // Lock is still held here — must not drop before mutation is complete.
+                    match move_to_failed(&config.work_dir, nickname, run_id) {
+                        Ok(()) => Err(error),
+                        Err(move_err) => Err(anyhow::anyhow!(
+                            "{error}; failed to move target run to failed: {move_err}"
+                        )),
+                    }
                 }
             };
+            drop(lock);
+            return final_result;
         }
         ReadyClaimOutcome::AlreadyProcessing => {
             return handle_process_run_processing(config, nickname, run_id);

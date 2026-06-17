@@ -204,13 +204,17 @@ fn read_status(
 }
 
 /// Poll `run-state` until the run reaches a terminal phase, actively
-/// driving server processing when the run is `ready`.
+/// driving server processing when the run is `ready` or `processing`.
 ///
-/// When the run is `ready`, this function invokes remote
-/// `purgery-server process-run --nickname <nickname> --run-id <run-id>` on the remote host using the
-/// configured server command.  If another processor is already
-/// handling the run and it transitions to `processing`, this function
-/// waits like the original `wait_for_terminal`.
+/// For `ready`: calls `process-run` immediately every time `ready` is
+/// observed, because that is the only way to transition the run to
+/// `processing`.
+///
+/// For `processing`: calls `process-run` immediately the first time
+/// `processing` is observed, and then at most once per
+/// `processing_drive_interval` to avoid running global GC too often.
+/// If the phase changes back to `processing` later, the counter resets
+/// and it drives immediately again.
 ///
 /// This makes a single `purgery-client sync --transform ...`
 /// invocation self-contained: the client uploads, finishes, and then
@@ -223,8 +227,10 @@ fn drive_server_until_terminal(
     run_id: &RunId,
 ) -> Result<RunStateResponse> {
     let poll_interval = Duration::from_secs(5);
+    let processing_drive_interval = Duration::from_secs(60);
     let mut last_phase = String::new();
     let mut attempts_since_report = 0u64;
+    let mut last_processing_drive: Option<std::time::Instant> = None;
 
     loop {
         let response = run_state(runner, host, server_cmd, nickname, run_id)?;
@@ -240,7 +246,7 @@ fn drive_server_until_terminal(
         }
 
         match response.phase.as_str() {
-            "ready" | "processing" => {
+            "ready" => {
                 if response.phase != last_phase {
                     info!(
                         nickname = %nickname.as_str(),
@@ -251,12 +257,51 @@ fn drive_server_until_terminal(
                     last_phase = response.phase.clone();
                     attempts_since_report = 0;
                 }
+                // Ready: always drive immediately — process-run is needed
+                // to claim the run.
                 if let Some(terminal) =
                     trigger_process_run_and_recheck(runner, host, server_cmd, nickname, run_id)?
                 {
                     return Ok(terminal);
                 }
-                // Non-terminal after process-run: poll again.
+                attempts_since_report += 1;
+                if attempts_since_report.is_multiple_of(12) {
+                    info!(
+                        nickname = %nickname.as_str(),
+                        run_id = %run_id.as_str(),
+                        phase = %last_phase,
+                        "still waiting for server to process run"
+                    );
+                }
+            }
+            "processing" => {
+                if response.phase != last_phase {
+                    info!(
+                        nickname = %nickname.as_str(),
+                        run_id = %run_id.as_str(),
+                        phase = %response.phase,
+                        "run phase changed"
+                    );
+                    last_phase = response.phase.clone();
+                    attempts_since_report = 0;
+                    // Phase just changed to processing: drive immediately
+                    // to handle abandoned runs.
+                    last_processing_drive = None;
+                }
+                // Only call process-run if enough time has passed since
+                // the last drive.  A long-running transform should not
+                // trigger GC every 5 seconds.
+                let should_drive = last_processing_drive
+                    .map(|t| t.elapsed() >= processing_drive_interval)
+                    .unwrap_or(true);
+                if should_drive {
+                    if let Some(terminal) =
+                        trigger_process_run_and_recheck(runner, host, server_cmd, nickname, run_id)?
+                    {
+                        return Ok(terminal);
+                    }
+                    last_processing_drive = Some(std::time::Instant::now());
+                }
                 attempts_since_report += 1;
                 if attempts_since_report.is_multiple_of(12) {
                     info!(
@@ -2053,6 +2098,205 @@ observed_at_unix_secs = 1000
         assert!(
             log.iter().any(|c| c.contains("process-run")),
             "resume must call process-run for processing run: {log:?}"
+        );
+    }
+
+    #[test]
+    fn processing_state_does_not_call_process_run_every_poll() {
+        // After the first process-run drive in the processing state,
+        // subsequent polls within the 60-second drive interval must
+        // not call process-run again.
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+
+        // First run-state call returns processing → triggers process-run
+        runner.add_response(
+            "run-state",
+            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-backoff\"\nphase = \"processing\"\nterminal = false\nmessage = \"run phase: processing\"\nupdated_at_unix_secs = 1000\nobserved_at_unix_secs = 1000\n",
+        );
+        // process-run succeeds
+        runner.add_response("process-run", "");
+        // trigger_process_run_and_recheck calls run-state again → still processing
+        runner.add_response(
+            "run-state",
+            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-backoff\"\nphase = \"processing\"\nterminal = false\nmessage = \"run phase: processing\"\nupdated_at_unix_secs = 1001\nobserved_at_unix_secs = 1001\n",
+        );
+        // Second poll: run-state returns processing again
+        // (should NOT call process-run, just poll)
+        runner.add_response(
+            "run-state",
+            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-backoff\"\nphase = \"processing\"\nterminal = false\nmessage = \"run phase: processing\"\nupdated_at_unix_secs = 1002\nobserved_at_unix_secs = 1002\n",
+        );
+        // Third poll: finally terminal
+        runner.add_response(
+            "run-state",
+            &done_run_state_toml().replace("test-run", "test-backoff"),
+        );
+        runner.add_response(
+            "status",
+            &done_status_toml().replace("test-run", "test-backoff"),
+        );
+
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: RunId::new("test-backoff".into()).unwrap(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            entries: vec![],
+        };
+        let run_config = RunConfig {
+            purgery_version: "0.1.0-test".to_string(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            destination: DestinationPath::new(camino::Utf8PathBuf::from("rel")).unwrap(),
+            delete_after_import: true,
+        };
+
+        persist_client_run_state(
+            &state_dir,
+            &Nickname::new("laptop".into()).unwrap(),
+            &RunId::new("test-backoff".into()).unwrap(),
+            "host",
+            "purgery-server",
+            &manifest,
+            &run_config,
+            None,
+            ClientRunPhase::WaitingForTerminalState,
+        )
+        .unwrap();
+
+        let result = resume_runs(&runner, &state_dir);
+        assert!(result.is_ok(), "resume must succeed: {result:?}");
+
+        let log = runner.command_log();
+        let pr_count = log.iter().filter(|c| c.contains("process-run")).count();
+        assert_eq!(
+            pr_count, 1,
+            "must call process-run exactly once (first processing poll, not subsequent): {log:?}"
+        );
+    }
+
+    #[test]
+    fn ready_state_calls_process_run_immediately() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+
+        // run-state returns ready → always drives immediately
+        runner.add_response(
+            "run-state",
+            &ready_run_state_toml().replace("test-run", "test-always-ready"),
+        );
+        runner.add_response("process-run", "");
+        // After process-run: processing (another processor claimed it)
+        runner.add_response(
+            "run-state",
+            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-always-ready\"\nphase = \"processing\"\nterminal = false\nmessage = \"run phase: processing\"\nupdated_at_unix_secs = 1000\nobserved_at_unix_secs = 1000\n",
+        );
+        // Poll again: still processing (within drive interval, no process-run)
+        runner.add_response(
+            "run-state",
+            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-always-ready\"\nphase = \"processing\"\nterminal = false\nmessage = \"run phase: processing\"\nupdated_at_unix_secs = 1001\nobserved_at_unix_secs = 1001\n",
+        );
+        // Finally terminal
+        runner.add_response(
+            "run-state",
+            &done_run_state_toml().replace("test-run", "test-always-ready"),
+        );
+        runner.add_response(
+            "status",
+            &done_status_toml().replace("test-run", "test-always-ready"),
+        );
+
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: RunId::new("test-always-ready".into()).unwrap(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            entries: vec![],
+        };
+        let run_config = RunConfig {
+            purgery_version: "0.1.0-test".to_string(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            destination: DestinationPath::new(camino::Utf8PathBuf::from("rel")).unwrap(),
+            delete_after_import: true,
+        };
+
+        persist_client_run_state(
+            &state_dir,
+            &Nickname::new("laptop".into()).unwrap(),
+            &RunId::new("test-always-ready".into()).unwrap(),
+            "host",
+            "purgery-server",
+            &manifest,
+            &run_config,
+            None,
+            ClientRunPhase::WaitingForTerminalState,
+        )
+        .unwrap();
+
+        let result = resume_runs(&runner, &state_dir);
+        assert!(result.is_ok(), "resume must succeed: {result:?}");
+
+        let log = runner.command_log();
+        assert!(
+            log.iter().any(|c| c.contains("process-run")),
+            "ready state must call process-run: {log:?}"
+        );
+    }
+
+    #[test]
+    fn resume_processing_drives_immediately() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+
+        // First run-state call returns processing → must drive immediately
+        runner.add_response(
+            "run-state",
+            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-resume-imm\"\nphase = \"processing\"\nterminal = false\nmessage = \"run phase: processing\"\nupdated_at_unix_secs = 1000\nobserved_at_unix_secs = 1000\n",
+        );
+        runner.add_response("process-run", "");
+        runner.add_response(
+            "run-state",
+            &done_run_state_toml().replace("test-run", "test-resume-imm"),
+        );
+        runner.add_response(
+            "status",
+            &done_status_toml().replace("test-run", "test-resume-imm"),
+        );
+
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: RunId::new("test-resume-imm".into()).unwrap(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            entries: vec![],
+        };
+        let run_config = RunConfig {
+            purgery_version: "0.1.0-test".to_string(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            destination: DestinationPath::new(camino::Utf8PathBuf::from("rel")).unwrap(),
+            delete_after_import: true,
+        };
+
+        persist_client_run_state(
+            &state_dir,
+            &Nickname::new("laptop".into()).unwrap(),
+            &RunId::new("test-resume-imm".into()).unwrap(),
+            "host",
+            "purgery-server",
+            &manifest,
+            &run_config,
+            None,
+            ClientRunPhase::WaitingForTerminalState,
+        )
+        .unwrap();
+
+        let result = resume_runs(&runner, &state_dir);
+        assert!(result.is_ok(), "resume must succeed: {result:?}");
+
+        let log = runner.command_log();
+        assert!(
+            log.iter().any(|c| c.contains("process-run")),
+            "must call process-run immediately on first processing observation: {log:?}"
         );
     }
 

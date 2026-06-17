@@ -124,7 +124,7 @@ Source trailing slashes, `.`, and `..` are normalized before split discovery. `<
 | `heartbeat-run --nickname N --run-id R` | Extends incoming lease | (none) |
 | `run-state --nickname N --run-id R` | None | `RunStateResponse` TOML |
 | `status --nickname N --run-id R` | None | `RunStatus` TOML |
-| `process-run --nickname N --run-id R` | Run global GC, then claim/process/recover the target run; if target processing is locked by another processor, no-op; does not process unrelated ready/processing runs | (none) |
+| `process-run --nickname N --run-id R` | Start global GC and wait for it before returning; drive only the target run by claiming/processing/recovering it; if target processing is locked by another processor, no-op; does not process unrelated ready/processing runs | (none) |
 | `process-once` | Run global GC, recover unlocked processing runs (respecting active processor locks), process ready runs | (none) |
 | `check` | None | (none) |
 | `gc` | Collects expired runs | (none) |
