@@ -27,7 +27,7 @@ client: rsync source entry to server staging area (files/<source-name>)
 client: persist local run state as upload_complete_finish_pending
 client: finish-run over SSH -> server moves incoming -> ready
 client: persist local state as waiting_for_terminal_state
-client: wait using run-state; retry only on ready/processing
+client: wait using run-state; actively drive via targeted process-run as needed
 client: on terminal: read status
 client: remove confirmed local original (server-confirmed cleanup)
 client: persist local state as cleanup_complete
@@ -145,7 +145,7 @@ All protocol output goes to stdout as TOML. Logs go to stderr.
 ## BeginRunResponse
 
 ```toml
-protocol_version = 1
+protocol_version = 2
 nickname = "laptop"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 incoming_dir = "/var/lib/purgery/work/laptop/incoming/01ARZ3NDEKTSV4RRFFQ69G5FAV"
@@ -249,7 +249,7 @@ The nickname is operational metadata and does not appear in final_paths.
 ## RunStateResponse
 
 ```toml
-protocol_version = 1
+protocol_version = 2
 nickname = "laptop"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 phase = "processing"
@@ -269,7 +269,7 @@ Phases: `incoming`, `ready`, `processing`, `done`, `failed`, `corrupt`, `not_fou
 The client persists per-run state under `{state_dir}/runs/{nickname}-{run_id}/state.toml`. This enables crash-safe resume of waiting and cleanup.
 
 ```toml
-protocol_version = 1
+protocol_version = 2
 nickname = "laptop"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 host = "user@server"
@@ -319,7 +319,7 @@ Examples:
 Before starting or resuming a server-backed operation, the client calls the server `version` command. The response is TOML:
 
 ```toml
-protocol_version = 1
+protocol_version = 2
 purgery_version = "0.1.0"
 ```
 
