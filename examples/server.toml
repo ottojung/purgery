@@ -1,3 +1,9 @@
+#
+# Put this file at the server's config path.
+# For example, if your server is user1@example.com
+# then this file probably belongs at `/home/user1/.config/purgery/config.toml`.
+#
+
 work_dir = "/var/lib/purgery/work"
 
 [[transform]]
