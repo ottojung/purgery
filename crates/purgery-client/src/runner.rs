@@ -119,6 +119,22 @@ impl RemoteCommandHandle {
             RemoteCommandHandleKind::Fake { .. } => Ok(()),
         }
     }
+
+    /// Block until the remote command exits.  For the real runner this
+    /// polls `try_wait` with a small delay.  For the fake runner it
+    /// returns the scripted exit immediately (the first time the exit
+    /// is available).
+    pub(crate) fn wait(&mut self) -> Result<RemoteCommandExit> {
+        loop {
+            match self.try_wait()? {
+                Some(exit) => return Ok(exit),
+                None => {
+                    // Small delay to avoid busy-waiting on a real process.
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        }
+    }
 }
 
 /// Information about a simulated spawned command for tests.
