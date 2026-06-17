@@ -674,10 +674,11 @@ pub fn heartbeat_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId)
     purgery_core::require_compatible_purgery_version(&lease.purgery_version, "lease")
         .with_context(|| "incompatible lease version")?;
 
-    if lease.protocol_version != 1 {
+    if lease.protocol_version != purgery_core::PROTOCOL_VERSION {
         anyhow::bail!(
-            "lease protocol version {} does not match expected 1",
-            lease.protocol_version
+            "lease protocol version {} does not match expected {}",
+            lease.protocol_version,
+            purgery_core::PROTOCOL_VERSION
         );
     }
     if lease.nickname != nickname.as_str() {
@@ -2050,7 +2051,7 @@ delete_after_import = true
 
         let response_str = begin_run(&server_config, &nickname, &run_id).unwrap();
         let response: purgery_core::BeginRunResponse = toml::from_str(&response_str).unwrap();
-        assert_eq!(response.protocol_version, 1);
+        assert_eq!(response.protocol_version, purgery_core::PROTOCOL_VERSION);
         assert_eq!(response.nickname, "laptop");
         assert_eq!(response.run_id, "test-begin");
 
@@ -2618,7 +2619,7 @@ delete_after_import = true
         // this parse would fail.
         let response: purgery_core::BeginRunResponse = toml::from_str(&response_str)
             .expect("begin-run stdout must be valid BeginRunResponse TOML");
-        assert_eq!(response.protocol_version, 1);
+        assert_eq!(response.protocol_version, purgery_core::PROTOCOL_VERSION);
         assert_eq!(response.nickname, "laptop");
         assert_eq!(response.run_id, "test-stdout-begin");
     }
@@ -7100,12 +7101,15 @@ expires_at_unix_secs = 9999999999999
         fs::create_dir_all(&incoming).unwrap();
         fs::write(
             incoming.join("lease.toml"),
-            r#"purgery_version = "0.1.0-test"
-protocol_version = 1
+            format!(
+                r#"purgery_version = "0.1.0-test"
+protocol_version = {}
 nickname = "laptop"
 run_id = "gc-lease-expired"
 expires_at_unix_secs = 1
 "#,
+                purgery_core::PROTOCOL_VERSION
+            ),
         )
         .unwrap();
 

@@ -465,23 +465,35 @@ mod tests {
         let runner = RemoteRunner::fake();
         runner.add_response(
             "begin-run",
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\n",
+            &format!(
+                "protocol_version = {}\npurgery_version = \"0.1.0-test\"\n",
+                purgery_core::PROTOCOL_VERSION
+            ),
         );
         runner.add_response(
             "prepare-run",
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\n",
+            &format!(
+                "protocol_version = {}\npurgery_version = \"0.1.0-test\"\n",
+                purgery_core::PROTOCOL_VERSION
+            ),
         );
 
         let out = runner.server_cmd("host", "ps", &["begin-run"]).unwrap();
         assert_eq!(
             out,
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\n"
+            format!(
+                "protocol_version = {}\npurgery_version = \"0.1.0-test\"\n",
+                purgery_core::PROTOCOL_VERSION
+            )
         );
 
         let out = runner.server_cmd("host", "ps", &["prepare-run"]).unwrap();
         assert_eq!(
             out,
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\n"
+            format!(
+                "protocol_version = {}\npurgery_version = \"0.1.0-test\"\n",
+                purgery_core::PROTOCOL_VERSION
+            )
         );
 
         let log = runner.command_log();
@@ -501,7 +513,10 @@ mod tests {
         let runner = RemoteRunner::fake();
         runner.add_response(
             "begin-run",
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\n",
+            &format!(
+                "protocol_version = {}\npurgery_version = \"0.1.0-test\"\n",
+                purgery_core::PROTOCOL_VERSION
+            ),
         );
         runner.add_error("begin-run", "simulated failure");
         let result = runner.server_cmd("host", "ps", &["begin-run"]);

@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use camino::Utf8Path;
 use purgery_core::{
-    current_purgery_version, Nickname, ProcessingProgress, PROTOCOL_VERSION, PurgeryRoot, RunId,
-    RunPhase, RunState, RunStatus, ServerConfig,
+    current_purgery_version, Nickname, ProcessingProgress, PurgeryRoot, RunId, RunPhase, RunState,
+    RunStatus, ServerConfig, PROTOCOL_VERSION,
 };
 use std::fs;
 use std::os::unix::io::AsRawFd;
@@ -623,10 +623,11 @@ pub fn finish_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) ->
             toml::from_str(&lease_content).with_context(|| "failed to parse lease file")?;
         purgery_core::require_compatible_purgery_version(&lease.purgery_version, "lease")
             .with_context(|| "incompatible lease version")?;
-        if lease.protocol_version != 1 {
+        if lease.protocol_version != PROTOCOL_VERSION {
             anyhow::bail!(
-                "lease protocol version {} does not match expected 1",
-                lease.protocol_version
+                "lease protocol version {} does not match expected {}",
+                lease.protocol_version,
+                PROTOCOL_VERSION
             );
         }
         if lease.nickname != nickname.as_str() {
