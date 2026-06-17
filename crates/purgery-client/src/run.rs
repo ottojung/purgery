@@ -209,9 +209,8 @@ fn read_status(
 /// The `process-run` is spawned in the background via `spawn_server_cmd`.
 /// The client polls `run-state` using short `server_cmd` calls.
 /// If the SSH transport fails, `run-state` decides whether to restart.
-/// If the command exits with a remote semantic error, the client fails
-/// immediately unless `run-state` reports that the run is terminal or
-/// that another processor is still actively handling it.
+/// If the command exits with a remote semantic error, the client re-polls
+/// `run-state` before deciding whether to fail.
 fn drive_server_until_terminal(
     runner: &RemoteRunner,
     host: &str,
@@ -269,9 +268,22 @@ fn drive_server_until_terminal(
                                 run_id.as_str(),
                                 stderr,
                             );
-                            if state.phase == "ready"
-                                || (state.phase == "processing"
-                                    && state.processor_state.as_deref() != Some("active"))
+                            // Re-poll run-state before deciding — the run may
+                            // have become terminal or active since we last checked.
+                            let fresh = match run_state(runner, host, server_cmd, nickname, run_id)
+                            {
+                                Ok(r) => r,
+                                Err(_) => {
+                                    anyhow::bail!("{err_msg}");
+                                }
+                            };
+                            if fresh.terminal {
+                                stop_worker_best_effort(&mut worker);
+                                return Ok(fresh);
+                            }
+                            if fresh.phase == "ready"
+                                || (fresh.phase == "processing"
+                                    && fresh.processor_state.as_deref() != Some("active"))
                             {
                                 anyhow::bail!("{err_msg}");
                             }
@@ -284,6 +296,7 @@ fn drive_server_until_terminal(
         }
 
         // Decide whether to start/restart the process-run worker.
+        // Never spawn while a local worker handle is still running.
         let processor_active = state
             .processor_state
             .as_deref()
@@ -292,7 +305,9 @@ fn drive_server_until_terminal(
 
         match state.phase.as_str() {
             "ready" => {
-                restart_worker = true;
+                if worker.is_none() {
+                    restart_worker = true;
+                }
             }
             "processing" => {
                 if !processor_active && worker.is_none() {
@@ -361,6 +376,109 @@ fn drive_server_until_terminal(
 fn stop_worker_best_effort(worker: &mut Option<RemoteCommandHandle>) {
     if let Some(w) = worker.as_mut() {
         let _ = w.kill();
+    }
+}
+
+/// A best-effort guard for a background remote command (e.g., GC).
+/// On finish, it waits or kills the command and logs the result.
+struct BackgroundCmdGuard {
+    handle: Option<RemoteCommandHandle>,
+    label: &'static str,
+    nickname: Nickname,
+    run_id: RunId,
+}
+
+impl BackgroundCmdGuard {
+    fn new(
+        runner: &RemoteRunner,
+        host: &str,
+        server_cmd: &str,
+        label: &'static str,
+        nickname: &Nickname,
+        run_id: &RunId,
+        args: &[&str],
+    ) -> Self {
+        let handle = match runner.spawn_server_cmd(host, server_cmd, args) {
+            Ok(h) => {
+                info!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    "spawned background {label}",
+                );
+                Some(h)
+            }
+            Err(e) => {
+                warn!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    error = %e,
+                    "failed to start background {label}",
+                );
+                None
+            }
+        };
+        BackgroundCmdGuard {
+            handle,
+            label,
+            nickname: nickname.clone(),
+            run_id: run_id.clone(),
+        }
+    }
+
+    /// Wait or settle the background command best-effort.
+    fn finish_best_effort(&mut self) {
+        if let Some(h) = self.handle.as_mut() {
+            for _ in 0..10 {
+                match h.try_wait() {
+                    Ok(Some(RemoteCommandExit::Success)) => {
+                        debug!(
+                            nickname = %self.nickname.as_str(),
+                            run_id = %self.run_id.as_str(),
+                            "background {label} completed successfully",
+                            label = self.label,
+                        );
+                        self.handle = None;
+                        return;
+                    }
+                    Ok(Some(RemoteCommandExit::TransportFailure { details, .. })) => {
+                        warn!(
+                            nickname = %self.nickname.as_str(),
+                            run_id = %self.run_id.as_str(),
+                            details,
+                            "background {label} transport failure",
+                            label = self.label,
+                        );
+                        self.handle = None;
+                        return;
+                    }
+                    Ok(Some(RemoteCommandExit::RemoteFailure { stderr, .. })) => {
+                        warn!(
+                            nickname = %self.nickname.as_str(),
+                            run_id = %self.run_id.as_str(),
+                            stderr,
+                            "background {label} remote failure",
+                            label = self.label,
+                        );
+                        self.handle = None;
+                        return;
+                    }
+                    Ok(Some(RemoteCommandExit::Killed)) => {
+                        self.handle = None;
+                        return;
+                    }
+                    Ok(None) => {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(_) => {
+                        self.handle = None;
+                        return;
+                    }
+                }
+            }
+            // Timed out waiting — kill it.
+            let _ = h.kill();
+            self.handle = None;
+        }
     }
 }
 
@@ -934,6 +1052,21 @@ pub(crate) fn run_sync_with_run_id(
 
     check_server_version(runner, &remote.host, server_cmd)
         .with_context(|| "server version compatibility check failed")?;
+
+    // Start background GC after confirming server compatibility.
+    // GC runs concurrently with the transform sync; failure is logged
+    // but does not fail the sync.  We await/best-effort settle GC before
+    // returning.
+    let mut gc_guard = BackgroundCmdGuard::new(
+        runner,
+        &remote.host,
+        server_cmd,
+        "gc",
+        &nickname,
+        run_id,
+        &["gc"],
+    );
+
     info!("starting server run");
     let begin_resp = begin_run(runner, &remote.host, server_cmd, &nickname, run_id)?;
 
@@ -1065,6 +1198,10 @@ pub(crate) fn run_sync_with_run_id(
     remove_client_run_state(&state_dir, &nickname, run_id);
 
     info!(state = %status.state.as_str(), "sync complete");
+
+    // Settle background GC best-effort before returning.
+    gc_guard.finish_best_effort();
+
     Ok(())
 }
 
