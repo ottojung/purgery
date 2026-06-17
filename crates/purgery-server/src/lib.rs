@@ -7108,6 +7108,154 @@ expires_at_unix_secs = 1
         );
     }
 
+    // ── process_run_target behavior ──────────────────────────────────
+
+    #[test]
+    fn process_run_target_failure_moves_to_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("tgt-fail".into()).unwrap();
+
+        // Create a ready run with good run.toml but missing manifest.toml
+        let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
+        fs::create_dir_all(&ready).unwrap();
+        write_run_toml(&ready, &nickname);
+
+        let result = process_run_target(&config, &nickname, &run_id);
+        assert!(
+            result.is_err(),
+            "process_run_target must fail for missing manifest"
+        );
+
+        // Run must NOT be left in ready or processing
+        assert!(
+            !ready.exists(),
+            "failed ready run must be moved out of ready"
+        );
+        let processing = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        assert!(
+            !processing.exists(),
+            "failed run must not be left in processing"
+        );
+
+        // Run must be moved to failed
+        let failed = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        assert!(failed.exists(), "failed run must be in failed directory");
+        assert!(
+            failed.join("status.toml").exists(),
+            "failed run must have a status file"
+        );
+    }
+
+    #[test]
+    fn process_run_target_incompatible_ready_left_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("tgt-incompat".into()).unwrap();
+
+        // Create a ready run with incompatible purgery_version in run.toml
+        let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
+        fs::create_dir_all(&ready).unwrap();
+        fs::write(
+            ready.join("run.toml"),
+            format!(
+                r#"purgery_version = "99.0.0"
+nickname = "{}"
+destination = "/tmp/dest"
+delete_after_import = true
+"#,
+                nickname.as_str()
+            ),
+        )
+        .unwrap();
+
+        let result = process_run_target(&config, &nickname, &run_id);
+        assert!(
+            result.is_err(),
+            "process_run_target must fail for incompatible run"
+        );
+
+        // Incompatible ready run must be left in place
+        assert!(
+            ready.exists(),
+            "incompatible ready run must remain in ready"
+        );
+        let failed = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        assert!(!failed.exists(), "must NOT move to failed");
+        let processing = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        assert!(!processing.exists(), "must NOT move to processing");
+    }
+
+    #[test]
+    fn process_run_target_idempotent_on_terminal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("tgt-term".into()).unwrap();
+
+        // Create a done run with valid terminal status
+        let done = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
+        fs::create_dir_all(&done).unwrap();
+        let status = RunStatus {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            state: RunState::Done,
+            entries: vec![],
+            error: None,
+        };
+        fs::write(done.join("status.toml"), status.to_toml().unwrap()).unwrap();
+
+        // process_run_target on a terminal run must succeed (idempotent)
+        let result = process_run_target(&config, &nickname, &run_id);
+        assert!(
+            result.is_ok(),
+            "process_run_target on terminal run must succeed"
+        );
+
+        // Terminal directory must still exist unchanged
+        assert!(done.exists(), "terminal run must still exist");
+        assert!(
+            done.join("status.toml").exists(),
+            "terminal status must still exist"
+        );
+    }
+
+    #[test]
+    fn process_run_target_not_found_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("tgt-nonexistent".into()).unwrap();
+
+        let result = process_run_target(&config, &nickname, &run_id);
+        assert!(
+            result.is_err(),
+            "process_run_target must fail for nonexistent run"
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("not found"),
+            "error must mention 'not found'"
+        );
+    }
+
     // ── progress/status version distinction in run-state ────────────
 
     #[test]

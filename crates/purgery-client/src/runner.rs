@@ -117,7 +117,6 @@ impl RemoteRunner {
     }
 
     #[allow(dead_code)]
-    #[allow(dead_code)]
     pub(crate) fn set_finish_run_hook(&self, hook: Box<dyn Fn() + Send>) {
         match self {
             RemoteRunner::Fake { inner } => {

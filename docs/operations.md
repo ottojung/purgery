@@ -56,9 +56,9 @@ purgery-client sync \
   -- ~/Videos user@server:/archive
 ```
 
-When `purgery-client sync` is invoked with `--transform`, the client uploads the run and finishes it, then automatically invokes remote `purgery-server process-run <nickname> <run-id>` on the server. This processes only the requested run — it does not touch other users' or other runs. This makes a single client-triggered transform sync self-contained: the server processing happens during the client invocation. The client does not require a separately running daemon, cron job, or timer for the normal transform path.
+When `purgery-client sync` is invoked with `--transform`, the client uploads the run and finishes it, then automatically invokes remote `purgery-server process-run --nickname <nickname> --run-id <run-id>` on the server. This processes only the requested run — it does not touch other users' or other runs. This makes a single client-triggered transform sync self-contained: the server processing happens during the client invocation. The client does not require a separately running daemon, cron job, or timer for the normal transform path.
 
-After processing the target run, `purgery-server process-run` also starts opportunistic garbage collection best-effort in the background. GC failure does not block target-run processing.
+After processing the target run, `purgery-server process-run` also starts opportunistic garbage collection best-effort in a concurrent thread. The command waits for the GC attempt to complete before returning. GC failure does not block target-run processing.
 
 Operators who want a daemon or timer to process all queued runs may run:
 

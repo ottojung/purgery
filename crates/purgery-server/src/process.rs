@@ -729,8 +729,10 @@ pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
 
 /// Process a specific run by nickname and run_id.
 ///
-/// First starts opportunistic global GC in a background thread
-/// (best-effort — failure does not block target processing).
+/// Starts opportunistic global GC in a background thread (best-effort —
+/// failure does not block target processing), waits for the GC attempt
+/// to finish before returning.
+///
 /// Then dispatches based on the run's current phase:
 /// - `ready`: process via `process_ready_run`
 /// - `processing`: recover via `recover_or_process_processing_run`
@@ -743,23 +745,50 @@ pub fn process_run_target(
     nickname: &Nickname,
     run_id: &RunId,
 ) -> Result<()> {
-    // Start opportunistic GC best-effort in the background.
+    // Start opportunistic GC concurrently with target-run processing.
     let gc_config = config.clone();
-    std::thread::spawn(move || {
+    let gc_handle = std::thread::spawn(move || {
         if let Err(error) = run_gc(&gc_config) {
             warn!(error = %error, "opportunistic GC failed");
         }
     });
 
+    let target_result = process_run_target_inner(config, nickname, run_id);
+
+    if let Err(_panic) = gc_handle.join() {
+        warn!("opportunistic GC thread panicked");
+    }
+
+    target_result
+}
+
+/// Inner implementation of `process_run_target` without GC.
+fn process_run_target_inner(
+    config: &ServerConfig,
+    nickname: &Nickname,
+    run_id: &RunId,
+) -> Result<()> {
     // Check run phases in order: ready, processing, then terminal.
     let ready_path = config.work_dir.run_dir(nickname, run_id, RunPhase::Ready);
     if ready_path.exists() {
-        return process_ready_run(config, nickname, run_id).map_err(|e| match e {
-            ProcessingError::Incompatible { message, .. } => {
-                anyhow::anyhow!("incompatible run left in place: {message}")
+        return match process_ready_run(config, nickname, run_id) {
+            Ok(()) => Ok(()),
+            Err(ProcessingError::Incompatible { message, .. }) => {
+                Err(anyhow::anyhow!("incompatible run left in place: {message}"))
             }
-            ProcessingError::Other(e) => e,
-        });
+            Err(ProcessingError::Other(error)) => {
+                warn!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    phase = "processing",
+                    error = %error,
+                    "run failed",
+                );
+                move_to_failed(&config.work_dir, nickname, run_id)
+                    .with_context(|| "failed to move target run to failed")?;
+                Err(error)
+            }
+        };
     }
 
     let processing_path = config
