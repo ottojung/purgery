@@ -51,7 +51,7 @@ Send a whole directory:
 purgery-client sync \
   --transform compress-video \
   --delete-after-import \
-  --split '**/*.mp4'
+  --split '**/*.mp4' \
   -- ~/Videos user@server:/archive
 ```
 
