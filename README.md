@@ -74,5 +74,5 @@ The above will match all files in `~/Videos` and send them one-by-one, compressi
 
 # License
 
-Purgery is free software. Purger is distributed under AGPL version 3.
+Purgery is free software. Purgery is distributed under AGPL version 3.
 
