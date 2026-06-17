@@ -1,5 +1,5 @@
 
-Purgery runs configured one-way file flows: send files to a server, optionally process them there, and optionally remove the local copies afterward.
+Purgery runs configured one-way file flows: send files to a remote location, optionally process them there, and optionally remove the local copies afterward.
 
 ## Problem
 
