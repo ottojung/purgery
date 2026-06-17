@@ -394,8 +394,14 @@ fn drive_server_until_terminal_with_interval(
 
 fn stop_worker_best_effort(worker: &mut Option<RemoteCommandHandle>) {
     if let Some(w) = worker.as_mut() {
-        let _ = w.kill();
+        match w.try_wait() {
+            Ok(Some(_)) => {}
+            _ => {
+                let _ = w.kill();
+            }
+        }
     }
+    *worker = None;
 }
 
 /// A best-effort guard for a background remote command (e.g., GC).
@@ -444,9 +450,9 @@ impl BackgroundCmdGuard {
         }
     }
 
-    /// Wait for the background command to exit.  Logs the result but
+    /// Block until the background command exits.  Logs the result but
     /// does not fail — GC failure must not affect sync outcome.
-    fn finish_best_effort(&mut self) {
+    fn finish_best_effort_wait(&mut self) {
         if let Some(h) = self.handle.as_mut() {
             match h.wait() {
                 Ok(RemoteCommandExit::Success) => {
@@ -1222,7 +1228,7 @@ pub(crate) fn run_sync_with_run_id(
 
     // Settle GC on every exit path after it has been started.
     // GC failure is logged but does not change the sync result.
-    gc_guard.finish_best_effort();
+    gc_guard.finish_best_effort_wait();
 
     sync_result
 }
@@ -3403,5 +3409,461 @@ observed_at_unix_secs = 1000
                 );
             }
         }
+    }
+
+    // ── GC lifecycle tests ──────────────────────────────────────────
+
+    #[test]
+    fn gc_started_before_begin_run() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_spawned_cmd_exit("'gc'", 0, RemoteCommandExit::Success);
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        runner.add_response("run-state", &ready_run_state_toml());
+        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        assert!(result.is_ok(), "sync should succeed: {:?}", result.err());
+
+        let log = runner.command_log();
+        let gc_pos = log.iter().position(|c| c.contains("'gc'"));
+        let begin_pos = log.iter().position(|c| c.contains("begin-run"));
+        assert!(gc_pos.is_some(), "gc must appear in command log: {log:?}");
+        assert!(begin_pos.is_some(), "begin-run must appear in command log");
+        assert!(
+            gc_pos.unwrap() < begin_pos.unwrap(),
+            "gc must appear before begin-run in command log"
+        );
+    }
+
+    #[test]
+    fn gc_success_does_not_affect_sync_success() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_spawned_cmd_exit("'gc'", 0, RemoteCommandExit::Success);
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        assert!(result.is_ok(), "sync should succeed");
+    }
+
+    #[test]
+    fn gc_remote_failure_logged_but_sync_succeeds() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_spawned_cmd_exit(
+            "'gc'",
+            0,
+            RemoteCommandExit::RemoteFailure {
+                exit_code: Some(1),
+                stderr: "simulated gc failure".to_string(),
+            },
+        );
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        assert!(
+            result.is_ok(),
+            "sync must succeed even when GC fails: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn gc_transport_failure_logged_but_sync_succeeds() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_spawned_cmd_exit(
+            "'gc'",
+            0,
+            RemoteCommandExit::TransportFailure {
+                exit_code: Some(255),
+                details: "ssh connection failed".to_string(),
+            },
+        );
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        assert!(
+            result.is_ok(),
+            "sync must succeed even when GC transport fails: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn transform_sync_error_still_settles_gc() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_spawned_cmd_exit("'gc'", 0, RemoteCommandExit::Success);
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_write_error("run.toml", "write failed during staging");
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        assert!(result.is_err(), "sync must fail when write fails");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("write failed during staging"),
+            "error must preserve original staging error, got: {err}"
+        );
+
+        let log = runner.command_log();
+        assert!(
+            log.iter().any(|c| c.contains("'gc'")),
+            "gc must appear in command log even after staging failure"
+        );
+    }
+
+    #[test]
+    fn passthrough_sync_does_not_start_gc() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let run_id = RunId::new("test-run".into()).unwrap();
+        let args = SyncArgs {
+            transform: None,
+            delete_after_import: false,
+            split: None,
+            state_dir: Some(state_dir),
+            source: src_with_file(&tmp),
+            destination: "host:dest".to_string(),
+            server_command: "purgery-server".to_string(),
+        };
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        assert!(result.is_ok(), "passthrough sync must succeed");
+
+        let log = runner.command_log();
+        assert!(
+            !log.iter().any(|c| c.contains("'gc'")),
+            "passthrough sync must not start GC: {log:?}"
+        );
+    }
+
+    #[test]
+    fn cleanup_sync_without_transform_does_not_start_gc() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let run_id = RunId::new("test-run".into()).unwrap();
+        let args = SyncArgs {
+            transform: None,
+            delete_after_import: true,
+            split: None,
+            state_dir: Some(state_dir),
+            source: src_with_file(&tmp),
+            destination: "host:dest".to_string(),
+            server_command: "purgery-server".to_string(),
+        };
+
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
+        runner.add_response("run-state", &done_run_state_toml());
+        let status = r#"purgery_version = "0.1.0-test"
+run_id = "test-run"
+nickname = "laptop"
+state = "done"
+
+[[entries]]
+local_path = "/tmp/test"
+relative_path = "test"
+status = "imported"
+"#
+        .to_string();
+        runner.add_response("status", &status);
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        assert!(result.is_ok(), "cleanup sync must succeed");
+
+        let log = runner.command_log();
+        assert!(
+            !log.iter().any(|c| c.contains("'gc'")),
+            "cleanup sync without transform must not start GC: {log:?}"
+        );
+    }
+
+    #[test]
+    fn no_start_gc_in_log() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_spawned_cmd_exit("'gc'", 0, RemoteCommandExit::Success);
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        assert!(result.is_ok());
+
+        let log = runner.command_log();
+        for cmd in &["start-run", "worker-run", "start-gc", "gc-worker"] {
+            assert!(
+                !log.iter().any(|c| c.contains(cmd)),
+                "forbidden command '{cmd}' found in log: {log:?}"
+            );
+        }
+    }
+
+    // ── Process-run regression tests ───────────────────────────────
+
+    #[test]
+    fn transform_sync_uses_process_run_not_start_run() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_spawned_cmd_exit("'gc'", 0, RemoteCommandExit::Success);
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        // Run-state must show non-terminal (ready) so process-run is spawned
+        runner.add_response("run-state", &ready_run_state_toml());
+        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        assert!(result.is_ok());
+
+        let log = runner.command_log();
+        assert!(
+            log.iter().any(|c| c.contains("process-run")),
+            "transform sync must spawn process-run: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|c| c.contains("start-run")),
+            "transform sync must not use start-run: {log:?}"
+        );
+    }
+
+    #[test]
+    fn transport_failure_restarts_process_run_when_ready() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_spawned_cmd_exit("'gc'", 0, RemoteCommandExit::Success);
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        runner.add_response("run-state", &ready_run_state_toml());
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::TransportFailure {
+                exit_code: Some(255),
+                details: "ssh failed".to_string(),
+            },
+        );
+        runner.add_response("run-state", &ready_run_state_toml());
+        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        assert!(
+            result.is_ok(),
+            "sync should survive transport failure + restart"
+        );
+
+        let log = runner.command_log();
+        let pr_count = log.iter().filter(|c| c.contains("process-run")).count();
+        assert!(
+            pr_count >= 2,
+            "process-run must be restarted after transport failure, count={pr_count}: {log:?}"
+        );
+    }
+
+    #[test]
+    fn transport_failure_does_not_restart_when_processing_active() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_spawned_cmd_exit("'gc'", 0, RemoteCommandExit::Success);
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        runner.add_response("run-state", &ready_run_state_toml());
+        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
+        let active_processing = format!(
+            r#"protocol_version = {}
+purgery_version = "0.1.0-test"
+nickname = "laptop"
+run_id = "test-run"
+phase = "processing"
+terminal = false
+message = "processing"
+processor_state = "active"
+updated_at_unix_secs = 1000
+observed_at_unix_secs = 1000
+"#,
+            purgery_core::PROTOCOL_VERSION
+        );
+        runner.add_response("run-state", &active_processing);
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        assert!(result.is_ok(), "sync must succeed");
+
+        let log = runner.command_log();
+        let pr_count = log.iter().filter(|c| c.contains("process-run")).count();
+        assert!(
+            pr_count <= 2,
+            "process-run must not be respawned while processing is active, count={pr_count}: {log:?}"
+        );
+    }
+
+    #[test]
+    fn no_duplicate_process_run_while_handle_running() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_spawned_cmd_exit("'gc'", 0, RemoteCommandExit::Success);
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        runner.add_response("run-state", &ready_run_state_toml());
+        runner.add_spawned_cmd_exit("process-run", 3, RemoteCommandExit::Success);
+        runner.add_response("run-state", &ready_run_state_toml());
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        assert!(result.is_ok(), "sync must succeed");
+
+        let log = runner.command_log();
+        let pr_count = log.iter().filter(|c| c.contains("process-run")).count();
+        assert!(
+            pr_count == 1,
+            "process-run must be spawned exactly once (handle was still running), count={pr_count}: {log:?}"
+        );
     }
 }

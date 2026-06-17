@@ -933,4 +933,75 @@ mod tests {
         assert_eq!(*recorded_includes, includes);
         assert_eq!(*recorded_exclude, "*".to_string());
     }
+
+    #[test]
+    fn wait_returns_success_for_scripted_exit() {
+        let runner = RemoteRunner::fake();
+        runner.add_spawned_cmd_exit("test-cmd", 2, RemoteCommandExit::Success);
+        let mut handle = runner
+            .spawn_server_cmd("host", "ps", &["test-cmd"])
+            .unwrap();
+        // wait() must block until the exit is available (after 2 poll calls).
+        let exit = handle.wait().unwrap();
+        assert_eq!(exit, RemoteCommandExit::Success);
+    }
+
+    #[test]
+    fn wait_returns_transport_failure() {
+        let runner = RemoteRunner::fake();
+        runner.add_spawned_cmd_exit(
+            "test-cmd",
+            0,
+            RemoteCommandExit::TransportFailure {
+                exit_code: Some(255),
+                details: "connection refused".to_string(),
+            },
+        );
+        let mut handle = runner
+            .spawn_server_cmd("host", "ps", &["test-cmd"])
+            .unwrap();
+        let exit = handle.wait().unwrap();
+        assert_eq!(
+            exit,
+            RemoteCommandExit::TransportFailure {
+                exit_code: Some(255),
+                details: "connection refused".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn wait_returns_remote_failure() {
+        let runner = RemoteRunner::fake();
+        runner.add_spawned_cmd_exit(
+            "test-cmd",
+            1,
+            RemoteCommandExit::RemoteFailure {
+                exit_code: Some(1),
+                stderr: "error: something failed".to_string(),
+            },
+        );
+        let mut handle = runner
+            .spawn_server_cmd("host", "ps", &["test-cmd"])
+            .unwrap();
+        let exit = handle.wait().unwrap();
+        assert_eq!(
+            exit,
+            RemoteCommandExit::RemoteFailure {
+                exit_code: Some(1),
+                stderr: "error: something failed".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn wait_returns_killed_for_unscripted_command() {
+        let runner = RemoteRunner::fake();
+        // No scripted exit for this command — wait() must return Killed immediately.
+        let mut handle = runner
+            .spawn_server_cmd("host", "ps", &["unknown-cmd"])
+            .unwrap();
+        let exit = handle.wait().unwrap();
+        assert_eq!(exit, RemoteCommandExit::Killed);
+    }
 }
