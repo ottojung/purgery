@@ -225,6 +225,8 @@ fn drive_server_until_terminal(
     let poll_interval = Duration::from_secs(5);
     let mut last_phase = String::new();
     let mut attempts_since_report = 0u64;
+    let max_ready_retries = 3u64;
+    let mut ready_retries = 0u64;
 
     loop {
         let response = run_state(runner, host, server_cmd, nickname, run_id)?;
@@ -246,10 +248,48 @@ fn drive_server_until_terminal(
                     run_id = %run_id.as_str(),
                     "triggering server processing via process-once",
                 );
-                let _ = runner.server_cmd(host, server_cmd, &["process-once"]);
-                // After process-once, check run-state again.  process-once
-                // may have processed another ready run, so we re-check
-                // our own run state.
+                let po_result = runner.server_cmd(host, server_cmd, &["process-once"]);
+                // Immediately re-check run-state after process-once.
+                let after = run_state(runner, host, server_cmd, nickname, run_id)?;
+                if after.terminal {
+                    info!(
+                        nickname = %nickname.as_str(),
+                        run_id = %run_id.as_str(),
+                        phase = %after.phase,
+                        "run reached terminal phase after process-once"
+                    );
+                    return Ok(after);
+                }
+                // process-once failed and the run did not become terminal —
+                // surface the error.
+                if let Err(e) = po_result {
+                    anyhow::bail!(
+                        "automatic server processing failed for run {}/{}: {e}",
+                        nickname.as_str(),
+                        run_id.as_str(),
+                    );
+                }
+                // process-once succeeded but this run is still not terminal.
+                // If another ready run was processed, try again (bounded).
+                if after.phase == "ready" {
+                    ready_retries += 1;
+                    if ready_retries > max_ready_retries {
+                        anyhow::bail!(
+                            "automatic server processing did not claim run {}/{} \
+                             after {max_ready_retries} attempts; run is still ready",
+                            nickname.as_str(),
+                            run_id.as_str(),
+                        );
+                    }
+                    debug!(
+                        nickname = %nickname.as_str(),
+                        run_id = %run_id.as_str(),
+                        ready_retries,
+                        "process-once returned but our run is still ready; retrying",
+                    );
+                    continue;
+                }
+                // Run is now processing — continue to poll.
             }
             "processing" => {
                 if response.phase != last_phase {
@@ -1685,7 +1725,7 @@ observed_at_unix_secs = 1000
     }
 
     #[test]
-    fn transform_sync_drives_ready_to_terminal() {
+    fn transform_sync_process_once_failure_is_surfaced() {
         let tmp = tempdir().unwrap();
         let state_dir = mk_state_dir(&tmp);
         let runner = mk_runner();
@@ -1699,12 +1739,42 @@ observed_at_unix_secs = 1000
         );
         runner.add_response("heartbeat-run", "");
         runner.add_response("finish-run", "");
-        // Two rounds of ready → process-once before terminal
+        // run-state returns ready
         runner.add_response("run-state", &ready_run_state_toml());
-        runner.add_response("process-once", "");
+        // process-once returns an error
+        runner.add_error("process-once", "simulated process-once failure");
+        // After process-once error, re-check: run is still ready (non-terminal)
         runner.add_response("run-state", &ready_run_state_toml());
-        runner.add_response("process-once", "");
-        // Finally terminal
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("automatic server processing failed"),
+            "error must mention automatic server processing, got: {err}"
+        );
+    }
+
+    #[test]
+    fn transform_sync_process_once_failure_is_ignored_when_run_terminal() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        // run-state returns ready
+        runner.add_response("run-state", &ready_run_state_toml());
+        // process-once returns an error
+        runner.add_error("process-once", "simulated process-once failure");
+        // After process-once error, re-check: run is now terminal (another processor completed it)
         runner.add_response("run-state", &done_run_state_toml());
         let status_toml =
             "purgery_version = \"0.1.0-test\"\nrun_id = \"test-run\"\nnickname = \"laptop\"\nstate = \"done\"\n".to_string();
@@ -1713,14 +1783,38 @@ observed_at_unix_secs = 1000
         let result = run_sync_with_run_id(&runner, &args, &run_id);
         assert!(
             result.is_ok(),
-            "sync must succeed even when process-once needs multiple calls"
+            "sync must succeed when process-once fails but run is terminal"
         );
+    }
 
-        let log = runner.command_log();
-        let process_once_count = log.iter().filter(|c| c.contains("process-once")).count();
+    #[test]
+    fn transform_sync_repeated_ready_is_bounded() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        // 4 rounds of ready → process-once (exceeds the 3 limit)
+        for _ in 0..4 {
+            runner.add_response("run-state", &ready_run_state_toml());
+            runner.add_response("process-once", "");
+            runner.add_response("run-state", &ready_run_state_toml());
+        }
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
         assert!(
-            process_once_count >= 2,
-            "expected at least 2 process-once calls, got {process_once_count}: {log:?}"
+            err.contains("still ready"),
+            "error must mention run is still ready, got: {err}"
         );
     }
 
