@@ -1,8 +1,6 @@
 use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
-use purgery_core::{
-    Nickname, RunId, RunPhase, RunState, RunStatus, ServerConfig,
-};
+use purgery_core::{Nickname, RunId, RunPhase, RunState, RunStatus, ServerConfig};
 use std::fs;
 use tracing::{info, warn};
 
@@ -112,7 +110,8 @@ pub fn run_gc(config: &ServerConfig) -> Result<()> {
                                 }
                                 match toml::from_str::<purgery_core::LeaseFile>(&content) {
                                     Ok(lease) => {
-                                        if lease.protocol_version != purgery_core::LEASE_FILE_VERSION
+                                        if lease.protocol_version
+                                            != purgery_core::LEASE_FILE_VERSION
                                             || lease.nickname != nickname.as_str()
                                             || lease.run_id != run_id.as_str()
                                         {

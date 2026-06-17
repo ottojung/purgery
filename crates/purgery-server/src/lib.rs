@@ -7868,9 +7868,7 @@ nickname = "laptop"
         let run_id = RunId::new("busy-ready".into()).unwrap();
 
         // Create a ready run with valid inputs (non-empty manifest).
-        let ready = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(&ready).unwrap();
         write_run_toml(&ready, &nickname);
         let manifest = Manifest {
@@ -7941,9 +7939,7 @@ nickname = "laptop"
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("lock-cleanup-done".into()).unwrap();
 
-        let ready = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
         fs::create_dir_all(&ready).unwrap();
         write_run_toml(&ready, &nickname);
         let staged_rel = "files/test.txt".to_string();
@@ -7969,9 +7965,7 @@ nickname = "laptop"
 
         process_run(&config, &nickname, &run_id).unwrap();
 
-        let done = config
-            .work_dir
-            .run_dir(&nickname, &run_id, RunPhase::Done);
+        let done = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(
             !done.join("processor.lock").exists(),
             "done dir must not contain processor.lock"
