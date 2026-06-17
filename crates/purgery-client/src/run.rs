@@ -218,7 +218,26 @@ fn drive_server_until_terminal(
     nickname: &Nickname,
     run_id: &RunId,
 ) -> Result<RunStateResponse> {
-    let poll_interval = Duration::from_secs(5);
+    drive_server_until_terminal_with_interval(
+        runner,
+        host,
+        server_cmd,
+        nickname,
+        run_id,
+        Duration::from_secs(5),
+    )
+}
+
+/// Like `drive_server_until_terminal` but with a configurable poll interval.
+/// Tests can pass a tiny interval to avoid multi-second sleeps.
+fn drive_server_until_terminal_with_interval(
+    runner: &RemoteRunner,
+    host: &str,
+    server_cmd: &str,
+    nickname: &Nickname,
+    run_id: &RunId,
+    poll_interval: Duration,
+) -> Result<RunStateResponse> {
     let mut worker: Option<RemoteCommandHandle> = None;
     let mut last_phase = String::new();
     let mut attempts_since_report = 0u64;
@@ -1901,11 +1920,11 @@ observed_at_unix_secs = 1000
         );
         runner.add_response("heartbeat-run", "");
         runner.add_response("finish-run", "");
-        // First run-state returns ready → triggers start-run
+        // First run-state returns ready → triggers process-run
         runner.add_response("run-state", &ready_run_state_toml());
-        // start-run response (empty on success)
+        // process-run response (empty on success)
         runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
-        // After start-run: run-state returns done
+        // After process-run: run-state returns done
         runner.add_response("run-state", &done_run_state_toml());
         let status_toml =
             "purgery_version = \"0.1.0-test\"\nrun_id = \"test-run\"\nnickname = \"laptop\"\nstate = \"done\"\n".to_string();
@@ -1917,24 +1936,24 @@ observed_at_unix_secs = 1000
         let log = runner.command_log();
         assert!(
             log.iter().any(|c| c.contains("process-run")),
-            "command log must contain start-run: {log:?}"
+            "command log must contain process-run: {log:?}"
         );
         assert!(
             !log.iter().any(|c| c.contains("process-once")),
             "command log must NOT contain process-once: {log:?}"
         );
-        // The start-run command must include the targeted nickname and run-id
+        // The process-run command must include the targeted nickname and run-id
         assert!(
             log.iter()
                 .filter(|c| c.contains("process-run"))
                 .any(|c| c.contains("--nickname") && c.contains("laptop")),
-            "start-run must include --nickname laptop: {log:?}"
+            "process-run must include --nickname laptop: {log:?}"
         );
         assert!(
             log.iter()
                 .filter(|c| c.contains("process-run"))
                 .any(|c| c.contains("--run-id") && c.contains("test-run")),
-            "start-run must include --run-id test-run: {log:?}"
+            "process-run must include --run-id test-run: {log:?}"
         );
         assert!(
             log.iter().any(|c| c.contains("finish-run")),
@@ -1966,7 +1985,7 @@ observed_at_unix_secs = 1000
         runner.add_response("finish-run", "");
         // run-state returns ready
         runner.add_response("run-state", &ready_run_state_toml());
-        // start-run returns an error
+        // process-run returns an error
         runner.add_spawned_cmd_exit(
             "process-run",
             0,
@@ -1975,7 +1994,7 @@ observed_at_unix_secs = 1000
                 stderr: "simulated process-run failure".to_string(),
             },
         );
-        // After start-run error, re-check: run is still ready
+        // After process-run error, re-check: run is still ready
         runner.add_response("run-state", &ready_run_state_toml());
 
         let result = run_sync_with_run_id(&runner, &args, &run_id);
@@ -2007,7 +2026,7 @@ observed_at_unix_secs = 1000
         runner.add_response("finish-run", "");
         // run-state returns ready
         runner.add_response("run-state", &ready_run_state_toml());
-        // start-run returns an error
+        // process-run returns an error
         runner.add_spawned_cmd_exit(
             "process-run",
             0,
@@ -2016,7 +2035,7 @@ observed_at_unix_secs = 1000
                 stderr: "simulated process-run failure".to_string(),
             },
         );
-        // After start-run error, re-check: run is now terminal
+        // After process-run error, re-check: run is now terminal
         runner.add_response("run-state", &done_run_state_toml());
         let status_toml =
             "purgery_version = \"0.1.0-test\"\nrun_id = \"test-run\"\nnickname = \"laptop\"\nstate = \"done\"\n".to_string();
@@ -2025,7 +2044,7 @@ observed_at_unix_secs = 1000
         let result = run_sync_with_run_id(&runner, &args, &run_id);
         assert!(
             result.is_ok(),
-            "sync must succeed when start-run fails but run is terminal"
+            "sync must succeed when process-run fails but run is terminal"
         );
     }
 
@@ -2088,9 +2107,9 @@ observed_at_unix_secs = 1000
         );
         runner.add_response("heartbeat-run", "");
         runner.add_response("finish-run", "");
-        // run-state returns ready → triggers start-run
+        // run-state returns ready → triggers process-run
         runner.add_response("run-state", &ready_run_state_toml());
-        // start-run succeeds
+        // process-run succeeds
         runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
         // But another processor already claimed it — run-state shows processing
         runner.add_response(
@@ -2106,13 +2125,13 @@ observed_at_unix_secs = 1000
         let result = run_sync_with_run_id(&runner, &args, &run_id);
         assert!(
             result.is_ok(),
-            "sync must succeed even when start-run race loses: {result:?}"
+            "sync must succeed even when process-run race loses: {result:?}"
         );
 
         let log = runner.command_log();
         assert!(
             log.iter().any(|c| c.contains("process-run")),
-            "command log must contain start-run: {log:?}"
+            "command log must contain process-run: {log:?}"
         );
         assert!(
             !log.iter().any(|c| c.contains("process-once")),
@@ -2175,7 +2194,7 @@ observed_at_unix_secs = 1000
         let log = runner.command_log();
         assert!(
             log.iter().any(|c| c.contains("process-run")),
-            "resume must call start-run: {log:?}"
+            "resume must call process-run: {log:?}"
         );
     }
 
@@ -2186,12 +2205,12 @@ observed_at_unix_secs = 1000
         let runner = mk_runner();
 
         // First run-state call returns processing (run is already being
-        // processed by another server).  The client should call start-run
+        // processed by another server).  The client should call process-run
         // on it and then poll until terminal.
         runner.add_response("run-state", &processing_state("test-resume-proc", 1000));
-        // start-run succeeds
+        // process-run succeeds
         runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
-        // After start-run, run-state returns done
+        // After process-run, run-state returns done
         runner.add_response(
             "run-state",
             &done_run_state_toml().replace("test-run", "test-resume-proc"),
@@ -2233,15 +2252,15 @@ observed_at_unix_secs = 1000
         let log = runner.command_log();
         assert!(
             log.iter().any(|c| c.contains("process-run")),
-            "resume must call start-run for processing run: {log:?}"
+            "resume must call process-run for processing run: {log:?}"
         );
     }
 
     #[test]
     fn processing_state_does_not_call_process_run_every_poll() {
-        // After the first start-run drive in the processing state,
+        // After the first process-run drive in the processing state,
         // subsequent polls within the 60-second drive interval must
-        // not call start-run again.
+        // not call process-run again.
         let tmp = tempdir().unwrap();
         let state_dir = mk_state_dir(&tmp);
         let runner = mk_runner();
@@ -2253,7 +2272,7 @@ observed_at_unix_secs = 1000
         // trigger_start_run_and_recheck calls run-state again → still processing
         runner.add_response("run-state", &processing_state("test-backoff", 1001));
         // Second poll: run-state returns processing again
-        // (should NOT call start-run, just poll)
+        // (should NOT call process-run, just poll)
         runner.add_response("run-state", &processing_state("test-backoff", 1002));
         // Third poll: finally terminal
         runner.add_response(
@@ -2298,7 +2317,7 @@ observed_at_unix_secs = 1000
         let pr_count = log.iter().filter(|c| c.contains("process-run")).count();
         assert_eq!(
             pr_count, 1,
-            "must call start-run exactly once (first processing poll, not subsequent): {log:?}"
+            "must call process-run exactly once (first processing poll, not subsequent): {log:?}"
         );
     }
 
@@ -2314,9 +2333,9 @@ observed_at_unix_secs = 1000
             &ready_run_state_toml().replace("test-run", "test-always-ready"),
         );
         runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
-        // After start-run: processing (another processor claimed it)
+        // After process-run: processing (another processor claimed it)
         runner.add_response("run-state", &processing_state("test-always-ready", 1000));
-        // Poll again: still processing (within drive interval, no start-run)
+        // Poll again: still processing (within drive interval, no process-run)
         runner.add_response("run-state", &processing_state("test-always-ready", 1001));
         // Finally terminal
         runner.add_response(
@@ -2360,7 +2379,7 @@ observed_at_unix_secs = 1000
         let log = runner.command_log();
         assert!(
             log.iter().any(|c| c.contains("process-run")),
-            "ready state must call start-run: {log:?}"
+            "ready state must call process-run: {log:?}"
         );
     }
 
@@ -2414,7 +2433,7 @@ observed_at_unix_secs = 1000
         let log = runner.command_log();
         assert!(
             log.iter().any(|c| c.contains("process-run")),
-            "must call start-run immediately on first processing observation: {log:?}"
+            "must call process-run immediately on first processing observation: {log:?}"
         );
     }
 
@@ -2426,7 +2445,7 @@ observed_at_unix_secs = 1000
 
         // First run-state returns processing
         runner.add_response("run-state", &processing_state("test-prerr", 1000));
-        // start-run fails
+        // process-run fails
         runner.add_spawned_cmd_exit(
             "process-run",
             0,
@@ -2469,7 +2488,7 @@ observed_at_unix_secs = 1000
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("failed to resume"),
-            "must fail to resume due to start-run error: {err}"
+            "must fail to resume due to process-run error: {err}"
         );
     }
 
@@ -2481,7 +2500,7 @@ observed_at_unix_secs = 1000
 
         // First run-state returns processing
         runner.add_response("run-state", &processing_state("test-prterm", 1000));
-        // start-run fails
+        // process-run fails
         runner.add_spawned_cmd_exit(
             "process-run",
             0,
@@ -2529,7 +2548,7 @@ observed_at_unix_secs = 1000
         let result = resume_runs(&runner, &state_dir);
         assert!(
             result.is_ok(),
-            "must succeed even when start-run fails if follow-up is terminal: {result:?}"
+            "must succeed even when process-run fails if follow-up is terminal: {result:?}"
         );
     }
 
