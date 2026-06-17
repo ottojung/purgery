@@ -1556,6 +1556,7 @@ color = "never"
             current_entry: None,
             current_transform: None,
             progress_status: None,
+            processor_state: None,
         };
         let serialized = toml::to_string(&response).expect("serialize");
         // observed_at_unix_secs must be present in serialized output
@@ -1589,6 +1590,7 @@ color = "never"
             current_entry: None,
             current_transform: None,
             progress_status: None,
+            processor_state: None,
         };
         // When progress is missing, updated_at should not be equal to observed_at
         // (they serve different purposes)

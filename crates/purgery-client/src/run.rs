@@ -206,11 +206,11 @@ fn read_status(
 /// Poll `run-state` until the run reaches a terminal phase, actively
 /// driving server processing when the run is `ready` or `processing`.
 ///
-/// For `ready`: calls `process-run` immediately every time `ready` is
+/// For `ready`: calls `start-run` immediately every time `ready` is
 /// observed, because that is the only way to transition the run to
 /// `processing`.
 ///
-/// For `processing`: calls `process-run` immediately the first time
+/// For `processing`: calls `start-run` immediately the first time
 /// `processing` is observed, and then at most once per
 /// `processing_drive_interval` to avoid running global GC too often.
 /// If the phase changes back to `processing` later, the counter resets
@@ -227,10 +227,10 @@ fn drive_server_until_terminal(
     run_id: &RunId,
 ) -> Result<RunStateResponse> {
     let poll_interval = Duration::from_secs(5);
-    let processing_drive_interval = Duration::from_secs(60);
+    let start_run_cooldown = Duration::from_secs(60);
     let mut last_phase = String::new();
     let mut attempts_since_report = 0u64;
-    let mut last_processing_drive: Option<std::time::Instant> = None;
+    let mut last_start_run: Option<std::time::Instant> = None;
 
     loop {
         let response = run_state(runner, host, server_cmd, nickname, run_id)?;
@@ -257,10 +257,10 @@ fn drive_server_until_terminal(
                     last_phase = response.phase.clone();
                     attempts_since_report = 0;
                 }
-                // Ready: always drive immediately — process-run is needed
+                // Ready: always drive immediately — start-run is needed
                 // to claim the run.
                 if let Some(terminal) =
-                    trigger_process_run_and_recheck(runner, host, server_cmd, nickname, run_id)?
+                    trigger_start_run_and_recheck(runner, host, server_cmd, nickname, run_id)?
                 {
                     return Ok(terminal);
                 }
@@ -284,23 +284,30 @@ fn drive_server_until_terminal(
                     );
                     last_phase = response.phase.clone();
                     attempts_since_report = 0;
-                    // Phase just changed to processing: drive immediately
-                    // to handle abandoned runs.
-                    last_processing_drive = None;
                 }
-                // Only call process-run if enough time has passed since
-                // the last drive.  A long-running transform should not
-                // trigger GC every 5 seconds.
-                let should_drive = last_processing_drive
-                    .map(|t| t.elapsed() >= processing_drive_interval)
-                    .unwrap_or(true);
-                if should_drive {
+                // Only call start-run if the processor is not active.
+                // If another worker holds the lock, polling is sufficient.
+                // Also throttle start-run calls when processing is idle
+                // to avoid hammering SSH every poll interval.
+                let processor_active = response
+                    .processor_state
+                    .as_deref()
+                    .map(|s| s == "active")
+                    .unwrap_or(false);
+                let should_start = if processor_active {
+                    false
+                } else {
+                    last_start_run
+                        .map(|t| t.elapsed() >= start_run_cooldown)
+                        .unwrap_or(true)
+                };
+                if should_start {
                     if let Some(terminal) =
-                        trigger_process_run_and_recheck(runner, host, server_cmd, nickname, run_id)?
+                        trigger_start_run_and_recheck(runner, host, server_cmd, nickname, run_id)?
                     {
                         return Ok(terminal);
                     }
-                    last_processing_drive = Some(std::time::Instant::now());
+                    last_start_run = Some(std::time::Instant::now());
                 }
                 attempts_since_report += 1;
                 if attempts_since_report.is_multiple_of(12) {
@@ -332,25 +339,25 @@ fn drive_server_until_terminal(
     }
 }
 
-/// Call `process-run` on the remote server and re-check the run state.
+/// Call `start-run` on the remote server and re-check the run state.
 ///
 /// Returns `Ok(Some(terminal_state))` if the run is now terminal.
 /// Returns `Ok(None)` if the run is still non-terminal.
-/// Returns `Err` if process-run failed and the follow-up state is also
+/// Returns `Err` if start-run failed and the follow-up state is also
 /// non-terminal (or failed), ensuring errors are surfaced rather than
 /// swallowed.
-fn trigger_process_run_and_recheck(
+fn trigger_start_run_and_recheck(
     runner: &RemoteRunner,
     host: &str,
     server_cmd: &str,
     nickname: &Nickname,
     run_id: &RunId,
 ) -> Result<Option<RunStateResponse>> {
-    let pr_result = runner.server_cmd(
+    let sr_result = runner.server_cmd(
         host,
         server_cmd,
         &[
-            "process-run",
+            "start-run",
             "--nickname",
             nickname.as_str(),
             "--run-id",
@@ -358,40 +365,40 @@ fn trigger_process_run_and_recheck(
         ],
     );
 
-    // Capture follow-up run-state before inspecting pr_result so
-    // a failed run-state does not mask the process-run error.
+    // Capture follow-up run-state before inspecting sr_result so
+    // a failed run-state does not mask the start-run error.
     let after_result = run_state(runner, host, server_cmd, nickname, run_id);
 
-    match (pr_result, after_result) {
+    match (sr_result, after_result) {
         (_, Ok(after)) if after.terminal => {
             info!(
                 nickname = %nickname.as_str(),
                 run_id = %run_id.as_str(),
                 phase = %after.phase,
-                "run reached terminal phase after process-run"
+                "run reached terminal phase after start-run"
             );
             Ok(Some(after))
         }
-        (Err(pr_err), Ok(nonterminal)) => {
+        (Err(sr_err), Ok(nonterminal)) => {
             anyhow::bail!(
                 "automatic server processing failed for run {}/{}: \
-                 {pr_err}; re-checked run-state but run is still {}",
+                 {sr_err}; re-checked run-state but run is still {}",
                 nickname.as_str(),
                 run_id.as_str(),
                 nonterminal.phase,
             );
         }
-        (Err(pr_err), Err(rs_err)) => {
+        (Err(sr_err), Err(rs_err)) => {
             anyhow::bail!(
                 "automatic server processing failed for run {}/{}: \
-                 {pr_err}; failed to re-check run-state: {rs_err}",
+                 {sr_err}; failed to re-check run-state: {rs_err}",
                 nickname.as_str(),
                 run_id.as_str(),
             );
         }
         (Ok(_), Err(rs_err)) => {
             anyhow::bail!(
-                "failed to re-check run state after process-run \
+                "failed to re-check run state after start-run \
                  for run {}/{}: {rs_err}",
                 nickname.as_str(),
                 run_id.as_str(),
@@ -399,20 +406,20 @@ fn trigger_process_run_and_recheck(
         }
         (Ok(_), Ok(after)) => {
             if after.phase == "ready" {
-                // Still ready after process-run: another processor may be
+                // Still ready after start-run: another processor may be
                 // claiming the run.  Keep polling rather than failing
                 // immediately — the lock contention is transient.
                 info!(
                     nickname = %nickname.as_str(),
                     run_id = %run_id.as_str(),
-                    "run still ready after process-run (another processor may be claiming); \
+                    "run still ready after start-run (another processor may be claiming); \
                      continuing to poll",
                 );
                 return Ok(None);
             }
             if after.phase != "processing" {
                 anyhow::bail!(
-                    "unexpected run-state phase {:?} after process-run \
+                    "unexpected run-state phase {:?} after start-run \
                      for run {}/{}",
                     after.phase,
                     nickname.as_str(),
@@ -1823,11 +1830,11 @@ observed_at_unix_secs = 1000
         );
         runner.add_response("heartbeat-run", "");
         runner.add_response("finish-run", "");
-        // First run-state returns ready → triggers process-run
+        // First run-state returns ready → triggers start-run
         runner.add_response("run-state", &ready_run_state_toml());
-        // process-run response (empty on success)
-        runner.add_response("process-run", "");
-        // After process-run: run-state returns done
+        // start-run response (empty on success)
+        runner.add_response("start-run", "");
+        // After start-run: run-state returns done
         runner.add_response("run-state", &done_run_state_toml());
         let status_toml =
             "purgery_version = \"0.1.0-test\"\nrun_id = \"test-run\"\nnickname = \"laptop\"\nstate = \"done\"\n".to_string();
@@ -1838,25 +1845,25 @@ observed_at_unix_secs = 1000
 
         let log = runner.command_log();
         assert!(
-            log.iter().any(|c| c.contains("process-run")),
-            "command log must contain process-run: {log:?}"
+            log.iter().any(|c| c.contains("start-run")),
+            "command log must contain start-run: {log:?}"
         );
         assert!(
             !log.iter().any(|c| c.contains("process-once")),
             "command log must NOT contain process-once: {log:?}"
         );
-        // The process-run command must include the targeted nickname and run-id
+        // The start-run command must include the targeted nickname and run-id
         assert!(
             log.iter()
-                .filter(|c| c.contains("process-run"))
+                .filter(|c| c.contains("start-run"))
                 .any(|c| c.contains("--nickname") && c.contains("laptop")),
-            "process-run must include --nickname laptop: {log:?}"
+            "start-run must include --nickname laptop: {log:?}"
         );
         assert!(
             log.iter()
-                .filter(|c| c.contains("process-run"))
+                .filter(|c| c.contains("start-run"))
                 .any(|c| c.contains("--run-id") && c.contains("test-run")),
-            "process-run must include --run-id test-run: {log:?}"
+            "start-run must include --run-id test-run: {log:?}"
         );
         assert!(
             log.iter().any(|c| c.contains("finish-run")),
@@ -1888,9 +1895,9 @@ observed_at_unix_secs = 1000
         runner.add_response("finish-run", "");
         // run-state returns ready
         runner.add_response("run-state", &ready_run_state_toml());
-        // process-run returns an error
-        runner.add_error("process-run", "simulated process-run failure");
-        // After process-run error, re-check: run is still ready
+        // start-run returns an error
+        runner.add_error("start-run", "simulated start-run failure");
+        // After start-run error, re-check: run is still ready
         runner.add_response("run-state", &ready_run_state_toml());
 
         let result = run_sync_with_run_id(&runner, &args, &run_id);
@@ -1922,9 +1929,9 @@ observed_at_unix_secs = 1000
         runner.add_response("finish-run", "");
         // run-state returns ready
         runner.add_response("run-state", &ready_run_state_toml());
-        // process-run returns an error
-        runner.add_error("process-run", "simulated process-run failure");
-        // After process-run error, re-check: run is now terminal
+        // start-run returns an error
+        runner.add_error("start-run", "simulated start-run failure");
+        // After start-run error, re-check: run is now terminal
         runner.add_response("run-state", &done_run_state_toml());
         let status_toml =
             "purgery_version = \"0.1.0-test\"\nrun_id = \"test-run\"\nnickname = \"laptop\"\nstate = \"done\"\n".to_string();
@@ -1933,7 +1940,7 @@ observed_at_unix_secs = 1000
         let result = run_sync_with_run_id(&runner, &args, &run_id);
         assert!(
             result.is_ok(),
-            "sync must succeed when process-run fails but run is terminal"
+            "sync must succeed when start-run fails but run is terminal"
         );
     }
 
@@ -1957,8 +1964,8 @@ observed_at_unix_secs = 1000
         runner.add_response("finish-run", "");
         // run-state returns ready
         runner.add_response("run-state", &ready_run_state_toml());
-        // process-run returns an error
-        runner.add_error("process-run", "simulated process-run failure");
+        // start-run returns an error
+        runner.add_error("start-run", "simulated start-run failure");
         // Follow-up run-state fails to parse
         runner.add_response(
             "run-state",
@@ -1976,8 +1983,8 @@ observed_at_unix_secs = 1000
             "error must mention run-state recheck failure, got: {err}"
         );
         assert!(
-            err.contains("simulated process-run failure"),
-            "error must include process-run error, got: {err}"
+            err.contains("simulated start-run failure"),
+            "error must include start-run error, got: {err}"
         );
         assert!(
             err.contains("re-check") || err.contains("run-state"),
@@ -2003,10 +2010,10 @@ observed_at_unix_secs = 1000
         );
         runner.add_response("heartbeat-run", "");
         runner.add_response("finish-run", "");
-        // run-state returns ready → triggers process-run
+        // run-state returns ready → triggers start-run
         runner.add_response("run-state", &ready_run_state_toml());
-        // process-run succeeds
-        runner.add_response("process-run", "");
+        // start-run succeeds
+        runner.add_response("start-run", "");
         // But another processor already claimed it — run-state shows processing
         runner.add_response(
             "run-state",
@@ -2021,13 +2028,13 @@ observed_at_unix_secs = 1000
         let result = run_sync_with_run_id(&runner, &args, &run_id);
         assert!(
             result.is_ok(),
-            "sync must succeed even when process-run race loses: {result:?}"
+            "sync must succeed even when start-run race loses: {result:?}"
         );
 
         let log = runner.command_log();
         assert!(
-            log.iter().any(|c| c.contains("process-run")),
-            "command log must contain process-run: {log:?}"
+            log.iter().any(|c| c.contains("start-run")),
+            "command log must contain start-run: {log:?}"
         );
         assert!(
             !log.iter().any(|c| c.contains("process-once")),
@@ -2048,7 +2055,7 @@ observed_at_unix_secs = 1000
             "run-state",
             &ready_run_state_toml().replace("test-run", "test-resume-drive"),
         );
-        runner.add_response("process-run", "");
+        runner.add_response("start-run", "");
         runner.add_response(
             "run-state",
             &done_run_state_toml().replace("test-run", "test-resume-drive"),
@@ -2089,8 +2096,8 @@ observed_at_unix_secs = 1000
 
         let log = runner.command_log();
         assert!(
-            log.iter().any(|c| c.contains("process-run")),
-            "resume must call process-run: {log:?}"
+            log.iter().any(|c| c.contains("start-run")),
+            "resume must call start-run: {log:?}"
         );
     }
 
@@ -2101,12 +2108,12 @@ observed_at_unix_secs = 1000
         let runner = mk_runner();
 
         // First run-state call returns processing (run is already being
-        // processed by another server).  The client should call process-run
+        // processed by another server).  The client should call start-run
         // on it and then poll until terminal.
         runner.add_response("run-state", &processing_state("test-resume-proc", 1000));
-        // process-run succeeds
-        runner.add_response("process-run", "");
-        // After process-run, run-state returns done
+        // start-run succeeds
+        runner.add_response("start-run", "");
+        // After start-run, run-state returns done
         runner.add_response(
             "run-state",
             &done_run_state_toml().replace("test-run", "test-resume-proc"),
@@ -2147,28 +2154,28 @@ observed_at_unix_secs = 1000
 
         let log = runner.command_log();
         assert!(
-            log.iter().any(|c| c.contains("process-run")),
-            "resume must call process-run for processing run: {log:?}"
+            log.iter().any(|c| c.contains("start-run")),
+            "resume must call start-run for processing run: {log:?}"
         );
     }
 
     #[test]
     fn processing_state_does_not_call_process_run_every_poll() {
-        // After the first process-run drive in the processing state,
+        // After the first start-run drive in the processing state,
         // subsequent polls within the 60-second drive interval must
-        // not call process-run again.
+        // not call start-run again.
         let tmp = tempdir().unwrap();
         let state_dir = mk_state_dir(&tmp);
         let runner = mk_runner();
 
-        // First run-state call returns processing → triggers process-run
+        // First run-state call returns processing → triggers start-run
         runner.add_response("run-state", &processing_state("test-backoff", 1000));
-        // process-run succeeds
-        runner.add_response("process-run", "");
-        // trigger_process_run_and_recheck calls run-state again → still processing
+        // start-run succeeds
+        runner.add_response("start-run", "");
+        // trigger_start_run_and_recheck calls run-state again → still processing
         runner.add_response("run-state", &processing_state("test-backoff", 1001));
         // Second poll: run-state returns processing again
-        // (should NOT call process-run, just poll)
+        // (should NOT call start-run, just poll)
         runner.add_response("run-state", &processing_state("test-backoff", 1002));
         // Third poll: finally terminal
         runner.add_response(
@@ -2210,10 +2217,10 @@ observed_at_unix_secs = 1000
         assert!(result.is_ok(), "resume must succeed: {result:?}");
 
         let log = runner.command_log();
-        let pr_count = log.iter().filter(|c| c.contains("process-run")).count();
+        let pr_count = log.iter().filter(|c| c.contains("start-run")).count();
         assert_eq!(
             pr_count, 1,
-            "must call process-run exactly once (first processing poll, not subsequent): {log:?}"
+            "must call start-run exactly once (first processing poll, not subsequent): {log:?}"
         );
     }
 
@@ -2228,10 +2235,10 @@ observed_at_unix_secs = 1000
             "run-state",
             &ready_run_state_toml().replace("test-run", "test-always-ready"),
         );
-        runner.add_response("process-run", "");
-        // After process-run: processing (another processor claimed it)
+        runner.add_response("start-run", "");
+        // After start-run: processing (another processor claimed it)
         runner.add_response("run-state", &processing_state("test-always-ready", 1000));
-        // Poll again: still processing (within drive interval, no process-run)
+        // Poll again: still processing (within drive interval, no start-run)
         runner.add_response("run-state", &processing_state("test-always-ready", 1001));
         // Finally terminal
         runner.add_response(
@@ -2274,8 +2281,8 @@ observed_at_unix_secs = 1000
 
         let log = runner.command_log();
         assert!(
-            log.iter().any(|c| c.contains("process-run")),
-            "ready state must call process-run: {log:?}"
+            log.iter().any(|c| c.contains("start-run")),
+            "ready state must call start-run: {log:?}"
         );
     }
 
@@ -2287,7 +2294,7 @@ observed_at_unix_secs = 1000
 
         // First run-state call returns processing → must drive immediately
         runner.add_response("run-state", &processing_state("test-resume-imm", 1000));
-        runner.add_response("process-run", "");
+        runner.add_response("start-run", "");
         runner.add_response(
             "run-state",
             &done_run_state_toml().replace("test-run", "test-resume-imm"),
@@ -2328,8 +2335,8 @@ observed_at_unix_secs = 1000
 
         let log = runner.command_log();
         assert!(
-            log.iter().any(|c| c.contains("process-run")),
-            "must call process-run immediately on first processing observation: {log:?}"
+            log.iter().any(|c| c.contains("start-run")),
+            "must call start-run immediately on first processing observation: {log:?}"
         );
     }
 
@@ -2341,8 +2348,8 @@ observed_at_unix_secs = 1000
 
         // First run-state returns processing
         runner.add_response("run-state", &processing_state("test-prerr", 1000));
-        // process-run fails
-        runner.add_error("process-run", "simulated process-run failure");
+        // start-run fails
+        runner.add_error("start-run", "simulated start-run failure");
         // Follow-up run-state is non-terminal (still processing)
         runner.add_response("run-state", &processing_state("test-prerr", 1001));
 
@@ -2377,7 +2384,7 @@ observed_at_unix_secs = 1000
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("failed to resume"),
-            "must fail to resume due to process-run error: {err}"
+            "must fail to resume due to start-run error: {err}"
         );
     }
 
@@ -2389,8 +2396,8 @@ observed_at_unix_secs = 1000
 
         // First run-state returns processing
         runner.add_response("run-state", &processing_state("test-prterm", 1000));
-        // process-run fails
-        runner.add_error("process-run", "simulated process-run failure");
+        // start-run fails
+        runner.add_error("start-run", "simulated start-run failure");
         // But follow-up run-state is terminal (another processor finished it)
         runner.add_response(
             "run-state",
@@ -2430,7 +2437,7 @@ observed_at_unix_secs = 1000
         let result = resume_runs(&runner, &state_dir);
         assert!(
             result.is_ok(),
-            "must succeed even when process-run fails if follow-up is terminal: {result:?}"
+            "must succeed even when start-run fails if follow-up is terminal: {result:?}"
         );
     }
 
