@@ -13,7 +13,7 @@ Some of these files can be copied as-is. Some should be stored in a compressed o
 
 ## What Purgery is for
 
-Purgery does one thing: it sends a single filesystem entry (a file, directory, or symlink) to a destination according to a configured plan.
+A basic Purgery operation sends one filesystem entry — a file, directory, or symlink — to a destination according to a configured plan.
 
 Depending on how you configure it:
 
@@ -23,10 +23,9 @@ Depending on how you configure it:
 
 Examples:
 
-* Send photos or videos from a laptop to long-term storage without removing them from the laptop.
 * Store compressed versions of large recordings; remove the large originals after compression succeeds.
 * Send project build outputs to a shared archive; remove the local build directory afterward.
-* Mirror a directory tree to a remote location one-way without removing local files.
+* Send photos or videos from a laptop to long-term storage without removing them from the laptop.
 
 ## Basic usage
 
