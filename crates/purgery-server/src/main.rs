@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use purgery_core::{ColorMode, LogFormat, LogLevel, Nickname, RunId, ServerConfig};
 use purgery_server::{
     begin_run, bootstrap, finish_run, heartbeat_run, prepare_run, process_once_raw,
-    read_run_status, run_gc, run_state, server_check, version_response,
+    process_run_target, read_run_status, run_gc, run_state, server_check, version_response,
 };
 use std::fs;
 
@@ -131,6 +131,13 @@ enum Command {
         #[arg(long)]
         run_id: String,
     },
+    /// Process a specific ready or processing run
+    ProcessRun {
+        #[arg(long)]
+        nickname: String,
+        #[arg(long)]
+        run_id: String,
+    },
 }
 
 /// Apply CLI logging overrides on top of a base config.
@@ -236,6 +243,11 @@ fn main() -> Result<()> {
                 "{}",
                 toml::to_string(&response).with_context(|| "failed to serialize run state")?
             );
+        }
+        Command::ProcessRun { nickname, run_id } => {
+            let nickname = Nickname::new(nickname).with_context(|| "invalid nickname")?;
+            let run_id = RunId::new(run_id).with_context(|| "invalid run ID")?;
+            process_run_target(&server_config, &nickname, &run_id)?;
         }
     }
 

@@ -42,8 +42,6 @@ If server directories do not exist, `check` reports an error.
 ## Normal operation
 
 ```sh
-purgery-server process-once --config server.toml
-
 purgery-client sync -- ~/video.mp4 user@server:/archive
 
 purgery-client sync \
@@ -58,13 +56,19 @@ purgery-client sync \
   -- ~/Videos user@server:/archive
 ```
 
-`process-once` runs side-effect-free server validation first, then GC opportunistically, then recovers processing runs and processes ready runs.
+When `purgery-client sync` is invoked with `--transform`, the client uploads the run and finishes it, then automatically invokes remote `purgery-server process-run <nickname> <run-id>` on the server. This processes only the requested run — it does not touch other users' or other runs. This makes a single client-triggered transform sync self-contained: the server processing happens during the client invocation. The client does not require a separately running daemon, cron job, or timer for the normal transform path.
 
-When `purgery-client sync` is invoked with `--transform`, the client uploads the run and then automatically invokes remote `purgery-server process-once` on the server. This makes a single client-triggered transform sync self-contained: the server processing happens during the client invocation. The client does not require a separately running daemon, cron job, or timer for the normal transform path.
+After processing the target run, `purgery-server process-run` also starts opportunistic garbage collection best-effort in the background. GC failure does not block target-run processing.
 
-Operators may still run `purgery-server process-once` independently (e.g., as a systemd timer). When another processor is already active, the client observes the run transitioning to `processing` and waits for the terminal state. If automatic server processing fails and the run has not reached a terminal state, the client reports the processing error.
+Operators who want a daemon or timer to process all queued runs may run:
 
-Passthrough syncs (without `--transform`) use direct rsync and do not call `process-once`.
+```sh
+purgery-server process-once --config server.toml
+```
+
+This recovers processing runs and processes all ready runs. It is independent of client-triggered `process-run`.
+
+Passthrough syncs (without `--transform`) use direct rsync and do not call any server processing command.
 
 ### Source entry model
 

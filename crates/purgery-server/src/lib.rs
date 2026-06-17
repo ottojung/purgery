@@ -20,7 +20,9 @@ mod transform;
 
 pub use gc::run_gc;
 pub use phases::{begin_run, find_processing_runs, find_ready_runs, finish_run, move_to_failed};
-pub use process::{process_once_raw, process_processing_run, process_ready_run};
+pub use process::{
+    process_once_raw, process_processing_run, process_ready_run, process_run_target,
+};
 pub use recover::{recover_or_process_processing_run, RecoveryError};
 pub use transform::{apply_transform, apply_transform_with_heartbeat};
 

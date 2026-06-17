@@ -726,3 +726,72 @@ pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
 
     Ok(())
 }
+
+/// Process a specific run by nickname and run_id.
+///
+/// First starts opportunistic global GC in a background thread
+/// (best-effort — failure does not block target processing).
+/// Then dispatches based on the run's current phase:
+/// - `ready`: process via `process_ready_run`
+/// - `processing`: recover via `recover_or_process_processing_run`
+/// - terminal: idempotent success
+/// - not found: error
+///
+/// Does not process unrelated runs.
+pub fn process_run_target(
+    config: &ServerConfig,
+    nickname: &Nickname,
+    run_id: &RunId,
+) -> Result<()> {
+    // Start opportunistic GC best-effort in the background.
+    let gc_config = config.clone();
+    std::thread::spawn(move || {
+        if let Err(error) = run_gc(&gc_config) {
+            warn!(error = %error, "opportunistic GC failed");
+        }
+    });
+
+    // Check run phases in order: ready, processing, then terminal.
+    let ready_path = config.work_dir.run_dir(nickname, run_id, RunPhase::Ready);
+    if ready_path.exists() {
+        return process_ready_run(config, nickname, run_id).map_err(|e| match e {
+            ProcessingError::Incompatible { message, .. } => {
+                anyhow::anyhow!("incompatible run left in place: {message}")
+            }
+            ProcessingError::Other(e) => e,
+        });
+    }
+
+    let processing_path = config
+        .work_dir
+        .run_dir(nickname, run_id, RunPhase::Processing);
+    if processing_path.exists() {
+        return recover_or_process_processing_run(config, nickname, run_id).map_err(|e| match e {
+            RecoveryError::IncompatibleStatus { message } => {
+                anyhow::anyhow!("incompatible run left in place: {message}")
+            }
+            RecoveryError::Other(e) => e,
+        });
+    }
+
+    // Check terminal phases.
+    let terminal_phases = [RunPhase::Done, RunPhase::Failed];
+    for phase in &terminal_phases {
+        let dir = config.work_dir.run_dir(nickname, run_id, *phase);
+        if dir.exists() {
+            info!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                phase = %phase.as_str(),
+                "run already terminal",
+            );
+            return Ok(());
+        }
+    }
+
+    anyhow::bail!(
+        "run {}/{} not found in ready, processing, or terminal phases",
+        nickname.as_str(),
+        run_id.as_str(),
+    )
+}

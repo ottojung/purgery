@@ -207,7 +207,7 @@ fn read_status(
 /// driving server processing when the run is `ready`.
 ///
 /// When the run is `ready`, this function invokes remote
-/// `purgery-server process-once` on the remote host using the
+/// `purgery-server process-run <nickname> <run-id>` on the remote host using the
 /// configured server command.  If another processor is already
 /// handling the run and it transitions to `processing`, this function
 /// waits like the original `wait_for_terminal`.
@@ -225,8 +225,6 @@ fn drive_server_until_terminal(
     let poll_interval = Duration::from_secs(5);
     let mut last_phase = String::new();
     let mut attempts_since_report = 0u64;
-    let max_ready_retries = 3u64;
-    let mut ready_retries = 0u64;
 
     loop {
         let response = run_state(runner, host, server_cmd, nickname, run_id)?;
@@ -246,72 +244,71 @@ fn drive_server_until_terminal(
                 info!(
                     nickname = %nickname.as_str(),
                     run_id = %run_id.as_str(),
-                    "triggering server processing via process-once",
+                    "triggering server processing via process-run",
                 );
-                let po_result = runner.server_cmd(host, server_cmd, &["process-once"]);
-                // Capture follow-up run-state before inspecting po_result so
-                // a failed run-state does not mask the original process-once error.
+                let pr_result = runner.server_cmd(
+                    host,
+                    server_cmd,
+                    &[
+                        "process-run",
+                        "--nickname",
+                        nickname.as_str(),
+                        "--run-id",
+                        run_id.as_str(),
+                    ],
+                );
+                // Capture follow-up run-state before inspecting pr_result so
+                // a failed run-state does not mask the process-run error.
                 let after_result = run_state(runner, host, server_cmd, nickname, run_id);
 
-                match (po_result, after_result) {
+                match (pr_result, after_result) {
                     (_, Ok(after)) if after.terminal => {
                         info!(
                             nickname = %nickname.as_str(),
                             run_id = %run_id.as_str(),
                             phase = %after.phase,
-                            "run reached terminal phase after process-once"
+                            "run reached terminal phase after process-run"
                         );
                         return Ok(after);
                     }
-                    (Err(po_err), Ok(nonterminal)) => {
+                    (Err(pr_err), Ok(nonterminal)) => {
                         anyhow::bail!(
                             "automatic server processing failed for run {}/{}: \
-                             {po_err}; re-checked run-state but run is still {}",
+                             {pr_err}; re-checked run-state but run is still {}",
                             nickname.as_str(),
                             run_id.as_str(),
                             nonterminal.phase,
                         );
                     }
-                    (Err(po_err), Err(rs_err)) => {
+                    (Err(pr_err), Err(rs_err)) => {
                         anyhow::bail!(
                             "automatic server processing failed for run {}/{}: \
-                             {po_err}; failed to re-check run-state: {rs_err}",
+                             {pr_err}; failed to re-check run-state: {rs_err}",
                             nickname.as_str(),
                             run_id.as_str(),
                         );
                     }
                     (Ok(_), Err(rs_err)) => {
                         anyhow::bail!(
-                            "failed to re-check run state after process-once \
+                            "failed to re-check run state after process-run \
                              for run {}/{}: {rs_err}",
                             nickname.as_str(),
                             run_id.as_str(),
                         );
                     }
                     (Ok(_), Ok(after)) => {
-                        // process-once succeeded but this run is still not terminal.
+                        // process-run succeeded but run is still not terminal.
                         if after.phase == "ready" {
-                            // Another ready run may have been processed; retry (bounded).
-                            ready_retries += 1;
-                            if ready_retries >= max_ready_retries {
-                                anyhow::bail!(
-                                    "automatic server processing did not claim run {}/{} \
-                                     after {max_ready_retries} attempts; run is still ready",
-                                    nickname.as_str(),
-                                    run_id.as_str(),
-                                );
-                            }
-                            debug!(
-                                nickname = %nickname.as_str(),
-                                run_id = %run_id.as_str(),
-                                ready_retries,
-                                "process-once returned but our run is still ready; retrying",
+                            anyhow::bail!(
+                                "process-run completed for run {}/{} but run is still ready; \
+                                 server may have incompatible or corrupt state",
+                                nickname.as_str(),
+                                run_id.as_str(),
                             );
-                            continue;
                         }
                         if after.phase != "processing" {
                             anyhow::bail!(
-                                "unexpected run-state phase {:?} after process-once \
+                                "unexpected run-state phase {:?} after process-run \
                                  for run {}/{}",
                                 after.phase,
                                 nickname.as_str(),
@@ -1713,7 +1710,7 @@ observed_at_unix_secs = 1000
     }
 
     #[test]
-    fn transform_sync_calls_process_once_after_finish_run() {
+    fn transform_sync_calls_process_run_after_finish_run() {
         let tmp = tempdir().unwrap();
         let state_dir = mk_state_dir(&tmp);
         let runner = mk_runner();
@@ -1727,11 +1724,11 @@ observed_at_unix_secs = 1000
         );
         runner.add_response("heartbeat-run", "");
         runner.add_response("finish-run", "");
-        // First run-state returns ready (non-terminal) → triggers process-once
+        // First run-state returns ready → triggers process-run
         runner.add_response("run-state", &ready_run_state_toml());
-        // process-once response (empty on success)
-        runner.add_response("process-once", "");
-        // After process-once: run-state returns done
+        // process-run response (empty on success)
+        runner.add_response("process-run", "");
+        // After process-run: run-state returns done
         runner.add_response("run-state", &done_run_state_toml());
         let status_toml =
             "purgery_version = \"0.1.0-test\"\nrun_id = \"test-run\"\nnickname = \"laptop\"\nstate = \"done\"\n".to_string();
@@ -1742,8 +1739,12 @@ observed_at_unix_secs = 1000
 
         let log = runner.command_log();
         assert!(
-            log.iter().any(|c| c.contains("process-once")),
-            "command log must contain process-once: {log:?}"
+            log.iter().any(|c| c.contains("process-run")),
+            "command log must contain process-run: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|c| c.contains("process-once")),
+            "command log must NOT contain process-once: {log:?}"
         );
         assert!(
             log.iter().any(|c| c.contains("finish-run")),
@@ -1756,7 +1757,7 @@ observed_at_unix_secs = 1000
     }
 
     #[test]
-    fn transform_sync_process_once_failure_is_surfaced() {
+    fn transform_sync_process_run_failure_is_surfaced() {
         let tmp = tempdir().unwrap();
         let state_dir = mk_state_dir(&tmp);
         let runner = mk_runner();
@@ -1772,9 +1773,9 @@ observed_at_unix_secs = 1000
         runner.add_response("finish-run", "");
         // run-state returns ready
         runner.add_response("run-state", &ready_run_state_toml());
-        // process-once returns an error
-        runner.add_error("process-once", "simulated process-once failure");
-        // After process-once error, re-check: run is still ready (non-terminal)
+        // process-run returns an error
+        runner.add_error("process-run", "simulated process-run failure");
+        // After process-run error, re-check: run is still ready
         runner.add_response("run-state", &ready_run_state_toml());
 
         let result = run_sync_with_run_id(&runner, &args, &run_id);
@@ -1787,7 +1788,7 @@ observed_at_unix_secs = 1000
     }
 
     #[test]
-    fn transform_sync_process_once_failure_is_ignored_when_run_terminal() {
+    fn transform_sync_process_run_failure_is_ignored_when_run_terminal() {
         let tmp = tempdir().unwrap();
         let state_dir = mk_state_dir(&tmp);
         let runner = mk_runner();
@@ -1803,9 +1804,9 @@ observed_at_unix_secs = 1000
         runner.add_response("finish-run", "");
         // run-state returns ready
         runner.add_response("run-state", &ready_run_state_toml());
-        // process-once returns an error
-        runner.add_error("process-once", "simulated process-once failure");
-        // After process-once error, re-check: run is now terminal (another processor completed it)
+        // process-run returns an error
+        runner.add_error("process-run", "simulated process-run failure");
+        // After process-run error, re-check: run is now terminal
         runner.add_response("run-state", &done_run_state_toml());
         let status_toml =
             "purgery_version = \"0.1.0-test\"\nrun_id = \"test-run\"\nnickname = \"laptop\"\nstate = \"done\"\n".to_string();
@@ -1814,12 +1815,12 @@ observed_at_unix_secs = 1000
         let result = run_sync_with_run_id(&runner, &args, &run_id);
         assert!(
             result.is_ok(),
-            "sync must succeed when process-once fails but run is terminal"
+            "sync must succeed when process-run fails but run is terminal"
         );
     }
 
     #[test]
-    fn process_once_error_is_preserved_when_followup_run_state_fails() {
+    fn process_run_error_is_preserved_when_followup_run_state_fails() {
         let tmp = tempdir().unwrap();
         let state_dir = mk_state_dir(&tmp);
         let runner = mk_runner();
@@ -1835,10 +1836,9 @@ observed_at_unix_secs = 1000
         runner.add_response("finish-run", "");
         // run-state returns ready
         runner.add_response("run-state", &ready_run_state_toml());
-        // process-once returns an error
-        runner.add_error("process-once", "simulated process-once failure");
-        // Follow-up run-state returns a response that fails to parse
-        // (missing purgery_version), simulating a corrupted transport response.
+        // process-run returns an error
+        runner.add_error("process-run", "simulated process-run failure");
+        // Follow-up run-state fails to parse
         runner.add_response(
             "run-state",
             "protocol_version = 1\nnickname = \"laptop\"\nrun_id = \"test-run\"\nphase = \"done\"\nterminal = true\n",
@@ -1852,43 +1852,12 @@ observed_at_unix_secs = 1000
             "error must mention automatic server processing, got: {err}"
         );
         assert!(
-            err.contains("simulated process-once failure"),
-            "error must include process-once error, got: {err}"
+            err.contains("simulated process-run failure"),
+            "error must include process-run error, got: {err}"
         );
         assert!(
             err.contains("re-check") || err.contains("run-state"),
             "error must mention run-state recheck failure, got: {err}"
-        );
-    }
-
-    #[test]
-    fn transform_sync_repeated_ready_is_bounded() {
-        let tmp = tempdir().unwrap();
-        let state_dir = mk_state_dir(&tmp);
-        let runner = mk_runner();
-        let args = transform_args(&tmp, &state_dir);
-        let run_id = RunId::new("test-run".into()).unwrap();
-
-        runner.add_response("begin-run", &begin_resp_toml());
-        runner.add_response(
-            "prepare-run",
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
-        );
-        runner.add_response("heartbeat-run", "");
-        runner.add_response("finish-run", "");
-        // 3 rounds of ready → process-once (hits the 3-attempt limit)
-        for _ in 0..3 {
-            runner.add_response("run-state", &ready_run_state_toml());
-            runner.add_response("process-once", "");
-            runner.add_response("run-state", &ready_run_state_toml());
-        }
-
-        let result = run_sync_with_run_id(&runner, &args, &run_id);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("still ready"),
-            "error must mention run is still ready, got: {err}"
         );
     }
 
@@ -1905,7 +1874,7 @@ observed_at_unix_secs = 1000
             "run-state",
             &ready_run_state_toml().replace("test-run", "test-resume-drive"),
         );
-        runner.add_response("process-once", "");
+        runner.add_response("process-run", "");
         runner.add_response(
             "run-state",
             &done_run_state_toml().replace("test-run", "test-resume-drive"),
@@ -1946,8 +1915,8 @@ observed_at_unix_secs = 1000
 
         let log = runner.command_log();
         assert!(
-            log.iter().any(|c| c.contains("process-once")),
-            "resume must call process-once: {log:?}"
+            log.iter().any(|c| c.contains("process-run")),
+            "resume must call process-run: {log:?}"
         );
     }
 
