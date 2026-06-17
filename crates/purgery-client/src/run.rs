@@ -666,6 +666,15 @@ fn drain_one(runner: &RemoteRunner, state_dir: &str, state: &ClientRunState) -> 
                 phase = ClientRunPhase::WaitingForTerminalState;
             }
             ClientRunPhase::WaitingForTerminalState => {
+                // Initiate background GC best-effort in resume path too.
+                if let Err(e) = runner.server_cmd(host, server_cmd, &["start-gc"]) {
+                    warn!(
+                        nickname = %nickname.as_str(),
+                        run_id = %run_id.as_str(),
+                        error = %e,
+                        "failed to initiate background GC during resume",
+                    );
+                }
                 debug!("driving server processing to terminal");
                 drive_server_until_terminal(runner, host, server_cmd, &nickname, &run_id)?;
                 let status = read_status(runner, host, server_cmd, &nickname, &run_id)?;
@@ -1089,6 +1098,17 @@ pub(crate) fn run_sync_with_run_id(
         None,
         ClientRunPhase::WaitingForTerminalState,
     )?;
+
+    // Initiate background GC best-effort.  This is a short-running command
+    // that spawns a detached GC worker.  We do not wait for it.
+    if let Err(e) = runner.server_cmd(&remote.host, server_cmd, &["start-gc"]) {
+        warn!(
+            nickname = %nickname.as_str(),
+            run_id = %run_id.as_str(),
+            error = %e,
+            "failed to initiate background GC",
+        );
+    }
 
     info!("driving server processing");
     drive_server_until_terminal(runner, &remote.host, server_cmd, &nickname, run_id)?;

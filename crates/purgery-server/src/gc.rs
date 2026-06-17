@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
 use purgery_core::{Nickname, RunId, RunPhase, RunState, RunStatus, ServerConfig};
 use std::fs;
+use std::os::unix::io::AsRawFd;
 use tracing::{info, warn};
 
 use crate::phases::publish_status_atomic;
@@ -240,4 +241,129 @@ pub fn run_gc(config: &ServerConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Return the path to the global GC lock file.
+fn gc_lock_path(work_dir: &camino::Utf8Path) -> camino::Utf8PathBuf {
+    work_dir.join(".gc.lock")
+}
+
+/// Try to acquire the global GC lock (nonblocking).
+/// Returns `Ok(true)` if the lock was acquired, `Ok(false)` if busy.
+fn try_lock_gc(work_dir: &camino::Utf8Path) -> Result<bool> {
+    let lock_path = gc_lock_path(work_dir);
+    // Ensure parent exists
+    if let Some(parent) = lock_path.parent() {
+        let _ = fs::create_dir_all(parent.as_std_path());
+    }
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path.as_std_path())
+    {
+        Ok(f) => f,
+        Err(e) => anyhow::bail!("failed to open GC lock {lock_path}: {e}"),
+    };
+    let fd = file.as_raw_fd();
+    let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if ret == 0 {
+        Ok(true)
+    } else {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            Ok(false)
+        } else {
+            Err(err).with_context(|| format!("failed to lock GC: {lock_path}"))
+        }
+    }
+}
+
+/// Short-running: start a detached GC worker and return.
+pub fn start_gc(config: &ServerConfig, config_path: &str) -> Result<StartGcResult> {
+    let purgery_path = config.work_dir.as_path();
+    match try_lock_gc(purgery_path) {
+        Ok(true) => {
+            // Lock acquired — spawn detached gc-worker.
+            let exe =
+                std::env::current_exe().with_context(|| "cannot determine current executable")?;
+            match std::process::Command::new(&exe)
+                .arg("--config")
+                .arg(config_path)
+                .arg("gc-worker")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                Ok(child) => {
+                    info!(pid = child.id(), "spawned gc-worker");
+                    Ok(StartGcResult::Spawned)
+                }
+                Err(e) => Ok(StartGcResult::SpawnFailed {
+                    message: format!("{e}"),
+                }),
+            }
+        }
+        Ok(false) => Ok(StartGcResult::AlreadyActive),
+        Err(e) => Ok(StartGcResult::SpawnFailed {
+            message: format!("{e}"),
+        }),
+    }
+}
+
+/// Long-running: acquire GC lock and run GC.
+pub fn gc_worker(config: &ServerConfig) -> Result<GcWorkerResult> {
+    let purgery_path = config.work_dir.as_path();
+    match try_lock_gc(purgery_path) {
+        Ok(true) => {
+            info!("gc-worker acquired lock; running garbage collection");
+            if let Err(e) = run_gc(config) {
+                warn!(error = %e, "GC failed");
+            }
+            Ok(GcWorkerResult::Completed)
+        }
+        Ok(false) => {
+            info!("gc-worker: another GC worker is active; skipping");
+            Ok(GcWorkerResult::SkippedLockBusy)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Outcome of `start_gc`.
+#[derive(Debug)]
+pub enum StartGcResult {
+    Spawned,
+    AlreadyActive,
+    SpawnFailed { message: String },
+}
+
+impl StartGcResult {
+    /// Serialize as simple TOML for the CLI response.
+    pub fn to_toml(&self) -> String {
+        let (action, message) = match self {
+            StartGcResult::Spawned => ("spawned_gc", "background GC started"),
+            StartGcResult::AlreadyActive => ("already_active", "another GC worker is active"),
+            StartGcResult::SpawnFailed { message } => ("spawn_failed", message.as_str()),
+        };
+        format!(
+            r#"protocol_version = {}
+purgery_version = "{}"
+
+action = {action:?}
+message = {message:?}
+"#,
+            purgery_core::PROTOCOL_VERSION,
+            purgery_core::current_purgery_version(),
+        )
+    }
+}
+
+/// Outcome of `gc_worker`.
+#[derive(Debug)]
+pub enum GcWorkerResult {
+    Completed,
+    SkippedLockBusy,
 }

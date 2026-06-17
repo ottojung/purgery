@@ -92,6 +92,57 @@ pub(crate) fn try_lock_existing_run_dir_processor(
     ProcessingRunLock::try_lock_existing_dir(run_dir)
 }
 
+/// Probe the processor lock state without creating `processor.lock`.
+///
+/// This is a read-only observation used by `run-state`.  It never creates
+/// the lock file.  If the file does not exist, the processor is idle.
+/// If the file exists and the lock is busy, the processor is active.
+/// If the file exists and the lock is free, the processor is idle.
+///
+/// Returns `None` if the run directory does not exist.
+/// Returns `Some(true)` if the processor appears active.
+/// Returns `Some(false)` if the processor appears idle (no file or free lock).
+pub(crate) fn probe_processor_lock_readonly(run_dir: &Utf8Path) -> Result<Option<bool>> {
+    if !run_dir.exists() {
+        return Ok(None);
+    }
+    let lock_path = run_dir.join("processor.lock");
+    if !lock_path.exists() {
+        // No lock file — processor is definitely idle.
+        return Ok(Some(false));
+    }
+    // File exists — try nonblocking exclusive lock WITHOUT create.
+    let file = match std::fs::OpenOptions::new()
+        .create(false)
+        .read(true)
+        .write(true)
+        .open(lock_path.as_std_path())
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Race: file was deleted between exists check and open.
+            return Ok(Some(false));
+        }
+        Err(e) => {
+            anyhow::bail!("failed to open processor lock for probe: {lock_path}: {e}")
+        }
+    };
+    let fd = file.as_raw_fd();
+    let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if ret == 0 {
+        // Got the lock — release immediately (don't hold during probe).
+        // Just close the file by letting it drop.
+        Ok(Some(false))
+    } else {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            Ok(Some(true))
+        } else {
+            Err(err).with_context(|| format!("failed to probe processor lock: {lock_path}"))
+        }
+    }
+}
+
 pub(crate) fn publish_status_atomic(directory: &Utf8Path, status: &RunStatus) -> Result<()> {
     let content = status.to_toml().context("failed to serialize status")?;
     let temporary = directory.join("status.toml.tmp");

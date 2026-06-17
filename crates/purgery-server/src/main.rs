@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use purgery_core::{ColorMode, LogFormat, LogLevel, Nickname, RunId, ServerConfig};
 use purgery_server::{
-    begin_run, bootstrap, finish_run, heartbeat_run, prepare_run, process_once_raw,
-    process_run_target, read_run_status, run_gc, run_state, server_check, start_run,
+    begin_run, bootstrap, finish_run, gc_worker, heartbeat_run, prepare_run, process_once_raw,
+    process_run_target, read_run_status, run_gc, run_state, server_check, start_gc, start_run,
     version_response, worker_run,
 };
 use std::fs;
@@ -153,6 +153,10 @@ enum Command {
         #[arg(long)]
         run_id: String,
     },
+    /// Start a detached background GC worker (short-running, nonblocking)
+    StartGc,
+    /// Internal worker: run garbage collection (long-running, detached)
+    GcWorker,
 }
 
 /// Apply CLI logging overrides on top of a base config.
@@ -268,12 +272,20 @@ fn main() -> Result<()> {
             let nickname = Nickname::new(nickname).with_context(|| "invalid nickname")?;
             let run_id = RunId::new(run_id).with_context(|| "invalid run ID")?;
             let result = start_run(&server_config, &nickname, &run_id, &path)?;
-            println!("{}", result.to_toml());
+            println!("{}", result.to_toml_with_ident(&nickname, &run_id));
         }
         Command::WorkerRun { nickname, run_id } => {
             let nickname = Nickname::new(nickname).with_context(|| "invalid nickname")?;
             let run_id = RunId::new(run_id).with_context(|| "invalid run ID")?;
             worker_run(&server_config, &nickname, &run_id)?;
+        }
+        Command::StartGc => {
+            let result = start_gc(&server_config, &path)?;
+            println!("{}", result.to_toml());
+        }
+        Command::GcWorker => {
+            server_check(&server_config)?;
+            gc_worker(&server_config)?;
         }
     }
 

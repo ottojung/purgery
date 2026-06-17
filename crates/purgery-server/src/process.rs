@@ -1266,8 +1266,14 @@ pub fn start_run(
         }
         drop(lock);
 
-        spawn_worker_process(config_path_for_worker, nickname, run_id);
-        return Ok(StartRunResult::WorkerSpawned);
+        match spawn_worker_process(config_path_for_worker, nickname, run_id) {
+            Ok(()) => return Ok(StartRunResult::WorkerSpawned),
+            Err(e) => {
+                return Ok(StartRunResult::SpawnFailed {
+                    message: format!("{e}"),
+                });
+            }
+        }
     }
 
     // 2. Processing.
@@ -1279,10 +1285,18 @@ pub fn start_run(
             Ok(crate::phases::ProcessorLockAttempt::Busy) => {
                 return Ok(StartRunResult::AlreadyActive);
             }
-            Ok(crate::phases::ProcessorLockAttempt::Acquired(_lock)) => {
-                // Lock was free — abandoned or not yet started. Spawn worker.
-                spawn_worker_process(config_path_for_worker, nickname, run_id);
-                return Ok(StartRunResult::WorkerSpawned);
+            Ok(crate::phases::ProcessorLockAttempt::Acquired(lock)) => {
+                // Lock was free — abandoned or not yet started. Drop probe
+                // lock BEFORE spawning so the worker can acquire it.
+                drop(lock);
+                match spawn_worker_process(config_path_for_worker, nickname, run_id) {
+                    Ok(()) => return Ok(StartRunResult::WorkerSpawned),
+                    Err(e) => {
+                        return Ok(StartRunResult::SpawnFailed {
+                            message: format!("{e}"),
+                        });
+                    }
+                }
             }
             _ => {
                 return Ok(StartRunResult::SpawnFailed {
@@ -1376,24 +1390,14 @@ pub fn worker_run(
 }
 
 /// Spawn a detached `worker-run` process for the given target run.
-fn spawn_worker_process(config_path: &str, nickname: &Nickname, run_id: &RunId) {
-    let exe = match std::env::current_exe() {
-        Ok(e) => e,
-        Err(e) => {
-            warn!(
-                nickname = %nickname.as_str(),
-                run_id = %run_id.as_str(),
-                error = %e,
-                "cannot determine current executable; cannot spawn worker",
-            );
-            return;
-        }
-    };
+fn spawn_worker_process(config_path: &str, nickname: &Nickname, run_id: &RunId) -> Result<()> {
+    let exe = std::env::current_exe()
+        .with_context(|| "cannot determine current executable; cannot spawn worker")?;
 
     let worker_stdout = std::process::Stdio::null();
     let worker_stderr = std::process::Stdio::null();
 
-    match std::process::Command::new(&exe)
+    let child = std::process::Command::new(&exe)
         .arg("--config")
         .arg(config_path)
         .arg("worker-run")
@@ -1405,25 +1409,22 @@ fn spawn_worker_process(config_path: &str, nickname: &Nickname, run_id: &RunId) 
         .stdout(worker_stdout)
         .stderr(worker_stderr)
         .spawn()
-    {
-        Ok(child) => {
-            info!(
-                nickname = %nickname.as_str(),
-                run_id = %run_id.as_str(),
-                pid = child.id(),
-                "spawned worker-run process",
-            );
-            // Detached — do not wait.
-        }
-        Err(e) => {
-            warn!(
-                nickname = %nickname.as_str(),
-                run_id = %run_id.as_str(),
-                error = %e,
-                "failed to spawn worker-run process",
-            );
-        }
-    }
+        .with_context(|| {
+            format!(
+                "failed to spawn worker-run for {}/{}",
+                nickname.as_str(),
+                run_id.as_str()
+            )
+        })?;
+
+    info!(
+        nickname = %nickname.as_str(),
+        run_id = %run_id.as_str(),
+        pid = child.id(),
+        "spawned worker-run process",
+    );
+
+    Ok(())
 }
 
 /// Handle a malformed ready run in the start-run context.
@@ -1464,8 +1465,8 @@ pub enum StartRunResult {
 }
 
 impl StartRunResult {
-    /// Serialize as simple TOML for the CLI response.
-    pub fn to_toml(&self) -> String {
+    /// Serialize as protocol-shaped TOML for the CLI response.
+    pub fn to_toml_with_ident(&self, nickname: &Nickname, run_id: &RunId) -> String {
         let (action, message) = match self {
             StartRunResult::WorkerSpawned => ("spawned_worker", "worker process started"),
             StartRunResult::AlreadyActive => ("already_active", "another worker is active"),
@@ -1483,9 +1484,20 @@ impl StartRunResult {
             }
         };
         format!(
-            r#"action = {action:?}
+            r#"protocol_version = {}
+purgery_version = "{}"
+
+nickname = {}
+run_id = {}
+
+action = {action:?}
+terminal = false
 message = {message:?}
 "#,
+            purgery_core::PROTOCOL_VERSION,
+            purgery_core::current_purgery_version(),
+            nickname.as_str(),
+            run_id.as_str(),
         )
     }
 
