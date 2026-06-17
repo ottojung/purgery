@@ -1110,8 +1110,10 @@ fn process_run_target_inner(
         ReadyClaimOutcome::IncompatibleReady { message } => {
             return Err(anyhow::anyhow!("incompatible run left in place: {message}"))
         }
-        ReadyClaimOutcome::MalformedReadyMovedToFailed { .. } => {
-            return Err(anyhow::anyhow!("malformed ready run moved to failed"))
+        ReadyClaimOutcome::MalformedReadyMovedToFailed { error } => {
+            return Err(anyhow::anyhow!(
+                "malformed ready run moved to failed: {error}"
+            ))
         }
         ReadyClaimOutcome::MalformedReadyMoveFailed {
             original_error,
