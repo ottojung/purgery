@@ -65,27 +65,6 @@ For advanced use cases such as splitting a source tree into individual entries o
 * **Not a general-purpose file organizer.** Every flow handles exactly one source entry. Multi-entry trees must be sent explicitly or via the `--split` pattern.
 * **Not primarily a media conversion tool.** Processing is optional and server-defined. The tool does not ship built-in encoders or converters.
 
-## Build and test
-
-Purgery is written in Rust. Build the workspace:
-
-```
-cargo build --workspace
-```
-
-Run all tests:
-
-```
-cargo test --workspace
-```
-
-Format and lint:
-
-```
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-```
-
 ## More documentation
 
 - [Config reference](docs/config.md) — server configuration, transform definitions, run configuration
