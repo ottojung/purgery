@@ -4,7 +4,7 @@
 # then this file probably belongs at `/home/user1/.config/purgery/config.toml`.
 #
 
-work_dir = "/var/lib/purgery/work"
+work_dir = ".local/state/purgery/work"
 
 [[transform]]
 name = "compress-video"
