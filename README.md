@@ -38,17 +38,6 @@ Examples:
 * **Not a general-purpose file organizer.** Every flow handles exactly one source entry. Multi-entry trees must be sent explicitly or via the `--split` pattern.
 * **Not primarily a media conversion tool.** Processing is optional and server-defined. The tool does not ship built-in encoders or converters.
 
-## What a configured flow specifies
-
-A flow describes four things:
-
-* **Where the entry comes from** — a path on the local filesystem.
-* **Where the entry should go** — a destination path on a remote machine.
-* **Whether the entry is stored as-is or as a processed output** — you may request a named processing step defined on the remote machine.
-* **Whether the original entry remains or is removed** — source removal is optional even when processing is not used.
-
-Processing steps (transforms) are defined and run on the remote machine. The flow sends the source entry to the remote side, and the processing step places its outputs at the destination paths it declares.
-
 ## Basic usage
 
 Send a file as-is and keep the source:
