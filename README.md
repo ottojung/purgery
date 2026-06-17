@@ -72,3 +72,8 @@ For advanced use cases such as splitting a source tree into individual entries o
 - [Operations](docs/operations.md) — check, GC, heartbeat, leases, split patterns
 - [Import semantics](docs/design/import-semantics.md) — one-source-entry model, work areas, per-entry rules
 - [Crash safety and idempotence](docs/design/crash-safety-and-idempotence.md) — durable phases, replay recovery, atomic replacement, deletion authority
+
+# License
+
+Purgery is free software. Purger is distributed under AGPL version 3.
+
