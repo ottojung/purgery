@@ -185,7 +185,7 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
     };
 
     let response = purgery_core::PrepareRunResponse {
-        protocol_version: 1,
+        protocol_version: purgery_core::PROTOCOL_VERSION,
         purgery_version: purgery_core::current_purgery_version().to_string(),
         nickname: nickname.as_str().to_owned(),
         run_id: run_id.as_str().to_owned(),
@@ -310,7 +310,7 @@ pub fn run_state(
             )
         };
         return Ok(purgery_core::RunStateResponse {
-            protocol_version: 1,
+            protocol_version: purgery_core::PROTOCOL_VERSION,
             purgery_version: purgery_core::current_purgery_version().to_string(),
             nickname: nickname.as_str().to_owned(),
             run_id: run_id.as_str().to_owned(),
@@ -339,7 +339,7 @@ pub fn run_state(
         match try_read_status(&status_path, nickname, run_id) {
             TerminalStatusOutcome::Valid => {
                 return Ok(purgery_core::RunStateResponse {
-                    protocol_version: 1,
+                    protocol_version: purgery_core::PROTOCOL_VERSION,
                     purgery_version: purgery_core::current_purgery_version().to_string(),
                     nickname: nickname.as_str().to_owned(),
                     run_id: run_id.as_str().to_owned(),
@@ -368,7 +368,7 @@ pub fn run_state(
             }
             TerminalStatusOutcome::Malformed(reason) => {
                 return Ok(purgery_core::RunStateResponse {
-                    protocol_version: 1,
+                    protocol_version: purgery_core::PROTOCOL_VERSION,
                     purgery_version: purgery_core::current_purgery_version().to_string(),
                     nickname: nickname.as_str().to_owned(),
                     run_id: run_id.as_str().to_owned(),
@@ -390,7 +390,7 @@ pub fn run_state(
 
     // No phase directory found
     Ok(purgery_core::RunStateResponse {
-        protocol_version: 1,
+        protocol_version: purgery_core::PROTOCOL_VERSION,
         purgery_version: purgery_core::current_purgery_version().to_string(),
         nickname: nickname.as_str().to_owned(),
         run_id: run_id.as_str().to_owned(),
@@ -3782,7 +3782,7 @@ delete_after_import = true
 
         // Write an existing progress file with matching envelope
         let old_progress = purgery_core::ProcessingProgress {
-            protocol_version: 1,
+            protocol_version: purgery_core::PROTOCOL_VERSION,
             purgery_version: "0.1.0-test".to_string(),
             nickname: "laptop".into(),
             run_id: "ts-envelope".into(),
@@ -3828,7 +3828,7 @@ delete_after_import = true
 
         // Write existing progress with DIFFERENT nickname
         let old_progress = purgery_core::ProcessingProgress {
-            protocol_version: 1,
+            protocol_version: purgery_core::PROTOCOL_VERSION,
             purgery_version: "0.1.0-test".to_string(),
             nickname: "other-machine".into(), // different nickname
             run_id: "ts-mismatch".into(),
@@ -3973,7 +3973,7 @@ delete_after_import = true
 
         // Manually write a progress file with a specific started_at
         let old_progress = purgery_core::ProcessingProgress {
-            protocol_version: 1,
+            protocol_version: purgery_core::PROTOCOL_VERSION,
             purgery_version: "0.1.0-test".to_string(),
             nickname: "laptop".into(),
             run_id: run_id.as_str().into(),

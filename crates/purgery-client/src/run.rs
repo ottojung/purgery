@@ -433,7 +433,7 @@ fn persist_client_run_state(
     phase: ClientRunPhase,
 ) -> Result<()> {
     let run_state = ClientRunState {
-        protocol_version: 1,
+        protocol_version: purgery_core::PROTOCOL_VERSION,
         purgery_version: purgery_core::current_purgery_version().to_string(),
         nickname: nickname.as_str().to_owned(),
         run_id: run_id.as_str().to_owned(),
@@ -1232,7 +1232,10 @@ mod tests {
         let runner = RemoteRunner::fake();
         runner.add_response(
             "version",
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\n",
+            &format!(
+                "protocol_version = {}\npurgery_version = \"0.1.0-test\"\n",
+                purgery_core::PROTOCOL_VERSION
+            ),
         );
         runner
     }
@@ -1241,8 +1244,17 @@ mod tests {
         tmp.path().join("purgery").to_string_lossy().to_string()
     }
 
+    /// Base protocol + purgery_version TOML header for test responses.
+    fn resp_header() -> String {
+        format!(
+            "protocol_version = {}\npurgery_version = \"0.1.0-test\"\n",
+            purgery_core::PROTOCOL_VERSION
+        )
+    }
+
     fn begin_resp_toml() -> String {
-        r#"protocol_version = 1
+        format!(
+            r#"protocol_version = {}
 purgery_version = "0.1.0-test"
 nickname = "laptop"
 run_id = "test-run"
@@ -1251,12 +1263,14 @@ files_dir = "/var/lib/purgery/work/laptop/incoming/test-run"
 run_config_path = "/var/lib/purgery/work/laptop/incoming/test-run/run.toml"
 manifest_path = "/var/lib/purgery/work/laptop/incoming/test-run/manifest.toml"
 heartbeat_interval_secs = 60
-"#
-        .to_string()
+"#,
+            purgery_core::PROTOCOL_VERSION
+        )
     }
 
     fn done_run_state_toml() -> String {
-        r#"protocol_version = 1
+        format!(
+            r#"protocol_version = {}
 purgery_version = "0.1.0-test"
 nickname = "laptop"
 run_id = "test-run"
@@ -1265,8 +1279,9 @@ terminal = true
 message = ""
 updated_at_unix_secs = 1000
 observed_at_unix_secs = 1000
-"#
-        .to_string()
+"#,
+            purgery_core::PROTOCOL_VERSION
+        )
     }
 
     fn done_status_toml() -> String {
@@ -1756,7 +1771,8 @@ state = "done"
     }
 
     fn ready_run_state_toml() -> String {
-        r#"protocol_version = 1
+        format!(
+            r#"protocol_version = {}
 purgery_version = "0.1.0-test"
 nickname = "laptop"
 run_id = "test-run"
@@ -1765,8 +1781,9 @@ terminal = false
 message = "run phase: ready"
 updated_at_unix_secs = 1000
 observed_at_unix_secs = 1000
-"#
-        .to_string()
+"#,
+            purgery_core::PROTOCOL_VERSION
+        )
     }
 
     #[test]

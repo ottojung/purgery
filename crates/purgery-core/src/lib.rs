@@ -1541,7 +1541,7 @@ color = "never"
         // RunStateResponse must include observed_at_unix_secs distinct from updated_at_unix_secs.
         use crate::RunStateResponse;
         let response = RunStateResponse {
-            protocol_version: 1,
+            protocol_version: PROTOCOL_VERSION,
             purgery_version: "0.1.0-test".to_string(),
             nickname: "laptop".into(),
             run_id: "test-run".into(),
@@ -1574,7 +1574,7 @@ color = "never"
         // A processing response with no progress info should have consistent
         // timestamp semantics. We verify the types carry the right fields.
         let response = RunStateResponse {
-            protocol_version: 1,
+            protocol_version: PROTOCOL_VERSION,
             purgery_version: "0.1.0-test".to_string(),
             nickname: "laptop".into(),
             run_id: "test-run".into(),

@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use camino::Utf8Path;
 use purgery_core::{
-    current_purgery_version, Nickname, ProcessingProgress, PurgeryRoot, RunId, RunPhase, RunState,
-    RunStatus, ServerConfig,
+    current_purgery_version, Nickname, ProcessingProgress, PROTOCOL_VERSION, PurgeryRoot, RunId,
+    RunPhase, RunState, RunStatus, ServerConfig,
 };
 use std::fs;
 use std::os::unix::io::AsRawFd;
@@ -280,7 +280,7 @@ pub(crate) fn write_progress(
         ExistingProgress::Missing | ExistingProgress::Malformed => now,
     };
     let progress = ProcessingProgress {
-        protocol_version: 1,
+        protocol_version: PROTOCOL_VERSION,
         purgery_version: current_purgery_version().to_string(),
         nickname: nickname.as_str().to_owned(),
         run_id: run_id.as_str().to_owned(),
@@ -529,7 +529,7 @@ pub fn begin_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> 
     }
 
     let lease = purgery_core::LeaseFile {
-        protocol_version: 1,
+        protocol_version: PROTOCOL_VERSION,
         purgery_version: current_purgery_version().to_string(),
         nickname: nickname.as_str().to_owned(),
         run_id: run_id.as_str().to_owned(),
@@ -555,7 +555,7 @@ pub fn begin_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> 
     }
 
     let response = purgery_core::BeginRunResponse {
-        protocol_version: 1,
+        protocol_version: PROTOCOL_VERSION,
         purgery_version: current_purgery_version().to_string(),
         nickname: nickname.as_str().to_owned(),
         run_id: run_id.as_str().to_owned(),
