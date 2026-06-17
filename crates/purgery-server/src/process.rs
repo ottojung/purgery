@@ -415,18 +415,24 @@ fn read_compatible_run_inputs(
 /// Used by both targeted `process-run` and batch `process-once`.
 #[derive(Debug)]
 pub(crate) enum ReadyClaimOutcome {
-    /// Ready was successfully renamed to processing. Caller should run
-    /// `process_processing_run`.
-    Claimed,
+    /// Ready was successfully renamed to processing. The caller holds
+    /// the processor lock and must call `process_processing_run`.
+    Claimed(crate::phases::ProcessingRunLock),
     /// Ready did not exist but processing did (another process claimed it).
     AlreadyProcessing,
     /// Ready did not exist and a terminal phase was found.
     AlreadyTerminal,
     /// Ready exists but has incompatible version metadata. Left in place.
     IncompatibleReady { message: String },
-    /// Ready exists but is malformed current-format state. Moved to failed
-    /// with a failure status written. Caller should not additionally fail it.
+    /// Ready exists but is malformed current-format state. Successfully
+    /// moved to failed with atomically published failure status.
     MalformedReadyMovedToFailed { error: anyhow::Error },
+    /// Ready exists but is malformed current-format state, and the
+    /// move-to-failed or status publication failed.
+    MalformedReadyMoveFailed {
+        original_error: anyhow::Error,
+        publish_error: anyhow::Error,
+    },
     /// Ready was not found anywhere (no ready, processing, or terminal phase).
     NotFound,
     /// Ready existed but claim (rename) failed for an unexpected reason,
@@ -437,11 +443,11 @@ pub(crate) enum ReadyClaimOutcome {
 /// Claim a ready run by checking version compatibility and renaming
 /// ready → processing.
 ///
-/// Returns a typed outcome so callers can handle each case correctly.
+/// The lock is acquired before the rename so it remains valid after.
+/// Returns `Claimed(lock)` on success — the caller MUST run
+/// `process_processing_run` while holding the lock.
 ///
-/// The caller MUST call `process_processing_run` after receiving
-/// `Claimed`.  For all other outcomes the caller should not attempt
-/// to process the run.
+/// For all other outcomes the caller should not attempt to process the run.
 pub(crate) fn claim_ready_run(
     config: &ServerConfig,
     nickname: &Nickname,
@@ -459,43 +465,23 @@ pub(crate) fn claim_ready_run(
             return ReadyClaimOutcome::IncompatibleReady { message };
         }
         Err(ProcessingError::Other(e)) => {
-            // Malformed current-format state: move ready → failed with status.
-            let msg = format!("{e}");
-            let failed_path = config.work_dir.run_dir(nickname, run_id, RunPhase::Failed);
-            if let Some(parent) = failed_path.parent() {
-                let _ = fs::create_dir_all(parent.as_std_path());
-            }
-            if let Err(rename_err) = fs::rename(&ready_path, failed_path.as_std_path()) {
-                warn!(
-                    nickname = %nickname.as_str(),
-                    run_id = %run_id.as_str(),
-                    error = %rename_err,
-                    "failed to move malformed ready run to failed",
-                );
-            }
-            let status = purgery_core::RunStatus {
-                purgery_version: purgery_core::current_purgery_version().to_string(),
-                run_id: run_id.clone(),
-                nickname: nickname.clone(),
-                state: purgery_core::RunState::Failed,
-                entries: vec![],
-                error: Some(msg),
-            };
-            if let Ok(status_toml) = status.to_toml() {
-                let final_status_path = failed_path.join("status.toml");
-                let tmp_status_path = failed_path.join("status.toml.tmp");
-                if let Some(parent) = final_status_path.parent() {
-                    let _ = fs::create_dir_all(parent.as_std_path());
-                }
-                let _ = fs::write(&tmp_status_path, &status_toml);
-                let _ = fs::rename(&tmp_status_path, &final_status_path);
-            }
-            return ReadyClaimOutcome::MalformedReadyMovedToFailed { error: e };
+            return handle_malformed_ready(config, nickname, run_id, e);
         }
         Ok(_) => {}
     }
 
-    // Compatible — claim by renaming ready → processing.
+    // Acquire the processor lock inside the ready directory BEFORE rename.
+    let lock = match crate::phases::try_lock_run_dir_processor(&ready_path) {
+        Ok(Some(l)) => l,
+        Ok(None) => return recheck_state(config, nickname, run_id),
+        Err(e) => {
+            return ReadyClaimOutcome::ClaimFailed {
+                error: anyhow::anyhow!("failed to acquire processor lock: {e}"),
+            };
+        }
+    };
+
+    // Compatible and locked — claim by renaming ready → processing.
     let processing_path = config
         .work_dir
         .run_dir(nickname, run_id, RunPhase::Processing);
@@ -507,7 +493,7 @@ pub(crate) fn claim_ready_run(
         }
     }
     match fs::rename(&ready_path, &processing_path) {
-        Ok(()) => ReadyClaimOutcome::Claimed,
+        Ok(()) => ReadyClaimOutcome::Claimed(lock),
         Err(e) => {
             warn!(
                 nickname = %nickname.as_str(),
@@ -515,8 +501,57 @@ pub(crate) fn claim_ready_run(
                 error = %e,
                 "failed to claim ready run (race); re-checking state",
             );
+            drop(lock);
             recheck_state(config, nickname, run_id)
         }
+    }
+}
+
+/// Move a malformed (but version-present/current-format) ready run to
+/// failed, publishing a failure status atomically.
+///
+/// Returns `MalformedReadyMovedToFailed` only if both the rename and
+/// status publication succeed. Returns `MalformedReadyMoveFailed` if
+/// either step fails.
+fn handle_malformed_ready(
+    config: &ServerConfig,
+    nickname: &Nickname,
+    run_id: &RunId,
+    original_error: anyhow::Error,
+) -> ReadyClaimOutcome {
+    let ready_path = config.work_dir.run_dir(nickname, run_id, RunPhase::Ready);
+    let failed_path = config.work_dir.run_dir(nickname, run_id, RunPhase::Failed);
+
+    if let Some(parent) = failed_path.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            return ReadyClaimOutcome::MalformedReadyMoveFailed {
+                original_error,
+                publish_error: anyhow::anyhow!("failed to create failed parent: {e}"),
+            };
+        }
+    }
+    if let Err(e) = fs::rename(&ready_path, failed_path.as_std_path()) {
+        return ReadyClaimOutcome::MalformedReadyMoveFailed {
+            original_error,
+            publish_error: anyhow::anyhow!("failed to move malformed ready to failed: {e}"),
+        };
+    }
+    let status = purgery_core::RunStatus {
+        purgery_version: purgery_core::current_purgery_version().to_string(),
+        run_id: run_id.clone(),
+        nickname: nickname.clone(),
+        state: purgery_core::RunState::Failed,
+        entries: vec![],
+        error: Some(original_error.to_string()),
+    };
+    if let Err(e) = crate::phases::publish_status_atomic(&failed_path, &status) {
+        return ReadyClaimOutcome::MalformedReadyMoveFailed {
+            original_error,
+            publish_error: anyhow::anyhow!("failed to publish failure status: {e}"),
+        };
+    }
+    ReadyClaimOutcome::MalformedReadyMovedToFailed {
+        error: original_error,
     }
 }
 
@@ -745,8 +780,10 @@ pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
             "processing run"
         );
         match claim_ready_run(config, nickname, run_id) {
-            ReadyClaimOutcome::Claimed => {
-                if let Err(e) = process_processing_run(config, nickname, run_id) {
+            ReadyClaimOutcome::Claimed(lock) => {
+                let result = process_processing_run(config, nickname, run_id);
+                drop(lock);
+                if let Err(e) = result {
                     warn!(
                         nickname = %nickname.as_str(),
                         run_id = %run_id.as_str(),
@@ -780,7 +817,23 @@ pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
                 );
             }
             ReadyClaimOutcome::MalformedReadyMovedToFailed { .. } => {
-                // Already moved to failed by claim_ready_run.
+                info!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    "malformed ready run moved to failed",
+                );
+            }
+            ReadyClaimOutcome::MalformedReadyMoveFailed {
+                original_error,
+                publish_error,
+            } => {
+                warn!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    original_error = %original_error,
+                    publish_error = %publish_error,
+                    "malformed ready run could not be moved to failed; leaving for operator inspection",
+                );
             }
             ReadyClaimOutcome::NotFound => {
                 info!(
@@ -805,18 +858,19 @@ pub fn process_once_raw(config: &ServerConfig) -> Result<()> {
 
 /// Process a specific run by nickname and run_id.
 ///
-/// Starts opportunistic global GC in a background thread (best-effort —
-/// failure does not block target processing), waits for the GC attempt
-/// to finish before returning.
+/// Always attempts global GC first.  This is intentional: without a daemon
+/// or timer, client-triggered server commands are also maintenance
+/// opportunities.  GC failure does not block target processing.
 ///
-/// Then dispatches based on the run's current phase:
-/// - `ready`: claim and process the target run
-/// - `processing`: no-op (another processor is handling it) — does not
-///   recover or replay
+/// Then drives only the target run:
+/// - ready: claim with processor lock and process
+/// - processing: try to acquire processor lock; if busy, another
+///   processor is active (no-op); if acquired, abandoned run is
+///   recovered via `recover_or_process_processing_run`
 /// - terminal: idempotent success
 /// - not found: error
 ///
-/// Does not process unrelated runs. Does not recover processing runs.
+/// Does not process unrelated runs.
 pub fn process_run_target(
     config: &ServerConfig,
     nickname: &Nickname,
@@ -845,54 +899,130 @@ fn process_run_target_inner(
     nickname: &Nickname,
     run_id: &RunId,
 ) -> Result<()> {
+    // 1. Try to claim from ready.
     match claim_ready_run(config, nickname, run_id) {
-        ReadyClaimOutcome::Claimed => match process_processing_run(config, nickname, run_id) {
-            Ok(()) => Ok(()),
-            Err(ProcessingError::Incompatible { message, .. }) => {
-                Err(anyhow::anyhow!("incompatible run in processing: {message}"))
-            }
-            Err(ProcessingError::Other(error)) => {
-                warn!(
-                    nickname = %nickname.as_str(),
-                    run_id = %run_id.as_str(),
-                    phase = "processing",
-                    error = %error,
-                    "run failed",
-                );
-                move_to_failed(&config.work_dir, nickname, run_id)
-                    .with_context(|| "failed to move target run to failed")?;
-                Err(error)
-            }
-        },
+        ReadyClaimOutcome::Claimed(lock) => {
+            let result = process_processing_run(config, nickname, run_id);
+            drop(lock);
+            return match result {
+                Ok(()) => Ok(()),
+                Err(ProcessingError::Incompatible { message, .. }) => {
+                    Err(anyhow::anyhow!("incompatible run in processing: {message}"))
+                }
+                Err(ProcessingError::Other(error)) => {
+                    warn!(
+                        nickname = %nickname.as_str(),
+                        run_id = %run_id.as_str(),
+                        phase = "processing",
+                        error = %error,
+                        "run failed",
+                    );
+                    move_to_failed(&config.work_dir, nickname, run_id)
+                        .with_context(|| "failed to move target run to failed")?;
+                    Err(error)
+                }
+            };
+        }
         ReadyClaimOutcome::AlreadyProcessing => {
-            info!(
-                nickname = %nickname.as_str(),
-                run_id = %run_id.as_str(),
-                "run is already processing; skipping",
-            );
-            Ok(())
+            return handle_processing_target(config, nickname, run_id);
         }
-        ReadyClaimOutcome::AlreadyTerminal => {
-            info!(
-                nickname = %nickname.as_str(),
-                run_id = %run_id.as_str(),
-                "run already terminal",
-            );
-            Ok(())
-        }
+        ReadyClaimOutcome::AlreadyTerminal => return Ok(()),
         ReadyClaimOutcome::IncompatibleReady { message } => {
-            Err(anyhow::anyhow!("incompatible run left in place: {message}"))
+            return Err(anyhow::anyhow!("incompatible run left in place: {message}"))
         }
         ReadyClaimOutcome::MalformedReadyMovedToFailed { .. } => {
-            Err(anyhow::anyhow!("malformed ready run moved to failed"))
+            return Err(anyhow::anyhow!("malformed ready run moved to failed"))
         }
-        ReadyClaimOutcome::NotFound => {
-            anyhow::bail!(
-                "run {}/{} not found in ready, processing, or terminal phases",
-                nickname.as_str(),
-                run_id.as_str(),
-            )
+        ReadyClaimOutcome::MalformedReadyMoveFailed {
+            original_error,
+            publish_error,
+        } => {
+            return Err(anyhow::anyhow!(
+                "malformed ready run could not be moved to failed: \
+                 {original_error}; publication error: {publish_error}"
+            ));
         }
-        ReadyClaimOutcome::ClaimFailed { error } => Err(error),
+        ReadyClaimOutcome::NotFound => { /* fall through */ }
+        ReadyClaimOutcome::ClaimFailed { error } => return Err(error),
+    }
+
+    // 2. Not ready — check processing.
+    let processing_path = config
+        .work_dir
+        .run_dir(nickname, run_id, RunPhase::Processing);
+    if processing_path.exists() {
+        return handle_processing_target(config, nickname, run_id);
+    }
+
+    // 3. Check terminal phases.
+    for phase in &[RunPhase::Done, RunPhase::Failed] {
+        let dir = config.work_dir.run_dir(nickname, run_id, *phase);
+        if dir.exists() {
+            info!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                phase = %phase.as_str(),
+                "run already terminal",
+            );
+            return Ok(());
+        }
+    }
+
+    anyhow::bail!(
+        "run {}/{} not found in ready, processing, or terminal phases",
+        nickname.as_str(),
+        run_id.as_str(),
+    )
+}
+
+/// Handle a target run that is already in `processing`.
+///
+/// Tries to acquire the processor lock.  If busy, another processor is
+/// active — return `Ok(())`.  If acquired, the run is abandoned and
+/// is recovered via `recover_or_process_processing_run`.
+fn handle_processing_target(
+    config: &ServerConfig,
+    nickname: &Nickname,
+    run_id: &RunId,
+) -> Result<()> {
+    let processing_path = config
+        .work_dir
+        .run_dir(nickname, run_id, RunPhase::Processing);
+
+    let lock = match crate::phases::try_lock_run_dir_processor(&processing_path) {
+        Ok(Some(l)) => l,
+        Ok(None) => {
+            info!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                "processing run is locked by another processor; skipping",
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            warn!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                error = %e,
+                "failed to check processor lock on processing run",
+            );
+            return Ok(());
+        }
+    };
+
+    info!(
+        nickname = %nickname.as_str(),
+        run_id = %run_id.as_str(),
+        "acquired abandoned processing run lock; recovering",
+    );
+    let result = recover_or_process_processing_run(config, nickname, run_id);
+    drop(lock);
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(RecoveryError::IncompatibleStatus { message }) => Err(anyhow::anyhow!(
+            "abandoned processing run is incompatible: {message}"
+        )),
+        Err(RecoveryError::Other(e)) => Err(e),
     }
 }

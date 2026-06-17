@@ -41,16 +41,15 @@ pub struct ResolvedTransform {
 /// Process a ready run. Kept as the public single-run entry point.
 pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> Result<()> {
     match crate::process::claim_ready_run(config, nickname, run_id) {
-        crate::process::ReadyClaimOutcome::Claimed => {
-            crate::process::process_processing_run(config, nickname, run_id).map_err(
-                |e| match e {
-                    crate::process::ProcessingError::Incompatible { message, .. } => {
-                        anyhow::anyhow!("{message}")
-                    }
-                    crate::process::ProcessingError::Other(e) => e,
-                },
-            )?;
-            Ok(())
+        crate::process::ReadyClaimOutcome::Claimed(lock) => {
+            let result = crate::process::process_processing_run(config, nickname, run_id);
+            drop(lock);
+            result.map_err(|e| match e {
+                crate::process::ProcessingError::Incompatible { message, .. } => {
+                    anyhow::anyhow!("{message}")
+                }
+                crate::process::ProcessingError::Other(e) => e,
+            })
         }
         crate::process::ReadyClaimOutcome::AlreadyProcessing => Ok(()),
         crate::process::ReadyClaimOutcome::AlreadyTerminal => Ok(()),
@@ -58,6 +57,13 @@ pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
             Err(anyhow::anyhow!("{message}"))
         }
         crate::process::ReadyClaimOutcome::MalformedReadyMovedToFailed { error } => Err(error),
+        crate::process::ReadyClaimOutcome::MalformedReadyMoveFailed {
+            original_error,
+            publish_error,
+        } => Err(anyhow::anyhow!(
+            "malformed ready could not be moved to failed: \
+             {original_error}; publication error: {publish_error}"
+        )),
         crate::process::ReadyClaimOutcome::NotFound => Err(anyhow::anyhow!("run not found")),
         crate::process::ReadyClaimOutcome::ClaimFailed { error } => Err(error),
     }
@@ -7348,13 +7354,19 @@ delete_after_import = true
             .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Processing);
         fs::create_dir_all(&processing).unwrap();
+
+        // Hold the processor lock from this test to simulate another
+        // active processor.
+        let lock = crate::phases::try_lock_run_dir_processor(&processing)
+            .unwrap()
+            .expect("must be able to acquire test lock");
+
         // No status.toml — this simulates an actively processing run.
         // process_run_target must NOT recover or replay it.
-
         let result = process_run_target(&config, &nickname, &run_id);
         assert!(
             result.is_ok(),
-            "processing run must be a no-op, not an error: {result:?}"
+            "processing run must be a no-op when lock is held: {result:?}"
         );
 
         // Processing directory unchanged
@@ -7369,6 +7381,9 @@ delete_after_import = true
             .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Failed);
         assert!(!failed.exists(), "must NOT move processing run to failed");
+
+        // Release lock before the directory is cleaned up by tmp
+        drop(lock);
     }
 
     #[test]

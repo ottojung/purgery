@@ -5,7 +5,77 @@ use purgery_core::{
     RunStatus, ServerConfig,
 };
 use std::fs;
+use std::os::unix::io::AsRawFd;
 use tracing::{info, warn};
+
+/// An exclusive file lock held on a processing run's `processor.lock` file.
+///
+/// The lock is automatically released when the `ProcessingRunLock` is dropped
+/// (the file descriptor is closed, which releases the `flock`).
+///
+/// Only the process holding this lock may mutate the run's processing
+/// directory.  If the lock cannot be acquired, another processor owns it
+/// and the run must not be recovered or replayed.
+#[derive(Debug)]
+pub(crate) struct ProcessingRunLock {
+    _file: std::fs::File,
+    _path: camino::Utf8PathBuf,
+}
+
+impl ProcessingRunLock {
+    /// Try to acquire an exclusive advisory lock on the given directory's
+    /// `processor.lock` file.
+    ///
+    /// Returns `Ok(None)` if the lock is already held by another process.
+    /// Returns `Ok(Some(lock))` if this process now owns the lock.
+    /// Returns `Err` on IO errors or lock setup failures.
+    fn try_lock_dir(run_dir: &Utf8Path) -> Result<Option<Self>> {
+        let lock_path = run_dir.join("processor.lock");
+        let file = match std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(lock_path.as_std_path())
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let _ = fs::create_dir_all(run_dir.as_std_path());
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .read(true)
+                    .write(true)
+                    .open(lock_path.as_std_path())
+                    .with_context(|| format!("failed to create processor lock: {lock_path}"))?
+            }
+            Err(e) => {
+                anyhow::bail!("failed to open processor lock file {lock_path}: {e}")
+            }
+        };
+
+        let fd = file.as_raw_fd();
+        // LOCK_EX | LOCK_NB = try exclusive lock without blocking
+        let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if ret == 0 {
+            Ok(Some(ProcessingRunLock {
+                _file: file,
+                _path: lock_path,
+            }))
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                Ok(None)
+            } else {
+                Err(err).with_context(|| format!("failed to lock processor: {lock_path}"))
+            }
+        }
+    }
+}
+
+pub(crate) fn try_lock_run_dir_processor(run_dir: &Utf8Path) -> Result<Option<ProcessingRunLock>> {
+    ProcessingRunLock::try_lock_dir(run_dir)
+}
 
 pub(crate) fn publish_status_atomic(directory: &Utf8Path, status: &RunStatus) -> Result<()> {
     let content = status.to_toml().context("failed to serialize status")?;
@@ -362,6 +432,10 @@ pub(crate) fn finalize_processing_run(
             dest_path.as_str()
         )
     })?;
+
+    // Clean up the processor lock file in the destination.
+    let lock_path = dest_path.join("processor.lock");
+    let _ = fs::remove_file(lock_path.as_std_path());
     Ok(())
 }
 

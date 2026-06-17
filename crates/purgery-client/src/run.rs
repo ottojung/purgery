@@ -330,6 +330,20 @@ fn drive_server_until_terminal(
                     last_phase = response.phase.clone();
                     attempts_since_report = 0;
                 }
+                // Call process-run for processing runs too — if the lock is
+                // free (abandoned), the server will recover the run; if busy,
+                // it returns quickly and we keep polling.
+                let _ = runner.server_cmd(
+                    host,
+                    server_cmd,
+                    &[
+                        "process-run",
+                        "--nickname",
+                        nickname.as_str(),
+                        "--run-id",
+                        run_id.as_str(),
+                    ],
+                );
                 attempts_since_report += 1;
                 if attempts_since_report.is_multiple_of(12) {
                     info!(
