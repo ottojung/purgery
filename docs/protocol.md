@@ -21,7 +21,7 @@ Server runs are transform-only. Every manifest entry must have a transform.
 client: validate args (--transform requires --delete-after-import)
 client: generate run ID
 client: check server version compatibility
-client: start foreground server GC over SSH in a local background handle
+client: run server GC best-effort (failure logged, not fatal)
 client: begin-run over SSH -> server creates incoming directory, returns paths
 client: write run.toml + manifest.toml to server incoming dir
 client: prepare-run over SSH -> server validates the destination, envelope, and requested transform
@@ -35,8 +35,16 @@ client: concurrently poll run-state; restart process-run on SSH transport failur
 client: on terminal: read status
 client: remove confirmed local original (server-confirmed cleanup)
 client: persist local state as cleanup_complete
-client: await/log GC result before returning
 ```
+
+Transform sync is synchronous. The client drives the target run to a terminal state
+before returning. This may wait indefinitely; the client logs periodic progress
+but does not enforce a hard timeout. A transform can legitimately take a long
+time.
+
+The `version` command is always called before any server-run sync to ensure
+client–server protocol and version compatibility. GC and `begin-run` are not
+called before version validation.
 
 ### Path C: Split (with --split)
 
@@ -132,7 +140,7 @@ Source trailing slashes, `.`, and `..` are normalized before split discovery. `<
 | `process-run --nickname N --run-id R` | Foreground targeted processor: claims/processes the target ready run, recovers an abandoned target in processing, or no-op if already processing or terminal. Does not process unrelated runs. Does not run GC. | (none) |
 | `process-once` | Run global GC, recover unlocked processing runs (respecting active processor locks), process ready runs | (none) |
 | `check` | Validate config and transforms | (none) |
-| `gc` | Foreground garbage-collection command. Transform clients start it best-effort and await/log it before exit. Failure does not fail transform sync. May run concurrently with transform client work. | (none) |
+| `gc` | Foreground garbage-collection command. Server-run sync clients initiate it best-effort after server version check and before `begin-run`. Failure is logged but does not fail the sync. Also run by `process-once` for batch maintenance. | (none) |
 
 ## Run phases
 

@@ -60,14 +60,20 @@ impl RemoteCommandHandle {
                                     details: "SSH exit code 255".to_string(),
                                 }))
                             } else {
-                                // Read stderr
+                                // Read stderr with bounded capture (64 KiB max).
+                                const MAX_STDERR_BYTES: usize = 65536;
                                 let stderr = child
                                     .stderr
                                     .take()
-                                    .map(|mut s| {
+                                    .map(|s| {
                                         let mut buf = String::new();
                                         use std::io::Read;
-                                        let _ = s.read_to_string(&mut buf);
+                                        let mut limited = s.take(MAX_STDERR_BYTES as u64 + 1);
+                                        let _ = limited.read_to_string(&mut buf);
+                                        if buf.len() > MAX_STDERR_BYTES {
+                                            buf.truncate(MAX_STDERR_BYTES);
+                                            buf.push_str("...(truncated)");
+                                        }
                                         buf
                                     })
                                     .unwrap_or_default();
@@ -127,8 +133,9 @@ impl RemoteCommandHandle {
     /// Fake-only escape hatch: if no exit was ever scripted (the
     /// command was created without a matching
     /// `add_spawned_cmd_exit`), we return `Killed` immediately so
-    /// callers like `finish_best_effort_wait` do not hang on
-    /// fire-and-forget handles that tests never configured.
+    /// callers do not hang on fire-and-forget handles that tests never
+    /// configured.
+    #[allow(dead_code)]
     pub(crate) fn wait(&mut self) -> Result<RemoteCommandExit> {
         if let RemoteCommandHandleKind::Fake {
             remaining_polls,
@@ -447,7 +454,7 @@ impl RemoteRunner {
                     .arg(&full_cmd)
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
                     .spawn()
                     .with_context(|| format!("failed to spawn SSH command on {host}"))?;
                 Ok(RemoteCommandHandle {

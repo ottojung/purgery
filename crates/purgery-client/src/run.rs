@@ -404,105 +404,6 @@ fn stop_worker_best_effort(worker: &mut Option<RemoteCommandHandle>) {
     *worker = None;
 }
 
-/// A best-effort guard for a background remote command (e.g., GC).
-/// On finish, it waits or kills the command and logs the result.
-struct BackgroundCmdGuard {
-    handle: Option<RemoteCommandHandle>,
-    label: &'static str,
-    nickname: Nickname,
-    run_id: RunId,
-}
-
-impl BackgroundCmdGuard {
-    fn new(
-        runner: &RemoteRunner,
-        host: &str,
-        server_cmd: &str,
-        label: &'static str,
-        nickname: &Nickname,
-        run_id: &RunId,
-        args: &[&str],
-    ) -> Self {
-        let handle = match runner.spawn_server_cmd(host, server_cmd, args) {
-            Ok(h) => {
-                info!(
-                    nickname = %nickname.as_str(),
-                    run_id = %run_id.as_str(),
-                    "spawned background {label}",
-                );
-                Some(h)
-            }
-            Err(e) => {
-                warn!(
-                    nickname = %nickname.as_str(),
-                    run_id = %run_id.as_str(),
-                    error = %e,
-                    "failed to start background {label}",
-                );
-                None
-            }
-        };
-        BackgroundCmdGuard {
-            handle,
-            label,
-            nickname: nickname.clone(),
-            run_id: run_id.clone(),
-        }
-    }
-
-    /// Block until the background command exits.  Logs the result but
-    /// does not fail — GC failure must not affect sync outcome.
-    fn finish_best_effort_wait(&mut self) {
-        if let Some(h) = self.handle.as_mut() {
-            match h.wait() {
-                Ok(RemoteCommandExit::Success) => {
-                    debug!(
-                        nickname = %self.nickname.as_str(),
-                        run_id = %self.run_id.as_str(),
-                        "background {label} completed successfully",
-                        label = self.label,
-                    );
-                }
-                Ok(RemoteCommandExit::TransportFailure { details, .. }) => {
-                    warn!(
-                        nickname = %self.nickname.as_str(),
-                        run_id = %self.run_id.as_str(),
-                        details,
-                        "background {label} transport failure",
-                        label = self.label,
-                    );
-                }
-                Ok(RemoteCommandExit::RemoteFailure { stderr, .. }) => {
-                    warn!(
-                        nickname = %self.nickname.as_str(),
-                        run_id = %self.run_id.as_str(),
-                        stderr,
-                        "background {label} remote failure",
-                        label = self.label,
-                    );
-                }
-                Ok(RemoteCommandExit::Killed) => {
-                    warn!(
-                        nickname = %self.nickname.as_str(),
-                        run_id = %self.run_id.as_str(),
-                        "background {label} was killed",
-                        label = self.label,
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        nickname = %self.nickname.as_str(),
-                        run_id = %self.run_id.as_str(),
-                        error = %e,
-                        "background {label} wait failed",
-                        label = self.label,
-                    );
-                }
-            }
-            self.handle = None;
-        }
-    }
-}
 #[allow(clippy::too_many_arguments)]
 fn persist_client_run_state(
     state_dir: &str,
@@ -1074,163 +975,148 @@ pub(crate) fn run_sync_with_run_id(
     check_server_version(runner, &remote.host, server_cmd)
         .with_context(|| "server version compatibility check failed")?;
 
-    // Start background GC after confirming server compatibility.
-    // GC runs concurrently with the transform sync; failure is logged
-    // but does not fail the sync.  We await/best-effort settle GC before
-    // returning.
-    let mut gc_guard = BackgroundCmdGuard::new(
-        runner,
-        &remote.host,
-        server_cmd,
-        "gc",
-        &nickname,
-        run_id,
-        &["gc"],
-    );
+    // Run server GC once before the transform server run.  Failure is
+    // logged but does not fail the sync — GC is maintenance.
+    info!("running server GC");
+    if let Err(e) = runner.server_cmd(&remote.host, server_cmd, &["gc"]) {
+        warn!(error = %e, "server GC failed (non-fatal)");
+    } else {
+        debug!("server GC completed");
+    }
 
     info!("starting server run");
 
-    // Wrap the transform body so that GC is settled on every exit
-    // path after it has been started.
-    let sync_result: Result<()> = (|| {
-        let begin_resp = begin_run(runner, &remote.host, server_cmd, &nickname, run_id)?;
+    let begin_resp = begin_run(runner, &remote.host, server_cmd, &nickname, run_id)?;
 
-        let mut hb_guard = HeartbeatGuard::new(
-            runner.clone(),
-            remote.host.clone(),
-            server_cmd.to_string(),
-            nickname.clone(),
-            run_id.clone(),
-            begin_resp.heartbeat_interval_secs,
-        );
+    let mut hb_guard = HeartbeatGuard::new(
+        runner.clone(),
+        remote.host.clone(),
+        server_cmd.to_string(),
+        nickname.clone(),
+        run_id.clone(),
+        begin_resp.heartbeat_interval_secs,
+    );
 
-        let staging_result = (|| -> Result<()> {
-            runner.write_remote_file(
-                &remote.host,
-                &begin_resp.run_config_path,
-                &run_config.to_toml()?,
-            )?;
-            runner.write_remote_file(
-                &remote.host,
-                &begin_resp.manifest_path,
-                &manifest.to_toml()?,
-            )?;
+    let staging_result = (|| -> Result<()> {
+        runner.write_remote_file(
+            &remote.host,
+            &begin_resp.run_config_path,
+            &run_config.to_toml()?,
+        )?;
+        runner.write_remote_file(
+            &remote.host,
+            &begin_resp.manifest_path,
+            &manifest.to_toml()?,
+        )?;
 
-            info!("validating server run plan");
-            let prepare_resp = prepare_run(runner, &remote.host, server_cmd, &nickname, run_id)?;
+        info!("validating server run plan");
+        let prepare_resp = prepare_run(runner, &remote.host, server_cmd, &nickname, run_id)?;
 
-            if let Some(ref dest) = prepare_resp.destination {
-                run_config = RunConfig {
-                    purgery_version: purgery_core::current_purgery_version().to_string(),
-                    nickname: nickname.clone(),
-                    destination: DestinationPath::new(camino::Utf8PathBuf::from(dest))
-                        .with_context(|| "server returned invalid resolved destination")?,
-                    delete_after_import: true,
-                };
-            }
-
-            info!("transferring files to server staging");
-            runner.run_rsync(
-                &source_spec.operation_path,
-                &remote.host,
-                &begin_resp.files_dir,
-            )?;
-
-            Ok(())
-        })();
-
-        if let Err(e) = staging_result {
-            hb_guard.stop_and_join();
-            return Err(e);
+        if let Some(ref dest) = prepare_resp.destination {
+            run_config = RunConfig {
+                purgery_version: purgery_core::current_purgery_version().to_string(),
+                nickname: nickname.clone(),
+                destination: DestinationPath::new(camino::Utf8PathBuf::from(dest))
+                    .with_context(|| "server returned invalid resolved destination")?,
+                delete_after_import: true,
+            };
         }
 
-        // Persist state BEFORE finish-run so a crash after rsync can resume.
-        persist_client_run_state(
-            &state_dir,
-            &nickname,
-            run_id,
+        info!("transferring files to server staging");
+        runner.run_rsync(
+            &source_spec.operation_path,
             &remote.host,
-            server_cmd,
-            &manifest,
-            &run_config,
-            None,
-            ClientRunPhase::UploadCompleteFinishPending,
+            &begin_resp.files_dir,
         )?;
 
-        // Check heartbeat health without stopping it. If the lease expired
-        // during staging, bail before finish-run and leave recoverable state.
-        hb_guard.is_healthy()?;
-
-        info!("finishing server run");
-        finish_run(runner, &remote.host, server_cmd, &nickname, run_id)?;
-
-        // Stop heartbeat only after finish-run succeeded — the lease must
-        // cover the entire incoming phase.
-        hb_guard.stop_and_join();
-
-        // Update persisted state to WaitingForTerminalState
-        persist_client_run_state(
-            &state_dir,
-            &nickname,
-            run_id,
-            &remote.host,
-            server_cmd,
-            &manifest,
-            &run_config,
-            None,
-            ClientRunPhase::WaitingForTerminalState,
-        )?;
-
-        info!("driving server processing");
-        drive_server_until_terminal(runner, &remote.host, server_cmd, &nickname, run_id)?;
-
-        info!("reading run status");
-        let status = read_status(runner, &remote.host, server_cmd, &nickname, run_id)?;
-        if status.nickname != nickname || status.run_id != *run_id {
-            anyhow::bail!("server status envelope does not match requested run");
-        }
-
-        let terminal_status =
-            toml::to_string(&status).map_err(|e| anyhow::anyhow!("status serialization: {e}"))?;
-        persist_client_run_state(
-            &state_dir,
-            &nickname,
-            run_id,
-            &remote.host,
-            server_cmd,
-            &manifest,
-            &run_config,
-            Some(&terminal_status),
-            ClientRunPhase::TerminalStatusSeen,
-        )?;
-
-        if let Some(ref state_path) = cleanup_state_path {
-            cleanup::confirm_imports_from_status(state_path, &status)?;
-            cleanup::process_cleanup_state_file(state_path)?;
-        }
-
-        persist_client_run_state(
-            &state_dir,
-            &nickname,
-            run_id,
-            &remote.host,
-            server_cmd,
-            &manifest,
-            &run_config,
-            None,
-            ClientRunPhase::CleanupComplete,
-        )?;
-        remove_client_run_state(&state_dir, &nickname, run_id);
-
-        info!(state = %status.state.as_str(), "sync complete");
         Ok(())
     })();
 
-    // Settle GC on every exit path after it has been started.
-    // GC failure is logged but does not change the sync result.
-    gc_guard.finish_best_effort_wait();
+    if let Err(e) = staging_result {
+        hb_guard.stop_and_join();
+        return Err(e);
+    }
 
-    sync_result
+    // Persist state BEFORE finish-run so a crash after rsync can resume.
+    persist_client_run_state(
+        &state_dir,
+        &nickname,
+        run_id,
+        &remote.host,
+        server_cmd,
+        &manifest,
+        &run_config,
+        None,
+        ClientRunPhase::UploadCompleteFinishPending,
+    )?;
+
+    // Check heartbeat health without stopping it. If the lease expired
+    // during staging, bail before finish-run and leave recoverable state.
+    hb_guard.is_healthy()?;
+
+    info!("finishing server run");
+    finish_run(runner, &remote.host, server_cmd, &nickname, run_id)?;
+
+    // Stop heartbeat only after finish-run succeeded — the lease must
+    // cover the entire incoming phase.
+    hb_guard.stop_and_join();
+
+    // Update persisted state to WaitingForTerminalState
+    persist_client_run_state(
+        &state_dir,
+        &nickname,
+        run_id,
+        &remote.host,
+        server_cmd,
+        &manifest,
+        &run_config,
+        None,
+        ClientRunPhase::WaitingForTerminalState,
+    )?;
+
+    info!("driving server processing");
+    drive_server_until_terminal(runner, &remote.host, server_cmd, &nickname, run_id)?;
+
+    info!("reading run status");
+    let status = read_status(runner, &remote.host, server_cmd, &nickname, run_id)?;
+    if status.nickname != nickname || status.run_id != *run_id {
+        anyhow::bail!("server status envelope does not match requested run");
+    }
+
+    let terminal_status =
+        toml::to_string(&status).map_err(|e| anyhow::anyhow!("status serialization: {e}"))?;
+    persist_client_run_state(
+        &state_dir,
+        &nickname,
+        run_id,
+        &remote.host,
+        server_cmd,
+        &manifest,
+        &run_config,
+        Some(&terminal_status),
+        ClientRunPhase::TerminalStatusSeen,
+    )?;
+
+    if let Some(ref state_path) = cleanup_state_path {
+        cleanup::confirm_imports_from_status(state_path, &status)?;
+        cleanup::process_cleanup_state_file(state_path)?;
+    }
+
+    persist_client_run_state(
+        &state_dir,
+        &nickname,
+        run_id,
+        &remote.host,
+        server_cmd,
+        &manifest,
+        &run_config,
+        None,
+        ClientRunPhase::CleanupComplete,
+    )?;
+    remove_client_run_state(&state_dir, &nickname, run_id);
+
+    info!(state = %status.state.as_str(), "sync complete");
+    Ok(())
 }
 
 /// Handle --split mode.
@@ -1269,6 +1155,21 @@ fn run_split(
         info!("split pattern matched nothing");
         return Ok(());
     }
+
+    // Run server GC once before processing any split entries, but only
+    // if this is a server-run sync (transform).  Passthrough-with-cleanup
+    // does not contact the server.
+    if has_transform {
+        check_server_version(runner, &target.host, &args.server_command)
+            .with_context(|| "server version compatibility check failed")?;
+        info!("running server GC");
+        if let Err(e) = runner.server_cmd(&target.host, &args.server_command, &["gc"]) {
+            warn!(error = %e, "server GC failed (non-fatal)");
+        } else {
+            debug!("server GC completed");
+        }
+    }
+
     let base_dest = &args.destination;
     for root in &entry_roots {
         let suffix = split::split_target_suffix(&source_spec.operation_path, &root.path);

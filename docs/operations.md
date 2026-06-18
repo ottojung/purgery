@@ -56,21 +56,23 @@ purgery-client sync \
   -- ~/Videos user@server:/archive
 ```
 
-When `purgery-client sync` is invoked with `--transform`, the client uploads the run and finishes it, then spawns a foreground remote `purgery-server process-run --nickname <nickname> --run-id <run-id>` in a local supervised handle while concurrently polling `run-state`. The client restarts `process-run` on SSH transport failure when needed, and reads status after terminal `run-state`.
+When `purgery-client sync` is invoked with `--transform`, the client uploads the run and finishes it, then spawns a foreground remote `purgery-server process-run --nickname <nickname> --run-id <run-id>` in a local supervised handle while concurrently polling `run-state`. The client restarts `process-run` on SSH transport failure when needed, and reads status after terminal `run-state`. Transform sync is synchronous and may wait indefinitely until the server run reaches a terminal state. A separate daemon, cron job, or timer is not required for the basic synchronous transform path.
 
-`process-run` does not run GC. The client starts `purgery-server gc` separately as a concurrent foreground remote command immediately after connecting to the server. GC failure is logged and does not fail the transform sync. The client settles the GC command before returning.
+Before the server run begins, the client initiates `purgery-server gc` as a best-effort foreground command. GC failure is logged and does not fail the transform sync. This is the only client-initiated GC for the invocation.
+
+`process-run` does not run GC.
 
 The target run is driven independently of unrelated ready/processing runs. `process-run` may claim the target from `ready`, recover an abandoned target in `processing`, observe that another processor is actively handling it, or observe that it is already terminal. It does not process unrelated ready/processing runs.
 
 This makes a single client-triggered transform sync self-contained: the server processing happens during the client invocation. The client does not require a separately running daemon, cron job, or timer for the normal transform path.
 
-Operators who want a daemon or timer to process all queued runs may run:
+Operators who want a daemon or timer to process all queued runs, recover abandoned work, or perform batch maintenance may run:
 
 ```sh
 purgery-server process-once --config server.toml
 ```
 
-This runs global GC, recovers unlocked processing runs (respecting active processor locks), and processes all ready runs. It is independent of client-triggered `process-run`.
+This runs GC, recovers unlocked processing runs (respecting active processor locks), and processes all ready runs. It is independent of client-triggered `process-run` and is no longer required for a normal synchronous transform client.
 
 Each processing run has a `processor.lock` file (using `flock`) that prevents concurrent mutation. A run may be mutated only by a process holding its lock. If the lock is held by another process, the run is considered actively owned and will not be recovered or replayed. A busy lock is normal concurrency, not an error. Terminal directories do not retain `processor.lock`.
 
@@ -208,7 +210,7 @@ Collection process:
 
 If `failed/<run_id>` already exists, the abandoned run is moved to a GC quarantine path instead of merging directories. The same status and file cleanup is applied to quarantined runs.
 
-GC is run opportunistically at the start of `process-once` and `begin-run`. It is never run from `check`. Expose separately for cron/systemd timers.
+GC is run by `process-once` before batch recovery/processing. Transform sync clients also initiate GC before `begin-run` as a best-effort foreground command. `begin-run` itself does not perform GC — this avoids duplicating GC when a transform sync client and an operator both trigger it.
 
 ## `--server-command` trust model
 

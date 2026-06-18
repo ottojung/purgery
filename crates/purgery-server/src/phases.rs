@@ -535,11 +535,6 @@ pub fn move_to_failed(work_dir: &PurgeryRoot, nickname: &Nickname, run_id: &RunI
 }
 
 pub fn begin_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> Result<String> {
-    // Run GC opportunistically before creating the run
-    if let Err(e) = crate::gc::run_gc(config) {
-        warn!(error = %e, "opportunistic GC failed");
-    }
-
     let phases = [
         RunPhase::Incoming,
         RunPhase::Ready,
