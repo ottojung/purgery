@@ -557,6 +557,14 @@ fn finish_worker_after_terminal(
         return Ok(());
     };
 
+    // Fast path: if the worker already exited, the drive loop has already
+    // validated the outcome against fresh run-state.  No need for a second
+    // round of validation here — just log and return.
+    if let Ok(Some(_exit)) = w.try_wait() {
+        return Ok(());
+    }
+
+    // Worker still running — bounded graceful wait after terminal observation.
     let exit = match w.wait_timeout(TERMINAL_WORKER_GRACE)? {
         Some(exit) => exit,
         None => {
@@ -573,16 +581,7 @@ fn finish_worker_after_terminal(
 
     match exit {
         RemoteCommandExit::Success { stdout } => {
-            let _resp =
-                parse_process_run_response(&stdout, nickname, run_id).with_context(|| {
-                    format!(
-                        "process-run succeeded after terminal state for run {}/{} \
-                         but produced invalid response",
-                        nickname.as_str(),
-                        run_id.as_str(),
-                    )
-                })?;
-            Ok(())
+            validate_terminal_worker_success(&stdout, runner, host, server_cmd, nickname, run_id)
         }
         RemoteCommandExit::RemoteFailure { stderr, .. } => {
             warn!(
@@ -644,6 +643,69 @@ fn validate_terminal_state_worker_failure(
         )
     })?;
     Ok(())
+}
+
+/// Validate a successful process-run exit that occurred after terminal
+/// run-state was observed.  Parses the response, verifies the outcome
+/// is compatible with terminal state, fresh-polls run-state, and checks
+/// that terminal status is readable.
+fn validate_terminal_worker_success(
+    stdout: &str,
+    runner: &RemoteRunner,
+    host: &str,
+    server_cmd: &str,
+    nickname: &Nickname,
+    run_id: &RunId,
+) -> Result<()> {
+    let resp = parse_process_run_response(stdout, nickname, run_id)?;
+
+    let outcome = purgery_core::ProcessRunOutcome::from_str_name(&resp.outcome)
+        .ok_or_else(|| anyhow::anyhow!("unknown process-run outcome '{}'", resp.outcome))?;
+
+    let fresh = run_state(runner, host, server_cmd, nickname, run_id).with_context(|| {
+        format!(
+            "failed to poll fresh run-state after successful process-run exit \
+             following terminal observation for run {}/{}",
+            nickname.as_str(),
+            run_id.as_str(),
+        )
+    })?;
+
+    if !fresh.terminal {
+        anyhow::bail!(
+            "process-run exited successfully after terminal state was observed \
+             for run {}/{} but fresh run-state is not terminal \
+             (phase={}, processor_state={:?})",
+            nickname.as_str(),
+            run_id.as_str(),
+            fresh.phase,
+            fresh.processor_state,
+        );
+    }
+
+    read_status(runner, host, server_cmd, nickname, run_id).with_context(|| {
+        format!(
+            "fresh terminal run-state observed for run {}/{} after successful \
+             process-run exit, but status is not readable",
+            nickname.as_str(),
+            run_id.as_str(),
+        )
+    })?;
+
+    match outcome {
+        purgery_core::ProcessRunOutcome::Processed
+        | purgery_core::ProcessRunOutcome::AlreadyTerminal => Ok(()),
+        purgery_core::ProcessRunOutcome::AlreadyActive
+        | purgery_core::ProcessRunOutcome::ClaimInProgress => {
+            anyhow::bail!(
+                "process-run exited successfully after terminal state was observed \
+                 for run {}/{} but reported suspicious nonterminal outcome={}",
+                nickname.as_str(),
+                run_id.as_str(),
+                resp.outcome,
+            )
+        }
+    }
 }
 
 /// Parse, validate envelope, and enforce `ProcessRunResponse` outcome
@@ -2638,6 +2700,16 @@ observed_at_unix_secs = 1000
             "status",
             &done_status_toml().replace("test-run", "test-backoff"),
         );
+        // Extra responses for terminal worker validation (worker still
+        // running after terminal observation).
+        runner.add_response(
+            "run-state",
+            &done_run_state_toml().replace("test-run", "test-backoff"),
+        );
+        runner.add_response(
+            "status",
+            &done_status_toml().replace("test-run", "test-backoff"),
+        );
 
         let manifest = Manifest {
             purgery_version: "0.1.0-test".to_string(),
@@ -3835,7 +3907,10 @@ observed_at_unix_secs = 1000
         runner.add_response("status", &done_status_toml());
 
         let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
-        assert!(result.is_ok(), "sync should succeed: {:?}", result.err());
+        if let Err(ref e) = result {
+            eprintln!("no_duplicate error: {e:#}");
+            panic!("no_duplicate: sync must succeed");
+        }
 
         let log = runner.command_log();
         let gc_pos = log.iter().position(|c| c.contains("'gc'"));
@@ -4348,6 +4423,9 @@ observed_at_unix_secs = 1000
         runner.add_response("run-state", &ready_run_state_toml());
         runner.add_response("run-state", &done_run_state_toml());
         runner.add_response("status", &done_status_toml());
+        // Extra responses for terminal worker validation
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
 
         let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
         assert!(result.is_ok(), "sync must succeed");
@@ -4659,6 +4737,28 @@ observed_at_unix_secs = 1000
     #[test]
     fn finish_worker_already_exited_does_not_hang() {
         let runner = mk_runner();
+        // terminal validation needs run-state and status responses
+        let term_state = format!(
+            r#"protocol_version = {}
+purgery_version = "0.1.0-test"
+nickname = "laptop"
+run_id = "r"
+phase = "done"
+terminal = true
+message = ""
+updated_at_unix_secs = 1000
+observed_at_unix_secs = 1000
+"#,
+            purgery_core::PROTOCOL_VERSION
+        );
+        let term_status = r#"purgery_version = "0.1.0-test"
+run_id = "r"
+nickname = "laptop"
+state = "done"
+"#
+        .to_string();
+        runner.add_response("run-state", &term_state);
+        runner.add_response("status", &term_status);
         runner.add_spawned_cmd_exit(
             "worker-test",
             0,
@@ -4669,7 +4769,6 @@ observed_at_unix_secs = 1000
         let handle = runner
             .spawn_server_cmd("host", "ps", &["worker-test"])
             .unwrap();
-        // Exited immediately (0 polls).
         let mut worker = Some(handle);
         let res = finish_worker_after_terminal(
             &mut worker,
@@ -4686,7 +4785,27 @@ observed_at_unix_secs = 1000
     #[test]
     fn finish_worker_waits_gracefully_for_scripted_exit() {
         let runner = mk_runner();
-        // Scripted exit after 2 polls — should be found during grace period.
+        let term_state = format!(
+            r#"protocol_version = {}
+purgery_version = "0.1.0-test"
+nickname = "laptop"
+run_id = "r"
+phase = "done"
+terminal = true
+message = ""
+updated_at_unix_secs = 1000
+observed_at_unix_secs = 1000
+"#,
+            purgery_core::PROTOCOL_VERSION
+        );
+        let term_status = r#"purgery_version = "0.1.0-test"
+run_id = "r"
+nickname = "laptop"
+state = "done"
+"#
+        .to_string();
+        runner.add_response("run-state", &term_state);
+        runner.add_response("status", &term_status);
         runner.add_spawned_cmd_exit(
             "worker-test",
             2,

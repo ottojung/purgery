@@ -1224,19 +1224,17 @@ fn handle_process_run_processing_outcome(
             anyhow::bail!("abandoned processing run is incompatible: {message}")
         }
         Ok(ProcessingTargetOutcome::NotFound) => {
-            let term_phase = detect_terminal_phase(config, nickname, run_id);
-            if term_phase == "done" || term_phase == "failed" {
-                Ok((
+            match verified_terminal_status_phase(config, nickname, run_id)? {
+                Some(term_phase) => Ok((
                     ProcessRunOutcome::AlreadyTerminal,
                     Some(term_phase),
                     Some("processing run completed before recovery".to_string()),
-                ))
-            } else {
-                anyhow::bail!(
-                    "run {}/{} disappeared from processing but is not in a terminal phase",
+                )),
+                None => anyhow::bail!(
+                    "run {}/{} disappeared from processing but no verified terminal status exists",
                     nickname.as_str(),
                     run_id.as_str(),
-                )
+                ),
             }
         }
         Ok(ProcessingTargetOutcome::FailurePublishFailed { .. }) => {
@@ -1268,4 +1266,42 @@ fn detect_terminal_phase(config: &ServerConfig, nickname: &Nickname, run_id: &Ru
         return phase.as_str().to_owned();
     }
     String::new()
+}
+
+/// Strict terminal status verification.  Returns the terminal phase
+/// (from `RunStatus.state`) only when a readable `status.toml` exists
+/// in either `done/` or `failed/`.  Errors if the directory exists
+/// but status is missing or malformed.  Returns `None` if neither
+/// terminal directory exists.
+fn verified_terminal_status_phase(
+    config: &ServerConfig,
+    nickname: &Nickname,
+    run_id: &RunId,
+) -> Result<Option<String>> {
+    for (phase, _) in &[(RunPhase::Done, "done"), (RunPhase::Failed, "failed")] {
+        let dir = config.work_dir.run_dir(nickname, run_id, *phase);
+        if !dir.exists() {
+            continue;
+        }
+        let status_path = dir.join("status.toml");
+        let content = fs::read_to_string(status_path.as_std_path()).with_context(|| {
+            format!(
+                "terminal directory exists for run {}/{} in phase {} \
+                 but status.toml is unreadable",
+                nickname.as_str(),
+                run_id.as_str(),
+                phase.as_str(),
+            )
+        })?;
+        let status = purgery_core::RunStatus::from_toml(&content).with_context(|| {
+            format!(
+                "terminal status.toml is invalid for run {}/{} in phase {}",
+                nickname.as_str(),
+                run_id.as_str(),
+                phase.as_str(),
+            )
+        })?;
+        return Ok(Some(status.state.as_str().to_owned()));
+    }
+    Ok(None)
 }
