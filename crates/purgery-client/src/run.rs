@@ -283,7 +283,7 @@ fn drive_server_until_terminal_with_interval(
                         Some(exit) => {
                             worker = None;
                             match exit {
-                                RemoteCommandExit::Success => {
+                                RemoteCommandExit::Success { .. } => {
                                     debug!(
                                         nickname = %nickname.as_str(),
                                         run_id = %run_id.as_str(),
@@ -1932,7 +1932,13 @@ observed_at_unix_secs = 1000
         // First run-state returns ready → triggers process-run
         runner.add_response("run-state", &ready_run_state_toml());
         // process-run response (empty on success)
-        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
         // After process-run: run-state returns done
         runner.add_response("run-state", &done_run_state_toml());
         let status_toml =
@@ -2119,7 +2125,13 @@ observed_at_unix_secs = 1000
         // run-state returns ready → triggers process-run
         runner.add_response("run-state", &ready_run_state_toml());
         // process-run succeeds
-        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
         // But another processor already claimed it — run-state shows processing
         runner.add_response(
             "run-state",
@@ -2161,7 +2173,13 @@ observed_at_unix_secs = 1000
             "run-state",
             &ready_run_state_toml().replace("test-run", "test-resume-drive"),
         );
-        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
         runner.add_response(
             "run-state",
             &done_run_state_toml().replace("test-run", "test-resume-drive"),
@@ -2218,7 +2236,13 @@ observed_at_unix_secs = 1000
         // on it and then poll until terminal.
         runner.add_response("run-state", &processing_state("test-resume-proc", 1000));
         // process-run succeeds
-        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
         // After process-run, run-state returns done
         runner.add_response(
             "run-state",
@@ -2341,7 +2365,13 @@ observed_at_unix_secs = 1000
             "run-state",
             &ready_run_state_toml().replace("test-run", "test-always-ready"),
         );
-        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
         // After process-run: processing (another processor claimed it)
         runner.add_response("run-state", &processing_state("test-always-ready", 1000));
         // Poll again: still processing (within drive interval, no process-run)
@@ -2400,7 +2430,13 @@ observed_at_unix_secs = 1000
 
         // First run-state call returns processing → must drive immediately
         runner.add_response("run-state", &processing_state("test-resume-imm", 1000));
-        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
         runner.add_response(
             "run-state",
             &done_run_state_toml().replace("test-run", "test-resume-imm"),
@@ -3425,7 +3461,13 @@ observed_at_unix_secs = 1000
         let args = transform_args(&tmp, &state_dir);
         let run_id = RunId::new("test-run".into()).unwrap();
 
-        runner.add_spawned_cmd_exit("'gc'", 0, RemoteCommandExit::Success);
+        runner.add_spawned_cmd_exit(
+            "'gc'",
+            0,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
         runner.add_response("begin-run", &begin_resp_toml());
         runner.add_response(
             "prepare-run",
@@ -3437,7 +3479,13 @@ observed_at_unix_secs = 1000
         runner.add_response("heartbeat-run", "");
         runner.add_response("finish-run", "");
         runner.add_response("run-state", &ready_run_state_toml());
-        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
         runner.add_response("run-state", &done_run_state_toml());
         runner.add_response("status", &done_status_toml());
 
@@ -3463,7 +3511,13 @@ observed_at_unix_secs = 1000
         let args = transform_args(&tmp, &state_dir);
         let run_id = RunId::new("test-run".into()).unwrap();
 
-        runner.add_spawned_cmd_exit("'gc'", 0, RemoteCommandExit::Success);
+        runner.add_spawned_cmd_exit(
+            "'gc'",
+            0,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
         runner.add_response("begin-run", &begin_resp_toml());
         runner.add_response(
             "prepare-run",
@@ -3474,7 +3528,13 @@ observed_at_unix_secs = 1000
         );
         runner.add_response("heartbeat-run", "");
         runner.add_response("finish-run", "");
-        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
         runner.add_response("run-state", &done_run_state_toml());
         runner.add_response("status", &done_status_toml());
 
@@ -3508,7 +3568,13 @@ observed_at_unix_secs = 1000
         );
         runner.add_response("heartbeat-run", "");
         runner.add_response("finish-run", "");
-        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
         runner.add_response("run-state", &done_run_state_toml());
         runner.add_response("status", &done_status_toml());
 
@@ -3546,7 +3612,13 @@ observed_at_unix_secs = 1000
         );
         runner.add_response("heartbeat-run", "");
         runner.add_response("finish-run", "");
-        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
         runner.add_response("run-state", &done_run_state_toml());
         runner.add_response("status", &done_status_toml());
 
@@ -3566,7 +3638,13 @@ observed_at_unix_secs = 1000
         let args = transform_args(&tmp, &state_dir);
         let run_id = RunId::new("test-run".into()).unwrap();
 
-        runner.add_spawned_cmd_exit("'gc'", 0, RemoteCommandExit::Success);
+        runner.add_spawned_cmd_exit(
+            "'gc'",
+            0,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
         runner.add_response("begin-run", &begin_resp_toml());
         runner.add_write_error("run.toml", "write failed during staging");
 
@@ -3637,7 +3715,13 @@ observed_at_unix_secs = 1000
         );
         runner.add_response("heartbeat-run", "");
         runner.add_response("finish-run", "");
-        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
         runner.add_response("run-state", &done_run_state_toml());
         let status = r#"purgery_version = "0.1.0-test"
 run_id = "test-run"
@@ -3670,7 +3754,13 @@ status = "imported"
         let args = transform_args(&tmp, &state_dir);
         let run_id = RunId::new("test-run".into()).unwrap();
 
-        runner.add_spawned_cmd_exit("'gc'", 0, RemoteCommandExit::Success);
+        runner.add_spawned_cmd_exit(
+            "'gc'",
+            0,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
         runner.add_response("begin-run", &begin_resp_toml());
         runner.add_response(
             "prepare-run",
@@ -3681,7 +3771,13 @@ status = "imported"
         );
         runner.add_response("heartbeat-run", "");
         runner.add_response("finish-run", "");
-        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
         runner.add_response("run-state", &done_run_state_toml());
         runner.add_response("status", &done_status_toml());
 
@@ -3707,7 +3803,13 @@ status = "imported"
         let args = transform_args(&tmp, &state_dir);
         let run_id = RunId::new("test-run".into()).unwrap();
 
-        runner.add_spawned_cmd_exit("'gc'", 0, RemoteCommandExit::Success);
+        runner.add_spawned_cmd_exit(
+            "'gc'",
+            0,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
         runner.add_response("begin-run", &begin_resp_toml());
         runner.add_response(
             "prepare-run",
@@ -3720,7 +3822,13 @@ status = "imported"
         runner.add_response("finish-run", "");
         // Run-state must show non-terminal (ready) so process-run is spawned
         runner.add_response("run-state", &ready_run_state_toml());
-        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
         runner.add_response("run-state", &done_run_state_toml());
         runner.add_response("status", &done_status_toml());
 
@@ -3746,7 +3854,13 @@ status = "imported"
         let args = transform_args(&tmp, &state_dir);
         let run_id = RunId::new("test-run".into()).unwrap();
 
-        runner.add_spawned_cmd_exit("'gc'", 0, RemoteCommandExit::Success);
+        runner.add_spawned_cmd_exit(
+            "'gc'",
+            0,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
         runner.add_response("begin-run", &begin_resp_toml());
         runner.add_response(
             "prepare-run",
@@ -3767,7 +3881,13 @@ status = "imported"
             },
         );
         runner.add_response("run-state", &ready_run_state_toml());
-        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
         runner.add_response("run-state", &done_run_state_toml());
         runner.add_response("status", &done_status_toml());
 
@@ -3793,7 +3913,13 @@ status = "imported"
         let args = transform_args(&tmp, &state_dir);
         let run_id = RunId::new("test-run".into()).unwrap();
 
-        runner.add_spawned_cmd_exit("'gc'", 0, RemoteCommandExit::Success);
+        runner.add_spawned_cmd_exit(
+            "'gc'",
+            0,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
         runner.add_response("begin-run", &begin_resp_toml());
         runner.add_response(
             "prepare-run",
@@ -3805,7 +3931,13 @@ status = "imported"
         runner.add_response("heartbeat-run", "");
         runner.add_response("finish-run", "");
         runner.add_response("run-state", &ready_run_state_toml());
-        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
         let active_processing = format!(
             r#"protocol_version = {}
 purgery_version = "0.1.0-test"
@@ -3843,7 +3975,13 @@ observed_at_unix_secs = 1000
         let args = transform_args(&tmp, &state_dir);
         let run_id = RunId::new("test-run".into()).unwrap();
 
-        runner.add_spawned_cmd_exit("'gc'", 0, RemoteCommandExit::Success);
+        runner.add_spawned_cmd_exit(
+            "'gc'",
+            0,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
         runner.add_response("begin-run", &begin_resp_toml());
         runner.add_response(
             "prepare-run",
@@ -3855,7 +3993,13 @@ observed_at_unix_secs = 1000
         runner.add_response("heartbeat-run", "");
         runner.add_response("finish-run", "");
         runner.add_response("run-state", &ready_run_state_toml());
-        runner.add_spawned_cmd_exit("process-run", 3, RemoteCommandExit::Success);
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            3,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
         runner.add_response("run-state", &ready_run_state_toml());
         runner.add_response("run-state", &done_run_state_toml());
         runner.add_response("status", &done_status_toml());
@@ -3906,7 +4050,13 @@ observed_at_unix_secs = 1000
             runner.add_response("heartbeat-run", "");
             runner.add_response("finish-run", "");
             runner.add_response("run-state", &ready_run_state_toml());
-            runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
+            runner.add_spawned_cmd_exit(
+                "process-run",
+                0,
+                RemoteCommandExit::Success {
+                    stdout: String::new(),
+                },
+            );
             runner.add_response("run-state", &done_run_state_toml());
             runner.add_response("status", &done_status_toml());
 
@@ -3935,7 +4085,13 @@ observed_at_unix_secs = 1000
             runner.add_response("heartbeat-run", "");
             runner.add_response("finish-run", "");
             runner.add_response("run-state", &ready_run_state_toml());
-            runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
+            runner.add_spawned_cmd_exit(
+                "process-run",
+                0,
+                RemoteCommandExit::Success {
+                    stdout: String::new(),
+                },
+            );
             runner.add_response("run-state", &done_run_state_toml());
             runner.add_response("status", &done_status_toml());
 
@@ -4105,7 +4261,13 @@ observed_at_unix_secs = 1000
         runner.add_response("heartbeat-run", "");
         runner.add_response("finish-run", "");
         runner.add_response("run-state", &ready_run_state_toml());
-        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
         runner.add_response("run-state", &done_run_state_toml());
         runner.add_response("status", &done_status_toml());
 
@@ -4152,7 +4314,13 @@ observed_at_unix_secs = 1000
     #[test]
     fn finish_worker_already_exited_does_not_hang() {
         let runner = mk_runner();
-        runner.add_spawned_cmd_exit("worker-test", 0, RemoteCommandExit::Success);
+        runner.add_spawned_cmd_exit(
+            "worker-test",
+            0,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
         let handle = runner
             .spawn_server_cmd("host", "ps", &["worker-test"])
             .unwrap();
@@ -4166,7 +4334,13 @@ observed_at_unix_secs = 1000
     fn finish_worker_waits_gracefully_for_scripted_exit() {
         let runner = mk_runner();
         // Scripted exit after 2 polls — should be found during grace period.
-        runner.add_spawned_cmd_exit("worker-test", 2, RemoteCommandExit::Success);
+        runner.add_spawned_cmd_exit(
+            "worker-test",
+            2,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
         let handle = runner
             .spawn_server_cmd("host", "ps", &["worker-test"])
             .unwrap();
@@ -4204,7 +4378,13 @@ observed_at_unix_secs = 1000
     #[test]
     fn terminate_worker_on_error_clears_handle() {
         let runner = mk_runner();
-        runner.add_spawned_cmd_exit("worker-test", 5, RemoteCommandExit::Success);
+        runner.add_spawned_cmd_exit(
+            "worker-test",
+            5,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
         let handle = runner
             .spawn_server_cmd("host", "ps", &["worker-test"])
             .unwrap();

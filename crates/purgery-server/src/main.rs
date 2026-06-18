@@ -247,7 +247,12 @@ fn main() -> Result<()> {
         Command::ProcessRun { nickname, run_id } => {
             let nickname = Nickname::new(nickname).with_context(|| "invalid nickname")?;
             let run_id = RunId::new(run_id).with_context(|| "invalid run ID")?;
-            process_run_target(&server_config, &nickname, &run_id)?;
+            let response = process_run_target(&server_config, &nickname, &run_id)?;
+            println!(
+                "{}",
+                toml::to_string(&response)
+                    .with_context(|| "failed to serialize process-run response")?
+            );
         }
     }
     Ok(())

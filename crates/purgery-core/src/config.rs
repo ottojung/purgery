@@ -243,6 +243,33 @@ pub struct PrepareRunResponse {
     pub destination: Option<String>,
 }
 
+/// Response from `purgery-server process-run --nickname N --run-id R`.
+///
+/// Printed as TOML on stdout when the command exits successfully.
+/// Nonzero exit indicates a hard error (not found, I/O failure, etc.);
+/// the client then re-polls run-state and may still accept terminal state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessRunResponse {
+    pub protocol_version: u32,
+    pub purgery_version: String,
+    pub nickname: String,
+    pub run_id: String,
+    /// Machine-readable outcome:
+    ///   "processed"            – the run was claimed and driven to terminal
+    ///   "already_terminal"     – target was already done/failed
+    ///   "already_active"       – target is processing with an active lock
+    ///   "claim_in_progress"    – ready lock is busy, another claimer is active
+    #[serde(rename = "outcome")]
+    pub outcome: String,
+    /// Current phase at the time of the outcome decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    /// Human-readable detail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
 // ── Run State / Progress ─────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

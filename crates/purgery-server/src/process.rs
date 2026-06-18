@@ -443,10 +443,11 @@ pub(crate) enum ReadyClaimOutcome {
     ClaimFailed { error: anyhow::Error },
 }
 
-/// Claim a ready run by checking version compatibility and renaming
-/// ready → processing.
+/// Claim a ready run.  The processor lock is acquired before any
+/// read or mutation of the ready directory so that all ready-run
+/// mutation, including malformed-ready failure publication, is
+/// protected by the lock.
 ///
-/// The lock is acquired before the rename so it remains valid after.
 /// Returns `Claimed(lock)` on success — the caller MUST run
 /// `process_processing_run` while holding the lock.
 ///
@@ -462,23 +463,11 @@ pub(crate) fn claim_ready_run(
         return recheck_state(config, nickname, run_id);
     }
 
-    // Check version compatibility before claiming.
-    match read_compatible_run_inputs(&ready_path, nickname, run_id) {
-        Err(ProcessingError::Incompatible { message, .. }) => {
-            return ReadyClaimOutcome::IncompatibleReady { message };
-        }
-        Err(ProcessingError::Other(e)) => {
-            return handle_malformed_ready(config, nickname, run_id, e);
-        }
-        Ok(_) => {}
-    }
-
-    // Acquire the processor lock inside the ready directory BEFORE rename.
+    // Acquire the processor lock BEFORE reading or mutating the ready
+    // directory.  This ensures all ready-run mutation is protected.
     let lock = match crate::phases::try_lock_existing_run_dir_processor(&ready_path) {
         Ok(crate::phases::ProcessorLockAttempt::Acquired(l)) => l,
         Ok(crate::phases::ProcessorLockAttempt::Busy) => {
-            // Another process is actively trying to claim this ready run.
-            // This is a normal race, not corruption.
             return ReadyClaimOutcome::ActiveClaimer;
         }
         Ok(crate::phases::ProcessorLockAttempt::Missing) => {
@@ -490,6 +479,18 @@ pub(crate) fn claim_ready_run(
             };
         }
     };
+
+    // Lock acquired — now read inputs.
+    match read_compatible_run_inputs(&ready_path, nickname, run_id) {
+        Err(ProcessingError::Incompatible { message, .. }) => {
+            drop(lock);
+            return ReadyClaimOutcome::IncompatibleReady { message };
+        }
+        Err(ProcessingError::Other(e)) => {
+            return handle_malformed_ready(config, nickname, run_id, e, lock);
+        }
+        Ok(_) => {}
+    }
 
     // Compatible and locked — claim by renaming ready → processing.
     let processing_path = config
@@ -532,6 +533,7 @@ fn handle_malformed_ready(
     nickname: &Nickname,
     run_id: &RunId,
     original_error: anyhow::Error,
+    _lock: crate::phases::ProcessingRunLock,
 ) -> ReadyClaimOutcome {
     let ready_path = config.work_dir.run_dir(nickname, run_id, RunPhase::Ready);
     let failed_path = config.work_dir.run_dir(nickname, run_id, RunPhase::Failed);
@@ -575,6 +577,10 @@ fn handle_malformed_ready(
             publish_error: anyhow::anyhow!("failed to move malformed ready to failed: {e}"),
         };
     }
+
+    // After renaming to failed, terminal dirs must not retain processor.lock.
+    // The lock was acquired in ready and came along with the rename.
+    let _ = fs::remove_file(failed_path.join("processor.lock"));
 
     ReadyClaimOutcome::MalformedReadyMovedToFailed {
         error: original_error,
@@ -1054,24 +1060,40 @@ pub fn process_run_target(
     config: &ServerConfig,
     nickname: &Nickname,
     run_id: &RunId,
-) -> Result<()> {
-    process_run_target_inner(config, nickname, run_id)
+) -> Result<purgery_core::ProcessRunResponse> {
+    use purgery_core::ProcessRunResponse;
+
+    let (outcome, phase, message) = process_run_inner(config, nickname, run_id)?;
+
+    Ok(ProcessRunResponse {
+        protocol_version: purgery_core::PROTOCOL_VERSION,
+        purgery_version: purgery_core::current_purgery_version().to_string(),
+        nickname: nickname.as_str().to_owned(),
+        run_id: run_id.as_str().to_owned(),
+        outcome,
+        phase,
+        message,
+    })
 }
 
-/// Inner implementation of `process_run_target` without GC.
-fn process_run_target_inner(
+/// Inner dispatch.  Returns (outcome_string, current_phase, detail_message).
+fn process_run_inner(
     config: &ServerConfig,
     nickname: &Nickname,
     run_id: &RunId,
-) -> Result<()> {
+) -> Result<(String, Option<String>, Option<String>)> {
     // 1. Try to claim from ready.
     match claim_ready_run(config, nickname, run_id) {
         ReadyClaimOutcome::Claimed(lock) => {
             let result = process_processing_run(config, nickname, run_id);
-            let final_result = match result {
-                Ok(()) => Ok(()),
+            let (outcome, phase, message) = match result {
+                Ok(()) => (
+                    "processed".to_string(),
+                    Some("done".to_string()),
+                    Some("run processed successfully".to_string()),
+                ),
                 Err(ProcessingError::Incompatible { message, .. }) => {
-                    Err(anyhow::anyhow!("incompatible run in processing: {message}"))
+                    anyhow::bail!("incompatible run in processing: {message}")
                 }
                 Err(ProcessingError::Other(error)) => {
                     warn!(
@@ -1081,49 +1103,54 @@ fn process_run_target_inner(
                         error = %error,
                         "run failed",
                     );
-                    // Lock is still held here — must not drop before mutation is complete.
                     match move_to_failed(&config.work_dir, nickname, run_id) {
-                        Ok(()) => Err(error),
-                        Err(move_err) => Err(anyhow::anyhow!(
+                        Ok(()) => (
+                            "processed".to_string(),
+                            Some("failed".to_string()),
+                            Some(error.to_string()),
+                        ),
+                        Err(move_err) => anyhow::bail!(
                             "{error}; failed to move target run to failed: {move_err}"
-                        )),
+                        ),
                     }
                 }
             };
             drop(lock);
-            return final_result;
+            return Ok((outcome, phase, message));
         }
         ReadyClaimOutcome::ActiveClaimer => {
             info!(
                 nickname = %nickname.as_str(),
                 run_id = %run_id.as_str(),
-                "ready run is being claimed by another processor; treating as active",
+                "ready run is being claimed by another processor",
             );
-            return Ok(());
-        }
-        ReadyClaimOutcome::AlreadyProcessing => {
-            return handle_process_run_processing(config, nickname, run_id);
-        }
-        ReadyClaimOutcome::AlreadyTerminal => return Ok(()),
-        ReadyClaimOutcome::IncompatibleReady { message } => {
-            return Err(anyhow::anyhow!("incompatible run left in place: {message}"))
-        }
-        ReadyClaimOutcome::MalformedReadyMovedToFailed { error } => {
-            return Err(anyhow::anyhow!(
-                "malformed ready run moved to failed: {error}"
-            ))
-        }
-        ReadyClaimOutcome::MalformedReadyMoveFailed {
-            original_error,
-            publish_error,
-        } => {
-            return Err(anyhow::anyhow!(
-                "malformed ready run could not be moved to failed: \
-                 {original_error}; publication error: {publish_error}"
+            return Ok((
+                "claim_in_progress".to_string(),
+                Some("ready".to_string()),
+                Some("another process owns the ready processor lock".to_string()),
             ));
         }
+        ReadyClaimOutcome::AlreadyProcessing => {
+            return handle_process_run_processing_outcome(config, nickname, run_id);
+        }
+        ReadyClaimOutcome::AlreadyTerminal => {
+            return Ok((
+                "already_terminal".to_string(),
+                None,
+                Some("run was already in a terminal phase".to_string()),
+            ));
+        }
+        ReadyClaimOutcome::IncompatibleReady { message } => {
+            anyhow::bail!("incompatible run left in place: {message}")
+        }
+        ReadyClaimOutcome::MalformedReadyMovedToFailed { error } => {
+            anyhow::bail!("malformed ready run moved to failed: {error}")
+        }
+        ReadyClaimOutcome::MalformedReadyMoveFailed { .. } => {
+            anyhow::bail!("malformed ready run could not be moved to failed")
+        }
         ReadyClaimOutcome::NotFound => { /* fall through */ }
-        ReadyClaimOutcome::ClaimFailed { error } => return Err(error),
+        ReadyClaimOutcome::ClaimFailed { error } => anyhow::bail!("{error}"),
     }
 
     // 2. Not ready — check processing.
@@ -1131,7 +1158,7 @@ fn process_run_target_inner(
         .work_dir
         .run_dir(nickname, run_id, RunPhase::Processing);
     if processing_path.exists() {
-        return handle_process_run_processing(config, nickname, run_id);
+        return handle_process_run_processing_outcome(config, nickname, run_id);
     }
 
     // 3. Check terminal phases.
@@ -1144,7 +1171,11 @@ fn process_run_target_inner(
                 phase = %phase.as_str(),
                 "run already terminal",
             );
-            return Ok(());
+            return Ok((
+                "already_terminal".to_string(),
+                Some(phase.as_str().to_owned()),
+                Some("run was already in a terminal phase".to_string()),
+            ));
         }
     }
 
@@ -1155,46 +1186,39 @@ fn process_run_target_inner(
     )
 }
 
-/// Handle a target run that is in `processing` phase.
-///
-/// Uses the shared `recover_processing_run_if_unlocked` helper so
-/// that lock-ownership invariants are the same as for `process-once`.
-fn handle_process_run_processing(
+/// Like `handle_process_run_processing` but returns structured outcomes.
+fn handle_process_run_processing_outcome(
     config: &ServerConfig,
     nickname: &Nickname,
     run_id: &RunId,
-) -> Result<()> {
+) -> Result<(String, Option<String>, Option<String>)> {
     match recover_processing_run_if_unlocked(config, nickname, run_id) {
-        Ok(ProcessingTargetOutcome::Recovered) => Ok(()),
-        Ok(ProcessingTargetOutcome::ActiveProcessor) => {
-            info!(
-                nickname = %nickname.as_str(),
-                run_id = %run_id.as_str(),
-                "processing run is locked by another processor; skipping",
-            );
-            Ok(())
+        Ok(ProcessingTargetOutcome::Recovered) => Ok((
+            "processed".to_string(),
+            None,
+            Some("processing run recovered and completed".to_string()),
+        )),
+        Ok(ProcessingTargetOutcome::ActiveProcessor) => Ok((
+            "already_active".to_string(),
+            Some("processing".to_string()),
+            Some("processor lock is held by another process".to_string()),
+        )),
+        Ok(ProcessingTargetOutcome::FailedPublished { error }) => Ok((
+            "processed".to_string(),
+            Some("failed".to_string()),
+            Some(format!("processing recovery failed: {error}")),
+        )),
+        Ok(ProcessingTargetOutcome::Incompatible { message }) => {
+            anyhow::bail!("abandoned processing run is incompatible: {message}")
         }
-        Ok(ProcessingTargetOutcome::Incompatible { message }) => Err(anyhow::anyhow!(
-            "abandoned processing run is incompatible: {message}"
+        Ok(ProcessingTargetOutcome::NotFound) => Ok((
+            "already_terminal".to_string(),
+            None,
+            Some("processing run disappeared before recovery".to_string()),
         )),
-        Ok(ProcessingTargetOutcome::NotFound) => {
-            info!(
-                nickname = %nickname.as_str(),
-                run_id = %run_id.as_str(),
-                "processing run disappeared before recovery",
-            );
-            Ok(())
+        Ok(ProcessingTargetOutcome::FailurePublishFailed { .. }) => {
+            anyhow::bail!("processing recovery failed and could not publish failure")
         }
-        Ok(ProcessingTargetOutcome::FailedPublished { error }) => Err(anyhow::anyhow!(
-            "processing recovery failed and run was moved to failed: {error}"
-        )),
-        Ok(ProcessingTargetOutcome::FailurePublishFailed {
-            recovery_error,
-            publish_error,
-        }) => Err(anyhow::anyhow!(
-            "processing recovery failed: {recovery_error}; \
-             failed to publish failure while holding processor lock: {publish_error}"
-        )),
         Err(e) => Err(e),
     }
 }

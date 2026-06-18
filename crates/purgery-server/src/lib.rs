@@ -41,7 +41,8 @@ pub struct ResolvedTransform {
 /// Process a ready run.  Delegates to `process_run_target` so all
 /// single-run processing shares the same implementation.
 pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> Result<()> {
-    process_run_target(config, nickname, run_id)
+    process_run_target(config, nickname, run_id)?;
+    Ok(())
 }
 
 /// Server-side subcommand: validate the run plan and resolve relative

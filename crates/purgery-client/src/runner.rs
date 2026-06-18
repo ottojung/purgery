@@ -7,8 +7,9 @@ use std::sync::{Arc, Mutex};
 /// Result of a spawned remote command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RemoteCommandExit {
-    /// Command exited with status 0.
-    Success,
+    /// Command exited with status 0.  Includes captured stdout when
+    /// the runner captures it (e.g. for `process-run` responses).
+    Success { stdout: String },
     /// Command exited with nonzero status (remote semantic failure).
     RemoteFailure {
         exit_code: Option<i32>,
@@ -76,7 +77,9 @@ impl RemoteCommandHandle {
 
                             let exit_code = status.code();
                             if status.success() {
-                                Ok(Some(RemoteCommandExit::Success))
+                                Ok(Some(RemoteCommandExit::Success {
+                                    stdout: String::new(),
+                                }))
                             } else if exit_code == Some(255) {
                                 let details = match stderr_result.as_ref() {
                                     Some(b) if !b.is_empty() => {
@@ -1057,13 +1060,24 @@ mod tests {
     #[test]
     fn wait_returns_success_for_scripted_exit() {
         let runner = RemoteRunner::fake();
-        runner.add_spawned_cmd_exit("test-cmd", 2, RemoteCommandExit::Success);
+        runner.add_spawned_cmd_exit(
+            "test-cmd",
+            2,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
         let mut handle = runner
             .spawn_server_cmd("host", "ps", &["test-cmd"])
             .unwrap();
         // wait() must block until the exit is available (after 2 poll calls).
         let exit = handle.wait().unwrap();
-        assert_eq!(exit, RemoteCommandExit::Success);
+        assert_eq!(
+            exit,
+            RemoteCommandExit::Success {
+                stdout: String::new()
+            }
+        );
     }
 
     #[test]
@@ -1127,14 +1141,25 @@ mod tests {
     #[test]
     fn wait_timeout_returns_exit_when_scripted() {
         let runner = RemoteRunner::fake();
-        runner.add_spawned_cmd_exit("test-cmd", 1, RemoteCommandExit::Success);
+        runner.add_spawned_cmd_exit(
+            "test-cmd",
+            1,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
         let mut handle = runner
             .spawn_server_cmd("host", "ps", &["test-cmd"])
             .unwrap();
         let exit = handle
             .wait_timeout(std::time::Duration::from_secs(5))
             .unwrap();
-        assert_eq!(exit, Some(RemoteCommandExit::Success));
+        assert_eq!(
+            exit,
+            Some(RemoteCommandExit::Success {
+                stdout: String::new()
+            })
+        );
     }
 
     #[test]
@@ -1152,7 +1177,13 @@ mod tests {
     #[test]
     fn terminate_and_reap_clears_fake_handle() {
         let runner = RemoteRunner::fake();
-        runner.add_spawned_cmd_exit("test-cmd", 5, RemoteCommandExit::Success);
+        runner.add_spawned_cmd_exit(
+            "test-cmd",
+            5,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
         let mut handle = runner
             .spawn_server_cmd("host", "ps", &["test-cmd"])
             .unwrap();
@@ -1167,6 +1198,11 @@ mod tests {
         // loops until exit is set. With remaining_polls=5, after 5
         // try_wait calls the exit becomes Success.
         // This test verifies the handle is consumed without hang.
-        assert_eq!(exit, RemoteCommandExit::Success);
+        assert_eq!(
+            exit,
+            RemoteCommandExit::Success {
+                stdout: String::new()
+            }
+        );
     }
 }
