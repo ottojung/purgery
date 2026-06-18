@@ -244,7 +244,19 @@ fn drive_server_until_terminal_with_interval(
     let mut attempts_since_report = 0u64;
 
     loop {
-        state = run_state(runner, host, server_cmd, nickname, run_id)?;
+        state = match run_state(runner, host, server_cmd, nickname, run_id) {
+            Ok(s) => s,
+            Err(e) => {
+                terminate_worker_on_error(&mut worker);
+                return Err(e).with_context(|| {
+                    format!(
+                        "failed to poll run-state for run {}/{}",
+                        nickname.as_str(),
+                        run_id.as_str()
+                    )
+                });
+            }
+        };
 
         if state.terminal {
             // Gracefully finish ownership of the worker — give it a
@@ -263,64 +275,80 @@ fn drive_server_until_terminal_with_interval(
 
         // Check if the worker has exited.
         if let Some(w) = worker.as_mut() {
-            match w.try_wait()? {
-                None => { /* still running */ }
-                Some(exit) => {
-                    worker = None;
-                    match exit {
-                        RemoteCommandExit::Success => {
-                            debug!(
-                                nickname = %nickname.as_str(),
-                                run_id = %run_id.as_str(),
-                                "process-run exited successfully; re-checking run-state",
-                            );
-                        }
-                        RemoteCommandExit::TransportFailure { details, .. } => {
-                            warn!(
-                                nickname = %nickname.as_str(),
-                                run_id = %run_id.as_str(),
-                                details,
-                                "process-run SSH transport failed",
-                            );
-                        }
-                        RemoteCommandExit::RemoteFailure { stderr, .. } => {
-                            let err_msg = format!(
-                                "process-run remote failure for run {}/{}: {}",
-                                nickname.as_str(),
-                                run_id.as_str(),
-                                stderr,
-                            );
-                            // Re-poll run-state before deciding — the run may
-                            // have become terminal or active since we last checked.
-                            // Assign to `state` so subsequent loop logic uses
-                            // the fresh data, not the stale pre-poll value.
-                            let fresh = match run_state(runner, host, server_cmd, nickname, run_id)
-                            {
-                                Ok(r) => r,
-                                Err(_) => {
-                                    terminate_worker_on_error(&mut worker);
-                                    anyhow::bail!("{err_msg}");
+            let try_result = w.try_wait();
+            match try_result {
+                Ok(result) => {
+                    match result {
+                        None => { /* still running */ }
+                        Some(exit) => {
+                            worker = None;
+                            match exit {
+                                RemoteCommandExit::Success => {
+                                    debug!(
+                                        nickname = %nickname.as_str(),
+                                        run_id = %run_id.as_str(),
+                                        "process-run exited successfully; re-checking run-state",
+                                    );
                                 }
-                            };
-                            if fresh.terminal {
-                                // Terminal wins — finish the worker and
-                                // return the fresh terminal state.
-                                finish_worker_after_terminal(&mut worker);
-                                return Ok(fresh);
+                                RemoteCommandExit::TransportFailure { details, .. } => {
+                                    warn!(
+                                        nickname = %nickname.as_str(),
+                                        run_id = %run_id.as_str(),
+                                        details,
+                                        "process-run SSH transport failed",
+                                    );
+                                }
+                                RemoteCommandExit::RemoteFailure { stderr, .. } => {
+                                    let err_msg = format!(
+                                        "process-run remote failure for run {}/{}: {}",
+                                        nickname.as_str(),
+                                        run_id.as_str(),
+                                        stderr,
+                                    );
+                                    // Re-poll run-state before deciding — the run may
+                                    // have become terminal or active since we last checked.
+                                    // Assign to `state` so subsequent loop logic uses
+                                    // the fresh data, not the stale pre-poll value.
+                                    let fresh =
+                                        match run_state(runner, host, server_cmd, nickname, run_id)
+                                        {
+                                            Ok(r) => r,
+                                            Err(_) => {
+                                                terminate_worker_on_error(&mut worker);
+                                                anyhow::bail!("{err_msg}");
+                                            }
+                                        };
+                                    if fresh.terminal {
+                                        // Terminal wins — finish the worker and
+                                        // return the fresh terminal state.
+                                        finish_worker_after_terminal(&mut worker);
+                                        return Ok(fresh);
+                                    }
+                                    if fresh.phase == "ready"
+                                        || (fresh.phase == "processing"
+                                            && fresh.processor_state.as_deref() != Some("active"))
+                                    {
+                                        terminate_worker_on_error(&mut worker);
+                                        anyhow::bail!("{err_msg}");
+                                    }
+                                    warn!("{}", err_msg);
+                                    // Use fresh state for subsequent restart decisions.
+                                    state = fresh;
+                                }
+                                RemoteCommandExit::Killed => {}
                             }
-                            if fresh.phase == "ready"
-                                || (fresh.phase == "processing"
-                                    && fresh.processor_state.as_deref() != Some("active"))
-                            {
-                                terminate_worker_on_error(&mut worker);
-                                anyhow::bail!("{err_msg}");
-                            }
-                            warn!("{}", err_msg);
-                            // Use fresh state for subsequent restart decisions.
-                            state = fresh;
                         }
-                        RemoteCommandExit::Killed => {}
                     }
+                }
+                Err(e) => {
+                    terminate_worker_on_error(&mut worker);
+                    return Err(e).with_context(|| {
+                        format!(
+                            "failed to check process-run worker for run {}/{}",
+                            nickname.as_str(),
+                            run_id.as_str()
+                        )
+                    });
                 }
             }
         }
