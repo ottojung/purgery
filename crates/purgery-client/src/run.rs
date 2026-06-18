@@ -239,14 +239,19 @@ fn drive_server_until_terminal_with_interval(
     poll_interval: Duration,
 ) -> Result<RunStateResponse> {
     let mut worker: Option<RemoteCommandHandle> = None;
+    let mut state: RunStateResponse;
     let mut last_phase = String::new();
     let mut attempts_since_report = 0u64;
 
     loop {
-        let state = run_state(runner, host, server_cmd, nickname, run_id)?;
+        state = run_state(runner, host, server_cmd, nickname, run_id)?;
 
         if state.terminal {
-            stop_worker_best_effort(&mut worker);
+            // Non-destructive reap: if the worker has already exited,
+            // clean it up.  Do NOT kill an in-flight worker — terminal
+            // run-state means the server-side result is already published;
+            // the local SSH process may still be unwinding normally.
+            reap_worker_if_exited(&mut worker);
             info!(
                 nickname = %nickname.as_str(),
                 run_id = %run_id.as_str(),
@@ -289,6 +294,8 @@ fn drive_server_until_terminal_with_interval(
                             );
                             // Re-poll run-state before deciding — the run may
                             // have become terminal or active since we last checked.
+                            // Assign to `state` so subsequent loop logic uses
+                            // the fresh data, not the stale pre-poll value.
                             let fresh = match run_state(runner, host, server_cmd, nickname, run_id)
                             {
                                 Ok(r) => r,
@@ -297,7 +304,9 @@ fn drive_server_until_terminal_with_interval(
                                 }
                             };
                             if fresh.terminal {
-                                stop_worker_best_effort(&mut worker);
+                                // Terminal wins — do not kill the worker,
+                                // just reap if already exited.
+                                reap_worker_if_exited(&mut worker);
                                 return Ok(fresh);
                             }
                             if fresh.phase == "ready"
@@ -307,6 +316,8 @@ fn drive_server_until_terminal_with_interval(
                                 anyhow::bail!("{err_msg}");
                             }
                             warn!("{}", err_msg);
+                            // Use fresh state for subsequent restart decisions.
+                            state = fresh;
                         }
                         RemoteCommandExit::Killed => {}
                     }
@@ -392,16 +403,27 @@ fn drive_server_until_terminal_with_interval(
     }
 }
 
-fn stop_worker_best_effort(worker: &mut Option<RemoteCommandHandle>) {
+/// If the worker has already exited, reap it.  Does not kill.
+/// Safe to call on the normal terminal observation path.
+fn reap_worker_if_exited(worker: &mut Option<RemoteCommandHandle>) {
     if let Some(w) = worker.as_mut() {
-        match w.try_wait() {
-            Ok(Some(_)) => {}
-            _ => {
-                let _ = w.kill();
-            }
+        if let Ok(Some(_)) = w.try_wait() {
+            *worker = None;
         }
     }
-    *worker = None;
+}
+
+/// Forcefully terminate the worker and reap the child process.
+/// Used on error/cancellation paths, never on normal terminal.
+#[allow(dead_code)]
+fn terminate_worker_and_reap(worker: &mut Option<RemoteCommandHandle>) {
+    if let Some(mut w) = worker.take() {
+        // Kill the local child, then wait for it to exit so we reap it
+        // and join the stderr drainer thread.
+        let _ = w.kill();
+        // `wait` blocks until the process exits and the drainer is joined.
+        let _ = w.wait();
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

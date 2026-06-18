@@ -89,14 +89,29 @@ impl RemoteCommandHandle {
                                     exit_code,
                                     details,
                                 }))
-                            } else {
+                            } else if let Some(code) = exit_code {
                                 let stderr = stderr_result
                                     .as_ref()
                                     .map(|b| String::from_utf8_lossy(b).to_string())
                                     .unwrap_or_default();
                                 Ok(Some(RemoteCommandExit::RemoteFailure {
-                                    exit_code,
+                                    exit_code: Some(code),
                                     stderr: stderr.trim().to_string(),
+                                }))
+                            } else {
+                                // status.code() == None means the process was
+                                // terminated by a signal — this is a local /
+                                // transport failure, not a remote semantic error.
+                                let details = match stderr_result.as_ref() {
+                                    Some(b) if !b.is_empty() => {
+                                        let s = String::from_utf8_lossy(b);
+                                        format!("local SSH process terminated by signal: {s}")
+                                    }
+                                    _ => "local SSH process terminated by signal".to_string(),
+                                };
+                                Ok(Some(RemoteCommandExit::TransportFailure {
+                                    exit_code: None,
+                                    details,
                                 }))
                             }
                         }
@@ -152,7 +167,6 @@ impl RemoteCommandHandle {
     /// `add_spawned_cmd_exit`), we return `Killed` immediately so
     /// callers do not hang on fire-and-forget handles that tests never
     /// configured.
-    #[allow(dead_code)]
     pub(crate) fn wait(&mut self) -> Result<RemoteCommandExit> {
         // For fake runner: handle unscripted commands immediately.
         if let RemoteCommandHandleKind::Fake {

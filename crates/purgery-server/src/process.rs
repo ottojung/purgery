@@ -523,6 +523,10 @@ pub(crate) fn claim_ready_run(
 /// Returns `MalformedReadyMovedToFailed` only if both the rename and
 /// status publication succeed. Returns `MalformedReadyMoveFailed` if
 /// either step fails.
+///
+/// Writes the status before the directory rename so that a failure to
+/// publish the status leaves the run safely in `ready/` — never in
+/// `failed/` without a valid status.
 fn handle_malformed_ready(
     config: &ServerConfig,
     nickname: &Nickname,
@@ -532,6 +536,28 @@ fn handle_malformed_ready(
     let ready_path = config.work_dir.run_dir(nickname, run_id, RunPhase::Ready);
     let failed_path = config.work_dir.run_dir(nickname, run_id, RunPhase::Failed);
 
+    let status = purgery_core::RunStatus {
+        purgery_version: purgery_core::current_purgery_version().to_string(),
+        run_id: run_id.clone(),
+        nickname: nickname.clone(),
+        state: purgery_core::RunState::Failed,
+        entries: vec![],
+        error: Some(original_error.to_string()),
+    };
+
+    // Publish status inside the ready directory first.  If this fails,
+    // the run is still safely in ready/ and nothing has moved.
+    if let Err(e) = crate::phases::publish_status_atomic(&ready_path, &status) {
+        // Clean up temp file that atomic write may have created.
+        let _ = fs::remove_file(ready_path.join("status.toml.tmp"));
+        return ReadyClaimOutcome::MalformedReadyMoveFailed {
+            original_error,
+            publish_error: anyhow::anyhow!("failed to write failure status to ready: {e}"),
+        };
+    }
+
+    // Now atomically rename the entire ready directory to failed.
+    // The status.toml we just wrote comes along with the rename.
     if let Some(parent) = failed_path.parent() {
         if let Err(e) = fs::create_dir_all(parent) {
             return ReadyClaimOutcome::MalformedReadyMoveFailed {
@@ -541,25 +567,15 @@ fn handle_malformed_ready(
         }
     }
     if let Err(e) = fs::rename(&ready_path, failed_path.as_std_path()) {
+        // Rename failed — clean up the status file we wrote in ready.
+        let _ = fs::remove_file(ready_path.join("status.toml"));
+        let _ = fs::remove_file(ready_path.join("status.toml.tmp"));
         return ReadyClaimOutcome::MalformedReadyMoveFailed {
             original_error,
             publish_error: anyhow::anyhow!("failed to move malformed ready to failed: {e}"),
         };
     }
-    let status = purgery_core::RunStatus {
-        purgery_version: purgery_core::current_purgery_version().to_string(),
-        run_id: run_id.clone(),
-        nickname: nickname.clone(),
-        state: purgery_core::RunState::Failed,
-        entries: vec![],
-        error: Some(original_error.to_string()),
-    };
-    if let Err(e) = crate::phases::publish_status_atomic(&failed_path, &status) {
-        return ReadyClaimOutcome::MalformedReadyMoveFailed {
-            original_error,
-            publish_error: anyhow::anyhow!("failed to publish failure status: {e}"),
-        };
-    }
+
     ReadyClaimOutcome::MalformedReadyMovedToFailed {
         error: original_error,
     }

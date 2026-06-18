@@ -268,7 +268,9 @@ pub struct RunStateResponse {
     pub current_transform: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress_status: Option<String>,
-    /// Processing liveness: `"none"`, `"active"`, `"idle"`, or `"unknown"`.
+    /// Processing liveness.  Omitted (None) outside `processing` phase.
+    /// Inside `processing`: `"active"` (lock held), `"idle"` (lock free),
+    /// or `"unknown"` (lock probe failed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub processor_state: Option<String>,
 }
