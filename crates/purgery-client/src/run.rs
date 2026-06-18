@@ -869,19 +869,29 @@ impl Drop for HeartbeatGuard {
     }
 }
 
+/// Tracks whether the top-level invocation has already performed
+/// server version check and GC for a server-run sync.  Recursive
+/// split entries reuse the fact that these are already done.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ServerRunSetup {
+    Needed,
+    AlreadyDone,
+}
+
 pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
     run_sync_with_runner(&RemoteRunner::real(), args)
 }
 
 pub(crate) fn run_sync_with_runner(runner: &RemoteRunner, args: &SyncArgs) -> Result<()> {
     let run_id = RunId::generate();
-    run_sync_with_run_id(runner, args, &run_id)
+    run_sync_with_run_id(runner, args, &run_id, ServerRunSetup::Needed)
 }
 
 pub(crate) fn run_sync_with_run_id(
     runner: &RemoteRunner,
     args: &SyncArgs,
     run_id: &RunId,
+    setup: ServerRunSetup,
 ) -> Result<()> {
     let state_dir = resolve_state_dir(args);
 
@@ -901,7 +911,7 @@ pub(crate) fn run_sync_with_run_id(
     }
 
     if let Some(ref _pattern) = args.split {
-        return run_split(runner, args, run_id, &state_dir, &source_spec);
+        return run_split(runner, args, run_id, &state_dir, &source_spec, setup);
     }
 
     let remote = parse_destination(&args.destination)?;
@@ -972,16 +982,21 @@ pub(crate) fn run_sync_with_run_id(
         delete_after_import: true,
     };
 
-    check_server_version(runner, &remote.host, server_cmd)
-        .with_context(|| "server version compatibility check failed")?;
+    match setup {
+        ServerRunSetup::Needed => {
+            check_server_version(runner, &remote.host, server_cmd)
+                .with_context(|| "server version compatibility check failed")?;
 
-    // Run server GC once before the transform server run.  Failure is
-    // logged but does not fail the sync — GC is maintenance.
-    info!("running server GC");
-    if let Err(e) = runner.server_cmd(&remote.host, server_cmd, &["gc"]) {
-        warn!(error = %e, "server GC failed (non-fatal)");
-    } else {
-        debug!("server GC completed");
+            info!("running server GC");
+            if let Err(e) = runner.server_cmd(&remote.host, server_cmd, &["gc"]) {
+                warn!(error = %e, "server GC failed (non-fatal)");
+            } else {
+                debug!("server GC completed");
+            }
+        }
+        ServerRunSetup::AlreadyDone => {
+            debug!("server version and GC already handled by top-level split");
+        }
     }
 
     info!("starting server run");
@@ -1131,6 +1146,7 @@ fn run_split(
     _run_id: &RunId,
     state_dir: &str,
     source_spec: &classify::SourceSpec,
+    setup: ServerRunSetup,
 ) -> Result<()> {
     let pattern = args.split.as_deref().unwrap();
     split::validate_split_pattern(pattern).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1156,17 +1172,24 @@ fn run_split(
         return Ok(());
     }
 
-    // Run server GC once before processing any split entries, but only
-    // if this is a server-run sync (transform).  Passthrough-with-cleanup
-    // does not contact the server.
+    // Run server version check and GC once before processing any split
+    // entries, but only if this is a server-run sync (transform) and
+    // the top-level invocation hasn't already done it.
     if has_transform {
-        check_server_version(runner, &target.host, &args.server_command)
-            .with_context(|| "server version compatibility check failed")?;
-        info!("running server GC");
-        if let Err(e) = runner.server_cmd(&target.host, &args.server_command, &["gc"]) {
-            warn!(error = %e, "server GC failed (non-fatal)");
-        } else {
-            debug!("server GC completed");
+        match setup {
+            ServerRunSetup::Needed => {
+                check_server_version(runner, &target.host, &args.server_command)
+                    .with_context(|| "server version compatibility check failed")?;
+                info!("running server GC");
+                if let Err(e) = runner.server_cmd(&target.host, &args.server_command, &["gc"]) {
+                    warn!(error = %e, "server GC failed (non-fatal)");
+                } else {
+                    debug!("server GC completed");
+                }
+            }
+            ServerRunSetup::AlreadyDone => {
+                debug!("server version and GC already handled by top-level invocation");
+            }
         }
     }
 
@@ -1185,7 +1208,13 @@ fn run_split(
             destination: split_dest,
         };
         let split_run_id = RunId::generate();
-        run_sync_with_run_id(runner, &split_args, &split_run_id)?;
+        // Tell each recursive entry that setup (version + GC) is already done.
+        run_sync_with_run_id(
+            runner,
+            &split_args,
+            &split_run_id,
+            ServerRunSetup::AlreadyDone,
+        )?;
     }
     Ok(())
 }
@@ -1785,7 +1814,7 @@ state = "done"
         // Add finish-run response AFTER the hook (responses consumed FIFO)
         runner.add_response("finish-run", "");
 
-        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
         assert!(result.is_ok(), "sync must succeed");
 
         // finish-run hook fired → finish-run was called
@@ -1840,7 +1869,7 @@ observed_at_unix_secs = 1000
             "purgery_version = \"0.1.0-test\"\nrun_id = \"test-run\"\nnickname = \"laptop\"\nstate = \"done\"\n".to_string();
         runner.add_response("status", &status_toml);
 
-        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
         assert!(result.is_ok(), "sync must succeed");
 
         let log = runner.command_log();
@@ -1907,7 +1936,7 @@ observed_at_unix_secs = 1000
         // After process-run error, re-check: run is still ready
         runner.add_response("run-state", &ready_run_state_toml());
 
-        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -1951,7 +1980,7 @@ observed_at_unix_secs = 1000
             "purgery_version = \"0.1.0-test\"\nrun_id = \"test-run\"\nnickname = \"laptop\"\nstate = \"done\"\n".to_string();
         runner.add_response("status", &status_toml);
 
-        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
         assert!(
             result.is_ok(),
             "sync must succeed when process-run fails but run is terminal"
@@ -1990,7 +2019,7 @@ observed_at_unix_secs = 1000
         // Loop polls run-state again → still ready (non-terminal)
         runner.add_response("run-state", &ready_run_state_toml());
 
-        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -2032,7 +2061,7 @@ observed_at_unix_secs = 1000
             "purgery_version = \"0.1.0-test\"\nrun_id = \"test-run\"\nnickname = \"laptop\"\nstate = \"done\"\n".to_string();
         runner.add_response("status", &status_toml);
 
-        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
         assert!(
             result.is_ok(),
             "sync must succeed even when process-run race loses: {result:?}"
@@ -2735,8 +2764,12 @@ observed_at_unix_secs = 1000
         let result = Arc::new(Mutex::new(None::<Result<()>>));
         let result_clone = Arc::clone(&result);
         let sync_handle = std::thread::spawn(move || {
-            *result_clone.lock().unwrap() =
-                Some(run_sync_with_run_id(&runner_for_sync, &args, &run_id));
+            *result_clone.lock().unwrap() = Some(run_sync_with_run_id(
+                &runner_for_sync,
+                &args,
+                &run_id,
+                ServerRunSetup::Needed,
+            ));
         });
 
         // Wait for rsync hook to fire (staging in progress)
@@ -2808,7 +2841,7 @@ observed_at_unix_secs = 1000
         // Make finish-run fail so UploadCompleteFinishPending persists.
         runner.add_error("finish-run", "simulated finish failure");
 
-        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
         assert!(result.is_err(), "sync must fail when finish-run fails");
 
         // The persisted UploadCompleteFinishPending state must contain
@@ -2948,7 +2981,7 @@ observed_at_unix_secs = 1000
         runner.add_response("status", &status_toml);
         runner.add_response("finish-run", "");
 
-        run_sync_with_run_id(&runner, &args, &run_id).unwrap();
+        run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed).unwrap();
 
         let written = runner.written_files();
         let manifest_content = written
@@ -3338,7 +3371,7 @@ observed_at_unix_secs = 1000
         runner.add_response("run-state", &done_run_state_toml());
         runner.add_response("status", &done_status_toml());
 
-        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
         assert!(result.is_ok(), "sync should succeed: {:?}", result.err());
 
         let log = runner.command_log();
@@ -3375,7 +3408,7 @@ observed_at_unix_secs = 1000
         runner.add_response("run-state", &done_run_state_toml());
         runner.add_response("status", &done_status_toml());
 
-        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
         assert!(result.is_ok(), "sync should succeed");
     }
 
@@ -3409,7 +3442,7 @@ observed_at_unix_secs = 1000
         runner.add_response("run-state", &done_run_state_toml());
         runner.add_response("status", &done_status_toml());
 
-        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
         assert!(
             result.is_ok(),
             "sync must succeed even when GC fails: {:?}",
@@ -3447,7 +3480,7 @@ observed_at_unix_secs = 1000
         runner.add_response("run-state", &done_run_state_toml());
         runner.add_response("status", &done_status_toml());
 
-        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
         assert!(
             result.is_ok(),
             "sync must succeed even when GC transport fails: {:?}",
@@ -3467,7 +3500,7 @@ observed_at_unix_secs = 1000
         runner.add_response("begin-run", &begin_resp_toml());
         runner.add_write_error("run.toml", "write failed during staging");
 
-        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
         assert!(result.is_err(), "sync must fail when write fails");
         let err = result.unwrap_err().to_string();
         assert!(
@@ -3498,7 +3531,7 @@ observed_at_unix_secs = 1000
             server_command: "purgery-server".to_string(),
         };
 
-        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
         assert!(result.is_ok(), "passthrough sync must succeed");
 
         let log = runner.command_log();
@@ -3549,7 +3582,7 @@ status = "imported"
         .to_string();
         runner.add_response("status", &status);
 
-        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
         assert!(result.is_ok(), "cleanup sync must succeed");
 
         let log = runner.command_log();
@@ -3582,7 +3615,7 @@ status = "imported"
         runner.add_response("run-state", &done_run_state_toml());
         runner.add_response("status", &done_status_toml());
 
-        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
         assert!(result.is_ok());
 
         let log = runner.command_log();
@@ -3621,7 +3654,7 @@ status = "imported"
         runner.add_response("run-state", &done_run_state_toml());
         runner.add_response("status", &done_status_toml());
 
-        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
         assert!(result.is_ok());
 
         let log = runner.command_log();
@@ -3668,7 +3701,7 @@ status = "imported"
         runner.add_response("run-state", &done_run_state_toml());
         runner.add_response("status", &done_status_toml());
 
-        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
         assert!(
             result.is_ok(),
             "sync should survive transport failure + restart"
@@ -3721,7 +3754,7 @@ observed_at_unix_secs = 1000
         runner.add_response("run-state", &done_run_state_toml());
         runner.add_response("status", &done_status_toml());
 
-        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
         assert!(result.is_ok(), "sync must succeed");
 
         let log = runner.command_log();
@@ -3757,7 +3790,7 @@ observed_at_unix_secs = 1000
         runner.add_response("run-state", &done_run_state_toml());
         runner.add_response("status", &done_status_toml());
 
-        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
         assert!(result.is_ok(), "sync must succeed");
 
         let log = runner.command_log();
@@ -3766,5 +3799,281 @@ observed_at_unix_secs = 1000
             pr_count == 1,
             "process-run must be spawned exactly once (handle was still running), count={pr_count}: {log:?}"
         );
+    }
+
+    // ── Server-run-setup tests ─────────────────────────────────────
+
+    #[test]
+    fn transform_split_matches_inits_gc_once_total() {
+        // Verify that when a top-level split sync calls run_sync_with_run_id
+        // for multiple entries, the ServerRunSetup prevents duplicate
+        // version check and GC.  We test this by calling the non-split
+        // path twice — once with Needed, once with AlreadyDone — and
+        // checking that version/GC appear only once total.
+
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+
+        // First call: ServerRunSetup::Needed — should run version + GC.
+        {
+            let runner = mk_runner();
+            let args = transform_args(&tmp, &state_dir);
+            runner.add_response(
+                "gc",
+                &format!(
+                    "protocol_version = {}\npurgery_version = \"0.1.0-test\"\n",
+                    purgery_core::PROTOCOL_VERSION
+                ),
+            );
+            runner.add_response("begin-run", &begin_resp_toml());
+            runner.add_response(
+                "prepare-run",
+                &format!(
+                    "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                    resp_header()
+                ),
+            );
+            runner.add_response("heartbeat-run", "");
+            runner.add_response("finish-run", "");
+            runner.add_response("run-state", &ready_run_state_toml());
+            runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
+            runner.add_response("run-state", &done_run_state_toml());
+            runner.add_response("status", &done_status_toml());
+
+            let run_id = RunId::new("test-run".into()).unwrap();
+            let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+            assert!(
+                result.is_ok(),
+                "first entry must succeed: {:?}",
+                result.err()
+            );
+        }
+
+        // Second call: ServerRunSetup::AlreadyDone — must NOT run
+        // version or GC again.
+        {
+            let runner = mk_runner();
+            let args = transform_args(&tmp, &state_dir);
+            runner.add_response("begin-run", &begin_resp_toml());
+            runner.add_response(
+                "prepare-run",
+                &format!(
+                    "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                    resp_header()
+                ),
+            );
+            runner.add_response("heartbeat-run", "");
+            runner.add_response("finish-run", "");
+            runner.add_response("run-state", &ready_run_state_toml());
+            runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
+            runner.add_response("run-state", &done_run_state_toml());
+            runner.add_response("status", &done_status_toml());
+
+            let run_id = RunId::new("test-run".into()).unwrap();
+            let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::AlreadyDone);
+            assert!(
+                result.is_ok(),
+                "second entry must succeed: {:?}",
+                result.err()
+            );
+
+            // The AlreadyDone variant must not have added version or gc.
+            let log = runner.command_log();
+            assert!(
+                !log.iter().any(|c| c.contains("'version'")),
+                "AlreadyDone call must not re-check version: {log:?}"
+            );
+            assert!(
+                !log.iter().any(|c| c.contains("'gc'")),
+                "AlreadyDone call must not re-run gc: {log:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn transform_split_no_matches_does_not_contact_server() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let src = tmp.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("a.txt"), "data").unwrap();
+
+        let args = SyncArgs {
+            transform: Some("transform".into()),
+            delete_after_import: true,
+            split: Some("*.mp4".into()),
+            state_dir: Some(state_dir),
+            source: src.to_string_lossy().to_string(),
+            destination: "laptop:rel".to_string(),
+            server_command: "purgery-server".to_string(),
+        };
+
+        let run_id = RunId::new("test-split-nomatch".into()).unwrap();
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(result.is_ok(), "no-match split must succeed");
+
+        let log = runner.command_log();
+        assert!(
+            !log.iter().any(|c| c.contains("'version'")),
+            "no-match split must not call version: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|c| c.contains("'gc'")),
+            "no-match split must not call gc: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|c| c.contains("begin-run")),
+            "no-match split must not call begin-run: {log:?}"
+        );
+    }
+
+    #[test]
+    fn passthrough_split_does_not_call_server_commands() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let src = tmp.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("a.mp4"), "data").unwrap();
+
+        let args = SyncArgs {
+            transform: None,
+            delete_after_import: false,
+            split: Some("*.mp4".into()),
+            state_dir: Some(state_dir),
+            source: src.to_string_lossy().to_string(),
+            destination: "host:/dest".to_string(),
+            server_command: "purgery-server".to_string(),
+        };
+
+        let run_id = RunId::new("test-passthrough-split".into()).unwrap();
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(result.is_ok(), "passthrough split must succeed");
+
+        let log = runner.command_log();
+        for cmd in &[
+            "'version'",
+            "'gc'",
+            "begin-run",
+            "prepare-run",
+            "finish-run",
+            "process-run",
+            "run-state",
+            "status",
+        ] {
+            assert!(
+                !log.iter().any(|c| c.contains(cmd)),
+                "passthrough split must not call {cmd}: {log:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn passthrough_cleanup_does_not_call_server_commands() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let file_path = tmp.path().join("video.mp4");
+        fs::write(&file_path, "data").unwrap();
+
+        let args = SyncArgs {
+            transform: None,
+            delete_after_import: true,
+            split: None,
+            state_dir: Some(state_dir),
+            source: file_path.to_string_lossy().to_string(),
+            destination: "host:/dest".to_string(),
+            server_command: "purgery-server".to_string(),
+        };
+
+        let run_id = RunId::new("test-passthrough-cleanup".into()).unwrap();
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(result.is_ok(), "passthrough with cleanup must succeed");
+
+        let log = runner.command_log();
+        for cmd in &[
+            "'version'",
+            "'gc'",
+            "begin-run",
+            "prepare-run",
+            "finish-run",
+            "process-run",
+            "run-state",
+            "status",
+        ] {
+            assert!(
+                !log.iter().any(|c| c.contains(cmd)),
+                "passthrough with cleanup must not call {cmd}: {log:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn normal_transform_calls_version_and_gc_once() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_response(
+            "gc",
+            &format!(
+                "protocol_version = {}\npurgery_version = \"0.1.0-test\"\n",
+                purgery_core::PROTOCOL_VERSION
+            ),
+        );
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        runner.add_response("run-state", &ready_run_state_toml());
+        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success);
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(
+            result.is_ok(),
+            "transform sync must succeed: {:?}",
+            result.err()
+        );
+
+        let log = runner.command_log();
+        assert!(
+            log.iter().any(|c| c.contains("'version'")),
+            "transform sync must call version: {log:?}"
+        );
+        assert!(
+            log.iter().any(|c| c.contains("'gc'")),
+            "transform sync must call gc: {log:?}"
+        );
+        assert!(
+            log.iter().any(|c| c.contains("begin-run")),
+            "transform sync must call begin-run: {log:?}"
+        );
+        assert!(
+            log.iter().any(|c| c.contains("process-run")),
+            "transform sync must call process-run: {log:?}"
+        );
+        assert!(
+            log.iter().any(|c| c.contains("status")),
+            "transform sync must call status: {log:?}"
+        );
+
+        let version_count = log.iter().filter(|c| c.contains("'version'")).count();
+        let gc_count = log.iter().filter(|c| c.contains("'gc'")).count();
+        assert_eq!(
+            version_count, 1,
+            "version called {version_count} times, expected 1"
+        );
+        assert_eq!(gc_count, 1, "gc called {gc_count} times, expected 1");
     }
 }

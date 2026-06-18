@@ -33,6 +33,12 @@ pub(crate) struct RemoteCommandHandle {
 enum RemoteCommandHandleKind {
     Real {
         child: Option<std::process::Child>,
+        /// Bounded stderr captured by a concurrent drainer thread.
+        /// Set after the child has exited and the drainer has been joined.
+        stderr_result: Option<Vec<u8>>,
+        /// Thread handle that drains stderr concurrently so the child
+        /// never blocks on a full pipe buffer.  Taken when joining.
+        drainer: Option<std::thread::JoinHandle<Vec<u8>>>,
     },
     Fake {
         /// How many polls before the fake command "finishes".
@@ -42,40 +48,51 @@ enum RemoteCommandHandleKind {
     },
 }
 
+/// Maximum bytes to keep from a spawned command's stderr.  Keeps the
+/// tail (final output), which is where the error typically appears.
+const MAX_STDERR_BYTES: usize = 64 * 1024;
+
 impl RemoteCommandHandle {
     /// Try to check if the command has exited. Returns `Ok(None)` if still running,
     /// `Ok(Some(exit))` if finished, or `Err` on waitpid failure.
     pub(crate) fn try_wait(&mut self) -> Result<Option<RemoteCommandExit>> {
         match &mut self.kind {
-            RemoteCommandHandleKind::Real { child } => {
+            RemoteCommandHandleKind::Real {
+                child,
+                stderr_result,
+                drainer,
+            } => {
                 if let Some(child) = child.as_mut() {
                     match child.try_wait() {
                         Ok(Some(status)) => {
+                            // Child has exited — the pipe has EOF'd, so the
+                            // drainer thread will finish imminently.  Join it
+                            // to ensure we have all captured stderr.
+                            let drained = drainer
+                                .take()
+                                .and_then(|h| h.join().ok())
+                                .unwrap_or_default();
+                            stderr_result.get_or_insert(drained);
+
                             let exit_code = status.code();
                             if status.success() {
                                 Ok(Some(RemoteCommandExit::Success))
                             } else if exit_code == Some(255) {
+                                let details = match stderr_result.as_ref() {
+                                    Some(b) if !b.is_empty() => {
+                                        let s = String::from_utf8_lossy(b);
+                                        format!("SSH exit code 255: {s}")
+                                    }
+                                    _ => "SSH exit code 255".to_string(),
+                                };
                                 Ok(Some(RemoteCommandExit::TransportFailure {
                                     exit_code,
-                                    details: "SSH exit code 255".to_string(),
+                                    details,
                                 }))
                             } else {
-                                // Read stderr with bounded capture (64 KiB max).
-                                const MAX_STDERR_BYTES: usize = 65536;
-                                let stderr = child
-                                    .stderr
-                                    .take()
-                                    .map(|s| {
-                                        let mut buf = String::new();
-                                        use std::io::Read;
-                                        let mut limited = s.take(MAX_STDERR_BYTES as u64 + 1);
-                                        let _ = limited.read_to_string(&mut buf);
-                                        if buf.len() > MAX_STDERR_BYTES {
-                                            buf.truncate(MAX_STDERR_BYTES);
-                                            buf.push_str("...(truncated)");
-                                        }
-                                        buf
-                                    })
+                                let stderr = stderr_result
+                                    .as_ref()
+                                    .map(|b| String::from_utf8_lossy(b).to_string())
                                     .unwrap_or_default();
                                 Ok(Some(RemoteCommandExit::RemoteFailure {
                                     exit_code,
@@ -116,7 +133,7 @@ impl RemoteCommandHandle {
     /// Kill the command.
     pub(crate) fn kill(&mut self) -> Result<()> {
         match &mut self.kind {
-            RemoteCommandHandleKind::Real { child } => {
+            RemoteCommandHandleKind::Real { child, .. } => {
                 if let Some(child) = child.as_mut() {
                     child.kill()?;
                 }
@@ -137,10 +154,11 @@ impl RemoteCommandHandle {
     /// configured.
     #[allow(dead_code)]
     pub(crate) fn wait(&mut self) -> Result<RemoteCommandExit> {
+        // For fake runner: handle unscripted commands immediately.
         if let RemoteCommandHandleKind::Fake {
-            remaining_polls,
-            exit,
-        } = &self.kind
+            ref remaining_polls,
+            ref exit,
+        } = self.kind
         {
             if remaining_polls.lock().unwrap().is_none() && exit.lock().unwrap().is_none() {
                 return Ok(RemoteCommandExit::Killed);
@@ -448,7 +466,7 @@ impl RemoteRunner {
 
         match self {
             RemoteRunner::Real => {
-                let child = Command::new("ssh")
+                let mut child = Command::new("ssh")
                     .arg("--")
                     .arg(host)
                     .arg(&full_cmd)
@@ -457,8 +475,44 @@ impl RemoteRunner {
                     .stderr(std::process::Stdio::piped())
                     .spawn()
                     .with_context(|| format!("failed to spawn SSH command on {host}"))?;
+
+                // Take the stderr pipe and spawn a drainer thread so
+                // the child never blocks on a full pipe buffer.
+                let mut stderr_pipe = child
+                    .stderr
+                    .take()
+                    .expect("stderr was piped, so it must be present");
+                let drainer = std::thread::spawn(move || {
+                    use std::io::Read;
+                    let mut buf = Vec::with_capacity(MAX_STDERR_BYTES);
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        match stderr_pipe.read(&mut chunk) {
+                            Ok(0) => break, // EOF
+                            Ok(n) => {
+                                buf.extend_from_slice(&chunk[..n]);
+                                if buf.len() > MAX_STDERR_BYTES {
+                                    // Keep only the tail (last MAX_STDERR_BYTES bytes).
+                                    let excess = buf.len() - MAX_STDERR_BYTES;
+                                    // SAFETY: drain advances the vec efficiently.
+                                    let _ = buf.drain(..excess);
+                                }
+                            }
+                            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                                continue;
+                            }
+                            Err(_) => break, // read error → give up
+                        }
+                    }
+                    buf
+                });
+
                 Ok(RemoteCommandHandle {
-                    kind: RemoteCommandHandleKind::Real { child: Some(child) },
+                    kind: RemoteCommandHandleKind::Real {
+                        child: Some(child),
+                        stderr_result: None,
+                        drainer: Some(drainer),
+                    },
                     spawned_cmd_contains: ssh_cmd,
                 })
             }

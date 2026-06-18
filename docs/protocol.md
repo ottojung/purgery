@@ -159,6 +159,7 @@ All protocol output goes to stdout as TOML. Logs go to stderr.
 
 ```toml
 protocol_version = 2
+purgery_version = "0.1.0"
 nickname = "laptop"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 incoming_dir = "/var/lib/purgery/work/laptop/incoming/01ARZ3NDEKTSV4RRFFQ69G5FAV"
@@ -171,6 +172,7 @@ heartbeat_interval_secs = 60
 ## Run config (run.toml)
 
 ```toml
+purgery_version = "0.1.0"
 nickname = "laptop"
 destination = "/archive"
 delete_after_import = true
@@ -191,6 +193,7 @@ For non-transform entries, the server commits the work entry directly to the bas
 A server-run manifest describes exactly one logical source entry and is uploaded only for transform runs. Direct passthrough never uploads a manifest.
 
 ```toml
+purgery_version = "0.1.0"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 
@@ -208,6 +211,10 @@ transform = "compress-video"
 For a directory source:
 
 ```toml
+purgery_version = "0.1.0"
+run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+nickname = "laptop"
+
 [[entries]]
 local_path = "/home/user/Videos"
 staged_path = "files/Videos"
@@ -223,6 +230,7 @@ transform = "compress-video"
 ## Status (status.toml)
 
 ```toml
+purgery_version = "0.1.0"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 state = "done"
@@ -263,6 +271,7 @@ The nickname is operational metadata and does not appear in final_paths.
 
 ```toml
 protocol_version = 2
+purgery_version = "0.1.0"
 nickname = "laptop"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 phase = "processing"
@@ -283,6 +292,7 @@ The client persists per-run state under `{state_dir}/runs/{nickname}-{run_id}/st
 
 ```toml
 protocol_version = 2
+purgery_version = "0.1.0"
 nickname = "laptop"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 host = "user@server"
