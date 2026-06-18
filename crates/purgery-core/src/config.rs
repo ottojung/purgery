@@ -49,6 +49,50 @@ pub struct LeaseFile {
     pub expires_at_unix_secs: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessRunResponse {
+    pub protocol_version: u32,
+    pub purgery_version: String,
+    pub nickname: String,
+    pub run_id: String,
+    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Machine-readable outcomes for `process-run`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessRunOutcome {
+    Processed,
+    AlreadyTerminal,
+    AlreadyActive,
+    ClaimInProgress,
+}
+
+impl ProcessRunOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProcessRunOutcome::Processed => "processed",
+            ProcessRunOutcome::AlreadyTerminal => "already_terminal",
+            ProcessRunOutcome::AlreadyActive => "already_active",
+            ProcessRunOutcome::ClaimInProgress => "claim_in_progress",
+        }
+    }
+
+    pub fn from_str_name(s: &str) -> Option<Self> {
+        match s {
+            "processed" => Some(ProcessRunOutcome::Processed),
+            "already_terminal" => Some(ProcessRunOutcome::AlreadyTerminal),
+            "already_active" => Some(ProcessRunOutcome::AlreadyActive),
+            "claim_in_progress" => Some(ProcessRunOutcome::ClaimInProgress),
+            _ => None,
+        }
+    }
+}
+
 // ── Config Types ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,33 +285,6 @@ pub struct PrepareRunResponse {
     pub run_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destination: Option<String>,
-}
-
-/// Response from `purgery-server process-run --nickname N --run-id R`.
-///
-/// Printed as TOML on stdout when the command exits successfully.
-/// Nonzero exit indicates a hard error (not found, I/O failure, etc.);
-/// the client then re-polls run-state and may still accept terminal state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProcessRunResponse {
-    pub protocol_version: u32,
-    pub purgery_version: String,
-    pub nickname: String,
-    pub run_id: String,
-    /// Machine-readable outcome:
-    ///   "processed"            – the run was claimed and driven to terminal
-    ///   "already_terminal"     – target was already done/failed
-    ///   "already_active"       – target is processing with an active lock
-    ///   "claim_in_progress"    – ready lock is busy, another claimer is active
-    #[serde(rename = "outcome")]
-    pub outcome: String,
-    /// Current phase at the time of the outcome decision.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub phase: Option<String>,
-    /// Human-readable detail.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
 }
 
 // ── Run State / Progress ─────────────────────────────────────────────

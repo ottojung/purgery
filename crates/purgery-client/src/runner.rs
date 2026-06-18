@@ -34,24 +34,56 @@ pub(crate) struct RemoteCommandHandle {
 enum RemoteCommandHandleKind {
     Real {
         child: Option<std::process::Child>,
-        /// Bounded stderr captured by a concurrent drainer thread.
-        /// Set after the child has exited and the drainer has been joined.
+        stdout_result: Option<Vec<u8>>,
         stderr_result: Option<Vec<u8>>,
-        /// Thread handle that drains stderr concurrently so the child
-        /// never blocks on a full pipe buffer.  Taken when joining.
-        drainer: Option<std::thread::JoinHandle<Vec<u8>>>,
+        stdout_drainer: Option<std::thread::JoinHandle<Vec<u8>>>,
+        stderr_drainer: Option<std::thread::JoinHandle<Vec<u8>>>,
     },
     Fake {
-        /// How many polls before the fake command "finishes".
-        /// None = never finishes (busy), Some(n) = finishes after n polls with given exit.
         remaining_polls: Arc<Mutex<Option<(u64, RemoteCommandExit)>>>,
         exit: Arc<Mutex<Option<RemoteCommandExit>>>,
     },
 }
 
-/// Maximum bytes to keep from a spawned command's stderr.  Keeps the
-/// tail (final output), which is where the error typically appears.
+const MAX_STDOUT_BYTES: usize = 64 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
+
+/// Spawn a drainer thread that reads from a pipe and keeps a bounded
+/// tail of the output.  Used for both stdout and stderr of spawned commands.
+fn spawn_drainer<R: std::io::Read + Send + 'static>(
+    mut pipe: R,
+    max_bytes: usize,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::with_capacity(max_bytes);
+        let mut truncated = false;
+        let mut chunk = [0u8; 4096];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.len() > max_bytes {
+                        let excess = buf.len() - max_bytes;
+                        let _ = buf.drain(..excess);
+                        truncated = true;
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        if truncated {
+            let marker = format!("...(output truncated; showing last {max_bytes} bytes)...\n");
+            let mut result = Vec::with_capacity(marker.len() + buf.len());
+            result.extend_from_slice(marker.as_bytes());
+            result.extend_from_slice(&buf);
+            result
+        } else {
+            buf
+        }
+    })
+}
 
 impl RemoteCommandHandle {
     /// Try to check if the command has exited. Returns `Ok(None)` if still running,
@@ -60,26 +92,35 @@ impl RemoteCommandHandle {
         match &mut self.kind {
             RemoteCommandHandleKind::Real {
                 child,
+                stdout_result,
                 stderr_result,
-                drainer,
+                stdout_drainer,
+                stderr_drainer,
             } => {
                 if let Some(child) = child.as_mut() {
                     match child.try_wait() {
                         Ok(Some(status)) => {
-                            // Child has exited — the pipe has EOF'd, so the
-                            // drainer thread will finish imminently.  Join it
-                            // to ensure we have all captured stderr.
-                            let drained = drainer
+                            // Child has exited — both pipes have EOF'd, so
+                            // both drainer threads will finish imminently.
+                            let drained_stdout = stdout_drainer
                                 .take()
                                 .and_then(|h| h.join().ok())
                                 .unwrap_or_default();
-                            stderr_result.get_or_insert(drained);
+                            stdout_result.get_or_insert(drained_stdout);
+
+                            let drained_stderr = stderr_drainer
+                                .take()
+                                .and_then(|h| h.join().ok())
+                                .unwrap_or_default();
+                            stderr_result.get_or_insert(drained_stderr);
 
                             let exit_code = status.code();
                             if status.success() {
-                                Ok(Some(RemoteCommandExit::Success {
-                                    stdout: String::new(),
-                                }))
+                                let captured = stdout_result
+                                    .as_ref()
+                                    .map(|b| String::from_utf8_lossy(b).to_string())
+                                    .unwrap_or_default();
+                                Ok(Some(RemoteCommandExit::Success { stdout: captured }))
                             } else if exit_code == Some(255) {
                                 let details = match stderr_result.as_ref() {
                                     Some(b) if !b.is_empty() => {
@@ -525,52 +566,27 @@ impl RemoteRunner {
                     .spawn()
                     .with_context(|| format!("failed to spawn SSH command on {host}"))?;
 
-                // Take the stderr pipe and spawn a drainer thread so
-                // the child never blocks on a full pipe buffer.
-                let mut stderr_pipe = child
+                // Take both stdout and stderr pipes and spawn drainer
+                // threads so the child never blocks on a full pipe buffer.
+                let stdout_pipe = child
+                    .stdout
+                    .take()
+                    .expect("stdout was piped, so it must be present");
+                let stdout_drainer = spawn_drainer(stdout_pipe, MAX_STDOUT_BYTES);
+
+                let stderr_pipe = child
                     .stderr
                     .take()
                     .expect("stderr was piped, so it must be present");
-                let drainer = std::thread::spawn(move || {
-                    use std::io::Read;
-                    let mut buf = Vec::with_capacity(MAX_STDERR_BYTES);
-                    let mut truncated = false;
-                    let mut chunk = [0u8; 4096];
-                    loop {
-                        match stderr_pipe.read(&mut chunk) {
-                            Ok(0) => break, // EOF
-                            Ok(n) => {
-                                buf.extend_from_slice(&chunk[..n]);
-                                if buf.len() > MAX_STDERR_BYTES {
-                                    // Keep only the tail; set truncation flag.
-                                    let excess = buf.len() - MAX_STDERR_BYTES;
-                                    let _ = buf.drain(..excess);
-                                    truncated = true;
-                                }
-                            }
-                            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                                continue;
-                            }
-                            Err(_) => break, // read error → give up
-                        }
-                    }
-                    if truncated {
-                        // Prepend a truncation notice before the captured tail.
-                        let marker = b"...(stderr truncated; showing last 65536 bytes)...\n";
-                        let mut result = Vec::with_capacity(marker.len() + buf.len());
-                        result.extend_from_slice(marker);
-                        result.extend_from_slice(&buf);
-                        result
-                    } else {
-                        buf
-                    }
-                });
+                let stderr_drainer = spawn_drainer(stderr_pipe, MAX_STDERR_BYTES);
 
                 Ok(RemoteCommandHandle {
                     kind: RemoteCommandHandleKind::Real {
                         child: Some(child),
+                        stdout_result: None,
                         stderr_result: None,
-                        drainer: Some(drainer),
+                        stdout_drainer: Some(stdout_drainer),
+                        stderr_drainer: Some(stderr_drainer),
                     },
                     spawned_cmd_contains: ssh_cmd,
                 })

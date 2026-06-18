@@ -242,6 +242,7 @@ fn drive_server_until_terminal_with_interval(
     let mut state: RunStateResponse;
     let mut last_phase = String::new();
     let mut attempts_since_report = 0u64;
+    let mut no_progress = NoProgressTracker::new();
 
     loop {
         state = match run_state(runner, host, server_cmd, nickname, run_id) {
@@ -259,9 +260,7 @@ fn drive_server_until_terminal_with_interval(
         };
 
         if state.terminal {
-            // Gracefully finish ownership of the worker — give it a
-            // bounded chance to exit cleanly before returning.
-            finish_worker_after_terminal(&mut worker);
+            finish_worker_after_terminal(&mut worker, runner, host, server_cmd, nickname, run_id)?;
             info!(
                 nickname = %nickname.as_str(),
                 run_id = %run_id.as_str(),
@@ -283,12 +282,40 @@ fn drive_server_until_terminal_with_interval(
                         Some(exit) => {
                             worker = None;
                             match exit {
-                                RemoteCommandExit::Success { .. } => {
-                                    debug!(
-                                        nickname = %nickname.as_str(),
-                                        run_id = %run_id.as_str(),
-                                        "process-run exited successfully; re-checking run-state",
-                                    );
+                                RemoteCommandExit::Success { stdout } => {
+                                    let decision = handle_process_run_success(
+                                        runner,
+                                        host,
+                                        server_cmd,
+                                        nickname,
+                                        run_id,
+                                        &stdout,
+                                        &state,
+                                        &mut no_progress,
+                                    )?;
+                                    match decision {
+                                        WorkerExitDecision::Terminal(ts) => {
+                                            finish_worker_after_terminal(
+                                                &mut worker,
+                                                runner,
+                                                host,
+                                                server_cmd,
+                                                nickname,
+                                                run_id,
+                                            )?;
+                                            info!(
+                                                nickname = %nickname.as_str(),
+                                                run_id = %run_id.as_str(),
+                                                phase = %ts.phase,
+                                                "process-run success confirmed terminal state",
+                                            );
+                                            return Ok(ts);
+                                        }
+                                        WorkerExitDecision::ContinueWaiting => {}
+                                        WorkerExitDecision::ContinueLoop(fresh_state) => {
+                                            state = fresh_state;
+                                        }
+                                    }
                                 }
                                 RemoteCommandExit::TransportFailure { details, .. } => {
                                     warn!(
@@ -319,9 +346,14 @@ fn drive_server_until_terminal_with_interval(
                                             }
                                         };
                                     if fresh.terminal {
-                                        // Terminal wins — finish the worker and
-                                        // return the fresh terminal state.
-                                        finish_worker_after_terminal(&mut worker);
+                                        finish_worker_after_terminal(
+                                            &mut worker,
+                                            runner,
+                                            host,
+                                            server_cmd,
+                                            nickname,
+                                            run_id,
+                                        )?;
                                         return Ok(fresh);
                                     }
                                     if fresh.phase == "ready"
@@ -335,7 +367,14 @@ fn drive_server_until_terminal_with_interval(
                                     // Use fresh state for subsequent restart decisions.
                                     state = fresh;
                                 }
-                                RemoteCommandExit::Killed => {}
+                                RemoteCommandExit::Killed => {
+                                    terminate_worker_on_error(&mut worker);
+                                    anyhow::bail!(
+                                        "process-run was killed for run {}/{}",
+                                        nickname.as_str(),
+                                        run_id.as_str(),
+                                    );
+                                }
                             }
                         }
                     }
@@ -433,37 +472,267 @@ fn drive_server_until_terminal_with_interval(
     }
 }
 
+/// Outcome of processing a process-run worker exit in the drive loop.
+enum WorkerExitDecision {
+    /// The worker result, combined with fresh run-state, indicates
+    /// terminal state.  Return this state.
+    Terminal(RunStateResponse),
+    /// Keep polling without spawning a new worker (e.g. active processor).
+    ContinueWaiting,
+    /// State changed meaningfully; use the provided fresh state for
+    /// restart decisions in this iteration.
+    ContinueLoop(RunStateResponse),
+}
+
+/// Tracks consecutive identical state observations for no-progress
+/// detection.  Reset when state changes meaningfully.
+#[derive(Clone, Debug, PartialEq)]
+struct ProgressSnapshot {
+    phase: String,
+    terminal: bool,
+    processor_state: Option<String>,
+    progress_state: Option<String>,
+    entry_index: Option<usize>,
+    entry_total: Option<usize>,
+    updated_at_unix_secs: u64,
+}
+
+impl From<&RunStateResponse> for ProgressSnapshot {
+    fn from(s: &RunStateResponse) -> Self {
+        ProgressSnapshot {
+            phase: s.phase.clone(),
+            terminal: s.terminal,
+            processor_state: s.processor_state.clone(),
+            progress_state: s.progress_state.clone(),
+            entry_index: s.entry_index,
+            entry_total: s.entry_total,
+            updated_at_unix_secs: s.updated_at_unix_secs,
+        }
+    }
+}
+
+const MAX_NO_PROGRESS_COUNT: u32 = 3;
+
+struct NoProgressTracker {
+    count: u32,
+    last_snapshot: Option<ProgressSnapshot>,
+}
+
+impl NoProgressTracker {
+    fn new() -> Self {
+        NoProgressTracker {
+            count: 0,
+            last_snapshot: None,
+        }
+    }
+
+    fn advance(&mut self, state: &RunStateResponse) -> bool {
+        let snap = ProgressSnapshot::from(state);
+        if self.last_snapshot.as_ref() == Some(&snap) {
+            self.count += 1;
+            self.count < MAX_NO_PROGRESS_COUNT
+        } else {
+            self.count = 0;
+            self.last_snapshot = Some(snap);
+            true
+        }
+    }
+}
+
 const TERMINAL_WORKER_GRACE: Duration = Duration::from_secs(5);
 
 /// Finish ownership of the local process-run worker after terminal
-/// run-state is observed.  Gives the SSH child a bounded grace period
-/// to exit naturally; if it does not, terminates it explicitly.
-/// Either way the child and its stderr drainer are fully reaped.
-fn finish_worker_after_terminal(worker: &mut Option<RemoteCommandHandle>) {
+/// run-state is observed.
+///
+/// Gives the SSH child a bounded grace period to exit naturally.
+/// If it does not exit within the grace period, terminates it and
+/// returns an error — there is no successful path where the client
+/// kills the worker.
+///
+/// If the worker already exited, validates its exit.
+fn finish_worker_after_terminal(
+    worker: &mut Option<RemoteCommandHandle>,
+    _runner: &RemoteRunner,
+    _host: &str,
+    _server_cmd: &str,
+    nickname: &Nickname,
+    run_id: &RunId,
+) -> Result<()> {
     let Some(mut w) = worker.take() else {
-        return;
+        return Ok(());
     };
 
-    // Already exited?
-    match w.try_wait() {
-        Ok(Some(_)) => return,
-        Ok(None) => { /* still running */ }
-        Err(_) => {
+    let exit = match w.wait_timeout(TERMINAL_WORKER_GRACE)? {
+        Some(exit) => exit,
+        None => {
             let _ = w.terminate_and_reap();
-            return;
+            anyhow::bail!(
+                "process-run did not exit within {}s after terminal run-state was observed \
+                 for run {}/{}",
+                TERMINAL_WORKER_GRACE.as_secs(),
+                nickname.as_str(),
+                run_id.as_str(),
+            );
         }
-    }
+    };
 
-    // Bounded graceful wait.
-    match w.wait_timeout(TERMINAL_WORKER_GRACE) {
-        Ok(Some(_)) => {} // exited naturally during grace period
-        Ok(None) => {
-            let _ = w.terminate_and_reap();
+    match exit {
+        RemoteCommandExit::Success { stdout } => {
+            let _resp =
+                parse_process_run_response(&stdout, nickname, run_id).with_context(|| {
+                    format!(
+                        "process-run succeeded after terminal state for run {}/{} \
+                         but produced invalid response",
+                        nickname.as_str(),
+                        run_id.as_str(),
+                    )
+                })?;
+            Ok(())
         }
-        Err(_) => {
-            let _ = w.terminate_and_reap();
+        RemoteCommandExit::RemoteFailure { stderr, .. } => {
+            warn!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                "process-run exited with remote failure after terminal state: {stderr}",
+            );
+            Ok(())
+        }
+        RemoteCommandExit::TransportFailure { details, .. } => {
+            warn!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                "process-run exited with transport failure after terminal state: {details}",
+            );
+            Ok(())
+        }
+        RemoteCommandExit::Killed => {
+            anyhow::bail!(
+                "process-run was killed after terminal state for run {}/{}",
+                nickname.as_str(),
+                run_id.as_str(),
+            );
         }
     }
+}
+
+/// Parse, validate envelope, and enforce `ProcessRunResponse` outcome
+/// against a fresh `run-state` poll.
+#[allow(clippy::too_many_arguments)]
+fn handle_process_run_success(
+    runner: &RemoteRunner,
+    host: &str,
+    server_cmd: &str,
+    nickname: &Nickname,
+    run_id: &RunId,
+    stdout: &str,
+    _state: &RunStateResponse,
+    no_progress: &mut NoProgressTracker,
+) -> Result<WorkerExitDecision> {
+    let resp = parse_process_run_response(stdout, nickname, run_id)?;
+
+    let outcome = purgery_core::ProcessRunOutcome::from_str_name(&resp.outcome)
+        .ok_or_else(|| anyhow::anyhow!("unknown process-run outcome '{}'", resp.outcome))?;
+
+    let fresh = run_state(runner, host, server_cmd, nickname, run_id)?;
+
+    match outcome {
+        purgery_core::ProcessRunOutcome::Processed
+        | purgery_core::ProcessRunOutcome::AlreadyTerminal => {
+            if !fresh.terminal {
+                anyhow::bail!(
+                    "process-run reported outcome={} but fresh run-state is not terminal \
+                     for run {}/{} (phase={})",
+                    resp.outcome,
+                    nickname.as_str(),
+                    run_id.as_str(),
+                    fresh.phase,
+                );
+            }
+            Ok(WorkerExitDecision::Terminal(fresh))
+        }
+        purgery_core::ProcessRunOutcome::AlreadyActive => {
+            if fresh.phase != "processing" || fresh.processor_state.as_deref() != Some("active") {
+                anyhow::bail!(
+                    "process-run reported outcome=already_active but fresh run-state is not \
+                     processing/active for run {}/{} (phase={}, processor_state={:?})",
+                    nickname.as_str(),
+                    run_id.as_str(),
+                    fresh.phase,
+                    fresh.processor_state,
+                );
+            }
+            Ok(WorkerExitDecision::ContinueWaiting)
+        }
+        purgery_core::ProcessRunOutcome::ClaimInProgress => {
+            if fresh.terminal {
+                return Ok(WorkerExitDecision::Terminal(fresh));
+            }
+            if fresh.phase == "processing" && fresh.processor_state.as_deref() == Some("active") {
+                return Ok(WorkerExitDecision::ContinueWaiting);
+            }
+            if fresh.phase == "ready" && !no_progress.advance(&fresh) {
+                anyhow::bail!(
+                    "process-run repeatedly exited without progress: outcome=claim_in_progress \
+                     and target remained ready after {} consecutive attempts for run {}/{}",
+                    MAX_NO_PROGRESS_COUNT,
+                    nickname.as_str(),
+                    run_id.as_str(),
+                );
+            }
+            Ok(WorkerExitDecision::ContinueLoop(fresh))
+        }
+    }
+}
+
+/// Parse and validate the envelope of a `ProcessRunResponse` from stdout.
+fn parse_process_run_response(
+    stdout: &str,
+    nickname: &Nickname,
+    run_id: &RunId,
+) -> Result<purgery_core::ProcessRunResponse> {
+    if stdout.trim().is_empty() {
+        anyhow::bail!(
+            "process-run exited successfully but produced empty stdout for run {}/{}",
+            nickname.as_str(),
+            run_id.as_str(),
+        );
+    }
+    let resp: purgery_core::ProcessRunResponse = toml::from_str(stdout).with_context(|| {
+        format!(
+            "failed to parse process-run response TOML for run {}/{}",
+            nickname.as_str(),
+            run_id.as_str(),
+        )
+    })?;
+    if resp.protocol_version != purgery_core::PROTOCOL_VERSION {
+        anyhow::bail!(
+            "process-run response protocol_version {} does not match client version {} \
+             for run {}/{}",
+            resp.protocol_version,
+            purgery_core::PROTOCOL_VERSION,
+            nickname.as_str(),
+            run_id.as_str(),
+        );
+    }
+    purgery_core::require_compatible_purgery_version(&resp.purgery_version, "process-run response")
+        .with_context(|| {
+            format!(
+                "incompatible purgery_version in process-run response for run {}/{}",
+                nickname.as_str(),
+                run_id.as_str(),
+            )
+        })?;
+    if resp.nickname != nickname.as_str() || resp.run_id != run_id.as_str() {
+        anyhow::bail!(
+            "process-run response envelope mismatch for run {}/{} \
+             (response nickname={}, run_id={})",
+            nickname.as_str(),
+            run_id.as_str(),
+            resp.nickname,
+            resp.run_id,
+        );
+    }
+    Ok(resp)
 }
 
 /// Terminate the local process-run worker before returning an error.
@@ -1361,6 +1630,20 @@ mod tests {
         )
     }
 
+    fn process_run_ok_toml(outcome: &str, run_id: &str) -> String {
+        format!(
+            r#"protocol_version = {}
+purgery_version = "0.1.0-test"
+nickname = "laptop"
+run_id = "{}"
+outcome = "{}"
+"#,
+            purgery_core::PROTOCOL_VERSION,
+            run_id,
+            outcome,
+        )
+    }
+
     /// Helper for repeated processing-state TOML responses.
     fn processing_state(run_id: &str, ts: u64) -> String {
         format!(
@@ -1936,7 +2219,7 @@ observed_at_unix_secs = 1000
             "process-run",
             0,
             RemoteCommandExit::Success {
-                stdout: String::new(),
+                stdout: process_run_ok_toml("processed", "test-run"),
             },
         );
         // After process-run: run-state returns done
@@ -2129,7 +2412,7 @@ observed_at_unix_secs = 1000
             "process-run",
             0,
             RemoteCommandExit::Success {
-                stdout: String::new(),
+                stdout: process_run_ok_toml("processed", "test-run"),
             },
         );
         // But another processor already claimed it — run-state shows processing
@@ -2177,7 +2460,7 @@ observed_at_unix_secs = 1000
             "process-run",
             0,
             RemoteCommandExit::Success {
-                stdout: String::new(),
+                stdout: process_run_ok_toml("processed", "test-resume-drive"),
             },
         );
         runner.add_response(
@@ -2240,7 +2523,7 @@ observed_at_unix_secs = 1000
             "process-run",
             0,
             RemoteCommandExit::Success {
-                stdout: String::new(),
+                stdout: process_run_ok_toml("processed", "test-resume-proc"),
             },
         );
         // After process-run, run-state returns done
@@ -2300,7 +2583,14 @@ observed_at_unix_secs = 1000
 
         // First run-state call returns processing (idle) → triggers process-run
         runner.add_response("run-state", &processing_state("test-backoff", 1000));
-        // process-run stays running forever (no add_spawned_cmd_exit).
+        // process-run stays running for several polls, then exits.
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            10,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("processed", "test-backoff"),
+            },
+        );
         // The supervisor keeps the same worker handle and does not respawn.
         // trigger_start_run_and_recheck calls run-state again → still processing
         runner.add_response("run-state", &processing_state("test-backoff", 1001));
@@ -2369,13 +2659,27 @@ observed_at_unix_secs = 1000
             "process-run",
             0,
             RemoteCommandExit::Success {
-                stdout: String::new(),
+                stdout: process_run_ok_toml("already_active", "test-always-ready"),
             },
         );
-        // After process-run: processing (another processor claimed it)
-        runner.add_response("run-state", &processing_state("test-always-ready", 1000));
-        // Poll again: still processing (within drive interval, no process-run)
-        runner.add_response("run-state", &processing_state("test-always-ready", 1001));
+        // After process-run: processing (another processor claimed it with active lock)
+        let active_proc = format!(
+            r#"protocol_version = {}
+purgery_version = "0.1.0-test"
+nickname = "laptop"
+run_id = "test-always-ready"
+phase = "processing"
+terminal = false
+message = "processing"
+processor_state = "active"
+updated_at_unix_secs = 1000
+observed_at_unix_secs = 1000
+"#,
+            purgery_core::PROTOCOL_VERSION
+        );
+        runner.add_response("run-state", &active_proc);
+        // Poll again: still processing with active processor (no process-run)
+        runner.add_response("run-state", &active_proc);
         // Finally terminal
         runner.add_response(
             "run-state",
@@ -2434,7 +2738,7 @@ observed_at_unix_secs = 1000
             "process-run",
             0,
             RemoteCommandExit::Success {
-                stdout: String::new(),
+                stdout: process_run_ok_toml("processed", "test-resume-imm"),
             },
         );
         runner.add_response(
@@ -3465,7 +3769,7 @@ observed_at_unix_secs = 1000
             "'gc'",
             0,
             RemoteCommandExit::Success {
-                stdout: String::new(),
+                stdout: process_run_ok_toml("processed", "test-run"),
             },
         );
         runner.add_response("begin-run", &begin_resp_toml());
@@ -3483,7 +3787,7 @@ observed_at_unix_secs = 1000
             "process-run",
             0,
             RemoteCommandExit::Success {
-                stdout: String::new(),
+                stdout: process_run_ok_toml("processed", "test-run"),
             },
         );
         runner.add_response("run-state", &done_run_state_toml());
@@ -3515,7 +3819,7 @@ observed_at_unix_secs = 1000
             "'gc'",
             0,
             RemoteCommandExit::Success {
-                stdout: String::new(),
+                stdout: process_run_ok_toml("processed", "test-run"),
             },
         );
         runner.add_response("begin-run", &begin_resp_toml());
@@ -3532,7 +3836,7 @@ observed_at_unix_secs = 1000
             "process-run",
             0,
             RemoteCommandExit::Success {
-                stdout: String::new(),
+                stdout: process_run_ok_toml("processed", "test-run"),
             },
         );
         runner.add_response("run-state", &done_run_state_toml());
@@ -3572,7 +3876,7 @@ observed_at_unix_secs = 1000
             "process-run",
             0,
             RemoteCommandExit::Success {
-                stdout: String::new(),
+                stdout: process_run_ok_toml("processed", "test-run"),
             },
         );
         runner.add_response("run-state", &done_run_state_toml());
@@ -3616,7 +3920,7 @@ observed_at_unix_secs = 1000
             "process-run",
             0,
             RemoteCommandExit::Success {
-                stdout: String::new(),
+                stdout: process_run_ok_toml("processed", "test-run"),
             },
         );
         runner.add_response("run-state", &done_run_state_toml());
@@ -3642,7 +3946,7 @@ observed_at_unix_secs = 1000
             "'gc'",
             0,
             RemoteCommandExit::Success {
-                stdout: String::new(),
+                stdout: process_run_ok_toml("processed", "test-run"),
             },
         );
         runner.add_response("begin-run", &begin_resp_toml());
@@ -3719,7 +4023,7 @@ observed_at_unix_secs = 1000
             "process-run",
             0,
             RemoteCommandExit::Success {
-                stdout: String::new(),
+                stdout: process_run_ok_toml("processed", "test-run"),
             },
         );
         runner.add_response("run-state", &done_run_state_toml());
@@ -3758,7 +4062,7 @@ status = "imported"
             "'gc'",
             0,
             RemoteCommandExit::Success {
-                stdout: String::new(),
+                stdout: process_run_ok_toml("processed", "test-run"),
             },
         );
         runner.add_response("begin-run", &begin_resp_toml());
@@ -3775,7 +4079,7 @@ status = "imported"
             "process-run",
             0,
             RemoteCommandExit::Success {
-                stdout: String::new(),
+                stdout: process_run_ok_toml("processed", "test-run"),
             },
         );
         runner.add_response("run-state", &done_run_state_toml());
@@ -3807,7 +4111,7 @@ status = "imported"
             "'gc'",
             0,
             RemoteCommandExit::Success {
-                stdout: String::new(),
+                stdout: process_run_ok_toml("processed", "test-run"),
             },
         );
         runner.add_response("begin-run", &begin_resp_toml());
@@ -3826,7 +4130,7 @@ status = "imported"
             "process-run",
             0,
             RemoteCommandExit::Success {
-                stdout: String::new(),
+                stdout: process_run_ok_toml("processed", "test-run"),
             },
         );
         runner.add_response("run-state", &done_run_state_toml());
@@ -3858,7 +4162,7 @@ status = "imported"
             "'gc'",
             0,
             RemoteCommandExit::Success {
-                stdout: String::new(),
+                stdout: process_run_ok_toml("processed", "test-run"),
             },
         );
         runner.add_response("begin-run", &begin_resp_toml());
@@ -3885,7 +4189,7 @@ status = "imported"
             "process-run",
             0,
             RemoteCommandExit::Success {
-                stdout: String::new(),
+                stdout: process_run_ok_toml("processed", "test-run"),
             },
         );
         runner.add_response("run-state", &done_run_state_toml());
@@ -3917,7 +4221,7 @@ status = "imported"
             "'gc'",
             0,
             RemoteCommandExit::Success {
-                stdout: String::new(),
+                stdout: process_run_ok_toml("processed", "test-run"),
             },
         );
         runner.add_response("begin-run", &begin_resp_toml());
@@ -3935,7 +4239,7 @@ status = "imported"
             "process-run",
             0,
             RemoteCommandExit::Success {
-                stdout: String::new(),
+                stdout: process_run_ok_toml("processed", "test-run"),
             },
         );
         let active_processing = format!(
@@ -3979,7 +4283,7 @@ observed_at_unix_secs = 1000
             "'gc'",
             0,
             RemoteCommandExit::Success {
-                stdout: String::new(),
+                stdout: process_run_ok_toml("processed", "test-run"),
             },
         );
         runner.add_response("begin-run", &begin_resp_toml());
@@ -3997,7 +4301,7 @@ observed_at_unix_secs = 1000
             "process-run",
             3,
             RemoteCommandExit::Success {
-                stdout: String::new(),
+                stdout: process_run_ok_toml("processed", "test-run"),
             },
         );
         runner.add_response("run-state", &ready_run_state_toml());
@@ -4054,7 +4358,7 @@ observed_at_unix_secs = 1000
                 "process-run",
                 0,
                 RemoteCommandExit::Success {
-                    stdout: String::new(),
+                    stdout: process_run_ok_toml("processed", "test-run"),
                 },
             );
             runner.add_response("run-state", &done_run_state_toml());
@@ -4089,7 +4393,7 @@ observed_at_unix_secs = 1000
                 "process-run",
                 0,
                 RemoteCommandExit::Success {
-                    stdout: String::new(),
+                    stdout: process_run_ok_toml("processed", "test-run"),
                 },
             );
             runner.add_response("run-state", &done_run_state_toml());
@@ -4265,7 +4569,7 @@ observed_at_unix_secs = 1000
             "process-run",
             0,
             RemoteCommandExit::Success {
-                stdout: String::new(),
+                stdout: process_run_ok_toml("processed", "test-run"),
             },
         );
         runner.add_response("run-state", &done_run_state_toml());
@@ -4318,7 +4622,7 @@ observed_at_unix_secs = 1000
             "worker-test",
             0,
             RemoteCommandExit::Success {
-                stdout: String::new(),
+                stdout: process_run_ok_toml("processed", "r"),
             },
         );
         let handle = runner
@@ -4326,7 +4630,15 @@ observed_at_unix_secs = 1000
             .unwrap();
         // Exited immediately (0 polls).
         let mut worker = Some(handle);
-        finish_worker_after_terminal(&mut worker);
+        let res = finish_worker_after_terminal(
+            &mut worker,
+            &runner,
+            "host",
+            "ps",
+            &Nickname::new("laptop".into()).unwrap(),
+            &RunId::new("r".into()).unwrap(),
+        );
+        assert!(res.is_ok(), "finish should succeed: {:?}", res.err());
         assert!(worker.is_none(), "worker must be consumed");
     }
 
@@ -4338,14 +4650,22 @@ observed_at_unix_secs = 1000
             "worker-test",
             2,
             RemoteCommandExit::Success {
-                stdout: String::new(),
+                stdout: process_run_ok_toml("processed", "r"),
             },
         );
         let handle = runner
             .spawn_server_cmd("host", "ps", &["worker-test"])
             .unwrap();
         let mut worker = Some(handle);
-        finish_worker_after_terminal(&mut worker);
+        let res = finish_worker_after_terminal(
+            &mut worker,
+            &runner,
+            "host",
+            "ps",
+            &Nickname::new("laptop".into()).unwrap(),
+            &RunId::new("r".into()).unwrap(),
+        );
+        assert!(res.is_ok(), "graceful wait should succeed: {:?}", res.err());
         assert!(
             worker.is_none(),
             "worker must be consumed after graceful wait"
@@ -4360,8 +4680,15 @@ observed_at_unix_secs = 1000
             .spawn_server_cmd("host", "ps", &["forever-worker"])
             .unwrap();
         let mut worker = Some(handle);
-        // Should not hang — the grace period expires and terminate fires.
-        finish_worker_after_terminal(&mut worker);
+        let res = finish_worker_after_terminal(
+            &mut worker,
+            &runner,
+            "host",
+            "ps",
+            &Nickname::new("laptop".into()).unwrap(),
+            &RunId::new("r".into()).unwrap(),
+        );
+        assert!(res.is_err(), "never-exiting worker must produce error");
         assert!(
             worker.is_none(),
             "worker must be consumed after termination"
@@ -4370,8 +4697,17 @@ observed_at_unix_secs = 1000
 
     #[test]
     fn finish_worker_is_noop_when_none() {
+        let runner = mk_runner();
         let mut worker: Option<RemoteCommandHandle> = None;
-        finish_worker_after_terminal(&mut worker);
+        let res = finish_worker_after_terminal(
+            &mut worker,
+            &runner,
+            "host",
+            "ps",
+            &Nickname::new("laptop".into()).unwrap(),
+            &RunId::new("r".into()).unwrap(),
+        );
+        assert!(res.is_ok());
         assert!(worker.is_none());
     }
 
@@ -4382,7 +4718,7 @@ observed_at_unix_secs = 1000
             "worker-test",
             5,
             RemoteCommandExit::Success {
-                stdout: String::new(),
+                stdout: process_run_ok_toml("processed", "r"),
             },
         );
         let handle = runner
