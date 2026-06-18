@@ -557,14 +557,9 @@ fn finish_worker_after_terminal(
         return Ok(());
     };
 
-    // Fast path: if the worker already exited, the drive loop has already
-    // validated the outcome against fresh run-state.  No need for a second
-    // round of validation here — just log and return.
-    if let Ok(Some(_exit)) = w.try_wait() {
-        return Ok(());
-    }
-
-    // Worker still running — bounded graceful wait after terminal observation.
+    // Bounded graceful wait.  If the worker already exited, wait_timeout
+    // returns the exit immediately; otherwise it blocks up to the grace
+    // period.  Either way the exit is then validated.
     let exit = match w.wait_timeout(TERMINAL_WORKER_GRACE)? {
         Some(exit) => exit,
         None => {

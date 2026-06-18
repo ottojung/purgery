@@ -1247,7 +1247,7 @@ fn handle_process_run_processing_outcome(
 /// Detect which terminal phase the run ended up in.  Reads the actual
 /// `RunStatus` state from the terminal directory's `status.toml` to
 /// report the correct terminal phase ("done", "failed", "partial").
-/// Falls back to "done" if the directory exists but status cannot be read.
+/// Falls back to the directory phase name if status cannot be read.
 fn detect_terminal_phase(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> String {
     let work_dir = &config.work_dir;
     for (phase, _) in &[(RunPhase::Done, "done"), (RunPhase::Failed, "failed")] {
