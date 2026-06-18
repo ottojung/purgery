@@ -311,9 +311,8 @@ fn drive_server_until_terminal_with_interval(
                                             );
                                             return Ok(ts);
                                         }
-                                        WorkerExitDecision::ContinueWaiting => {}
-                                        WorkerExitDecision::ContinueLoop(fresh_state) => {
-                                            state = fresh_state;
+                                        WorkerExitDecision::ContinueWithFreshState(fresh) => {
+                                            state = fresh;
                                         }
                                     }
                                 }
@@ -474,14 +473,10 @@ fn drive_server_until_terminal_with_interval(
 
 /// Outcome of processing a process-run worker exit in the drive loop.
 enum WorkerExitDecision {
-    /// The worker result, combined with fresh run-state, indicates
-    /// terminal state.  Return this state.
+    /// The worker exit + fresh run-state indicates terminal state.
     Terminal(RunStateResponse),
-    /// Keep polling without spawning a new worker (e.g. active processor).
-    ContinueWaiting,
-    /// State changed meaningfully; use the provided fresh state for
-    /// restart decisions in this iteration.
-    ContinueLoop(RunStateResponse),
+    /// Nonterminal outcome; use the fresh state for the next restart decision.
+    ContinueWithFreshState(RunStateResponse),
 }
 
 /// Tracks consecutive identical state observations for no-progress
@@ -552,9 +547,9 @@ const TERMINAL_WORKER_GRACE: Duration = Duration::from_secs(5);
 /// If the worker already exited, validates its exit.
 fn finish_worker_after_terminal(
     worker: &mut Option<RemoteCommandHandle>,
-    _runner: &RemoteRunner,
-    _host: &str,
-    _server_cmd: &str,
+    runner: &RemoteRunner,
+    host: &str,
+    server_cmd: &str,
     nickname: &Nickname,
     run_id: &RunId,
 ) -> Result<()> {
@@ -595,7 +590,7 @@ fn finish_worker_after_terminal(
                 run_id = %run_id.as_str(),
                 "process-run exited with remote failure after terminal state: {stderr}",
             );
-            Ok(())
+            validate_terminal_state_worker_failure(runner, host, server_cmd, nickname, run_id)
         }
         RemoteCommandExit::TransportFailure { details, .. } => {
             warn!(
@@ -603,7 +598,7 @@ fn finish_worker_after_terminal(
                 run_id = %run_id.as_str(),
                 "process-run exited with transport failure after terminal state: {details}",
             );
-            Ok(())
+            validate_terminal_state_worker_failure(runner, host, server_cmd, nickname, run_id)
         }
         RemoteCommandExit::Killed => {
             anyhow::bail!(
@@ -613,6 +608,42 @@ fn finish_worker_after_terminal(
             );
         }
     }
+}
+
+/// When a worker exits with failure after terminal state was observed,
+/// verify that the terminal state still holds and status is readable.
+fn validate_terminal_state_worker_failure(
+    runner: &RemoteRunner,
+    host: &str,
+    server_cmd: &str,
+    nickname: &Nickname,
+    run_id: &RunId,
+) -> Result<()> {
+    let fresh = run_state(runner, host, server_cmd, nickname, run_id).with_context(|| {
+        format!(
+            "failed to poll run-state after worker failure for run {}/{}",
+            nickname.as_str(),
+            run_id.as_str(),
+        )
+    })?;
+    if !fresh.terminal {
+        anyhow::bail!(
+            "worker exited with failure after terminal state for run {}/{} \
+             but fresh run-state is not terminal (phase={})",
+            nickname.as_str(),
+            run_id.as_str(),
+            fresh.phase,
+        );
+    }
+    read_status(runner, host, server_cmd, nickname, run_id).with_context(|| {
+        format!(
+            "terminal run-state observed for run {}/{} but status is not readable \
+             after worker failure",
+            nickname.as_str(),
+            run_id.as_str(),
+        )
+    })?;
+    Ok(())
 }
 
 /// Parse, validate envelope, and enforce `ProcessRunResponse` outcome
@@ -661,14 +692,14 @@ fn handle_process_run_success(
                     fresh.processor_state,
                 );
             }
-            Ok(WorkerExitDecision::ContinueWaiting)
+            Ok(WorkerExitDecision::ContinueWithFreshState(fresh))
         }
         purgery_core::ProcessRunOutcome::ClaimInProgress => {
             if fresh.terminal {
                 return Ok(WorkerExitDecision::Terminal(fresh));
             }
             if fresh.phase == "processing" && fresh.processor_state.as_deref() == Some("active") {
-                return Ok(WorkerExitDecision::ContinueWaiting);
+                return Ok(WorkerExitDecision::ContinueWithFreshState(fresh));
             }
             if fresh.phase == "ready" && !no_progress.advance(&fresh) {
                 anyhow::bail!(
@@ -679,7 +710,7 @@ fn handle_process_run_success(
                     run_id.as_str(),
                 );
             }
-            Ok(WorkerExitDecision::ContinueLoop(fresh))
+            Ok(WorkerExitDecision::ContinueWithFreshState(fresh))
         }
     }
 }
@@ -2335,9 +2366,10 @@ observed_at_unix_secs = 1000
         );
         // After process-run error, re-check: run is now terminal
         runner.add_response("run-state", &done_run_state_toml());
-        let status_toml =
-            "purgery_version = \"0.1.0-test\"\nrun_id = \"test-run\"\nnickname = \"laptop\"\nstate = \"done\"\n".to_string();
-        runner.add_response("status", &status_toml);
+        runner.add_response("status", &done_status_toml());
+        // Additional responses for terminal worker validation
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
 
         let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
         assert!(
@@ -2859,6 +2891,15 @@ observed_at_unix_secs = 1000
             },
         );
         // But follow-up run-state is terminal (another processor finished it)
+        runner.add_response(
+            "run-state",
+            &done_run_state_toml().replace("test-run", "test-prterm"),
+        );
+        runner.add_response(
+            "status",
+            &done_status_toml().replace("test-run", "test-prterm"),
+        );
+        // Additional responses for terminal worker validation
         runner.add_response(
             "run-state",
             &done_run_state_toml().replace("test-run", "test-prterm"),
@@ -4819,6 +4860,9 @@ observed_at_unix_secs = 1000
             },
         );
         // Fresh run-state shows terminal → should succeed
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
+        // Additional responses for terminal worker validation
         runner.add_response("run-state", &done_run_state_toml());
         runner.add_response("status", &done_status_toml());
 

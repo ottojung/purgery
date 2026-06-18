@@ -561,7 +561,7 @@ impl RemoteRunner {
                     .arg(host)
                     .arg(&full_cmd)
                     .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
                     .spawn()
                     .with_context(|| format!("failed to spawn SSH command on {host}"))?;

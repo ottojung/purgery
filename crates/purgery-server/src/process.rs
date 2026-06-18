@@ -1070,28 +1070,27 @@ pub fn process_run_target(
         purgery_version: purgery_core::current_purgery_version().to_string(),
         nickname: nickname.as_str().to_owned(),
         run_id: run_id.as_str().to_owned(),
-        outcome,
+        outcome: outcome.as_str().to_owned(),
         phase,
         message,
     })
 }
 
-/// Inner dispatch.  Returns (outcome_string, current_phase, detail_message).
+/// Inner dispatch.  Returns (outcome, phase, message).
 fn process_run_inner(
     config: &ServerConfig,
     nickname: &Nickname,
     run_id: &RunId,
-) -> Result<(String, Option<String>, Option<String>)> {
+) -> Result<(ProcessRunOutcome, Option<String>, Option<String>)> {
     // 1. Try to claim from ready.
     match claim_ready_run(config, nickname, run_id) {
         ReadyClaimOutcome::Claimed(lock) => {
             let result = process_processing_run(config, nickname, run_id);
             let (outcome, phase, message) = match result {
                 Ok(()) => {
-                    // Determine the actual terminal phase.
                     let term_phase = detect_terminal_phase(config, nickname, run_id);
                     (
-                        ProcessRunOutcome::Processed.as_str().to_string(),
+                        ProcessRunOutcome::Processed,
                         Some(term_phase),
                         Some("run processed successfully".to_string()),
                     )
@@ -1108,11 +1107,14 @@ fn process_run_inner(
                         "run failed",
                     );
                     match move_to_failed(&config.work_dir, nickname, run_id) {
-                        Ok(()) => (
-                            "processed".to_string(),
-                            Some("failed".to_string()),
-                            Some(error.to_string()),
-                        ),
+                        Ok(()) => {
+                            let term_phase = detect_terminal_phase(config, nickname, run_id);
+                            (
+                                ProcessRunOutcome::Processed,
+                                Some(term_phase),
+                                Some(error.to_string()),
+                            )
+                        }
                         Err(move_err) => anyhow::bail!(
                             "{error}; failed to move target run to failed: {move_err}"
                         ),
@@ -1129,7 +1131,7 @@ fn process_run_inner(
                 "ready run is being claimed by another processor",
             );
             return Ok((
-                "claim_in_progress".to_string(),
+                ProcessRunOutcome::ClaimInProgress,
                 Some("ready".to_string()),
                 Some("another process owns the ready processor lock".to_string()),
             ));
@@ -1139,7 +1141,7 @@ fn process_run_inner(
         }
         ReadyClaimOutcome::AlreadyTerminal => {
             return Ok((
-                "already_terminal".to_string(),
+                ProcessRunOutcome::AlreadyTerminal,
                 None,
                 Some("run was already in a terminal phase".to_string()),
             ));
@@ -1176,7 +1178,7 @@ fn process_run_inner(
                 "run already terminal",
             );
             return Ok((
-                "already_terminal".to_string(),
+                ProcessRunOutcome::AlreadyTerminal,
                 Some(phase.as_str().to_owned()),
                 Some("run was already in a terminal phase".to_string()),
             ));
@@ -1195,25 +1197,25 @@ fn handle_process_run_processing_outcome(
     config: &ServerConfig,
     nickname: &Nickname,
     run_id: &RunId,
-) -> Result<(String, Option<String>, Option<String>)> {
+) -> Result<(ProcessRunOutcome, Option<String>, Option<String>)> {
     match recover_processing_run_if_unlocked(config, nickname, run_id) {
         Ok(ProcessingTargetOutcome::Recovered) => {
             let term_phase = detect_terminal_phase(config, nickname, run_id);
             Ok((
-                "processed".to_string(),
+                ProcessRunOutcome::Processed,
                 Some(term_phase),
                 Some("processing run recovered and completed".to_string()),
             ))
         }
         Ok(ProcessingTargetOutcome::ActiveProcessor) => Ok((
-            "already_active".to_string(),
+            ProcessRunOutcome::AlreadyActive,
             Some("processing".to_string()),
             Some("processor lock is held by another process".to_string()),
         )),
         Ok(ProcessingTargetOutcome::FailedPublished { error }) => {
             let term_phase = detect_terminal_phase(config, nickname, run_id);
             Ok((
-                "processed".to_string(),
+                ProcessRunOutcome::Processed,
                 Some(term_phase),
                 Some(format!("processing recovery failed: {error}")),
             ))
@@ -1222,11 +1224,10 @@ fn handle_process_run_processing_outcome(
             anyhow::bail!("abandoned processing run is incompatible: {message}")
         }
         Ok(ProcessingTargetOutcome::NotFound) => {
-            // Re-check actual terminal state before claiming terminal.
             let term_phase = detect_terminal_phase(config, nickname, run_id);
             if term_phase == "done" || term_phase == "failed" {
                 Ok((
-                    "already_terminal".to_string(),
+                    ProcessRunOutcome::AlreadyTerminal,
                     Some(term_phase),
                     Some("processing run completed before recovery".to_string()),
                 ))
@@ -1245,16 +1246,26 @@ fn handle_process_run_processing_outcome(
     }
 }
 
-/// Detect which terminal phase the run ended up in.  Returns the
-/// phase string ("done", "failed") or empty string if not in any
-/// terminal phase.
+/// Detect which terminal phase the run ended up in.  Reads the actual
+/// `RunStatus` state from the terminal directory's `status.toml` to
+/// report the correct terminal phase ("done", "failed", "partial").
+/// Falls back to "done" if the directory exists but status cannot be read.
 fn detect_terminal_phase(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> String {
     let work_dir = &config.work_dir;
-    for (phase, name) in &[(RunPhase::Done, "done"), (RunPhase::Failed, "failed")] {
+    for (phase, _) in &[(RunPhase::Done, "done"), (RunPhase::Failed, "failed")] {
         let dir = work_dir.run_dir(nickname, run_id, *phase);
-        if dir.exists() {
-            return name.to_string();
+        if !dir.exists() {
+            continue;
         }
+        // Try reading the actual status state.
+        let status_path = dir.join("status.toml");
+        if let Ok(content) = fs::read_to_string(status_path.as_std_path()) {
+            if let Ok(status) = purgery_core::RunStatus::from_toml(&content) {
+                return status.state.as_str().to_owned();
+            }
+        }
+        // Fallback to phase name.
+        return phase.as_str().to_owned();
     }
     String::new()
 }

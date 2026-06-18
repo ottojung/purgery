@@ -21,14 +21,19 @@ pub(crate) enum ProcessorLockAttempt {
     Missing,
 }
 
-/// An exclusive file lock held on a processing run's `processor.lock` file.
+/// An exclusive processor lock held on an existing run directory.
+///
+/// The same lock file (`processor.lock`) is used while claiming a ready
+/// run and while owning a processing run.  Only the process holding this
+/// lock may mutate the locked run directory.
 ///
 /// The lock is automatically released when the `ProcessingRunLock` is dropped
 /// (the file descriptor is closed, which releases the `flock`).
 ///
-/// Only the process holding this lock may mutate the run's processing
-/// directory.  If the lock cannot be acquired, another processor owns it
-/// and the run must not be recovered or replayed.
+/// If this lock is dropped while the holder still owns the run directory
+/// (e.g., after a crash), the run is considered abandoned and may be
+/// recovered by another process.  Terminal directories (`done`, `failed`)
+/// must not retain `processor.lock`.
 #[derive(Debug)]
 pub(crate) struct ProcessingRunLock {
     _file: std::fs::File,
