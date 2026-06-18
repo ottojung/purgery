@@ -145,8 +145,10 @@ impl RemoteCommandHandle {
         }
     }
 
-    /// Kill the command.
-    pub(crate) fn kill(&mut self) -> Result<()> {
+    /// Kill the local child process.  After calling this you must still
+    /// wait/reap the child and join the stderr drainer — this method alone
+    /// is not sufficient for full cleanup.  Prefer `terminate_and_reap`.
+    fn kill_raw(&mut self) -> Result<()> {
         match &mut self.kind {
             RemoteCommandHandleKind::Real { child, .. } => {
                 if let Some(child) = child.as_mut() {
@@ -186,6 +188,36 @@ impl RemoteCommandHandle {
                 }
             }
         }
+    }
+
+    /// Wait up to `timeout` for the command to exit.  Returns
+    /// `Ok(Some(exit))` if the command exited within the timeout,
+    /// `Ok(None)` if still running.
+    pub(crate) fn wait_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<Option<RemoteCommandExit>> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match self.try_wait()? {
+                Some(exit) => return Ok(Some(exit)),
+                None => {
+                    if std::time::Instant::now() >= deadline {
+                        return Ok(None);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        }
+    }
+
+    /// Kill the command (if still running), wait for it to exit, and
+    /// join the stderr drainer.  After this call the handle is fully
+    /// reaped: no child or drainer remains running.
+    pub(crate) fn terminate_and_reap(&mut self) -> Result<RemoteCommandExit> {
+        // For the real runner, send kill then wait for exit + drainer.
+        let _ = self.kill_raw();
+        self.wait()
     }
 }
 
@@ -1085,11 +1117,56 @@ mod tests {
     #[test]
     fn wait_returns_killed_for_unscripted_command() {
         let runner = RemoteRunner::fake();
-        // No scripted exit for this command — wait() must return Killed immediately.
         let mut handle = runner
             .spawn_server_cmd("host", "ps", &["unknown-cmd"])
             .unwrap();
         let exit = handle.wait().unwrap();
         assert_eq!(exit, RemoteCommandExit::Killed);
+    }
+
+    #[test]
+    fn wait_timeout_returns_exit_when_scripted() {
+        let runner = RemoteRunner::fake();
+        runner.add_spawned_cmd_exit("test-cmd", 1, RemoteCommandExit::Success);
+        let mut handle = runner
+            .spawn_server_cmd("host", "ps", &["test-cmd"])
+            .unwrap();
+        let exit = handle
+            .wait_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(exit, Some(RemoteCommandExit::Success));
+    }
+
+    #[test]
+    fn wait_timeout_returns_none_for_unscripted() {
+        let runner = RemoteRunner::fake();
+        let mut handle = runner
+            .spawn_server_cmd("host", "ps", &["unknown-cmd"])
+            .unwrap();
+        let exit = handle
+            .wait_timeout(std::time::Duration::from_millis(1))
+            .unwrap();
+        assert_eq!(exit, None);
+    }
+
+    #[test]
+    fn terminate_and_reap_clears_fake_handle() {
+        let runner = RemoteRunner::fake();
+        runner.add_spawned_cmd_exit("test-cmd", 5, RemoteCommandExit::Success);
+        let mut handle = runner
+            .spawn_server_cmd("host", "ps", &["test-cmd"])
+            .unwrap();
+        let exit = handle.terminate_and_reap().unwrap();
+        // terminate_and_reap kills then waits; for fake runner wait()
+        // will see Killed (or the scripted exit if it was already set).
+        // Since polls=5 > 0, the scripted exit is not yet set, so
+        // kill_raw is a no-op for fake, and wait() polls once which
+        // decrements remaining_polls but exit is still None; the
+        // fake runner's wait() would loop forever.  But terminate_and_reap
+        // calls kill_raw + wait for fake: kill_raw is a no-op, wait()
+        // loops until exit is set. With remaining_polls=5, after 5
+        // try_wait calls the exit becomes Success.
+        // This test verifies the handle is consumed without hang.
+        assert_eq!(exit, RemoteCommandExit::Success);
     }
 }

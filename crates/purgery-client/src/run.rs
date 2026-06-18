@@ -247,11 +247,9 @@ fn drive_server_until_terminal_with_interval(
         state = run_state(runner, host, server_cmd, nickname, run_id)?;
 
         if state.terminal {
-            // Non-destructive reap: if the worker has already exited,
-            // clean it up.  Do NOT kill an in-flight worker — terminal
-            // run-state means the server-side result is already published;
-            // the local SSH process may still be unwinding normally.
-            reap_worker_if_exited(&mut worker);
+            // Gracefully finish ownership of the worker — give it a
+            // bounded chance to exit cleanly before returning.
+            finish_worker_after_terminal(&mut worker);
             info!(
                 nickname = %nickname.as_str(),
                 run_id = %run_id.as_str(),
@@ -300,19 +298,21 @@ fn drive_server_until_terminal_with_interval(
                             {
                                 Ok(r) => r,
                                 Err(_) => {
+                                    terminate_worker_on_error(&mut worker);
                                     anyhow::bail!("{err_msg}");
                                 }
                             };
                             if fresh.terminal {
-                                // Terminal wins — do not kill the worker,
-                                // just reap if already exited.
-                                reap_worker_if_exited(&mut worker);
+                                // Terminal wins — finish the worker and
+                                // return the fresh terminal state.
+                                finish_worker_after_terminal(&mut worker);
                                 return Ok(fresh);
                             }
                             if fresh.phase == "ready"
                                 || (fresh.phase == "processing"
                                     && fresh.processor_state.as_deref() != Some("active"))
                             {
+                                terminate_worker_on_error(&mut worker);
                                 anyhow::bail!("{err_msg}");
                             }
                             warn!("{}", err_msg);
@@ -345,6 +345,7 @@ fn drive_server_until_terminal_with_interval(
                 }
             }
             "not_found" => {
+                terminate_worker_on_error(&mut worker);
                 anyhow::bail!(
                     "run {}/{} not found on server",
                     nickname.as_str(),
@@ -352,6 +353,7 @@ fn drive_server_until_terminal_with_interval(
                 );
             }
             other => {
+                terminate_worker_on_error(&mut worker);
                 anyhow::bail!(
                     "unexpected run-state phase '{other}' for run {}/{}",
                     nickname.as_str(),
@@ -403,26 +405,44 @@ fn drive_server_until_terminal_with_interval(
     }
 }
 
-/// If the worker has already exited, reap it.  Does not kill.
-/// Safe to call on the normal terminal observation path.
-fn reap_worker_if_exited(worker: &mut Option<RemoteCommandHandle>) {
-    if let Some(w) = worker.as_mut() {
-        if let Ok(Some(_)) = w.try_wait() {
-            *worker = None;
+const TERMINAL_WORKER_GRACE: Duration = Duration::from_secs(5);
+
+/// Finish ownership of the local process-run worker after terminal
+/// run-state is observed.  Gives the SSH child a bounded grace period
+/// to exit naturally; if it does not, terminates it explicitly.
+/// Either way the child and its stderr drainer are fully reaped.
+fn finish_worker_after_terminal(worker: &mut Option<RemoteCommandHandle>) {
+    let Some(mut w) = worker.take() else {
+        return;
+    };
+
+    // Already exited?
+    match w.try_wait() {
+        Ok(Some(_)) => return,
+        Ok(None) => { /* still running */ }
+        Err(_) => {
+            let _ = w.terminate_and_reap();
+            return;
+        }
+    }
+
+    // Bounded graceful wait.
+    match w.wait_timeout(TERMINAL_WORKER_GRACE) {
+        Ok(Some(_)) => {} // exited naturally during grace period
+        Ok(None) => {
+            let _ = w.terminate_and_reap();
+        }
+        Err(_) => {
+            let _ = w.terminate_and_reap();
         }
     }
 }
 
-/// Forcefully terminate the worker and reap the child process.
-/// Used on error/cancellation paths, never on normal terminal.
-#[allow(dead_code)]
-fn terminate_worker_and_reap(worker: &mut Option<RemoteCommandHandle>) {
+/// Terminate the local process-run worker before returning an error.
+/// Ensures no owned child is left running or unreaped on error paths.
+fn terminate_worker_on_error(worker: &mut Option<RemoteCommandHandle>) {
     if let Some(mut w) = worker.take() {
-        // Kill the local child, then wait for it to exit so we reap it
-        // and join the stderr drainer thread.
-        let _ = w.kill();
-        // `wait` blocks until the process exits and the drainer is joined.
-        let _ = w.wait();
+        let _ = w.terminate_and_reap();
     }
 }
 
@@ -4097,5 +4117,172 @@ observed_at_unix_secs = 1000
             "version called {version_count} times, expected 1"
         );
         assert_eq!(gc_count, 1, "gc called {gc_count} times, expected 1");
+    }
+
+    // ── Worker lifecycle tests ─────────────────────────────────────
+
+    #[test]
+    fn finish_worker_already_exited_does_not_hang() {
+        let runner = mk_runner();
+        runner.add_spawned_cmd_exit("worker-test", 0, RemoteCommandExit::Success);
+        let handle = runner
+            .spawn_server_cmd("host", "ps", &["worker-test"])
+            .unwrap();
+        // Exited immediately (0 polls).
+        let mut worker = Some(handle);
+        finish_worker_after_terminal(&mut worker);
+        assert!(worker.is_none(), "worker must be consumed");
+    }
+
+    #[test]
+    fn finish_worker_waits_gracefully_for_scripted_exit() {
+        let runner = mk_runner();
+        // Scripted exit after 2 polls — should be found during grace period.
+        runner.add_spawned_cmd_exit("worker-test", 2, RemoteCommandExit::Success);
+        let handle = runner
+            .spawn_server_cmd("host", "ps", &["worker-test"])
+            .unwrap();
+        let mut worker = Some(handle);
+        finish_worker_after_terminal(&mut worker);
+        assert!(
+            worker.is_none(),
+            "worker must be consumed after graceful wait"
+        );
+    }
+
+    #[test]
+    fn finish_worker_terminates_when_worker_never_exits() {
+        let runner = mk_runner();
+        // No scripted exit — worker runs forever.
+        let handle = runner
+            .spawn_server_cmd("host", "ps", &["forever-worker"])
+            .unwrap();
+        let mut worker = Some(handle);
+        // Should not hang — the grace period expires and terminate fires.
+        finish_worker_after_terminal(&mut worker);
+        assert!(
+            worker.is_none(),
+            "worker must be consumed after termination"
+        );
+    }
+
+    #[test]
+    fn finish_worker_is_noop_when_none() {
+        let mut worker: Option<RemoteCommandHandle> = None;
+        finish_worker_after_terminal(&mut worker);
+        assert!(worker.is_none());
+    }
+
+    #[test]
+    fn terminate_worker_on_error_clears_handle() {
+        let runner = mk_runner();
+        runner.add_spawned_cmd_exit("worker-test", 5, RemoteCommandExit::Success);
+        let handle = runner
+            .spawn_server_cmd("host", "ps", &["worker-test"])
+            .unwrap();
+        let mut worker = Some(handle);
+        terminate_worker_on_error(&mut worker);
+        assert!(
+            worker.is_none(),
+            "worker must be consumed after error termination"
+        );
+    }
+
+    #[test]
+    fn terminate_worker_on_error_noop_when_none() {
+        let mut worker: Option<RemoteCommandHandle> = None;
+        terminate_worker_on_error(&mut worker);
+        assert!(worker.is_none());
+    }
+
+    #[test]
+    fn terminal_state_with_running_worker_does_not_hang() {
+        // Integration-style test: drive_server_until_terminal sees
+        // terminal state while a process-run worker is still running.
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        // Script the transform flow.  The process-run exit is not
+        // scripted (worker runs forever), but the run-state should
+        // become terminal on the first poll, triggering the
+        // finish_worker_after_terminal path.
+        runner.add_response(
+            "gc",
+            &format!(
+                "protocol_version = {}\npurgery_version = \"0.1.0-test\"\n",
+                purgery_core::PROTOCOL_VERSION
+            ),
+        );
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        // Run-state returns terminal immediately → client should not spawn process-run.
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(
+            result.is_ok(),
+            "sync must succeed when run is already terminal: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn remote_failure_with_fresh_terminal_succeeds() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_response(
+            "gc",
+            &format!(
+                "protocol_version = {}\npurgery_version = \"0.1.0-test\"\n",
+                purgery_core::PROTOCOL_VERSION
+            ),
+        );
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        // Run-state shows ready → triggers process-run spawn
+        runner.add_response("run-state", &ready_run_state_toml());
+        // process-run returns remote failure
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::RemoteFailure {
+                exit_code: Some(1),
+                stderr: "simulated failure".to_string(),
+            },
+        );
+        // Fresh run-state shows terminal → should succeed
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(
+            result.is_ok(),
+            "sync must succeed when process-run fails but fresh state is terminal: {:?}",
+            result.err()
+        );
     }
 }
