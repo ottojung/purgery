@@ -485,6 +485,7 @@ impl RemoteRunner {
                 let drainer = std::thread::spawn(move || {
                     use std::io::Read;
                     let mut buf = Vec::with_capacity(MAX_STDERR_BYTES);
+                    let mut truncated = false;
                     let mut chunk = [0u8; 4096];
                     loop {
                         match stderr_pipe.read(&mut chunk) {
@@ -492,10 +493,10 @@ impl RemoteRunner {
                             Ok(n) => {
                                 buf.extend_from_slice(&chunk[..n]);
                                 if buf.len() > MAX_STDERR_BYTES {
-                                    // Keep only the tail (last MAX_STDERR_BYTES bytes).
+                                    // Keep only the tail; set truncation flag.
                                     let excess = buf.len() - MAX_STDERR_BYTES;
-                                    // SAFETY: drain advances the vec efficiently.
                                     let _ = buf.drain(..excess);
+                                    truncated = true;
                                 }
                             }
                             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
@@ -504,7 +505,16 @@ impl RemoteRunner {
                             Err(_) => break, // read error → give up
                         }
                     }
-                    buf
+                    if truncated {
+                        // Prepend a truncation notice before the captured tail.
+                        let marker = b"...(stderr truncated; showing last 65536 bytes)...\n";
+                        let mut result = Vec::with_capacity(marker.len() + buf.len());
+                        result.extend_from_slice(marker);
+                        result.extend_from_slice(&buf);
+                        result
+                    } else {
+                        buf
+                    }
                 });
 
                 Ok(RemoteCommandHandle {
