@@ -2281,7 +2281,7 @@ state = "done"
         // heartbeat must have run — if it had failed, is_healthy would
         // have rejected it before finish-run
         let log = runner.command_log();
-        assert!(log.iter().any(|c| c.contains("heartbeat-run"))        );
+        assert!(log.iter().any(|c| c.contains("heartbeat-run")));
     }
 
     fn processing_state_with_processor(run_id: &str, ts: u64, state: &str) -> String {
@@ -5029,7 +5029,10 @@ state = "done"
         runner.add_response("heartbeat-run", "");
         runner.add_response("finish-run", "");
         // First poll returns processing with unknown processor_state
-        runner.add_response("run-state", &processing_state_with_processor("test-run", 1000, "unknown"));
+        runner.add_response(
+            "run-state",
+            &processing_state_with_processor("test-run", 1000, "unknown"),
+        );
         // No process-run exit is scripted — no spawn should happen.
 
         let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
@@ -5135,11 +5138,18 @@ observed_at_unix_secs = 1000
         runner.add_response("heartbeat-run", "");
         runner.add_response("finish-run", "");
         // First poll returns processing with idle processor_state
-        runner.add_response("run-state", &processing_state_with_processor("test-run", 1000, "idle"));
+        runner.add_response(
+            "run-state",
+            &processing_state_with_processor("test-run", 1000, "idle"),
+        );
         // process-run exits with success → terminal
-        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success {
-            stdout: process_run_ok_toml("processed", "test-run"),
-        });
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("processed", "test-run"),
+            },
+        );
         runner.add_response("run-state", &done_run_state_toml());
         runner.add_response("status", &done_status_toml());
         // Extra for terminal worker validation
