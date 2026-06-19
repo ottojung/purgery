@@ -674,11 +674,11 @@ pub fn heartbeat_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId)
     purgery_core::require_compatible_purgery_version(&lease.purgery_version, "lease")
         .with_context(|| "incompatible lease version")?;
 
-    if lease.protocol_version != purgery_core::LEASE_FILE_VERSION {
+    if lease.protocol_version != purgery_core::PROTOCOL_VERSION {
         anyhow::bail!(
             "lease protocol version {} does not match expected {}",
             lease.protocol_version,
-            purgery_core::LEASE_FILE_VERSION
+            purgery_core::PROTOCOL_VERSION
         );
     }
     if lease.nickname != nickname.as_str() {

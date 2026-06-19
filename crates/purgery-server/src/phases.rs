@@ -336,7 +336,7 @@ pub(crate) fn write_progress(
         ExistingProgress::Missing | ExistingProgress::Malformed => now,
     };
     let progress = ProcessingProgress {
-        protocol_version: purgery_core::PROGRESS_FILE_VERSION,
+        protocol_version: purgery_core::PROTOCOL_VERSION,
         purgery_version: current_purgery_version().to_string(),
         nickname: nickname.as_str().to_owned(),
         run_id: run_id.as_str().to_owned(),
@@ -588,7 +588,7 @@ pub fn begin_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> 
     }
 
     let lease = purgery_core::LeaseFile {
-        protocol_version: purgery_core::LEASE_FILE_VERSION,
+        protocol_version: purgery_core::PROTOCOL_VERSION,
         purgery_version: current_purgery_version().to_string(),
         nickname: nickname.as_str().to_owned(),
         run_id: run_id.as_str().to_owned(),
@@ -682,11 +682,11 @@ pub fn finish_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) ->
             toml::from_str(&lease_content).with_context(|| "failed to parse lease file")?;
         purgery_core::require_compatible_purgery_version(&lease.purgery_version, "lease")
             .with_context(|| "incompatible lease version")?;
-        if lease.protocol_version != purgery_core::LEASE_FILE_VERSION {
+        if lease.protocol_version != purgery_core::PROTOCOL_VERSION {
             anyhow::bail!(
                 "lease protocol version {} does not match expected {}",
                 lease.protocol_version,
-                purgery_core::LEASE_FILE_VERSION
+                purgery_core::PROTOCOL_VERSION
             );
         }
         if lease.nickname != nickname.as_str() {
