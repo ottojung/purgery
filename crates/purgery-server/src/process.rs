@@ -1063,50 +1063,77 @@ pub fn process_run_target(
 ) -> Result<purgery_core::ProcessRunResponse> {
     use purgery_core::ProcessRunResponse;
 
-    let (outcome, run_phase, message) = process_run_inner(config, nickname, run_id)?;
-
-    // Read terminal status state only when the outcome indicates
-    // terminal completion.  run_phase is directory-based and never
-    // contains "partial"; status_state is from RunStatus.state and
-    // may contain "partial".
-    let status_state = match outcome {
-        ProcessRunOutcome::Processed | ProcessRunOutcome::AlreadyTerminal => {
-            read_terminal_status_state(config, nickname, run_id)
-        }
-        _ => None,
-    };
+    let result = process_run_inner(config, nickname, run_id)?;
 
     Ok(ProcessRunResponse {
         protocol_version: purgery_core::PROTOCOL_VERSION,
         purgery_version: purgery_core::current_purgery_version().to_string(),
         nickname: nickname.as_str().to_owned(),
         run_id: run_id.as_str().to_owned(),
-        outcome: outcome.as_str().to_owned(),
-        run_phase,
-        status_state,
-        message,
+        outcome: result.outcome.as_str().to_owned(),
+        run_phase: result.run_phase,
+        status_state: result.status_state,
+        message: result.message,
     })
 }
 
-/// Inner dispatch.  Returns (outcome, run_phase, message).
+/// Structured result from `process_run_inner` that maps directly to
+/// `ProcessRunResponse`.  For terminal outcomes (`Processed`,
+/// `AlreadyTerminal`) both `run_phase` and `status_state` are populated
+/// from verified terminal status.  For nonterminal outcomes
+/// `status_state` is `None`.
+struct ProcessRunInnerResult {
+    outcome: ProcessRunOutcome,
+    run_phase: Option<String>,
+    status_state: Option<String>,
+    message: Option<String>,
+}
+
+/// Build a terminal `ProcessRunInnerResult` from verified terminal status.
+/// Fails if terminal status cannot be verified (missing, malformed,
+/// incompatible, or envelope-mismatched).
+fn terminal_response(
+    config: &ServerConfig,
+    nickname: &Nickname,
+    run_id: &RunId,
+    outcome: ProcessRunOutcome,
+    message: String,
+) -> Result<ProcessRunInnerResult> {
+    let Some((run_phase, status_state)) = verified_terminal_status(config, nickname, run_id)?
+    else {
+        anyhow::bail!(
+            "run {}/{} expected terminal status after outcome {} but no verified terminal status exists",
+            nickname.as_str(),
+            run_id.as_str(),
+            outcome.as_str(),
+        );
+    };
+    Ok(ProcessRunInnerResult {
+        outcome,
+        run_phase: Some(run_phase),
+        status_state: Some(status_state),
+        message: Some(message),
+    })
+}
+
+/// Inner dispatch.  Returns a `ProcessRunInnerResult`.
 fn process_run_inner(
     config: &ServerConfig,
     nickname: &Nickname,
     run_id: &RunId,
-) -> Result<(ProcessRunOutcome, Option<String>, Option<String>)> {
+) -> Result<ProcessRunInnerResult> {
     // 1. Try to claim from ready.
     match claim_ready_run(config, nickname, run_id) {
         ReadyClaimOutcome::Claimed(lock) => {
             let result = process_processing_run(config, nickname, run_id);
-            let (outcome, phase, message) = match result {
-                Ok(()) => {
-                    let term_phase = detect_terminal_run_phase(config, nickname, run_id);
-                    (
-                        ProcessRunOutcome::Processed,
-                        Some(term_phase),
-                        Some("run processed successfully".to_string()),
-                    )
-                }
+            let inner = match result {
+                Ok(()) => terminal_response(
+                    config,
+                    nickname,
+                    run_id,
+                    ProcessRunOutcome::Processed,
+                    "run processed successfully".to_string(),
+                ),
                 Err(ProcessingError::Incompatible { message, .. }) => {
                     anyhow::bail!("incompatible run in processing: {message}")
                 }
@@ -1119,14 +1146,13 @@ fn process_run_inner(
                         "run failed",
                     );
                     match move_to_failed(&config.work_dir, nickname, run_id) {
-                        Ok(()) => {
-                            let term_phase = detect_terminal_run_phase(config, nickname, run_id);
-                            (
-                                ProcessRunOutcome::Processed,
-                                Some(term_phase),
-                                Some(error.to_string()),
-                            )
-                        }
+                        Ok(()) => terminal_response(
+                            config,
+                            nickname,
+                            run_id,
+                            ProcessRunOutcome::Processed,
+                            error.to_string(),
+                        ),
                         Err(move_err) => anyhow::bail!(
                             "{error}; failed to move target run to failed: {move_err}"
                         ),
@@ -1134,7 +1160,7 @@ fn process_run_inner(
                 }
             };
             drop(lock);
-            return Ok((outcome, phase, message));
+            return inner;
         }
         ReadyClaimOutcome::ActiveClaimer => {
             info!(
@@ -1142,23 +1168,25 @@ fn process_run_inner(
                 run_id = %run_id.as_str(),
                 "ready run is being claimed by another processor",
             );
-            return Ok((
-                ProcessRunOutcome::ClaimInProgress,
-                Some("ready".to_string()),
-                Some("another process owns the ready processor lock".to_string()),
-            ));
+            return Ok(ProcessRunInnerResult {
+                outcome: ProcessRunOutcome::ClaimInProgress,
+                run_phase: Some("ready".to_string()),
+                status_state: None,
+                message: Some("another process owns the ready processor lock".to_string()),
+            });
         }
         ReadyClaimOutcome::AlreadyProcessing => {
             return handle_process_run_processing_outcome(config, nickname, run_id);
         }
         ReadyClaimOutcome::AlreadyTerminal => {
             match verified_terminal_status(config, nickname, run_id)? {
-                Some((ref run_phase, _)) => {
-                    return Ok((
-                        ProcessRunOutcome::AlreadyTerminal,
-                        Some(run_phase.clone()),
-                        Some("run was already in a terminal phase".to_string()),
-                    ));
+                Some((run_phase, status_state)) => {
+                    return Ok(ProcessRunInnerResult {
+                        outcome: ProcessRunOutcome::AlreadyTerminal,
+                        run_phase: Some(run_phase),
+                        status_state: Some(status_state),
+                        message: Some("run was already in a terminal phase".to_string()),
+                    });
                 }
                 None => anyhow::bail!(
                     "run {}/{} reported as terminal by claim ready but no verified terminal status found",
@@ -1172,11 +1200,13 @@ fn process_run_inner(
         }
         ReadyClaimOutcome::MalformedReadyMovedToFailed { error } => {
             let term_phase = detect_terminal_run_phase(config, nickname, run_id);
-            return Ok((
-                ProcessRunOutcome::Processed,
-                Some(term_phase),
-                Some(format!("malformed ready run moved to failed: {error}")),
-            ));
+            let status_state = read_terminal_status_state(config, nickname, run_id);
+            return Ok(ProcessRunInnerResult {
+                outcome: ProcessRunOutcome::Processed,
+                run_phase: Some(term_phase),
+                status_state,
+                message: Some(format!("malformed ready run moved to failed: {error}")),
+            });
         }
         ReadyClaimOutcome::MalformedReadyMoveFailed { .. } => {
             anyhow::bail!("malformed ready run could not be moved to failed")
@@ -1193,29 +1223,31 @@ fn process_run_inner(
         return handle_process_run_processing_outcome(config, nickname, run_id);
     }
 
-    // 3. Check terminal phases.
-    for phase in &[RunPhase::Done, RunPhase::Failed] {
-        let dir = config.work_dir.run_dir(nickname, run_id, *phase);
-        if dir.exists() {
+    // 3. Check terminal phases — must use verified terminal status, not
+    //    directory existence alone.
+    match verified_terminal_status(config, nickname, run_id)? {
+        Some((run_phase, status_state)) => {
             info!(
                 nickname = %nickname.as_str(),
                 run_id = %run_id.as_str(),
-                phase = %phase.as_str(),
+                phase = %run_phase,
                 "run already terminal",
             );
-            return Ok((
-                ProcessRunOutcome::AlreadyTerminal,
-                Some(phase.as_str().to_owned()),
-                Some("run was already in a terminal phase".to_string()),
-            ));
+            Ok(ProcessRunInnerResult {
+                outcome: ProcessRunOutcome::AlreadyTerminal,
+                run_phase: Some(run_phase),
+                status_state: Some(status_state),
+                message: Some("run was already in a terminal phase".to_string()),
+            })
+        }
+        None => {
+            anyhow::bail!(
+                "run {}/{} not found in ready, processing, or terminal phases",
+                nickname.as_str(),
+                run_id.as_str(),
+            )
         }
     }
-
-    anyhow::bail!(
-        "run {}/{} not found in ready, processing, or terminal phases",
-        nickname.as_str(),
-        run_id.as_str(),
-    )
 }
 
 /// Like `handle_process_run_processing` but returns structured outcomes.
@@ -1223,39 +1255,39 @@ fn handle_process_run_processing_outcome(
     config: &ServerConfig,
     nickname: &Nickname,
     run_id: &RunId,
-) -> Result<(ProcessRunOutcome, Option<String>, Option<String>)> {
+) -> Result<ProcessRunInnerResult> {
     match recover_processing_run_if_unlocked(config, nickname, run_id) {
-        Ok(ProcessingTargetOutcome::Recovered) => {
-            let term_phase = detect_terminal_run_phase(config, nickname, run_id);
-            Ok((
-                ProcessRunOutcome::Processed,
-                Some(term_phase),
-                Some("processing run recovered and completed".to_string()),
-            ))
-        }
-        Ok(ProcessingTargetOutcome::ActiveProcessor) => Ok((
-            ProcessRunOutcome::AlreadyActive,
-            Some("processing".to_string()),
-            Some("processor lock is held by another process".to_string()),
-        )),
-        Ok(ProcessingTargetOutcome::FailedPublished { error }) => {
-            let term_phase = detect_terminal_run_phase(config, nickname, run_id);
-            Ok((
-                ProcessRunOutcome::Processed,
-                Some(term_phase),
-                Some(format!("processing recovery failed: {error}")),
-            ))
-        }
+        Ok(ProcessingTargetOutcome::Recovered) => terminal_response(
+            config,
+            nickname,
+            run_id,
+            ProcessRunOutcome::Processed,
+            "processing run recovered and completed".to_string(),
+        ),
+        Ok(ProcessingTargetOutcome::ActiveProcessor) => Ok(ProcessRunInnerResult {
+            outcome: ProcessRunOutcome::AlreadyActive,
+            run_phase: Some("processing".to_string()),
+            status_state: None,
+            message: Some("processor lock is held by another process".to_string()),
+        }),
+        Ok(ProcessingTargetOutcome::FailedPublished { error }) => terminal_response(
+            config,
+            nickname,
+            run_id,
+            ProcessRunOutcome::Processed,
+            format!("processing recovery failed: {error}"),
+        ),
         Ok(ProcessingTargetOutcome::Incompatible { message }) => {
             anyhow::bail!("abandoned processing run is incompatible: {message}")
         }
         Ok(ProcessingTargetOutcome::NotFound) => {
             match verified_terminal_status(config, nickname, run_id)? {
-                Some((run_phase, _state)) => Ok((
-                    ProcessRunOutcome::AlreadyTerminal,
-                    Some(run_phase),
-                    Some("processing run completed before recovery".to_string()),
-                )),
+                Some((run_phase, status_state)) => Ok(ProcessRunInnerResult {
+                    outcome: ProcessRunOutcome::AlreadyTerminal,
+                    run_phase: Some(run_phase),
+                    status_state: Some(status_state),
+                    message: Some("processing run completed before recovery".to_string()),
+                }),
                 None => anyhow::bail!(
                     "run {}/{} disappeared from processing but no verified terminal status exists",
                     nickname.as_str(),

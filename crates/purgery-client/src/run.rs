@@ -335,6 +335,30 @@ fn drive_server_until_terminal_with_interval(
                                         details,
                                         "process-run SSH transport failed",
                                     );
+                                    // Re-poll run-state before deciding.  Do not use stale
+                                    // state — a fresh observation tells us whether to
+                                    // restart, wait, or terminate.
+                                    let fresh =
+                                        match run_state(runner, host, server_cmd, nickname, run_id)
+                                        {
+                                            Ok(r) => r,
+                                            Err(e) => {
+                                                terminate_worker_on_error(&mut worker);
+                                                return Err(e).with_context(|| {
+                                                    format!(
+                                                    "process-run transport failed for run {}/{} \
+                                                     and fresh run-state could not be read; \
+                                                     leaving persisted state for resume",
+                                                    nickname.as_str(),
+                                                    run_id.as_str(),
+                                                )
+                                                });
+                                            }
+                                        };
+                                    if fresh.terminal {
+                                        return Ok(fresh);
+                                    }
+                                    state = fresh;
                                 }
                                 RemoteCommandExit::RemoteFailure { stderr, .. } => {
                                     let err_msg = format!(
@@ -4233,6 +4257,7 @@ status = "imported"
                 stdout: process_run_ok_toml("processed", "test-run"),
             },
         );
+        runner.add_response("run-state", &ready_run_state_toml());
         runner.add_response("run-state", &done_run_state_toml());
         runner.add_response("status", &done_status_toml());
 
