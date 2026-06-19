@@ -1152,17 +1152,20 @@ fn process_run_inner(
             return handle_process_run_processing_outcome(config, nickname, run_id);
         }
         ReadyClaimOutcome::AlreadyTerminal => {
-            let term_phase = detect_terminal_run_phase(config, nickname, run_id);
-            let run_phase = if term_phase.is_empty() {
-                None
-            } else {
-                Some(term_phase)
-            };
-            return Ok((
-                ProcessRunOutcome::AlreadyTerminal,
-                run_phase,
-                Some("run was already in a terminal phase".to_string()),
-            ));
+            match verified_terminal_status(config, nickname, run_id)? {
+                Some((ref run_phase, _)) => {
+                    return Ok((
+                        ProcessRunOutcome::AlreadyTerminal,
+                        Some(run_phase.clone()),
+                        Some("run was already in a terminal phase".to_string()),
+                    ));
+                }
+                None => anyhow::bail!(
+                    "run {}/{} reported as terminal by claim ready but no verified terminal status found",
+                    nickname.as_str(),
+                    run_id.as_str(),
+                ),
+            }
         }
         ReadyClaimOutcome::IncompatibleReady { message } => {
             anyhow::bail!("incompatible run left in place: {message}")
@@ -1247,17 +1250,12 @@ fn handle_process_run_processing_outcome(
             anyhow::bail!("abandoned processing run is incompatible: {message}")
         }
         Ok(ProcessingTargetOutcome::NotFound) => {
-            match verified_terminal_state(config, nickname, run_id)? {
-                Some(_status_state) => {
-                    // run_phase comes from the directory, not from status state,
-                    // so it can never be "partial".
-                    let run_phase = detect_terminal_run_phase(config, nickname, run_id);
-                    Ok((
-                        ProcessRunOutcome::AlreadyTerminal,
-                        Some(run_phase),
-                        Some("processing run completed before recovery".to_string()),
-                    ))
-                }
+            match verified_terminal_status(config, nickname, run_id)? {
+                Some((run_phase, _state)) => Ok((
+                    ProcessRunOutcome::AlreadyTerminal,
+                    Some(run_phase),
+                    Some("processing run completed before recovery".to_string()),
+                )),
                 None => anyhow::bail!(
                     "run {}/{} disappeared from processing but no verified terminal status exists",
                     nickname.as_str(),
@@ -1288,7 +1286,7 @@ fn detect_terminal_run_phase(config: &ServerConfig, nickname: &Nickname, run_id:
 
 /// Read the terminal `RunStatus.state` from `status.toml`.  Returns
 /// `Some("done"|"partial"|"failed")` when readable, `None` otherwise.
-/// This is the authoritative terminal state, not the directory phase.
+/// This is not authoritative — use `verified_terminal_status` for that.
 fn read_terminal_status_state(
     config: &ServerConfig,
     nickname: &Nickname,
@@ -1309,25 +1307,29 @@ fn read_terminal_status_state(
     None
 }
 
-/// Strict terminal status verification.  Returns `RunStatus.state`
-/// (which may be `"done"`, `"partial"`, or `"failed"`) only when a
-/// readable `status.toml` exists in either `done/` or `failed/`.
-/// Errors if the directory exists but status is missing or malformed.
-/// Returns `None` if neither terminal directory exists.
+/// Verify that a terminal run has authoritative terminal status.
 ///
-/// This is the function to use for terminal *authority* checks.  It
-/// does NOT return a filesystem/protocol phase — use
-/// `detect_terminal_run_phase` for that.
-fn verified_terminal_state(
+/// Returns the directory phase (`"done"` or `"failed"`) and the
+/// `RunStatus.state` (`"done"`, `"partial"`, or `"failed"`) only when:
+///
+/// * a terminal directory exists;
+/// * `status.toml` is readable and parseable;
+/// * `purgery_version` is compatible;
+/// * nickname/run_id envelope matches.
+///
+/// Errors if the directory exists but any of the above is missing or
+/// invalid.  Returns `None` if neither terminal directory exists.
+fn verified_terminal_status(
     config: &ServerConfig,
     nickname: &Nickname,
     run_id: &RunId,
-) -> Result<Option<String>> {
-    for (phase, _) in &[(RunPhase::Done, "done"), (RunPhase::Failed, "failed")] {
+) -> Result<Option<(String, String)>> {
+    for phase in &[RunPhase::Done, RunPhase::Failed] {
         let dir = config.work_dir.run_dir(nickname, run_id, *phase);
         if !dir.exists() {
             continue;
         }
+        let phase_name = phase.as_str().to_owned();
         let status_path = dir.join("status.toml");
         let content = fs::read_to_string(status_path.as_std_path()).with_context(|| {
             format!(
@@ -1335,7 +1337,7 @@ fn verified_terminal_state(
                  but status.toml is unreadable",
                 nickname.as_str(),
                 run_id.as_str(),
-                phase.as_str(),
+                phase_name,
             )
         })?;
         let status = purgery_core::RunStatus::from_toml(&content).with_context(|| {
@@ -1343,10 +1345,35 @@ fn verified_terminal_state(
                 "terminal status.toml is invalid for run {}/{} in phase {}",
                 nickname.as_str(),
                 run_id.as_str(),
-                phase.as_str(),
+                phase_name,
             )
         })?;
-        return Ok(Some(status.state.as_str().to_owned()));
+        purgery_core::require_compatible_purgery_version(
+            &status.purgery_version,
+            "terminal status",
+        )
+        .with_context(|| {
+            format!(
+                "incompatible terminal status version for run {}/{} in phase {}",
+                nickname.as_str(),
+                run_id.as_str(),
+                phase_name,
+            )
+        })?;
+        // Validate envelope: nickname/run_id must match.
+        if status.nickname != *nickname || status.run_id != *run_id {
+            anyhow::bail!(
+                "terminal status envelope mismatch for run {}/{} in phase {}: \
+                 status has nickname={}, run_id={}",
+                nickname.as_str(),
+                run_id.as_str(),
+                phase_name,
+                status.nickname.as_str(),
+                status.run_id.as_str(),
+            );
+        }
+        let status_state = status.state.as_str().to_owned();
+        return Ok(Some((phase_name, status_state)));
     }
     Ok(None)
 }

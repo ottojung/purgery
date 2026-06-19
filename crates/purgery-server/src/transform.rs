@@ -9,7 +9,9 @@ use crate::ResolvedTransform;
 const MAX_TRANSFORM_OUTPUT_BYTES: usize = 64 * 1024;
 
 /// Spawn a reader thread that drains a pipe and keeps a bounded tail.
-fn bounded_output_reader(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Result<Vec<u8>, String>> {
+fn bounded_output_reader(
+    mut pipe: impl Read + Send + 'static,
+) -> std::thread::JoinHandle<Result<Vec<u8>, String>> {
     std::thread::spawn(move || {
         let mut buf = Vec::with_capacity(MAX_TRANSFORM_OUTPUT_BYTES);
         let mut truncated = false;
@@ -30,7 +32,9 @@ fn bounded_output_reader(mut pipe: impl Read + Send + 'static) -> std::thread::J
             }
         }
         if truncated {
-            let marker = format!("...(output truncated; showing last {MAX_TRANSFORM_OUTPUT_BYTES} bytes)...\n");
+            let marker = format!(
+                "...(output truncated; showing last {MAX_TRANSFORM_OUTPUT_BYTES} bytes)...\n"
+            );
             let mut result = Vec::with_capacity(marker.len() + buf.len());
             result.extend_from_slice(marker.as_bytes());
             result.extend_from_slice(&buf);
@@ -113,10 +117,8 @@ pub fn apply_transform_with_heartbeat(
             // never blocks on a full pipe buffer.  Do NOT inherit
             // these pipes — protocol stdout must remain machine-
             // readable TOML.
-            let stdout_handle = child.stdout.take()
-                .map(|p| bounded_output_reader(p));
-            let stderr_handle = child.stderr.take()
-                .map(|p| bounded_output_reader(p));
+            let stdout_handle = child.stdout.take().map(bounded_output_reader);
+            let stderr_handle = child.stderr.take().map(bounded_output_reader);
 
             let transform_status = loop {
                 match child.try_wait() {
