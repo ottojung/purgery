@@ -260,7 +260,7 @@ fn drive_server_until_terminal_with_interval(
         };
 
         if state.terminal {
-            finish_worker_after_terminal(&mut worker, runner, host, server_cmd, nickname, run_id)?;
+            finish_worker_after_terminal(&mut worker, nickname, run_id);
             info!(
                 nickname = %nickname.as_str(),
                 run_id = %run_id.as_str(),
@@ -297,12 +297,9 @@ fn drive_server_until_terminal_with_interval(
                                         WorkerExitDecision::Terminal(ts) => {
                                             finish_worker_after_terminal(
                                                 &mut worker,
-                                                runner,
-                                                host,
-                                                server_cmd,
                                                 nickname,
                                                 run_id,
-                                            )?;
+                                            );
                                             info!(
                                                 nickname = %nickname.as_str(),
                                                 run_id = %run_id.as_str(),
@@ -345,14 +342,7 @@ fn drive_server_until_terminal_with_interval(
                                             }
                                         };
                                     if fresh.terminal {
-                                        finish_worker_after_terminal(
-                                            &mut worker,
-                                            runner,
-                                            host,
-                                            server_cmd,
-                                            nickname,
-                                            run_id,
-                                        )?;
+                                        finish_worker_after_terminal(&mut worker, nickname, run_id);
                                         return Ok(fresh);
                                     }
                                     if fresh.phase == "ready"
@@ -537,168 +527,70 @@ impl NoProgressTracker {
 const TERMINAL_WORKER_GRACE: Duration = Duration::from_secs(5);
 
 /// Finish ownership of the local process-run worker after terminal
-/// run-state is observed.
+/// run-state is observed.  Best-effort: terminal state is authoritative
+/// once `run-state` reports terminal AND terminal `status.toml` is
+/// readable.  The local SSH child is only a supervision mechanism;
+/// its exit status does not affect sync success.
 ///
-/// Gives the SSH child a bounded grace period to exit naturally.
-/// If it does not exit within the grace period, terminates it and
-/// returns an error — there is no successful path where the client
-/// kills the worker.
-///
-/// If the worker already exited, validates its exit.
-fn finish_worker_after_terminal(
+/// If the worker does not exit within the grace period, terminates it
+/// and warns.  Never returns an error — server terminal state wins.
+pub(crate) fn finish_worker_after_terminal(
     worker: &mut Option<RemoteCommandHandle>,
-    runner: &RemoteRunner,
-    host: &str,
-    server_cmd: &str,
     nickname: &Nickname,
     run_id: &RunId,
-) -> Result<()> {
+) {
     let Some(mut w) = worker.take() else {
-        return Ok(());
+        return;
     };
 
-    // Bounded graceful wait.  If the worker already exited, wait_timeout
-    // returns the exit immediately; otherwise it blocks up to the grace
-    // period.  Either way the exit is then validated.
-    let exit = match w.wait_timeout(TERMINAL_WORKER_GRACE)? {
-        Some(exit) => exit,
-        None => {
-            let _ = w.terminate_and_reap();
-            anyhow::bail!(
-                "process-run did not exit within {}s after terminal run-state was observed \
-                 for run {}/{}",
+    match w.wait_timeout(TERMINAL_WORKER_GRACE) {
+        Ok(Some(exit)) => match exit {
+            RemoteCommandExit::Success { .. } => {
+                debug!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    "process-run exited after terminal state",
+                );
+            }
+            RemoteCommandExit::RemoteFailure { stderr, .. } => {
+                warn!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    "process-run remote failure after terminal state: {stderr}",
+                );
+            }
+            RemoteCommandExit::TransportFailure { details, .. } => {
+                warn!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    "process-run transport failure after terminal state: {details}",
+                );
+            }
+            RemoteCommandExit::Killed => {
+                warn!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    "process-run was killed after terminal state",
+                );
+            }
+        },
+        Ok(None) => {
+            warn!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                "process-run did not exit within {}s after terminal state; terminating",
                 TERMINAL_WORKER_GRACE.as_secs(),
-                nickname.as_str(),
-                run_id.as_str(),
             );
+            let _ = w.terminate_and_reap();
         }
-    };
-
-    match exit {
-        RemoteCommandExit::Success { stdout } => {
-            validate_terminal_worker_success(&stdout, runner, host, server_cmd, nickname, run_id)
-        }
-        RemoteCommandExit::RemoteFailure { stderr, .. } => {
+        Err(e) => {
             warn!(
                 nickname = %nickname.as_str(),
                 run_id = %run_id.as_str(),
-                "process-run exited with remote failure after terminal state: {stderr}",
+                error = %e,
+                "failed to wait for process-run after terminal state",
             );
-            validate_terminal_state_worker_failure(runner, host, server_cmd, nickname, run_id)
-        }
-        RemoteCommandExit::TransportFailure { details, .. } => {
-            warn!(
-                nickname = %nickname.as_str(),
-                run_id = %run_id.as_str(),
-                "process-run exited with transport failure after terminal state: {details}",
-            );
-            validate_terminal_state_worker_failure(runner, host, server_cmd, nickname, run_id)
-        }
-        RemoteCommandExit::Killed => {
-            anyhow::bail!(
-                "process-run was killed after terminal state for run {}/{}",
-                nickname.as_str(),
-                run_id.as_str(),
-            );
-        }
-    }
-}
-
-/// When a worker exits with failure after terminal state was observed,
-/// verify that the terminal state still holds and status is readable.
-fn validate_terminal_state_worker_failure(
-    runner: &RemoteRunner,
-    host: &str,
-    server_cmd: &str,
-    nickname: &Nickname,
-    run_id: &RunId,
-) -> Result<()> {
-    let fresh = run_state(runner, host, server_cmd, nickname, run_id).with_context(|| {
-        format!(
-            "failed to poll run-state after worker failure for run {}/{}",
-            nickname.as_str(),
-            run_id.as_str(),
-        )
-    })?;
-    if !fresh.terminal {
-        anyhow::bail!(
-            "worker exited with failure after terminal state for run {}/{} \
-             but fresh run-state is not terminal (phase={})",
-            nickname.as_str(),
-            run_id.as_str(),
-            fresh.phase,
-        );
-    }
-    read_status(runner, host, server_cmd, nickname, run_id).with_context(|| {
-        format!(
-            "terminal run-state observed for run {}/{} but status is not readable \
-             after worker failure",
-            nickname.as_str(),
-            run_id.as_str(),
-        )
-    })?;
-    Ok(())
-}
-
-/// Validate a successful process-run exit that occurred after terminal
-/// run-state was observed.  Parses the response, verifies the outcome
-/// is compatible with terminal state, fresh-polls run-state, and checks
-/// that terminal status is readable.
-fn validate_terminal_worker_success(
-    stdout: &str,
-    runner: &RemoteRunner,
-    host: &str,
-    server_cmd: &str,
-    nickname: &Nickname,
-    run_id: &RunId,
-) -> Result<()> {
-    let resp = parse_process_run_response(stdout, nickname, run_id)?;
-
-    let outcome = purgery_core::ProcessRunOutcome::from_str_name(&resp.outcome)
-        .ok_or_else(|| anyhow::anyhow!("unknown process-run outcome '{}'", resp.outcome))?;
-
-    let fresh = run_state(runner, host, server_cmd, nickname, run_id).with_context(|| {
-        format!(
-            "failed to poll fresh run-state after successful process-run exit \
-             following terminal observation for run {}/{}",
-            nickname.as_str(),
-            run_id.as_str(),
-        )
-    })?;
-
-    if !fresh.terminal {
-        anyhow::bail!(
-            "process-run exited successfully after terminal state was observed \
-             for run {}/{} but fresh run-state is not terminal \
-             (phase={}, processor_state={:?})",
-            nickname.as_str(),
-            run_id.as_str(),
-            fresh.phase,
-            fresh.processor_state,
-        );
-    }
-
-    read_status(runner, host, server_cmd, nickname, run_id).with_context(|| {
-        format!(
-            "fresh terminal run-state observed for run {}/{} after successful \
-             process-run exit, but status is not readable",
-            nickname.as_str(),
-            run_id.as_str(),
-        )
-    })?;
-
-    match outcome {
-        purgery_core::ProcessRunOutcome::Processed
-        | purgery_core::ProcessRunOutcome::AlreadyTerminal => Ok(()),
-        purgery_core::ProcessRunOutcome::AlreadyActive
-        | purgery_core::ProcessRunOutcome::ClaimInProgress => {
-            anyhow::bail!(
-                "process-run exited successfully after terminal state was observed \
-                 for run {}/{} but reported suspicious nonterminal outcome={}",
-                nickname.as_str(),
-                run_id.as_str(),
-                resp.outcome,
-            )
+            let _ = w.terminate_and_reap();
         }
     }
 }
@@ -4765,15 +4657,11 @@ state = "done"
             .spawn_server_cmd("host", "ps", &["worker-test"])
             .unwrap();
         let mut worker = Some(handle);
-        let res = finish_worker_after_terminal(
+        finish_worker_after_terminal(
             &mut worker,
-            &runner,
-            "host",
-            "ps",
             &Nickname::new("laptop".into()).unwrap(),
             &RunId::new("r".into()).unwrap(),
         );
-        assert!(res.is_ok(), "finish should succeed: {:?}", res.err());
         assert!(worker.is_none(), "worker must be consumed");
     }
 
@@ -4812,15 +4700,11 @@ state = "done"
             .spawn_server_cmd("host", "ps", &["worker-test"])
             .unwrap();
         let mut worker = Some(handle);
-        let res = finish_worker_after_terminal(
+        finish_worker_after_terminal(
             &mut worker,
-            &runner,
-            "host",
-            "ps",
             &Nickname::new("laptop".into()).unwrap(),
             &RunId::new("r".into()).unwrap(),
         );
-        assert!(res.is_ok(), "graceful wait should succeed: {:?}", res.err());
         assert!(
             worker.is_none(),
             "worker must be consumed after graceful wait"
@@ -4830,20 +4714,15 @@ state = "done"
     #[test]
     fn finish_worker_terminates_when_worker_never_exits() {
         let runner = mk_runner();
-        // No scripted exit — worker runs forever.
         let handle = runner
             .spawn_server_cmd("host", "ps", &["forever-worker"])
             .unwrap();
         let mut worker = Some(handle);
-        let res = finish_worker_after_terminal(
+        finish_worker_after_terminal(
             &mut worker,
-            &runner,
-            "host",
-            "ps",
             &Nickname::new("laptop".into()).unwrap(),
             &RunId::new("r".into()).unwrap(),
         );
-        assert!(res.is_err(), "never-exiting worker must produce error");
         assert!(
             worker.is_none(),
             "worker must be consumed after termination"
@@ -4852,17 +4731,12 @@ state = "done"
 
     #[test]
     fn finish_worker_is_noop_when_none() {
-        let runner = mk_runner();
         let mut worker: Option<RemoteCommandHandle> = None;
-        let res = finish_worker_after_terminal(
+        finish_worker_after_terminal(
             &mut worker,
-            &runner,
-            "host",
-            "ps",
             &Nickname::new("laptop".into()).unwrap(),
             &RunId::new("r".into()).unwrap(),
         );
-        assert!(res.is_ok());
         assert!(worker.is_none());
     }
 

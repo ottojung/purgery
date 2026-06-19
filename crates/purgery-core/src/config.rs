@@ -57,8 +57,13 @@ pub struct ProcessRunResponse {
     pub nickname: String,
     pub run_id: String,
     pub outcome: String,
+    /// Filesystem/protocol phase when known: `ready`, `processing`, `done`, `failed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub phase: Option<String>,
+    pub run_phase: Option<String>,
+    /// Terminal status state when known: `done`, `partial`, `failed`.
+    /// Only set after processing reaches a terminal outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_state: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }

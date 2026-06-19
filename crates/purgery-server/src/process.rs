@@ -1063,7 +1063,19 @@ pub fn process_run_target(
 ) -> Result<purgery_core::ProcessRunResponse> {
     use purgery_core::ProcessRunResponse;
 
-    let (outcome, phase, message) = process_run_inner(config, nickname, run_id)?;
+    let (outcome, run_phase, message) = process_run_inner(config, nickname, run_id)?;
+
+    // Derive status_state from the terminal run phase when it's a terminal outcome.
+    let status_state = if outcome == ProcessRunOutcome::Processed {
+        let phase = detect_terminal_phase(config, nickname, run_id);
+        if phase.is_empty() {
+            None
+        } else {
+            Some(phase)
+        }
+    } else {
+        None
+    };
 
     Ok(ProcessRunResponse {
         protocol_version: purgery_core::PROTOCOL_VERSION,
@@ -1071,12 +1083,13 @@ pub fn process_run_target(
         nickname: nickname.as_str().to_owned(),
         run_id: run_id.as_str().to_owned(),
         outcome: outcome.as_str().to_owned(),
-        phase,
+        run_phase,
+        status_state,
         message,
     })
 }
 
-/// Inner dispatch.  Returns (outcome, phase, message).
+/// Inner dispatch.  Returns (outcome, run_phase, message).
 fn process_run_inner(
     config: &ServerConfig,
     nickname: &Nickname,
