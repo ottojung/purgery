@@ -137,7 +137,7 @@ Source trailing slashes, `.`, and `..` are normalized before split discovery. `<
 | `heartbeat-run --nickname N --run-id R` | Extends incoming lease | (none) |
 | `run-state --nickname N --run-id R` | None | `RunStateResponse` TOML |
 | `status --nickname N --run-id R` | None | `RunStatus` TOML |
-| `process-run --nickname N --run-id R` | Foreground targeted processor: claims/processes the target ready run, recovers an abandoned target in processing, or no-op if already processing or terminal. Does not process unrelated runs. Does not run GC. | (none) |
+| `process-run --nickname N --run-id R` | Foreground targeted processor: claims/processes the target ready run, recovers an abandoned target in processing, or no-op if already processing or terminal. Does not process unrelated runs. Does not run GC. | `ProcessRunResponse` TOML |
 | `process-once` | Run global GC, recover unlocked processing runs (respecting active processor locks), process ready runs | (none) |
 | `check` | Validate config and transforms | (none) |
 | `gc` | Foreground garbage-collection command. Server-run sync clients initiate it best-effort after server version check and before `begin-run`. Failure is logged but does not fail the sync. Also run by `process-once` for batch maintenance. | (none) |
@@ -285,6 +285,35 @@ Phases: `incoming`, `ready`, `processing`, `done`, `failed`, `corrupt`, `not_fou
 - Terminal (`terminal = true`): `done`, `failed`.
 - Non-terminal (`terminal = false`): `incoming`, `ready`, `processing`, `corrupt`, `not_found`.
 `not_found` means the server does not know about the run; it is not a terminal success and the client treats it as an error.
+
+## ProcessRunResponse
+
+The `process-run` subcommand prints `ProcessRunResponse` TOML on stdout on success.
+
+```toml
+protocol_version = 2
+purgery_version = "0.1.0"
+nickname = "laptop"
+run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+outcome = "processed"
+run_phase = "done"
+status_state = "done"
+message = "run processed successfully"
+```
+
+### Outcome values
+
+| Outcome | Meaning |
+|---------|---------|
+| `processed` | The run was claimed and driven to a terminal state (done or failed). |
+| `already_terminal` | The target was already in a terminal phase when `process-run` was called. |
+| `already_active` | The target is being processed by another process holding the processor lock. |
+| `claim_in_progress` | Another process holds the ready-run claim lock. |
+
+### Phase vs. state
+
+- `run_phase` — filesystem/protocol phase (`ready`, `processing`, `done`, `failed`). Never contains `partial`.
+- `status_state` — terminal `RunStatus.state` (`done`, `partial`, `failed`). Only present when terminal status is known. May differ from `run_phase`: for example a `partial` run may reside in the `failed/` directory, in which case `run_phase = "failed"` and `status_state = "partial"`.
 
 ## Client run state persistence
 
