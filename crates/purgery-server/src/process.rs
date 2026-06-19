@@ -1065,10 +1065,16 @@ pub fn process_run_target(
 
     let (outcome, run_phase, message) = process_run_inner(config, nickname, run_id)?;
 
-    // Derive status_state from the terminal status file when it's a terminal
-    // outcome.  RunPhase is directory-based and never contains "partial";
-    // status_state is from RunStatus.state and may contain "partial".
-    let status_state = read_terminal_status_state(config, nickname, run_id);
+    // Read terminal status state only when the outcome indicates
+    // terminal completion.  run_phase is directory-based and never
+    // contains "partial"; status_state is from RunStatus.state and
+    // may contain "partial".
+    let status_state = match outcome {
+        ProcessRunOutcome::Processed | ProcessRunOutcome::AlreadyTerminal => {
+            read_terminal_status_state(config, nickname, run_id)
+        }
+        _ => None,
+    };
 
     Ok(ProcessRunResponse {
         protocol_version: purgery_core::PROTOCOL_VERSION,
@@ -1230,12 +1236,17 @@ fn handle_process_run_processing_outcome(
             anyhow::bail!("abandoned processing run is incompatible: {message}")
         }
         Ok(ProcessingTargetOutcome::NotFound) => {
-            match verified_terminal_status_phase(config, nickname, run_id)? {
-                Some(term_phase) => Ok((
-                    ProcessRunOutcome::AlreadyTerminal,
-                    Some(term_phase),
-                    Some("processing run completed before recovery".to_string()),
-                )),
+            match verified_terminal_state(config, nickname, run_id)? {
+                Some(_status_state) => {
+                    // run_phase comes from the directory, not from status state,
+                    // so it can never be "partial".
+                    let run_phase = detect_terminal_run_phase(config, nickname, run_id);
+                    Ok((
+                        ProcessRunOutcome::AlreadyTerminal,
+                        Some(run_phase),
+                        Some("processing run completed before recovery".to_string()),
+                    ))
+                }
                 None => anyhow::bail!(
                     "run {}/{} disappeared from processing but no verified terminal status exists",
                     nickname.as_str(),
@@ -1287,12 +1298,16 @@ fn read_terminal_status_state(
     None
 }
 
-/// Strict terminal status verification.  Returns the terminal phase
-/// (from `RunStatus.state`) only when a readable `status.toml` exists
-/// in either `done/` or `failed/`.  Errors if the directory exists
-/// but status is missing or malformed.  Returns `None` if neither
-/// terminal directory exists.
-fn verified_terminal_status_phase(
+/// Strict terminal status verification.  Returns `RunStatus.state`
+/// (which may be `"done"`, `"partial"`, or `"failed"`) only when a
+/// readable `status.toml` exists in either `done/` or `failed/`.
+/// Errors if the directory exists but status is missing or malformed.
+/// Returns `None` if neither terminal directory exists.
+///
+/// This is the function to use for terminal *authority* checks.  It
+/// does NOT return a filesystem/protocol phase — use
+/// `detect_terminal_run_phase` for that.
+fn verified_terminal_state(
     config: &ServerConfig,
     nickname: &Nickname,
     run_id: &RunId,
