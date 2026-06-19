@@ -1162,7 +1162,11 @@ delete_after_import = true
         fs::write(ready_path.join("manifest.toml"), "not valid toml {{{").unwrap();
 
         let result = process_run(&config, &nickname, &run_id);
-        assert!(result.is_ok(), "malformed ready moved to failed must succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "malformed ready moved to failed must succeed: {:?}",
+            result.err()
+        );
 
         let failed_path = config
             .work_dir
@@ -1213,7 +1217,11 @@ delete_after_import = true
         .unwrap();
 
         let result = process_run(&config, &nickname, &run_id);
-        assert!(result.is_ok(), "malformed ready moved to failed must succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "malformed ready moved to failed must succeed: {:?}",
+            result.err()
+        );
 
         let failed_path = config
             .work_dir
