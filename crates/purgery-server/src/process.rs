@@ -1152,9 +1152,15 @@ fn process_run_inner(
             return handle_process_run_processing_outcome(config, nickname, run_id);
         }
         ReadyClaimOutcome::AlreadyTerminal => {
+            let term_phase = detect_terminal_run_phase(config, nickname, run_id);
+            let run_phase = if term_phase.is_empty() {
+                None
+            } else {
+                Some(term_phase)
+            };
             return Ok((
                 ProcessRunOutcome::AlreadyTerminal,
-                None,
+                run_phase,
                 Some("run was already in a terminal phase".to_string()),
             ));
         }
