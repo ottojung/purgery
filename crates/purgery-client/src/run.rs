@@ -384,10 +384,10 @@ fn drive_server_until_terminal_with_interval(
                                         finish_worker_after_terminal(&mut worker, nickname, run_id);
                                         return Ok(fresh);
                                     }
-                                    let proc_obs = processor_observation(&fresh);
-                                    let should_fail = match proc_obs {
+                                    let should_fail = match processor_observation(&fresh) {
                                         ProcessorObservation::Active => false,
-                                        ProcessorObservation::Idle => true,
+                                        ProcessorObservation::Idle
+                                        | ProcessorObservation::Missing => true,
                                         ProcessorObservation::Unknown(raw) => {
                                             warn!(
                                                 nickname = %nickname.as_str(),
@@ -395,9 +395,20 @@ fn drive_server_until_terminal_with_interval(
                                                 processor_state = raw,
                                                 "process-run remote failure with unknown processor state",
                                             );
-                                            true
+                                            // Build a more descriptive error.
+                                            let fresh_msg = format!(
+                                                "process-run remote failure for run {}/{}: {}; \
+                                                 fresh run-state is processing with \
+                                                 unknown processor_state=\"{}\", \
+                                                 so the client refused to recover/restart",
+                                                nickname.as_str(),
+                                                run_id.as_str(),
+                                                stderr,
+                                                raw,
+                                            );
+                                            terminate_worker_on_error(&mut worker);
+                                            anyhow::bail!("{fresh_msg}");
                                         }
-                                        ProcessorObservation::Missing => true,
                                     };
                                     if fresh.phase == "ready" || should_fail {
                                         terminate_worker_on_error(&mut worker);
@@ -2270,7 +2281,24 @@ state = "done"
         // heartbeat must have run — if it had failed, is_healthy would
         // have rejected it before finish-run
         let log = runner.command_log();
-        assert!(log.iter().any(|c| c.contains("heartbeat-run")));
+        assert!(log.iter().any(|c| c.contains("heartbeat-run"))        );
+    }
+
+    fn processing_state_with_processor(run_id: &str, ts: u64, state: &str) -> String {
+        format!(
+            r#"protocol_version = {}
+purgery_version = "0.1.0-test"
+nickname = "laptop"
+run_id = "{run_id}"
+phase = "processing"
+terminal = false
+message = "run phase: processing"
+processor_state = "{state}"
+updated_at_unix_secs = {ts}
+observed_at_unix_secs = {ts}
+"#,
+            purgery_core::PROTOCOL_VERSION
+        )
     }
 
     fn ready_run_state_toml() -> String {
@@ -4975,6 +5003,160 @@ state = "done"
             result.is_ok(),
             "sync must succeed when process-run fails but fresh state is terminal: {:?}",
             result.err()
+        );
+    }
+
+    // ── Processor state unknown/missing regression tests ───────────
+
+    #[test]
+    fn processing_unknown_processor_state_does_not_spawn() {
+        // A processing run with unknown processor_state and no local
+        // worker must not spawn process-run and must return an error.
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        // First poll returns processing with unknown processor_state
+        runner.add_response("run-state", &processing_state_with_processor("test-run", 1000, "unknown"));
+        // No process-run exit is scripted — no spawn should happen.
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(
+            result.is_err(),
+            "unknown processor_state with no worker must produce error"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("processor ownership cannot be determined"),
+            "error must mention unclear processor ownership: {err}"
+        );
+
+        let log = runner.command_log();
+        let pr_count = log.iter().filter(|c| c.contains("process-run")).count();
+        assert_eq!(
+            pr_count, 0,
+            "no process-run must be spawned for unknown processor_state: {log:?}"
+        );
+    }
+
+    #[test]
+    fn processing_missing_processor_state_does_not_spawn() {
+        // A processing run with None processor_state and no local
+        // worker must not spawn process-run and must return an error.
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        // First poll returns processing with no processor_state field.
+        let no_proc_state = format!(
+            r#"protocol_version = {}
+purgery_version = "0.1.0-test"
+nickname = "laptop"
+run_id = "test-run"
+phase = "processing"
+terminal = false
+message = "run phase: processing"
+updated_at_unix_secs = 1000
+observed_at_unix_secs = 1000
+"#,
+            purgery_core::PROTOCOL_VERSION
+        );
+        runner.add_response("run-state", &no_proc_state);
+        // No process-run exit is scripted — no spawn should happen.
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(
+            result.is_err(),
+            "missing processor_state with no worker must produce error"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("processor ownership cannot be determined"),
+            "error must mention unclear processor ownership: {err}"
+        );
+
+        let log = runner.command_log();
+        let pr_count = log.iter().filter(|c| c.contains("process-run")).count();
+        assert_eq!(
+            pr_count, 0,
+            "no process-run must be spawned for missing processor_state: {log:?}"
+        );
+    }
+
+    #[test]
+    fn processing_idle_processor_state_spawns_process_run() {
+        // A processing run with idle processor_state and no local
+        // worker must spawn process-run.
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_response(
+            "gc",
+            &format!(
+                "protocol_version = {}\npurgery_version = \"0.1.0-test\"\n",
+                purgery_core::PROTOCOL_VERSION
+            ),
+        );
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        // First poll returns processing with idle processor_state
+        runner.add_response("run-state", &processing_state_with_processor("test-run", 1000, "idle"));
+        // process-run exits with success → terminal
+        runner.add_spawned_cmd_exit("process-run", 0, RemoteCommandExit::Success {
+            stdout: process_run_ok_toml("processed", "test-run"),
+        });
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
+        // Extra for terminal worker validation
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(
+            result.is_ok(),
+            "idle processor_state must spawn process-run: {:?}",
+            result.err()
+        );
+
+        let log = runner.command_log();
+        assert!(
+            log.iter().any(|c| c.contains("process-run")),
+            "process-run must be spawned for idle processor_state: {log:?}"
         );
     }
 }
