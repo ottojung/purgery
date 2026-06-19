@@ -384,10 +384,22 @@ fn drive_server_until_terminal_with_interval(
                                         finish_worker_after_terminal(&mut worker, nickname, run_id);
                                         return Ok(fresh);
                                     }
-                                    if fresh.phase == "ready"
-                                        || (fresh.phase == "processing"
-                                            && fresh.processor_state.as_deref() != Some("active"))
-                                    {
+                                    let proc_obs = processor_observation(&fresh);
+                                    let should_fail = match proc_obs {
+                                        ProcessorObservation::Active => false,
+                                        ProcessorObservation::Idle => true,
+                                        ProcessorObservation::Unknown(raw) => {
+                                            warn!(
+                                                nickname = %nickname.as_str(),
+                                                run_id = %run_id.as_str(),
+                                                processor_state = raw,
+                                                "process-run remote failure with unknown processor state",
+                                            );
+                                            true
+                                        }
+                                        ProcessorObservation::Missing => true,
+                                    };
+                                    if fresh.phase == "ready" || should_fail {
                                         terminate_worker_on_error(&mut worker);
                                         anyhow::bail!("{err_msg}");
                                     }
@@ -422,11 +434,7 @@ fn drive_server_until_terminal_with_interval(
 
         // Decide whether to start/restart the process-run worker.
         // Never spawn while a local worker handle is still running.
-        let processor_active = state
-            .processor_state
-            .as_deref()
-            .map(|s| s == "active")
-            .unwrap_or(false);
+        let proc_obs = processor_observation(&state);
 
         match state.phase.as_str() {
             "ready" => {
@@ -434,11 +442,40 @@ fn drive_server_until_terminal_with_interval(
                     restart_worker = true;
                 }
             }
-            "processing" => {
-                if !processor_active && worker.is_none() {
-                    restart_worker = true;
+            "processing" => match proc_obs {
+                ProcessorObservation::Active => {
+                    // Another processor owns the run — keep waiting.
                 }
-            }
+                ProcessorObservation::Idle => {
+                    if worker.is_none() {
+                        restart_worker = true;
+                    }
+                }
+                ProcessorObservation::Unknown(_) | ProcessorObservation::Missing => {
+                    // Ownership cannot be determined.  If a local worker is
+                    // active, keep it (don't kill on a single unclear poll).
+                    // Otherwise fail clearly to avoid racing on unsafe state.
+                    if worker.is_some() {
+                        warn!(
+                            nickname = %nickname.as_str(),
+                            run_id = %run_id.as_str(),
+                            processor_state = ?state.processor_state,
+                            "processing run has unclear processor ownership; \
+                             keeping existing worker alive",
+                        );
+                    } else {
+                        terminate_worker_on_error(&mut worker);
+                        anyhow::bail!(
+                            "run {}/{} is in processing phase but processor ownership \
+                             cannot be determined (processor_state={:?}); \
+                             leaving persisted state for resume",
+                            nickname.as_str(),
+                            run_id.as_str(),
+                            state.processor_state,
+                        );
+                    }
+                }
+            },
             "not_found" => {
                 terminate_worker_on_error(&mut worker);
                 anyhow::bail!(
@@ -759,6 +796,22 @@ fn parse_process_run_response(
 fn terminate_worker_on_error(worker: &mut Option<RemoteCommandHandle>) {
     if let Some(mut w) = worker.take() {
         let _ = w.terminate_and_reap();
+    }
+}
+
+enum ProcessorObservation<'a> {
+    Active,
+    Idle,
+    Unknown(&'a str),
+    Missing,
+}
+
+fn processor_observation(state: &RunStateResponse) -> ProcessorObservation<'_> {
+    match state.processor_state.as_deref() {
+        Some("active") => ProcessorObservation::Active,
+        Some("idle") => ProcessorObservation::Idle,
+        Some(other) => ProcessorObservation::Unknown(other),
+        None => ProcessorObservation::Missing,
     }
 }
 
