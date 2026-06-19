@@ -239,25 +239,40 @@ fn drive_server_until_terminal_with_interval(
     poll_interval: Duration,
 ) -> Result<RunStateResponse> {
     let mut worker: Option<RemoteCommandHandle> = None;
-    let mut state: RunStateResponse;
     let mut last_phase = String::new();
     let mut attempts_since_report = 0u64;
     let mut no_progress = NoProgressTracker::new();
 
+    // Start with a dummy state so we never read uninitialized data.
+    // The first poll below will overwrite it.
+    let mut state: RunStateResponse = dummy_run_state(nickname, run_id);
+
     loop {
-        state = match run_state(runner, host, server_cmd, nickname, run_id) {
-            Ok(s) => s,
+        // Poll run-state.  If a worker is active, a transient failure
+        // must not kill it — just warn and keep the previous state.
+        // The first poll always succeeds because there is no worker.
+        match run_state(runner, host, server_cmd, nickname, run_id) {
+            Ok(s) => state = s,
             Err(e) => {
-                terminate_worker_on_error(&mut worker);
-                return Err(e).with_context(|| {
-                    format!(
-                        "failed to poll run-state for run {}/{}",
-                        nickname.as_str(),
-                        run_id.as_str()
-                    )
-                });
+                if worker.is_some() {
+                    warn!(
+                        nickname = %nickname.as_str(),
+                        run_id = %run_id.as_str(),
+                        error = %e,
+                        "run-state poll failed while worker is active",
+                    );
+                } else {
+                    terminate_worker_on_error(&mut worker);
+                    return Err(e).with_context(|| {
+                        format!(
+                            "failed to poll run-state for run {}/{}",
+                            nickname.as_str(),
+                            run_id.as_str()
+                        )
+                    });
+                }
             }
-        };
+        }
 
         if state.terminal {
             finish_worker_after_terminal(&mut worker, nickname, run_id);
@@ -720,6 +735,29 @@ fn parse_process_run_response(
 fn terminate_worker_on_error(worker: &mut Option<RemoteCommandHandle>) {
     if let Some(mut w) = worker.take() {
         let _ = w.terminate_and_reap();
+    }
+}
+
+/// Create a placeholder RunStateResponse that is never terminal.
+/// Used as initial value before the first real poll.
+fn dummy_run_state(nickname: &Nickname, run_id: &RunId) -> RunStateResponse {
+    RunStateResponse {
+        protocol_version: purgery_core::PROTOCOL_VERSION,
+        purgery_version: String::new(),
+        nickname: nickname.as_str().to_owned(),
+        run_id: run_id.as_str().to_owned(),
+        phase: "starting".to_string(),
+        terminal: false,
+        message: String::new(),
+        updated_at_unix_secs: 0,
+        observed_at_unix_secs: 0,
+        progress_state: None,
+        entry_index: None,
+        entry_total: None,
+        current_entry: None,
+        current_transform: None,
+        progress_status: None,
+        processor_state: None,
     }
 }
 
