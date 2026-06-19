@@ -1199,14 +1199,13 @@ fn process_run_inner(
             anyhow::bail!("incompatible run left in place: {message}")
         }
         ReadyClaimOutcome::MalformedReadyMovedToFailed { error } => {
-            let term_phase = detect_terminal_run_phase(config, nickname, run_id);
-            let status_state = read_terminal_status_state(config, nickname, run_id);
-            return Ok(ProcessRunInnerResult {
-                outcome: ProcessRunOutcome::Processed,
-                run_phase: Some(term_phase),
-                status_state,
-                message: Some(format!("malformed ready run moved to failed: {error}")),
-            });
+            return terminal_response(
+                config,
+                nickname,
+                run_id,
+                ProcessRunOutcome::Processed,
+                format!("malformed ready run moved to failed: {error}"),
+            );
         }
         ReadyClaimOutcome::MalformedReadyMoveFailed { .. } => {
             anyhow::bail!("malformed ready run could not be moved to failed")
@@ -1300,43 +1299,6 @@ fn handle_process_run_processing_outcome(
         }
         Err(e) => Err(e),
     }
-}
-
-/// Detect the filesystem/protocol terminal phase: returns the directory
-/// phase name ("done" or "failed") if the directory exists, or empty
-/// string if neither exists.  This is purely directory-based and never
-/// returns "partial".
-fn detect_terminal_run_phase(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> String {
-    for (phase, name) in &[(RunPhase::Done, "done"), (RunPhase::Failed, "failed")] {
-        let dir = config.work_dir.run_dir(nickname, run_id, *phase);
-        if dir.exists() {
-            return name.to_string();
-        }
-    }
-    String::new()
-}
-
-/// Read the terminal `RunStatus.state` from `status.toml`.  Returns
-/// `Some("done"|"partial"|"failed")` when readable, `None` otherwise.
-/// This is not authoritative — use `verified_terminal_status` for that.
-fn read_terminal_status_state(
-    config: &ServerConfig,
-    nickname: &Nickname,
-    run_id: &RunId,
-) -> Option<String> {
-    for phase in &[RunPhase::Done, RunPhase::Failed] {
-        let dir = config.work_dir.run_dir(nickname, run_id, *phase);
-        if !dir.exists() {
-            continue;
-        }
-        let status_path = dir.join("status.toml");
-        if let Ok(content) = fs::read_to_string(status_path.as_std_path()) {
-            if let Ok(status) = purgery_core::RunStatus::from_toml(&content) {
-                return Some(status.state.as_str().to_owned());
-            }
-        }
-    }
-    None
 }
 
 /// Verify that a terminal run has authoritative terminal status.
