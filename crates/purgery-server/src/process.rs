@@ -1162,7 +1162,12 @@ fn process_run_inner(
             anyhow::bail!("incompatible run left in place: {message}")
         }
         ReadyClaimOutcome::MalformedReadyMovedToFailed { error } => {
-            anyhow::bail!("malformed ready run moved to failed: {error}")
+            let term_phase = detect_terminal_run_phase(config, nickname, run_id);
+            return Ok((
+                ProcessRunOutcome::Processed,
+                Some(term_phase),
+                Some(format!("malformed ready run moved to failed: {error}")),
+            ));
         }
         ReadyClaimOutcome::MalformedReadyMoveFailed { .. } => {
             anyhow::bail!("malformed ready run could not be moved to failed")

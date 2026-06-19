@@ -1129,7 +1129,11 @@ delete_after_import = true
         .unwrap();
 
         let result = process_run(&config, &dir_nickname, &run_id);
-        assert!(result.is_err());
+        assert!(
+            result.is_ok(),
+            "malformed ready moved to failed must succeed: {:?}",
+            result.err()
+        );
 
         let failed_path = config
             .work_dir
@@ -1158,7 +1162,7 @@ delete_after_import = true
         fs::write(ready_path.join("manifest.toml"), "not valid toml {{{").unwrap();
 
         let result = process_run(&config, &nickname, &run_id);
-        assert!(result.is_err());
+        assert!(result.is_ok(), "malformed ready moved to failed must succeed: {:?}", result.err());
 
         let failed_path = config
             .work_dir
@@ -1209,7 +1213,7 @@ delete_after_import = true
         .unwrap();
 
         let result = process_run(&config, &nickname, &run_id);
-        assert!(result.is_err());
+        assert!(result.is_ok(), "malformed ready moved to failed must succeed: {:?}", result.err());
 
         let failed_path = config
             .work_dir
@@ -7149,8 +7153,9 @@ expires_at_unix_secs = 1
 
         let result = process_run_target(&config, &nickname, &run_id);
         assert!(
-            result.is_err(),
-            "process_run_target must fail for missing manifest"
+            result.is_ok(),
+            "malformed ready moved to failed must succeed: {:?}",
+            result.err()
         );
 
         // Run must NOT be left in ready or processing
@@ -7478,16 +7483,31 @@ not valid toml {{{"#,
         // with a "failed to parse" error (ProcessingError::Other).
         fs::write(ready.join("manifest.toml"), "invalid {{{").unwrap();
 
-        // process_run_target should move it to failed
+        // process_run_target should move it to failed and succeed
         let result = process_run_target(&config, &nickname, &run_id);
         assert!(
-            result.is_err(),
-            "malformed ready should produce error: {result:?}"
+            result.is_ok(),
+            "malformed ready moved to failed must succeed: {:?}",
+            result.err()
         );
-        let err = result.unwrap_err().to_string();
+        let response = result.unwrap();
+        assert_eq!(response.outcome, "processed", "outcome must be processed");
+        assert_eq!(
+            response.run_phase.as_deref(),
+            Some("failed"),
+            "run_phase must be failed"
+        );
+        assert_eq!(
+            response.status_state.as_deref(),
+            Some("failed"),
+            "status_state must be failed"
+        );
         assert!(
-            err.contains("malformed ready run moved to failed"),
-            "error must indicate move to failed: {err}"
+            response
+                .message
+                .unwrap_or_default()
+                .contains("malformed ready run moved to failed"),
+            "message must indicate move to failed"
         );
 
         // Ready must be gone
