@@ -7264,12 +7264,73 @@ delete_after_import = true
             result.is_ok(),
             "process_run_target on terminal run must succeed"
         );
+        let response = result.unwrap();
+        assert_eq!(
+            response.outcome, "already_terminal",
+            "already-terminal done outcome"
+        );
+        assert_eq!(
+            response.run_phase.as_deref(),
+            Some("done"),
+            "run_phase for terminal done"
+        );
+        assert_eq!(
+            response.status_state.as_deref(),
+            Some("done"),
+            "status_state for terminal done"
+        );
 
         // Terminal directory must still exist unchanged
         assert!(done.exists(), "terminal run must still exist");
         assert!(
             done.join("status.toml").exists(),
             "terminal status must still exist"
+        );
+    }
+
+    #[test]
+    fn process_run_target_idempotent_on_terminal_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("tgt-term-failed".into()).unwrap();
+
+        // Create a failed run with valid terminal status
+        let failed = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        fs::create_dir_all(&failed).unwrap();
+        let status = RunStatus {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            state: RunState::Failed,
+            entries: vec![],
+            error: Some("test failure".to_string()),
+        };
+        fs::write(failed.join("status.toml"), status.to_toml().unwrap()).unwrap();
+
+        let result = process_run_target(&config, &nickname, &run_id);
+        assert!(
+            result.is_ok(),
+            "process_run_target on terminal failed run must succeed"
+        );
+        let response = result.unwrap();
+        assert_eq!(
+            response.outcome, "already_terminal",
+            "already-terminal failed outcome"
+        );
+        assert_eq!(
+            response.run_phase.as_deref(),
+            Some("failed"),
+            "run_phase for terminal failed"
+        );
+        assert_eq!(
+            response.status_state.as_deref(),
+            Some("failed"),
+            "status_state for terminal failed"
         );
     }
 
