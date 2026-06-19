@@ -1,9 +1,45 @@
 use camino::{Utf8Path, Utf8PathBuf};
 use std::collections::HashSet;
 use std::fs;
+use std::io::Read;
 use tracing::info;
 
 use crate::ResolvedTransform;
+
+const MAX_TRANSFORM_OUTPUT_BYTES: usize = 64 * 1024;
+
+/// Spawn a reader thread that drains a pipe and keeps a bounded tail.
+fn bounded_output_reader(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Result<Vec<u8>, String>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::with_capacity(MAX_TRANSFORM_OUTPUT_BYTES);
+        let mut truncated = false;
+        let mut chunk = [0u8; 4096];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.len() > MAX_TRANSFORM_OUTPUT_BYTES {
+                        let excess = buf.len() - MAX_TRANSFORM_OUTPUT_BYTES;
+                        let _ = buf.drain(..excess);
+                        truncated = true;
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(format!("pipe read error: {e}")),
+            }
+        }
+        if truncated {
+            let marker = format!("...(output truncated; showing last {MAX_TRANSFORM_OUTPUT_BYTES} bytes)...\n");
+            let mut result = Vec::with_capacity(marker.len() + buf.len());
+            result.extend_from_slice(marker.as_bytes());
+            result.extend_from_slice(&buf);
+            Ok(result)
+        } else {
+            Ok(buf)
+        }
+    })
+}
 
 /// Default heartbeat interval for subprocess progress updates (5 seconds).
 const DEFAULT_HEARTBEAT_SECS: u64 = 5;
@@ -68,8 +104,19 @@ pub fn apply_transform_with_heartbeat(
             let mut child = std::process::Command::new(&def.program)
                 .args(&args)
                 .current_dir(work_parent)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
                 .spawn()
                 .map_err(|e| format!("failed to spawn {}: {e}", resolved.name))?;
+
+            // Drain stdout and stderr concurrently so the transform
+            // never blocks on a full pipe buffer.  Do NOT inherit
+            // these pipes — protocol stdout must remain machine-
+            // readable TOML.
+            let stdout_handle = child.stdout.take()
+                .map(|p| bounded_output_reader(p));
+            let stderr_handle = child.stderr.take()
+                .map(|p| bounded_output_reader(p));
 
             let transform_status = loop {
                 match child.try_wait() {
@@ -91,10 +138,23 @@ pub fn apply_transform_with_heartbeat(
             };
 
             if !transform_status.success() {
+                // Join drainers to capture stdout/stderr before building the error.
+                let captured_stdout = stdout_handle
+                    .and_then(|h| h.join().ok())
+                    .unwrap_or(Ok(Vec::new()))
+                    .unwrap_or_default();
+                let captured_stderr = stderr_handle
+                    .and_then(|h| h.join().ok())
+                    .unwrap_or(Ok(Vec::new()))
+                    .unwrap_or_default();
+                let stdout_tail = String::from_utf8_lossy(&captured_stdout);
+                let stderr_tail = String::from_utf8_lossy(&captured_stderr);
                 return Err(format!(
-                    "{} failed with exit code {:?}",
+                    "{} failed with exit code {:?}\nstdout: {}\nstderr: {}",
                     resolved.name,
-                    transform_status.code()
+                    transform_status.code(),
+                    stdout_tail.trim(),
+                    stderr_tail.trim(),
                 ));
             }
 
