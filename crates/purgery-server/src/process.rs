@@ -1065,17 +1065,10 @@ pub fn process_run_target(
 
     let (outcome, run_phase, message) = process_run_inner(config, nickname, run_id)?;
 
-    // Derive status_state from the terminal run phase when it's a terminal outcome.
-    let status_state = if outcome == ProcessRunOutcome::Processed {
-        let phase = detect_terminal_phase(config, nickname, run_id);
-        if phase.is_empty() {
-            None
-        } else {
-            Some(phase)
-        }
-    } else {
-        None
-    };
+    // Derive status_state from the terminal status file when it's a terminal
+    // outcome.  RunPhase is directory-based and never contains "partial";
+    // status_state is from RunStatus.state and may contain "partial".
+    let status_state = read_terminal_status_state(config, nickname, run_id);
 
     Ok(ProcessRunResponse {
         protocol_version: purgery_core::PROTOCOL_VERSION,
@@ -1101,7 +1094,7 @@ fn process_run_inner(
             let result = process_processing_run(config, nickname, run_id);
             let (outcome, phase, message) = match result {
                 Ok(()) => {
-                    let term_phase = detect_terminal_phase(config, nickname, run_id);
+                    let term_phase = detect_terminal_run_phase(config, nickname, run_id);
                     (
                         ProcessRunOutcome::Processed,
                         Some(term_phase),
@@ -1121,7 +1114,7 @@ fn process_run_inner(
                     );
                     match move_to_failed(&config.work_dir, nickname, run_id) {
                         Ok(()) => {
-                            let term_phase = detect_terminal_phase(config, nickname, run_id);
+                            let term_phase = detect_terminal_run_phase(config, nickname, run_id);
                             (
                                 ProcessRunOutcome::Processed,
                                 Some(term_phase),
@@ -1213,7 +1206,7 @@ fn handle_process_run_processing_outcome(
 ) -> Result<(ProcessRunOutcome, Option<String>, Option<String>)> {
     match recover_processing_run_if_unlocked(config, nickname, run_id) {
         Ok(ProcessingTargetOutcome::Recovered) => {
-            let term_phase = detect_terminal_phase(config, nickname, run_id);
+            let term_phase = detect_terminal_run_phase(config, nickname, run_id);
             Ok((
                 ProcessRunOutcome::Processed,
                 Some(term_phase),
@@ -1226,7 +1219,7 @@ fn handle_process_run_processing_outcome(
             Some("processor lock is held by another process".to_string()),
         )),
         Ok(ProcessingTargetOutcome::FailedPublished { error }) => {
-            let term_phase = detect_terminal_phase(config, nickname, run_id);
+            let term_phase = detect_terminal_run_phase(config, nickname, run_id);
             Ok((
                 ProcessRunOutcome::Processed,
                 Some(term_phase),
@@ -1257,28 +1250,41 @@ fn handle_process_run_processing_outcome(
     }
 }
 
-/// Detect which terminal phase the run ended up in.  Reads the actual
-/// `RunStatus` state from the terminal directory's `status.toml` to
-/// report the correct terminal phase ("done", "failed", "partial").
-/// Falls back to the directory phase name if status cannot be read.
-fn detect_terminal_phase(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> String {
-    let work_dir = &config.work_dir;
-    for (phase, _) in &[(RunPhase::Done, "done"), (RunPhase::Failed, "failed")] {
-        let dir = work_dir.run_dir(nickname, run_id, *phase);
+/// Detect the filesystem/protocol terminal phase: returns the directory
+/// phase name ("done" or "failed") if the directory exists, or empty
+/// string if neither exists.  This is purely directory-based and never
+/// returns "partial".
+fn detect_terminal_run_phase(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> String {
+    for (phase, name) in &[(RunPhase::Done, "done"), (RunPhase::Failed, "failed")] {
+        let dir = config.work_dir.run_dir(nickname, run_id, *phase);
+        if dir.exists() {
+            return name.to_string();
+        }
+    }
+    String::new()
+}
+
+/// Read the terminal `RunStatus.state` from `status.toml`.  Returns
+/// `Some("done"|"partial"|"failed")` when readable, `None` otherwise.
+/// This is the authoritative terminal state, not the directory phase.
+fn read_terminal_status_state(
+    config: &ServerConfig,
+    nickname: &Nickname,
+    run_id: &RunId,
+) -> Option<String> {
+    for phase in &[RunPhase::Done, RunPhase::Failed] {
+        let dir = config.work_dir.run_dir(nickname, run_id, *phase);
         if !dir.exists() {
             continue;
         }
-        // Try reading the actual status state.
         let status_path = dir.join("status.toml");
         if let Ok(content) = fs::read_to_string(status_path.as_std_path()) {
             if let Ok(status) = purgery_core::RunStatus::from_toml(&content) {
-                return status.state.as_str().to_owned();
+                return Some(status.state.as_str().to_owned());
             }
         }
-        // Fallback to phase name.
-        return phase.as_str().to_owned();
     }
-    String::new()
+    None
 }
 
 /// Strict terminal status verification.  Returns the terminal phase

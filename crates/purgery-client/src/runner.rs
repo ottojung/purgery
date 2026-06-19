@@ -200,7 +200,18 @@ impl RemoteCommandHandle {
                 }
                 Ok(())
             }
-            RemoteCommandHandleKind::Fake { .. } => Ok(()),
+            RemoteCommandHandleKind::Fake {
+                ref remaining_polls,
+                ref exit,
+            } => {
+                // Mark as killed so that wait() / terminate_and_reap
+                // can observe the exit.
+                exit.lock()
+                    .unwrap()
+                    .get_or_insert(RemoteCommandExit::Killed);
+                *remaining_polls.lock().unwrap() = None;
+                Ok(())
+            }
         }
     }
 
@@ -208,18 +219,6 @@ impl RemoteCommandHandle {
     /// polls `try_wait` with a small delay.  For the fake runner it
     /// returns the scripted exit (waiting if scripted with polls).
     pub(crate) fn wait(&mut self) -> Result<RemoteCommandExit> {
-        // If the fake runner has no exit scripted at all, return Killed
-        // immediately to avoid hanging tests that forgot to script an exit.
-        if let RemoteCommandHandleKind::Fake {
-            ref remaining_polls,
-            ref exit,
-        } = self.kind
-        {
-            let rem = remaining_polls.lock().unwrap();
-            if rem.is_none() && exit.lock().unwrap().is_none() {
-                return Ok(RemoteCommandExit::Killed);
-            }
-        }
         loop {
             match self.try_wait()? {
                 Some(exit) => return Ok(exit),
@@ -1146,7 +1145,8 @@ mod tests {
         let mut handle = runner
             .spawn_server_cmd("host", "ps", &["unknown-cmd"])
             .unwrap();
-        let exit = handle.wait().unwrap();
+        // No exit scripted — terminate_and_reap should set Killed.
+        let exit = handle.terminate_and_reap().unwrap();
         assert_eq!(exit, RemoteCommandExit::Killed);
     }
 
@@ -1200,21 +1200,9 @@ mod tests {
             .spawn_server_cmd("host", "ps", &["test-cmd"])
             .unwrap();
         let exit = handle.terminate_and_reap().unwrap();
-        // terminate_and_reap kills then waits; for fake runner wait()
-        // will see Killed (or the scripted exit if it was already set).
-        // Since polls=5 > 0, the scripted exit is not yet set, so
-        // kill_raw is a no-op for fake, and wait() polls once which
-        // decrements remaining_polls but exit is still None; the
-        // fake runner's wait() would loop forever.  But terminate_and_reap
-        // calls kill_raw + wait for fake: kill_raw is a no-op, wait()
-        // loops until exit is set. With remaining_polls=5, after 5
-        // try_wait calls the exit becomes Success.
-        // This test verifies the handle is consumed without hang.
-        assert_eq!(
-            exit,
-            RemoteCommandExit::Success {
-                stdout: String::new()
-            }
-        );
+        // terminate_and_reap calls kill_raw then wait.  kill_raw for the
+        // fake runner sets the exit to Killed immediately, so wait()
+        // observes Killed (not the scripted Success).
+        assert_eq!(exit, RemoteCommandExit::Killed);
     }
 }
