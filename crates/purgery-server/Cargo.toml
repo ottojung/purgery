@@ -9,6 +9,7 @@ clap = { version = "4", features = ["derive"] }
 purgery-core = { path = "../purgery-core" }
 anyhow = "1"
 camino = { version = "1", features = ["serde1"] }
+libc = "0.2"
 regex = "1"
 toml = "1.1"
 tracing = "0.1"

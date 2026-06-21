@@ -2,10 +2,151 @@ use anyhow::{Context, Result};
 use camino::Utf8Path;
 use purgery_core::{
     current_purgery_version, Nickname, ProcessingProgress, PurgeryRoot, RunId, RunPhase, RunState,
-    RunStatus, ServerConfig,
+    RunStatus, ServerConfig, PROTOCOL_VERSION,
 };
 use std::fs;
+use std::os::unix::io::AsRawFd;
 use tracing::{info, warn};
+
+/// Outcome of attempting to acquire a processor lock on an existing run
+/// directory.
+#[derive(Debug)]
+pub(crate) enum ProcessorLockAttempt {
+    /// Lock acquired. The caller may safely mutate the run.
+    Acquired(ProcessingRunLock),
+    /// Lock is held by another process. The caller must not mutate the run.
+    Busy,
+    /// The run directory does not exist. The caller should re-check state
+    /// (the run may have been claimed, completed, or cleaned up already).
+    Missing,
+}
+
+/// An exclusive processor lock held on an existing run directory.
+///
+/// The same lock file (`processor.lock`) is used while claiming a ready
+/// run and while owning a processing run.  Only the process holding this
+/// lock may mutate the locked run directory.
+///
+/// The lock is automatically released when the `ProcessingRunLock` is dropped
+/// (the file descriptor is closed, which releases the `flock`).
+///
+/// If this lock is dropped while the holder still owns the run directory
+/// (e.g., after a crash), the run is considered abandoned and may be
+/// recovered by another process.  Terminal directories (`done`, `failed`)
+/// must not retain `processor.lock`.
+#[derive(Debug)]
+pub(crate) struct ProcessingRunLock {
+    _file: std::fs::File,
+    _path: camino::Utf8PathBuf,
+}
+
+impl ProcessingRunLock {
+    /// Try to acquire an exclusive advisory lock on an existing directory's
+    /// `processor.lock` file.
+    ///
+    /// Returns `Missing` if the run directory does not exist — the caller
+    /// must re-check state rather than recreating the directory.
+    /// Returns `Acquired` if the lock is obtained.
+    /// Returns `Busy` if another process holds the lock.
+    /// Returns `Err` on IO errors or lock setup failures.
+    fn try_lock_existing_dir(run_dir: &Utf8Path) -> Result<ProcessorLockAttempt> {
+        if !run_dir.exists() {
+            return Ok(ProcessorLockAttempt::Missing);
+        }
+        let lock_path = run_dir.join("processor.lock");
+        let file = match std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path.as_std_path())
+        {
+            Ok(f) => f,
+            Err(e) => {
+                anyhow::bail!("failed to open processor lock file {lock_path}: {e}")
+            }
+        };
+
+        let fd = file.as_raw_fd();
+        let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if ret == 0 {
+            Ok(ProcessorLockAttempt::Acquired(ProcessingRunLock {
+                _file: file,
+                _path: lock_path,
+            }))
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                Ok(ProcessorLockAttempt::Busy)
+            } else {
+                Err(err).with_context(|| format!("failed to lock processor: {lock_path}"))
+            }
+        }
+    }
+}
+
+/// Try to acquire the processor lock on an existing run directory.
+///
+/// The directory must already exist — the caller must have confirmed it
+/// exists before calling this function.  If the directory has been removed
+/// between the check and the lock attempt, `Missing` is returned and the
+/// caller should re-check state.
+pub(crate) fn try_lock_existing_run_dir_processor(
+    run_dir: &Utf8Path,
+) -> Result<ProcessorLockAttempt> {
+    ProcessingRunLock::try_lock_existing_dir(run_dir)
+}
+
+/// Probe the processor lock state without creating `processor.lock`.
+///
+/// This is a read-only observation used by `run-state`.  It never creates
+/// the lock file.  If the file does not exist, the processor is idle.
+/// If the file exists and the lock is busy, the processor is active.
+/// If the file exists and the lock is free, the processor is idle.
+///
+/// Returns `None` if the run directory does not exist.
+/// Returns `Some(true)` if the processor appears active.
+/// Returns `Some(false)` if the processor appears idle (no file or free lock).
+pub(crate) fn probe_processor_lock_readonly(run_dir: &Utf8Path) -> Result<Option<bool>> {
+    if !run_dir.exists() {
+        return Ok(None);
+    }
+    let lock_path = run_dir.join("processor.lock");
+    if !lock_path.exists() {
+        // No lock file — processor is definitely idle.
+        return Ok(Some(false));
+    }
+    // File exists — try nonblocking exclusive lock WITHOUT create.
+    let file = match std::fs::OpenOptions::new()
+        .create(false)
+        .read(true)
+        .write(true)
+        .open(lock_path.as_std_path())
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Race: file was deleted between exists check and open.
+            return Ok(Some(false));
+        }
+        Err(e) => {
+            anyhow::bail!("failed to open processor lock for probe: {lock_path}: {e}")
+        }
+    };
+    let fd = file.as_raw_fd();
+    let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if ret == 0 {
+        // Got the lock — release immediately (don't hold during probe).
+        // Just close the file by letting it drop.
+        Ok(Some(false))
+    } else {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            Ok(Some(true))
+        } else {
+            Err(err).with_context(|| format!("failed to probe processor lock: {lock_path}"))
+        }
+    }
+}
 
 pub(crate) fn publish_status_atomic(directory: &Utf8Path, status: &RunStatus) -> Result<()> {
     let content = status.to_toml().context("failed to serialize status")?;
@@ -195,7 +336,7 @@ pub(crate) fn write_progress(
         ExistingProgress::Missing | ExistingProgress::Malformed => now,
     };
     let progress = ProcessingProgress {
-        protocol_version: 1,
+        protocol_version: purgery_core::PROTOCOL_VERSION,
         purgery_version: current_purgery_version().to_string(),
         nickname: nickname.as_str().to_owned(),
         run_id: run_id.as_str().to_owned(),
@@ -264,6 +405,10 @@ pub(crate) fn write_run_failure(
             failed_path.as_str()
         )
     })?;
+
+    // Clean up the processor lock file from the terminal directory.
+    let lock_path = failed_path.join("processor.lock");
+    let _ = fs::remove_file(lock_path.as_std_path());
 
     Ok(())
 }
@@ -362,6 +507,10 @@ pub(crate) fn finalize_processing_run(
             dest_path.as_str()
         )
     })?;
+
+    // Clean up the processor lock file in the destination.
+    let lock_path = dest_path.join("processor.lock");
+    let _ = fs::remove_file(lock_path.as_std_path());
     Ok(())
 }
 
@@ -381,17 +530,16 @@ pub fn move_to_failed(work_dir: &PurgeryRoot, nickname: &Nickname, run_id: &RunI
                 failed_path.as_str()
             )
         })?;
+
+        // Clean up the processor lock file from the terminal directory.
+        let lock_path = failed_path.join("processor.lock");
+        let _ = fs::remove_file(lock_path.as_std_path());
     }
 
     Ok(())
 }
 
 pub fn begin_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> Result<String> {
-    // Run GC opportunistically before creating the run
-    if let Err(e) = crate::gc::run_gc(config) {
-        warn!(error = %e, "opportunistic GC failed");
-    }
-
     let phases = [
         RunPhase::Incoming,
         RunPhase::Ready,
@@ -440,7 +588,7 @@ pub fn begin_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> 
     }
 
     let lease = purgery_core::LeaseFile {
-        protocol_version: 1,
+        protocol_version: purgery_core::PROTOCOL_VERSION,
         purgery_version: current_purgery_version().to_string(),
         nickname: nickname.as_str().to_owned(),
         run_id: run_id.as_str().to_owned(),
@@ -466,7 +614,7 @@ pub fn begin_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> 
     }
 
     let response = purgery_core::BeginRunResponse {
-        protocol_version: 1,
+        protocol_version: PROTOCOL_VERSION,
         purgery_version: current_purgery_version().to_string(),
         nickname: nickname.as_str().to_owned(),
         run_id: run_id.as_str().to_owned(),
@@ -534,10 +682,11 @@ pub fn finish_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) ->
             toml::from_str(&lease_content).with_context(|| "failed to parse lease file")?;
         purgery_core::require_compatible_purgery_version(&lease.purgery_version, "lease")
             .with_context(|| "incompatible lease version")?;
-        if lease.protocol_version != 1 {
+        if lease.protocol_version != purgery_core::PROTOCOL_VERSION {
             anyhow::bail!(
-                "lease protocol version {} does not match expected 1",
-                lease.protocol_version
+                "lease protocol version {} does not match expected {}",
+                lease.protocol_version,
+                purgery_core::PROTOCOL_VERSION
             );
         }
         if lease.nickname != nickname.as_str() {

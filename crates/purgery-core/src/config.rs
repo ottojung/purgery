@@ -49,6 +49,55 @@ pub struct LeaseFile {
     pub expires_at_unix_secs: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessRunResponse {
+    pub protocol_version: u32,
+    pub purgery_version: String,
+    pub nickname: String,
+    pub run_id: String,
+    pub outcome: String,
+    /// Filesystem/protocol phase when known: `ready`, `processing`, `done`, `failed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_phase: Option<String>,
+    /// Terminal status state when known: `done`, `partial`, `failed`.
+    /// Only set after processing reaches a terminal outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Machine-readable outcomes for `process-run`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessRunOutcome {
+    Processed,
+    AlreadyTerminal,
+    AlreadyActive,
+    ClaimInProgress,
+}
+
+impl ProcessRunOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProcessRunOutcome::Processed => "processed",
+            ProcessRunOutcome::AlreadyTerminal => "already_terminal",
+            ProcessRunOutcome::AlreadyActive => "already_active",
+            ProcessRunOutcome::ClaimInProgress => "claim_in_progress",
+        }
+    }
+
+    pub fn from_str_name(s: &str) -> Option<Self> {
+        match s {
+            "processed" => Some(ProcessRunOutcome::Processed),
+            "already_terminal" => Some(ProcessRunOutcome::AlreadyTerminal),
+            "already_active" => Some(ProcessRunOutcome::AlreadyActive),
+            "claim_in_progress" => Some(ProcessRunOutcome::ClaimInProgress),
+            _ => None,
+        }
+    }
+}
+
 // ── Config Types ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -268,6 +317,11 @@ pub struct RunStateResponse {
     pub current_transform: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress_status: Option<String>,
+    /// Processing liveness.  Omitted (None) outside `processing` phase.
+    /// Inside `processing`: `"active"` (lock held), `"idle"` (lock free),
+    /// or `"unknown"` (lock probe failed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processor_state: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

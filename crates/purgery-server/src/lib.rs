@@ -20,7 +20,7 @@ mod transform;
 
 pub use gc::run_gc;
 pub use phases::{begin_run, find_processing_runs, find_ready_runs, finish_run, move_to_failed};
-pub use process::{process_once_raw, process_processing_run, process_ready_run};
+pub use process::{process_once_raw, process_processing_run, process_run_target};
 pub use recover::{recover_or_process_processing_run, RecoveryError};
 pub use transform::{apply_transform, apply_transform_with_heartbeat};
 
@@ -38,14 +38,11 @@ pub struct ResolvedTransform {
     pub def: purgery_core::TransformDefinition,
 }
 
-/// Process a ready run. Kept as the public single-run entry point.
+/// Process a ready run.  Delegates to `process_run_target` so all
+/// single-run processing shares the same implementation.
 pub fn process_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -> Result<()> {
-    process_ready_run(config, nickname, run_id).map_err(|e| match e {
-        crate::process::ProcessingError::Incompatible { message, .. } => {
-            anyhow::anyhow!("{message}")
-        }
-        crate::process::ProcessingError::Other(e) => e,
-    })
+    process_run_target(config, nickname, run_id)?;
+    Ok(())
 }
 
 /// Server-side subcommand: validate the run plan and resolve relative
@@ -164,7 +161,7 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
     };
 
     let response = purgery_core::PrepareRunResponse {
-        protocol_version: 1,
+        protocol_version: purgery_core::PROTOCOL_VERSION,
         purgery_version: purgery_core::current_purgery_version().to_string(),
         nickname: nickname.as_str().to_owned(),
         run_id: run_id.as_str().to_owned(),
@@ -274,8 +271,27 @@ pub fn run_state(
             current_entry,
             current_transform,
             progress_status,
+            processor_state,
         ) = if *phase == RunPhase::Processing {
-            read_progress_fields(&dir, nickname, run_id, now)
+            let progress_data = read_progress_fields(&dir, nickname, run_id, now);
+            // Determine processor state without creating processor.lock.
+            let proc_state = match crate::phases::probe_processor_lock_readonly(&dir) {
+                Ok(Some(true)) => Some("active".to_string()),
+                Ok(Some(false)) => Some("idle".to_string()),
+                Ok(None) => None,
+                Err(_) => Some("unknown".to_string()),
+            };
+            (
+                progress_data.0,
+                progress_data.1,
+                progress_data.2,
+                progress_data.3,
+                progress_data.4,
+                progress_data.5,
+                progress_data.6,
+                progress_data.7,
+                proc_state,
+            )
         } else {
             (
                 format!("run phase: {}", phase_str),
@@ -286,10 +302,11 @@ pub fn run_state(
                 None::<String>,
                 None::<String>,
                 None::<String>,
+                None::<String>,
             )
         };
         return Ok(purgery_core::RunStateResponse {
-            protocol_version: 1,
+            protocol_version: purgery_core::PROTOCOL_VERSION,
             purgery_version: purgery_core::current_purgery_version().to_string(),
             nickname: nickname.as_str().to_owned(),
             run_id: run_id.as_str().to_owned(),
@@ -304,6 +321,7 @@ pub fn run_state(
             current_entry,
             current_transform,
             progress_status,
+            processor_state,
         });
     }
 
@@ -318,7 +336,7 @@ pub fn run_state(
         match try_read_status(&status_path, nickname, run_id) {
             TerminalStatusOutcome::Valid => {
                 return Ok(purgery_core::RunStateResponse {
-                    protocol_version: 1,
+                    protocol_version: purgery_core::PROTOCOL_VERSION,
                     purgery_version: purgery_core::current_purgery_version().to_string(),
                     nickname: nickname.as_str().to_owned(),
                     run_id: run_id.as_str().to_owned(),
@@ -333,6 +351,7 @@ pub fn run_state(
                     current_entry: None,
                     current_transform: None,
                     progress_status: None,
+                    processor_state: None,
                 });
             }
             TerminalStatusOutcome::Incompatible { path } => {
@@ -347,7 +366,7 @@ pub fn run_state(
             }
             TerminalStatusOutcome::Malformed(reason) => {
                 return Ok(purgery_core::RunStateResponse {
-                    protocol_version: 1,
+                    protocol_version: purgery_core::PROTOCOL_VERSION,
                     purgery_version: purgery_core::current_purgery_version().to_string(),
                     nickname: nickname.as_str().to_owned(),
                     run_id: run_id.as_str().to_owned(),
@@ -362,6 +381,7 @@ pub fn run_state(
                     current_entry: None,
                     current_transform: None,
                     progress_status: None,
+                    processor_state: None,
                 });
             }
         }
@@ -369,7 +389,7 @@ pub fn run_state(
 
     // No phase directory found
     Ok(purgery_core::RunStateResponse {
-        protocol_version: 1,
+        protocol_version: purgery_core::PROTOCOL_VERSION,
         purgery_version: purgery_core::current_purgery_version().to_string(),
         nickname: nickname.as_str().to_owned(),
         run_id: run_id.as_str().to_owned(),
@@ -384,6 +404,7 @@ pub fn run_state(
         current_entry: None,
         current_transform: None,
         progress_status: None,
+        processor_state: None,
     })
 }
 
@@ -653,10 +674,11 @@ pub fn heartbeat_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId)
     purgery_core::require_compatible_purgery_version(&lease.purgery_version, "lease")
         .with_context(|| "incompatible lease version")?;
 
-    if lease.protocol_version != 1 {
+    if lease.protocol_version != purgery_core::PROTOCOL_VERSION {
         anyhow::bail!(
-            "lease protocol version {} does not match expected 1",
-            lease.protocol_version
+            "lease protocol version {} does not match expected {}",
+            lease.protocol_version,
+            purgery_core::PROTOCOL_VERSION
         );
     }
     if lease.nickname != nickname.as_str() {
@@ -1107,7 +1129,11 @@ delete_after_import = true
         .unwrap();
 
         let result = process_run(&config, &dir_nickname, &run_id);
-        assert!(result.is_err());
+        assert!(
+            result.is_ok(),
+            "malformed ready moved to failed must succeed: {:?}",
+            result.err()
+        );
 
         let failed_path = config
             .work_dir
@@ -1136,7 +1162,11 @@ delete_after_import = true
         fs::write(ready_path.join("manifest.toml"), "not valid toml {{{").unwrap();
 
         let result = process_run(&config, &nickname, &run_id);
-        assert!(result.is_err());
+        assert!(
+            result.is_ok(),
+            "malformed ready moved to failed must succeed: {:?}",
+            result.err()
+        );
 
         let failed_path = config
             .work_dir
@@ -1187,7 +1217,11 @@ delete_after_import = true
         .unwrap();
 
         let result = process_run(&config, &nickname, &run_id);
-        assert!(result.is_err());
+        assert!(
+            result.is_ok(),
+            "malformed ready moved to failed must succeed: {:?}",
+            result.err()
+        );
 
         let failed_path = config
             .work_dir
@@ -2029,7 +2063,7 @@ delete_after_import = true
 
         let response_str = begin_run(&server_config, &nickname, &run_id).unwrap();
         let response: purgery_core::BeginRunResponse = toml::from_str(&response_str).unwrap();
-        assert_eq!(response.protocol_version, 1);
+        assert_eq!(response.protocol_version, purgery_core::PROTOCOL_VERSION);
         assert_eq!(response.nickname, "laptop");
         assert_eq!(response.run_id, "test-begin");
 
@@ -2597,7 +2631,7 @@ delete_after_import = true
         // this parse would fail.
         let response: purgery_core::BeginRunResponse = toml::from_str(&response_str)
             .expect("begin-run stdout must be valid BeginRunResponse TOML");
-        assert_eq!(response.protocol_version, 1);
+        assert_eq!(response.protocol_version, purgery_core::PROTOCOL_VERSION);
         assert_eq!(response.nickname, "laptop");
         assert_eq!(response.run_id, "test-stdout-begin");
     }
@@ -3761,7 +3795,7 @@ delete_after_import = true
 
         // Write an existing progress file with matching envelope
         let old_progress = purgery_core::ProcessingProgress {
-            protocol_version: 1,
+            protocol_version: purgery_core::PROTOCOL_VERSION,
             purgery_version: "0.1.0-test".to_string(),
             nickname: "laptop".into(),
             run_id: "ts-envelope".into(),
@@ -3807,7 +3841,7 @@ delete_after_import = true
 
         // Write existing progress with DIFFERENT nickname
         let old_progress = purgery_core::ProcessingProgress {
-            protocol_version: 1,
+            protocol_version: purgery_core::PROTOCOL_VERSION,
             purgery_version: "0.1.0-test".to_string(),
             nickname: "other-machine".into(), // different nickname
             run_id: "ts-mismatch".into(),
@@ -3952,7 +3986,7 @@ delete_after_import = true
 
         // Manually write a progress file with a specific started_at
         let old_progress = purgery_core::ProcessingProgress {
-            protocol_version: 1,
+            protocol_version: purgery_core::PROTOCOL_VERSION,
             purgery_version: "0.1.0-test".to_string(),
             nickname: "laptop".into(),
             run_id: run_id.as_str().into(),
@@ -7079,12 +7113,15 @@ expires_at_unix_secs = 9999999999999
         fs::create_dir_all(&incoming).unwrap();
         fs::write(
             incoming.join("lease.toml"),
-            r#"purgery_version = "0.1.0-test"
-protocol_version = 1
+            format!(
+                r#"purgery_version = "0.1.0-test"
+protocol_version = {}
 nickname = "laptop"
 run_id = "gc-lease-expired"
 expires_at_unix_secs = 1
 "#,
+                purgery_core::PROTOCOL_VERSION
+            ),
         )
         .unwrap();
 
@@ -7103,6 +7140,984 @@ expires_at_unix_secs = 1
         assert!(
             failed.exists(),
             "expired compatible lease must move to failed"
+        );
+    }
+
+    // ── process_run_target behavior ──────────────────────────────────
+
+    #[test]
+    fn process_run_target_failure_moves_to_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("tgt-fail".into()).unwrap();
+
+        // Create a ready run with good run.toml but missing manifest.toml
+        let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
+        fs::create_dir_all(&ready).unwrap();
+        write_run_toml(&ready, &nickname);
+
+        let result = process_run_target(&config, &nickname, &run_id);
+        assert!(
+            result.is_ok(),
+            "malformed ready moved to failed must succeed: {:?}",
+            result.err()
+        );
+
+        // Run must NOT be left in ready or processing
+        assert!(
+            !ready.exists(),
+            "failed ready run must be moved out of ready"
+        );
+        let processing = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        assert!(
+            !processing.exists(),
+            "failed run must not be left in processing"
+        );
+
+        // Run must be moved to failed
+        let failed = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        assert!(failed.exists(), "failed run must be in failed directory");
+        assert!(
+            failed.join("status.toml").exists(),
+            "failed run must have a status file"
+        );
+    }
+
+    #[test]
+    fn process_run_target_incompatible_ready_left_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("tgt-incompat".into()).unwrap();
+
+        // Create a ready run with incompatible purgery_version in run.toml
+        let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
+        fs::create_dir_all(&ready).unwrap();
+        fs::write(
+            ready.join("run.toml"),
+            format!(
+                r#"purgery_version = "99.0.0"
+nickname = "{}"
+destination = "/tmp/dest"
+delete_after_import = true
+"#,
+                nickname.as_str()
+            ),
+        )
+        .unwrap();
+
+        let result = process_run_target(&config, &nickname, &run_id);
+        assert!(
+            result.is_err(),
+            "process_run_target must fail for incompatible run"
+        );
+
+        // Incompatible ready run must be left in place
+        assert!(
+            ready.exists(),
+            "incompatible ready run must remain in ready"
+        );
+        let failed = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        assert!(!failed.exists(), "must NOT move to failed");
+        let processing = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        assert!(!processing.exists(), "must NOT move to processing");
+    }
+
+    #[test]
+    fn process_run_target_idempotent_on_terminal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("tgt-term".into()).unwrap();
+
+        // Create a done run with valid terminal status
+        let done = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
+        fs::create_dir_all(&done).unwrap();
+        let status = RunStatus {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            state: RunState::Done,
+            entries: vec![],
+            error: None,
+        };
+        fs::write(done.join("status.toml"), status.to_toml().unwrap()).unwrap();
+
+        // process_run_target on a terminal run must succeed (idempotent)
+        let result = process_run_target(&config, &nickname, &run_id);
+        assert!(
+            result.is_ok(),
+            "process_run_target on terminal run must succeed"
+        );
+        let response = result.unwrap();
+        assert_eq!(
+            response.outcome, "already_terminal",
+            "already-terminal done outcome"
+        );
+        assert_eq!(
+            response.run_phase.as_deref(),
+            Some("done"),
+            "run_phase for terminal done"
+        );
+        assert_eq!(
+            response.status_state.as_deref(),
+            Some("done"),
+            "status_state for terminal done"
+        );
+
+        // Terminal directory must still exist unchanged
+        assert!(done.exists(), "terminal run must still exist");
+        assert!(
+            done.join("status.toml").exists(),
+            "terminal status must still exist"
+        );
+    }
+
+    #[test]
+    fn process_run_target_idempotent_on_terminal_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("tgt-term-failed".into()).unwrap();
+
+        // Create a failed run with valid terminal status
+        let failed = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        fs::create_dir_all(&failed).unwrap();
+        let status = RunStatus {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            state: RunState::Failed,
+            entries: vec![],
+            error: Some("test failure".to_string()),
+        };
+        fs::write(failed.join("status.toml"), status.to_toml().unwrap()).unwrap();
+
+        let result = process_run_target(&config, &nickname, &run_id);
+        assert!(
+            result.is_ok(),
+            "process_run_target on terminal failed run must succeed"
+        );
+        let response = result.unwrap();
+        assert_eq!(
+            response.outcome, "already_terminal",
+            "already-terminal failed outcome"
+        );
+        assert_eq!(
+            response.run_phase.as_deref(),
+            Some("failed"),
+            "run_phase for terminal failed"
+        );
+        assert_eq!(
+            response.status_state.as_deref(),
+            Some("failed"),
+            "status_state for terminal failed"
+        );
+    }
+
+    #[test]
+    fn process_run_target_not_found_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("tgt-nonexistent".into()).unwrap();
+
+        let result = process_run_target(&config, &nickname, &run_id);
+        assert!(
+            result.is_err(),
+            "process_run_target must fail for nonexistent run"
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("not found"),
+            "error must mention 'not found'"
+        );
+    }
+
+    #[test]
+    fn process_run_target_ready_normal_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("tgt-normal".into()).unwrap();
+
+        // Create a ready run with valid inputs and a transform defined
+        let mut config_with_transform = config.clone();
+        config_with_transform.transforms.insert(
+            "test-step".into(),
+            TransformDefinition {
+                name: "test-step".into(),
+                kind: TransformKind::Subprocess,
+                program: "/bin/true".to_string(),
+                args: Vec::new(),
+                expected_outputs: Vec::new(),
+            },
+        );
+        let ready = config_with_transform
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Ready);
+        fs::create_dir_all(&ready).unwrap();
+        write_run_toml_with_raw_destination(&ready, &nickname, "/tmp/dest");
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![ManifestEntry {
+                local_path: ClientLocalPath::new("/source/file.txt".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/file.txt".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("file.txt".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
+                size: 13,
+                mtime_ns: 0,
+                sha256: None,
+                link_target: None,
+                transform: Some("test-step".into()),
+            }],
+        };
+        fs::write(ready.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+
+        let result = process_run_target(&config_with_transform, &nickname, &run_id);
+        assert!(
+            result.is_ok(),
+            "normal ready run should be processed successfully"
+        );
+
+        // Run should end up in done or failed
+        assert!(!ready.exists(), "ready run must be claimed");
+        let failed = config_with_transform
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        let done = config_with_transform
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Done);
+        assert!(
+            failed.exists() || done.exists(),
+            "processed run must end up in done or failed"
+        );
+    }
+
+    #[test]
+    fn process_run_target_processing_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("tgt-processing".into()).unwrap();
+
+        // Create a processing run with no terminal status (simulating
+        // an active transform that has not yet completed).
+        let processing = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        fs::create_dir_all(&processing).unwrap();
+
+        // Hold the processor lock from this test to simulate another
+        // active processor.
+        let lock = match crate::phases::try_lock_existing_run_dir_processor(&processing).unwrap() {
+            crate::phases::ProcessorLockAttempt::Acquired(l) => l,
+            _ => panic!("must be able to acquire test lock"),
+        };
+
+        // No status.toml — this simulates an actively processing run.
+        // process_run_target must NOT recover or replay it.
+        let result = process_run_target(&config, &nickname, &run_id);
+        assert!(
+            result.is_ok(),
+            "processing run must be a no-op when lock is held: {result:?}"
+        );
+
+        // Processing directory unchanged
+        assert!(processing.exists(), "processing directory must remain");
+        // No terminal status written
+        assert!(
+            !processing.join("status.toml").exists(),
+            "must not write status for processing run"
+        );
+        // Not moved to failed
+        let failed = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        assert!(!failed.exists(), "must NOT move processing run to failed");
+
+        // Release lock before the directory is cleaned up by tmp
+        drop(lock);
+    }
+
+    #[test]
+    fn process_once_loses_claim_race_does_not_move_processing_to_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let _server_root = Utf8PathBuf::from_path_buf(tmp.path().join("storage")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("race-loser".into()).unwrap();
+
+        // Simulate the race: process-once lists this as ready...
+        let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
+        fs::create_dir_all(&ready).unwrap();
+        write_run_toml(&ready, &nickname);
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![],
+        };
+        fs::write(ready.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+
+        // ...but process-run claimed it before process-once could.
+        // Remove ready and create processing to simulate the race loss.
+        let processing = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        fs::create_dir_all(&processing).unwrap();
+        fs::remove_dir_all(&ready).unwrap();
+
+        // process-once calls claim_ready_run which sees processing, not ready.
+        let outcome = crate::process::claim_ready_run(&config, &nickname, &run_id);
+        assert!(
+            matches!(
+                outcome,
+                crate::process::ReadyClaimOutcome::AlreadyProcessing
+            ),
+            "claim must return AlreadyProcessing when processing exists: {outcome:?}"
+        );
+
+        // Processing run must remain intact
+        assert!(processing.exists(), "processing directory must remain");
+        let failed = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        assert!(!failed.exists(), "must NOT move processing run to failed");
+    }
+
+    // ── Lock-aware processing helpers ────────────────────────────────
+
+    #[test]
+    fn try_lock_existing_run_dir_processor_missing_dir_does_not_create_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nonexistent = Utf8PathBuf::from_path_buf(tmp.path().join("nonexistent")).unwrap();
+        assert!(!nonexistent.exists(), "prerequisite: dir must not exist");
+
+        let result = crate::phases::try_lock_existing_run_dir_processor(&nonexistent).unwrap();
+        assert!(
+            matches!(result, crate::phases::ProcessorLockAttempt::Missing),
+            "must return Missing for nonexistent dir: {result:?}"
+        );
+        assert!(
+            !nonexistent.exists(),
+            "must NOT create directory when lock is attempted on missing dir"
+        );
+    }
+
+    #[test]
+    fn malformed_ready_moved_to_failed_only_after_status_published() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("malformed-pub".into()).unwrap();
+
+        // Create a ready run with current-format but malformed run.toml
+        let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
+        fs::create_dir_all(&ready).unwrap();
+        fs::write(
+            ready.join("run.toml"),
+            r#"purgery_version = "0.1.0-test"
+not valid toml {{{"#,
+        )
+        .unwrap();
+        // Also need a manifest.toml so we get past read_compatible_run_inputs
+        // with a "failed to parse" error (ProcessingError::Other).
+        fs::write(ready.join("manifest.toml"), "invalid {{{").unwrap();
+
+        // process_run_target should move it to failed and succeed
+        let result = process_run_target(&config, &nickname, &run_id);
+        assert!(
+            result.is_ok(),
+            "malformed ready moved to failed must succeed: {:?}",
+            result.err()
+        );
+        let response = result.unwrap();
+        assert_eq!(response.outcome, "processed", "outcome must be processed");
+        assert_eq!(
+            response.run_phase.as_deref(),
+            Some("failed"),
+            "run_phase must be failed"
+        );
+        assert_eq!(
+            response.status_state.as_deref(),
+            Some("failed"),
+            "status_state must be failed"
+        );
+        assert!(
+            response
+                .message
+                .unwrap_or_default()
+                .contains("malformed ready run moved to failed"),
+            "message must indicate move to failed"
+        );
+
+        // Ready must be gone
+        assert!(
+            !ready.exists(),
+            "malformed ready must be moved out of ready"
+        );
+
+        // Failed directory must exist with published status
+        let failed = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        assert!(failed.exists(), "malformed ready run must end up in failed");
+        assert!(
+            failed.join("status.toml").exists(),
+            "failed run must have published status.toml"
+        );
+        let status_content = fs::read_to_string(failed.join("status.toml")).unwrap();
+        let status: RunStatus = toml::from_str(&status_content).unwrap();
+        assert_eq!(status.state, RunState::Failed);
+        assert!(status.error.is_some(), "status must have error message");
+    }
+
+    #[test]
+    fn process_once_raw_does_not_recover_locked_processing_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("locked-proconce".into()).unwrap();
+
+        // Create a processing run with no terminal status (simulating an
+        // active transform).
+        let processing = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        fs::create_dir_all(&processing).unwrap();
+
+        // Also write run.toml and manifest.toml so the processing run
+        // would otherwise be recoverable.
+        write_run_toml(&processing, &nickname);
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![ManifestEntry {
+                local_path: ClientLocalPath::new("/source/file.txt".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/file.txt".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("file.txt".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
+                size: 13,
+                mtime_ns: 0,
+                sha256: None,
+                link_target: None,
+                transform: None,
+            }],
+        };
+        fs::write(
+            processing.join("manifest.toml"),
+            manifest.to_toml().unwrap(),
+        )
+        .unwrap();
+
+        // Hold the processor lock to simulate an active processor.
+        let lock = match crate::phases::try_lock_existing_run_dir_processor(&processing).unwrap() {
+            crate::phases::ProcessorLockAttempt::Acquired(l) => l,
+            _ => panic!("must be able to acquire test lock"),
+        };
+
+        // process_once_raw must not recover the locked run
+        let result = process_once_raw(&config);
+        assert!(
+            result.is_ok(),
+            "process_once_raw must succeed even with locked runs: {result:?}"
+        );
+
+        // Processing directory unchanged
+        assert!(
+            processing.exists(),
+            "locked processing directory must remain"
+        );
+        assert!(
+            !processing.join("status.toml").exists(),
+            "must not write status for locked processing run"
+        );
+
+        // Not moved to failed or done
+        let failed = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        assert!(
+            !failed.exists(),
+            "must NOT move locked processing to failed"
+        );
+        let done = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
+        assert!(!done.exists(), "must NOT move locked processing to done");
+
+        drop(lock);
+    }
+
+    #[test]
+    fn process_run_target_processing_lock_busy_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("tgt-busy-lock".into()).unwrap();
+
+        // Create a processing run with valid inputs.
+        let processing = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        fs::create_dir_all(&processing).unwrap();
+        write_run_toml(&processing, &nickname);
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![],
+        };
+        fs::write(
+            processing.join("manifest.toml"),
+            manifest.to_toml().unwrap(),
+        )
+        .unwrap();
+
+        // Hold the processor lock to simulate an active processor.
+        let lock = match crate::phases::try_lock_existing_run_dir_processor(&processing).unwrap() {
+            crate::phases::ProcessorLockAttempt::Acquired(l) => l,
+            _ => panic!("must be able to acquire test lock"),
+        };
+
+        // process_run_target must not recover the locked run
+        let result = process_run_target(&config, &nickname, &run_id);
+        assert!(
+            result.is_ok(),
+            "process_run_target must succeed as no-op when lock is busy: {result:?}"
+        );
+
+        // Processing directory unchanged
+        assert!(
+            processing.exists(),
+            "locked processing directory must remain"
+        );
+        assert!(
+            !processing.join("status.toml").exists(),
+            "must not write status for locked processing run"
+        );
+
+        let failed = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        assert!(
+            !failed.exists(),
+            "must NOT move locked processing run to failed"
+        );
+
+        drop(lock);
+    }
+
+    #[test]
+    fn process_run_target_processing_lock_free_recovers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("tgt-free-lock".into()).unwrap();
+
+        // Create a processing run with valid inputs (no lock held).
+        let processing = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        fs::create_dir_all(&processing).unwrap();
+        write_run_toml(&processing, &nickname);
+        // Provide valid manifest with a non-transform entry that can
+        // be processed without a staged file (will fail gracefully).
+        let staged_rel = "files/test.txt".to_string();
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![ManifestEntry {
+                local_path: ClientLocalPath::new("/source/test.txt".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new(staged_rel.into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("test.txt".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
+                size: 4,
+                mtime_ns: 1000000,
+                sha256: None,
+                link_target: None,
+                transform: None,
+            }],
+        };
+        fs::write(
+            processing.join("manifest.toml"),
+            manifest.to_toml().unwrap(),
+        )
+        .unwrap();
+
+        // process_run_target must recover the abandoned processing run
+        let result = process_run_target(&config, &nickname, &run_id);
+        assert!(
+            result.is_ok(),
+            "process_run_target must recover abandoned processing run: {result:?}"
+        );
+
+        // Processing run must be finalized to done or failed
+        assert!(
+            !processing.exists(),
+            "recovered processing run must be moved out of processing"
+        );
+        let done = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
+        let failed = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        assert!(
+            done.exists() || failed.exists(),
+            "recovered run must end up in done or failed"
+        );
+    }
+
+    // ── Lock held through failure mutation ─────────────────────────
+
+    #[test]
+    fn process_run_target_failure_keeps_lock_until_failed_move_complete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("lock-fail-tgt".into()).unwrap();
+
+        // Create a ready run — it will be claimed and processed.  The
+        // entries will fail (missing staged file), so the run ends up
+        // in failed state.  The processor lock must be held from claim
+        // through the final move to failed.
+        let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
+        fs::create_dir_all(&ready).unwrap();
+        write_run_toml(&ready, &nickname);
+
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![ManifestEntry {
+                local_path: ClientLocalPath::new("/source/missing.txt".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/missing.txt".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("missing.txt".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
+                size: 4,
+                mtime_ns: 1000000,
+                sha256: None,
+                link_target: None,
+                transform: None,
+            }],
+        };
+        fs::write(ready.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+
+        // process_run_target succeeds because the failed entries are
+        // handled gracefully (written as Failed status, moved to failed).
+        let result = process_run_target(&config, &nickname, &run_id);
+        assert!(result.is_ok(), "run processing must complete: {result:?}");
+
+        // Ready must be gone (claimed)
+        assert!(!ready.exists(), "ready dir must be claimed");
+
+        // Processing must be gone — the lock was held until after the
+        // move to failed completed.
+        let processing = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        assert!(
+            !processing.exists(),
+            "processing dir must be moved to failed while lock was held"
+        );
+
+        // Run must end up in failed
+        let failed = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        assert!(failed.exists(), "failed run must be in failed directory");
+        assert!(
+            failed.join("status.toml").exists(),
+            "failed run must have status.toml"
+        );
+    }
+
+    #[test]
+    fn process_once_ready_failure_keeps_lock_until_failed_move_complete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("lock-fail-once".into()).unwrap();
+
+        // Create a ready run that will fail during processing
+        let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
+        fs::create_dir_all(&ready).unwrap();
+        write_run_toml(&ready, &nickname);
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![ManifestEntry {
+                local_path: ClientLocalPath::new("/source/missing.txt".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/missing.txt".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("missing.txt".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
+                size: 4,
+                mtime_ns: 1000000,
+                sha256: None,
+                link_target: None,
+                transform: None,
+            }],
+        };
+        fs::write(ready.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+
+        let result = process_once_raw(&config);
+        assert!(result.is_ok(), "process_once_raw must complete: {result:?}");
+
+        // Ready must be gone (claimed)
+        assert!(!ready.exists(), "ready dir must be claimed");
+
+        // Processing must be gone (moved to failed while lock was held)
+        let processing = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        assert!(
+            !processing.exists(),
+            "processing dir must be moved to failed while lock was held"
+        );
+
+        // Run must end up in failed
+        let failed = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        assert!(failed.exists(), "failed run must be in failed directory");
+        assert!(
+            failed.join("status.toml").exists(),
+            "failed run must have status.toml"
+        );
+    }
+
+    #[test]
+    fn process_once_processing_recovery_failure_publishes_failure_before_unlock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("recover-fail-lock".into()).unwrap();
+
+        // Create a processing run with a version-compatible but
+        // malformed manifest (valid TOML, fails Manifest::from_toml).
+        // This will cause process_processing_run to error and call
+        // write_run_failure internally before returning the error.
+        let processing = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        fs::create_dir_all(&processing).unwrap();
+
+        // Valid run.toml
+        write_run_toml(&processing, &nickname);
+
+        // Malformed manifest: compatible version but missing required
+        // fields (no entries), causing Manifest::from_toml to error.
+        fs::write(
+            processing.join("manifest.toml"),
+            r#"purgery_version = "0.1.0-test"
+run_id = "recover-fail-lock"
+nickname = "laptop"
+"#,
+        )
+        .unwrap();
+
+        // process_once_raw must handle this without mutating after
+        // dropping the processor lock.
+        let result = process_once_raw(&config);
+        assert!(result.is_ok(), "process_once_raw must succeed: {result:?}");
+
+        // The processing directory must be gone — failure was published
+        // while the lock was held.
+        assert!(
+            !processing.exists(),
+            "processing dir must be moved to failed while lock was held"
+        );
+
+        // Run must end up in failed with a status
+        let failed = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        assert!(failed.exists(), "failed run must be in failed directory");
+        assert!(
+            failed.join("status.toml").exists(),
+            "failed run must have status.toml"
+        );
+    }
+
+    #[test]
+    fn process_run_target_ready_lock_busy_returns_ok_not_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("busy-ready".into()).unwrap();
+
+        // Create a ready run with valid inputs (non-empty manifest).
+        let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
+        fs::create_dir_all(&ready).unwrap();
+        write_run_toml(&ready, &nickname);
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![ManifestEntry {
+                local_path: ClientLocalPath::new("/source/file.txt".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/file.txt".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("file.txt".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
+                size: 4,
+                mtime_ns: 1000000,
+                sha256: None,
+                link_target: None,
+                transform: None,
+            }],
+        };
+        fs::write(ready.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+
+        // Also create the staged file so the run is actually processable.
+        fs::create_dir_all(ready.join("files")).unwrap();
+        fs::write(ready.join("files/file.txt"), b"data").unwrap();
+
+        // Hold the processor lock from the test to simulate another
+        // active claimer.
+        let lock = match crate::phases::try_lock_existing_run_dir_processor(&ready).unwrap() {
+            crate::phases::ProcessorLockAttempt::Acquired(l) => l,
+            _ => panic!("must be able to acquire test lock"),
+        };
+
+        // process_run_target must NOT report this as an error or
+        // corruption — a busy lock is normal concurrency.
+        let result = process_run_target(&config, &nickname, &run_id);
+        assert!(
+            result.is_ok(),
+            "busy ready lock must be non-fatal: {result:?}"
+        );
+
+        // Run must remain in ready, untouched.
+        assert!(ready.exists(), "ready dir must remain");
+        assert!(
+            !ready.join("status.toml").exists(),
+            "must not write status for ready run"
+        );
+        let failed = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Failed);
+        assert!(!failed.exists(), "must NOT move to failed");
+        let processing = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        assert!(!processing.exists(), "must NOT move to processing");
+
+        drop(lock);
+    }
+
+    #[test]
+    fn terminal_dirs_do_not_retain_processor_lock() {
+        // Verify that every path to a terminal phase removes
+        // processor.lock from the terminal directory.
+
+        // Path 1: successful done run via process_processing_run +
+        // finalize_processing_run.
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let config = test_server_config(&work_dir);
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("lock-cleanup-done".into()).unwrap();
+
+        let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
+        fs::create_dir_all(&ready).unwrap();
+        write_run_toml(&ready, &nickname);
+        let staged_rel = "files/test.txt".to_string();
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![ManifestEntry {
+                local_path: ClientLocalPath::new("/source/test.txt".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new(staged_rel.into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("test.txt".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
+                size: 4,
+                mtime_ns: 1000000,
+                sha256: None,
+                link_target: None,
+                transform: None,
+            }],
+        };
+        fs::write(ready.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+        fs::create_dir_all(ready.join("files")).unwrap();
+        fs::write(ready.join("files/test.txt"), b"data").unwrap();
+
+        process_run(&config, &nickname, &run_id).unwrap();
+
+        let done = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
+        assert!(
+            !done.join("processor.lock").exists(),
+            "done dir must not contain processor.lock"
+        );
+
+        // Path 2: failed run via move_to_failed.
+        let run_id2 = RunId::new("lock-cleanup-fail".into()).unwrap();
+        let ready2 = config
+            .work_dir
+            .run_dir(&nickname, &run_id2, RunPhase::Ready);
+        fs::create_dir_all(&ready2).unwrap();
+        write_run_toml(&ready2, &nickname);
+        let manifest2 = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: run_id2.clone(),
+            nickname: nickname.clone(),
+            entries: vec![ManifestEntry {
+                local_path: ClientLocalPath::new("/source/missing.txt".into()).unwrap(),
+                staged_path: NormalizedRelativePath::new("files/missing.txt".into()).unwrap(),
+                relative_path: NormalizedRelativePath::new("missing.txt".into()).unwrap(),
+                kind: ManifestEntryKind::RegularFile,
+                size: 4,
+                mtime_ns: 1000000,
+                sha256: None,
+                link_target: None,
+                transform: None,
+            }],
+        };
+        fs::write(ready2.join("manifest.toml"), manifest2.to_toml().unwrap()).unwrap();
+
+        process_run(&config, &nickname, &run_id2).unwrap();
+
+        let failed = config
+            .work_dir
+            .run_dir(&nickname, &run_id2, RunPhase::Failed);
+        assert!(
+            !failed.join("processor.lock").exists(),
+            "failed dir must not contain processor.lock"
         );
     }
 

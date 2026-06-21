@@ -1,12 +1,66 @@
 use camino::{Utf8Path, Utf8PathBuf};
 use std::collections::HashSet;
 use std::fs;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::ResolvedTransform;
 
+const MAX_TRANSFORM_OUTPUT_BYTES: usize = 64 * 1024;
+
 /// Default heartbeat interval for subprocess progress updates (5 seconds).
 const DEFAULT_HEARTBEAT_SECS: u64 = 5;
+
+/// Spawn a reader thread that drains a pipe and keeps a bounded tail.
+fn bounded_output_reader(
+    mut pipe: impl std::io::Read + Send + 'static,
+) -> std::thread::JoinHandle<Result<Vec<u8>, String>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::with_capacity(MAX_TRANSFORM_OUTPUT_BYTES);
+        let mut truncated = false;
+        let mut chunk = [0u8; 4096];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.len() > MAX_TRANSFORM_OUTPUT_BYTES {
+                        let excess = buf.len() - MAX_TRANSFORM_OUTPUT_BYTES;
+                        let _ = buf.drain(..excess);
+                        truncated = true;
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(format!("pipe read error: {e}")),
+            }
+        }
+        if truncated {
+            let marker = format!(
+                "...(output truncated; showing last {MAX_TRANSFORM_OUTPUT_BYTES} bytes)...\n"
+            );
+            let mut result = Vec::with_capacity(marker.len() + buf.len());
+            result.extend_from_slice(marker.as_bytes());
+            result.extend_from_slice(&buf);
+            Ok(result)
+        } else {
+            Ok(buf)
+        }
+    })
+}
+
+/// Join a bounded output reader thread.  Returns the captured bytes
+/// or an error message if the thread panicked or the reader failed.
+fn join_bounded_output(
+    handle: Option<std::thread::JoinHandle<Result<Vec<u8>, String>>>,
+) -> Result<Vec<u8>, String> {
+    match handle {
+        Some(h) => match h.join() {
+            Ok(Ok(bytes)) => Ok(bytes),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err("output reader thread panicked".to_string()),
+        },
+        None => Ok(Vec::new()),
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn apply_transform(
@@ -68,8 +122,17 @@ pub fn apply_transform_with_heartbeat(
             let mut child = std::process::Command::new(&def.program)
                 .args(&args)
                 .current_dir(work_parent)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
                 .spawn()
                 .map_err(|e| format!("failed to spawn {}: {e}", resolved.name))?;
+
+            // Drain stdout and stderr concurrently so the transform
+            // never blocks on a full pipe buffer.  Do NOT inherit
+            // these pipes — protocol stdout must remain machine-
+            // readable TOML.
+            let stdout_handle = child.stdout.take().map(bounded_output_reader);
+            let stderr_handle = child.stderr.take().map(bounded_output_reader);
 
             let transform_status = loop {
                 match child.try_wait() {
@@ -90,12 +153,44 @@ pub fn apply_transform_with_heartbeat(
                 }
             };
 
+            // Always join drainers after the child exits, regardless
+            // of success or failure.
+            let captured_stdout = join_bounded_output(stdout_handle);
+            let captured_stderr = join_bounded_output(stderr_handle);
+
             if !transform_status.success() {
+                let stdout_tail = captured_stdout
+                    .as_ref()
+                    .map(|b| String::from_utf8_lossy(b).to_string())
+                    .unwrap_or_else(|e| format!("(stdout unavailable: {e})"));
+                let stderr_tail = captured_stderr
+                    .as_ref()
+                    .map(|b| String::from_utf8_lossy(b).to_string())
+                    .unwrap_or_else(|e| format!("(stderr unavailable: {e})"));
                 return Err(format!(
-                    "{} failed with exit code {:?}",
+                    "{} failed with exit code {:?}\nstdout: {}\nstderr: {}",
                     resolved.name,
-                    transform_status.code()
+                    transform_status.code(),
+                    stdout_tail.trim(),
+                    stderr_tail.trim(),
                 ));
+            }
+
+            // Success: log a warning if drainers failed, but do not
+            // fail the transform for that.
+            if let Err(e) = &captured_stdout {
+                warn!(
+                    transform = %resolved.name,
+                    error = %e,
+                    "stdout drainer failed after successful transform",
+                );
+            }
+            if let Err(e) = &captured_stderr {
+                warn!(
+                    transform = %resolved.name,
+                    error = %e,
+                    "stderr drainer failed after successful transform",
+                );
             }
 
             progress_cb(&purgery_core::ProgressUpdate::new(

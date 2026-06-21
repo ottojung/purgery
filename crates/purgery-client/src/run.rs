@@ -12,7 +12,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::classify;
 use crate::cleanup;
-use crate::runner::RemoteRunner;
+use crate::runner::{RemoteCommandExit, RemoteCommandHandle, RemoteRunner};
 use crate::split;
 use crate::SyncArgs;
 
@@ -203,53 +203,292 @@ fn read_status(
     Ok(status)
 }
 
-fn wait_for_terminal(
+/// Supervise a foreground `process-run` SSH command while concurrently
+/// polling `run-state` until the run reaches a terminal phase.
+///
+/// The `process-run` is spawned in the background via `spawn_server_cmd`.
+/// The client polls `run-state` using short `server_cmd` calls.
+/// If the SSH transport fails, `run-state` decides whether to restart.
+/// If the command exits with a remote semantic error, the client re-polls
+/// `run-state` before deciding whether to fail.
+fn drive_server_until_terminal(
     runner: &RemoteRunner,
     host: &str,
     server_cmd: &str,
     nickname: &Nickname,
     run_id: &RunId,
 ) -> Result<RunStateResponse> {
-    let poll_interval = Duration::from_secs(5);
+    drive_server_until_terminal_with_interval(
+        runner,
+        host,
+        server_cmd,
+        nickname,
+        run_id,
+        Duration::from_secs(5),
+    )
+}
+
+/// Like `drive_server_until_terminal` but with a configurable poll interval.
+/// Tests can pass a tiny interval to avoid multi-second sleeps.
+fn drive_server_until_terminal_with_interval(
+    runner: &RemoteRunner,
+    host: &str,
+    server_cmd: &str,
+    nickname: &Nickname,
+    run_id: &RunId,
+    poll_interval: Duration,
+) -> Result<RunStateResponse> {
+    let mut worker: Option<RemoteCommandHandle> = None;
     let mut last_phase = String::new();
     let mut attempts_since_report = 0u64;
+    let mut no_progress = NoProgressTracker::new();
+
+    // Start with a dummy state so we never read uninitialized data.
+    // The first poll below will overwrite it.
+    let mut state: RunStateResponse = dummy_run_state(nickname, run_id);
 
     loop {
-        let response = run_state(runner, host, server_cmd, nickname, run_id)?;
+        // Poll run-state.  If a worker is active, a transient failure
+        // must not kill it — just warn and keep the previous state.
+        // The first poll always succeeds because there is no worker.
+        match run_state(runner, host, server_cmd, nickname, run_id) {
+            Ok(s) => state = s,
+            Err(e) => {
+                if worker.is_some() {
+                    warn!(
+                        nickname = %nickname.as_str(),
+                        run_id = %run_id.as_str(),
+                        error = %e,
+                        "run-state poll failed while worker is active",
+                    );
+                } else {
+                    terminate_worker_on_error(&mut worker);
+                    return Err(e).with_context(|| {
+                        format!(
+                            "failed to poll run-state for run {}/{}",
+                            nickname.as_str(),
+                            run_id.as_str()
+                        )
+                    });
+                }
+            }
+        }
 
-        if response.terminal {
+        if state.terminal {
+            finish_worker_after_terminal(&mut worker, nickname, run_id);
             info!(
                 nickname = %nickname.as_str(),
                 run_id = %run_id.as_str(),
-                phase = %response.phase,
+                phase = %state.phase,
                 "run reached terminal phase"
             );
-            return Ok(response);
+            return Ok(state);
         }
 
-        match response.phase.as_str() {
-            "ready" | "processing" => {
-                if response.phase != last_phase {
-                    info!(
-                        nickname = %nickname.as_str(),
-                        run_id = %run_id.as_str(),
-                        phase = %response.phase,
-                        "run phase changed"
-                    );
-                    last_phase = response.phase.clone();
-                    attempts_since_report = 0;
+        let mut restart_worker = false;
+
+        // Check if the worker has exited.
+        if let Some(w) = worker.as_mut() {
+            let try_result = w.try_wait();
+            match try_result {
+                Ok(result) => {
+                    match result {
+                        None => { /* still running */ }
+                        Some(exit) => {
+                            worker = None;
+                            match exit {
+                                RemoteCommandExit::Success { stdout } => {
+                                    let decision = handle_process_run_success(
+                                        runner,
+                                        host,
+                                        server_cmd,
+                                        nickname,
+                                        run_id,
+                                        &stdout,
+                                        &state,
+                                        &mut no_progress,
+                                    )?;
+                                    match decision {
+                                        WorkerExitDecision::Terminal(ts) => {
+                                            finish_worker_after_terminal(
+                                                &mut worker,
+                                                nickname,
+                                                run_id,
+                                            );
+                                            info!(
+                                                nickname = %nickname.as_str(),
+                                                run_id = %run_id.as_str(),
+                                                phase = %ts.phase,
+                                                "process-run success confirmed terminal state",
+                                            );
+                                            return Ok(ts);
+                                        }
+                                        WorkerExitDecision::ContinueWithFreshState(fresh) => {
+                                            state = fresh;
+                                        }
+                                    }
+                                }
+                                RemoteCommandExit::TransportFailure { details, .. } => {
+                                    warn!(
+                                        nickname = %nickname.as_str(),
+                                        run_id = %run_id.as_str(),
+                                        details,
+                                        "process-run SSH transport failed",
+                                    );
+                                    // Re-poll run-state before deciding.  Do not use stale
+                                    // state — a fresh observation tells us whether to
+                                    // restart, wait, or terminate.
+                                    let fresh =
+                                        match run_state(runner, host, server_cmd, nickname, run_id)
+                                        {
+                                            Ok(r) => r,
+                                            Err(e) => {
+                                                terminate_worker_on_error(&mut worker);
+                                                return Err(e).with_context(|| {
+                                                    format!(
+                                                    "process-run transport failed for run {}/{} \
+                                                     and fresh run-state could not be read; \
+                                                     leaving persisted state for resume",
+                                                    nickname.as_str(),
+                                                    run_id.as_str(),
+                                                )
+                                                });
+                                            }
+                                        };
+                                    if fresh.terminal {
+                                        return Ok(fresh);
+                                    }
+                                    state = fresh;
+                                }
+                                RemoteCommandExit::RemoteFailure { stderr, .. } => {
+                                    let err_msg = format!(
+                                        "process-run remote failure for run {}/{}: {}",
+                                        nickname.as_str(),
+                                        run_id.as_str(),
+                                        stderr,
+                                    );
+                                    // Re-poll run-state before deciding — the run may
+                                    // have become terminal or active since we last checked.
+                                    // Assign to `state` so subsequent loop logic uses
+                                    // the fresh data, not the stale pre-poll value.
+                                    let fresh =
+                                        match run_state(runner, host, server_cmd, nickname, run_id)
+                                        {
+                                            Ok(r) => r,
+                                            Err(_) => {
+                                                terminate_worker_on_error(&mut worker);
+                                                anyhow::bail!("{err_msg}");
+                                            }
+                                        };
+                                    if fresh.terminal {
+                                        finish_worker_after_terminal(&mut worker, nickname, run_id);
+                                        return Ok(fresh);
+                                    }
+                                    let should_fail = match processor_observation(&fresh) {
+                                        ProcessorObservation::Active => false,
+                                        ProcessorObservation::Idle
+                                        | ProcessorObservation::Missing => true,
+                                        ProcessorObservation::Unknown(raw) => {
+                                            warn!(
+                                                nickname = %nickname.as_str(),
+                                                run_id = %run_id.as_str(),
+                                                processor_state = raw,
+                                                "process-run remote failure with unknown processor state",
+                                            );
+                                            // Build a more descriptive error.
+                                            let fresh_msg = format!(
+                                                "process-run remote failure for run {}/{}: {}; \
+                                                 fresh run-state is processing with \
+                                                 unknown processor_state=\"{}\", \
+                                                 so the client refused to recover/restart",
+                                                nickname.as_str(),
+                                                run_id.as_str(),
+                                                stderr,
+                                                raw,
+                                            );
+                                            terminate_worker_on_error(&mut worker);
+                                            anyhow::bail!("{fresh_msg}");
+                                        }
+                                    };
+                                    if fresh.phase == "ready" || should_fail {
+                                        terminate_worker_on_error(&mut worker);
+                                        anyhow::bail!("{err_msg}");
+                                    }
+                                    warn!("{}", err_msg);
+                                    // Use fresh state for subsequent restart decisions.
+                                    state = fresh;
+                                }
+                                RemoteCommandExit::Killed => {
+                                    terminate_worker_on_error(&mut worker);
+                                    anyhow::bail!(
+                                        "process-run was killed for run {}/{}",
+                                        nickname.as_str(),
+                                        run_id.as_str(),
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
-                attempts_since_report += 1;
-                if attempts_since_report.is_multiple_of(12) {
-                    info!(
-                        nickname = %nickname.as_str(),
-                        run_id = %run_id.as_str(),
-                        phase = %last_phase,
-                        "still waiting for server to process run"
-                    );
+                Err(e) => {
+                    terminate_worker_on_error(&mut worker);
+                    return Err(e).with_context(|| {
+                        format!(
+                            "failed to check process-run worker for run {}/{}",
+                            nickname.as_str(),
+                            run_id.as_str()
+                        )
+                    });
                 }
             }
+        }
+
+        // Decide whether to start/restart the process-run worker.
+        // Never spawn while a local worker handle is still running.
+        let proc_obs = processor_observation(&state);
+
+        match state.phase.as_str() {
+            "ready" => {
+                if worker.is_none() {
+                    restart_worker = true;
+                }
+            }
+            "processing" => match proc_obs {
+                ProcessorObservation::Active => {
+                    // Another processor owns the run — keep waiting.
+                }
+                ProcessorObservation::Idle => {
+                    if worker.is_none() {
+                        restart_worker = true;
+                    }
+                }
+                ProcessorObservation::Unknown(_) | ProcessorObservation::Missing => {
+                    // Ownership cannot be determined.  If a local worker is
+                    // active, keep it (don't kill on a single unclear poll).
+                    // Otherwise fail clearly to avoid racing on unsafe state.
+                    if worker.is_some() {
+                        warn!(
+                            nickname = %nickname.as_str(),
+                            run_id = %run_id.as_str(),
+                            processor_state = ?state.processor_state,
+                            "processing run has unclear processor ownership; \
+                             keeping existing worker alive",
+                        );
+                    } else {
+                        terminate_worker_on_error(&mut worker);
+                        anyhow::bail!(
+                            "run {}/{} is in processing phase but processor ownership \
+                             cannot be determined (processor_state={:?}); \
+                             leaving persisted state for resume",
+                            nickname.as_str(),
+                            run_id.as_str(),
+                            state.processor_state,
+                        );
+                    }
+                }
+            },
             "not_found" => {
+                terminate_worker_on_error(&mut worker);
                 anyhow::bail!(
                     "run {}/{} not found on server",
                     nickname.as_str(),
@@ -257,6 +496,7 @@ fn wait_for_terminal(
                 );
             }
             other => {
+                terminate_worker_on_error(&mut worker);
                 anyhow::bail!(
                     "unexpected run-state phase '{other}' for run {}/{}",
                     nickname.as_str(),
@@ -265,7 +505,347 @@ fn wait_for_terminal(
             }
         }
 
+        if restart_worker {
+            worker = Some(runner.spawn_server_cmd(
+                host,
+                server_cmd,
+                &[
+                    "process-run",
+                    "--nickname",
+                    nickname.as_str(),
+                    "--run-id",
+                    run_id.as_str(),
+                ],
+            )?);
+            info!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                "spawned foreground process-run",
+            );
+        }
+
+        if state.phase != last_phase {
+            info!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                phase = %state.phase,
+                "run phase changed"
+            );
+            last_phase = state.phase.clone();
+            attempts_since_report = 0;
+        }
+        attempts_since_report += 1;
+        if attempts_since_report.is_multiple_of(12) {
+            info!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                phase = %last_phase,
+                "still waiting for server to process run"
+            );
+        }
+
         std::thread::sleep(poll_interval);
+    }
+}
+
+/// Outcome of processing a process-run worker exit in the drive loop.
+enum WorkerExitDecision {
+    /// The worker exit + fresh run-state indicates terminal state.
+    Terminal(RunStateResponse),
+    /// Nonterminal outcome; use the fresh state for the next restart decision.
+    ContinueWithFreshState(RunStateResponse),
+}
+
+/// Tracks consecutive identical state observations for no-progress
+/// detection.  Reset when state changes meaningfully.
+#[derive(Clone, Debug, PartialEq)]
+struct ProgressSnapshot {
+    phase: String,
+    terminal: bool,
+    processor_state: Option<String>,
+    progress_state: Option<String>,
+    entry_index: Option<usize>,
+    entry_total: Option<usize>,
+    updated_at_unix_secs: u64,
+}
+
+impl From<&RunStateResponse> for ProgressSnapshot {
+    fn from(s: &RunStateResponse) -> Self {
+        ProgressSnapshot {
+            phase: s.phase.clone(),
+            terminal: s.terminal,
+            processor_state: s.processor_state.clone(),
+            progress_state: s.progress_state.clone(),
+            entry_index: s.entry_index,
+            entry_total: s.entry_total,
+            updated_at_unix_secs: s.updated_at_unix_secs,
+        }
+    }
+}
+
+const MAX_NO_PROGRESS_COUNT: u32 = 3;
+
+struct NoProgressTracker {
+    count: u32,
+    last_snapshot: Option<ProgressSnapshot>,
+}
+
+impl NoProgressTracker {
+    fn new() -> Self {
+        NoProgressTracker {
+            count: 0,
+            last_snapshot: None,
+        }
+    }
+
+    fn advance(&mut self, state: &RunStateResponse) -> bool {
+        let snap = ProgressSnapshot::from(state);
+        if self.last_snapshot.as_ref() == Some(&snap) {
+            self.count += 1;
+            self.count < MAX_NO_PROGRESS_COUNT
+        } else {
+            self.count = 0;
+            self.last_snapshot = Some(snap);
+            true
+        }
+    }
+}
+
+const TERMINAL_WORKER_GRACE: Duration = Duration::from_secs(5);
+
+/// Finish ownership of the local process-run worker after terminal
+/// run-state is observed.  Best-effort: terminal state is authoritative
+/// once `run-state` reports terminal AND terminal `status.toml` is
+/// readable.  The local SSH child is only a supervision mechanism;
+/// its exit status does not affect sync success.
+///
+/// If the worker does not exit within the grace period, terminates it
+/// and warns.  Never returns an error — server terminal state wins.
+pub(crate) fn finish_worker_after_terminal(
+    worker: &mut Option<RemoteCommandHandle>,
+    nickname: &Nickname,
+    run_id: &RunId,
+) {
+    let Some(mut w) = worker.take() else {
+        return;
+    };
+
+    match w.wait_timeout(TERMINAL_WORKER_GRACE) {
+        Ok(Some(exit)) => match exit {
+            RemoteCommandExit::Success { .. } => {
+                debug!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    "process-run exited after terminal state",
+                );
+            }
+            RemoteCommandExit::RemoteFailure { stderr, .. } => {
+                warn!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    "process-run remote failure after terminal state: {stderr}",
+                );
+            }
+            RemoteCommandExit::TransportFailure { details, .. } => {
+                warn!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    "process-run transport failure after terminal state: {details}",
+                );
+            }
+            RemoteCommandExit::Killed => {
+                warn!(
+                    nickname = %nickname.as_str(),
+                    run_id = %run_id.as_str(),
+                    "process-run was killed after terminal state",
+                );
+            }
+        },
+        Ok(None) => {
+            warn!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                "process-run did not exit within {}s after terminal state; terminating",
+                TERMINAL_WORKER_GRACE.as_secs(),
+            );
+            let _ = w.terminate_and_reap();
+        }
+        Err(e) => {
+            warn!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                error = %e,
+                "failed to wait for process-run after terminal state",
+            );
+            let _ = w.terminate_and_reap();
+        }
+    }
+}
+
+/// Parse, validate envelope, and enforce `ProcessRunResponse` outcome
+/// against a fresh `run-state` poll.
+#[allow(clippy::too_many_arguments)]
+fn handle_process_run_success(
+    runner: &RemoteRunner,
+    host: &str,
+    server_cmd: &str,
+    nickname: &Nickname,
+    run_id: &RunId,
+    stdout: &str,
+    _state: &RunStateResponse,
+    no_progress: &mut NoProgressTracker,
+) -> Result<WorkerExitDecision> {
+    let resp = parse_process_run_response(stdout, nickname, run_id)?;
+
+    let outcome = purgery_core::ProcessRunOutcome::from_str_name(&resp.outcome)
+        .ok_or_else(|| anyhow::anyhow!("unknown process-run outcome '{}'", resp.outcome))?;
+
+    let fresh = run_state(runner, host, server_cmd, nickname, run_id)?;
+
+    match outcome {
+        purgery_core::ProcessRunOutcome::Processed
+        | purgery_core::ProcessRunOutcome::AlreadyTerminal => {
+            if !fresh.terminal {
+                anyhow::bail!(
+                    "process-run reported outcome={} but fresh run-state is not terminal \
+                     for run {}/{} (phase={})",
+                    resp.outcome,
+                    nickname.as_str(),
+                    run_id.as_str(),
+                    fresh.phase,
+                );
+            }
+            Ok(WorkerExitDecision::Terminal(fresh))
+        }
+        purgery_core::ProcessRunOutcome::AlreadyActive => {
+            if fresh.phase != "processing" || fresh.processor_state.as_deref() != Some("active") {
+                anyhow::bail!(
+                    "process-run reported outcome=already_active but fresh run-state is not \
+                     processing/active for run {}/{} (phase={}, processor_state={:?})",
+                    nickname.as_str(),
+                    run_id.as_str(),
+                    fresh.phase,
+                    fresh.processor_state,
+                );
+            }
+            Ok(WorkerExitDecision::ContinueWithFreshState(fresh))
+        }
+        purgery_core::ProcessRunOutcome::ClaimInProgress => {
+            if fresh.terminal {
+                return Ok(WorkerExitDecision::Terminal(fresh));
+            }
+            if fresh.phase == "processing" && fresh.processor_state.as_deref() == Some("active") {
+                return Ok(WorkerExitDecision::ContinueWithFreshState(fresh));
+            }
+            if fresh.phase == "ready" && !no_progress.advance(&fresh) {
+                anyhow::bail!(
+                    "process-run repeatedly exited without progress: outcome=claim_in_progress \
+                     and target remained ready after {} consecutive attempts for run {}/{}",
+                    MAX_NO_PROGRESS_COUNT,
+                    nickname.as_str(),
+                    run_id.as_str(),
+                );
+            }
+            Ok(WorkerExitDecision::ContinueWithFreshState(fresh))
+        }
+    }
+}
+
+/// Parse and validate the envelope of a `ProcessRunResponse` from stdout.
+fn parse_process_run_response(
+    stdout: &str,
+    nickname: &Nickname,
+    run_id: &RunId,
+) -> Result<purgery_core::ProcessRunResponse> {
+    if stdout.trim().is_empty() {
+        anyhow::bail!(
+            "process-run exited successfully but produced empty stdout for run {}/{}",
+            nickname.as_str(),
+            run_id.as_str(),
+        );
+    }
+    let resp: purgery_core::ProcessRunResponse = toml::from_str(stdout).with_context(|| {
+        format!(
+            "failed to parse process-run response TOML for run {}/{}",
+            nickname.as_str(),
+            run_id.as_str(),
+        )
+    })?;
+    if resp.protocol_version != purgery_core::PROTOCOL_VERSION {
+        anyhow::bail!(
+            "process-run response protocol_version {} does not match client version {} \
+             for run {}/{}",
+            resp.protocol_version,
+            purgery_core::PROTOCOL_VERSION,
+            nickname.as_str(),
+            run_id.as_str(),
+        );
+    }
+    purgery_core::require_compatible_purgery_version(&resp.purgery_version, "process-run response")
+        .with_context(|| {
+            format!(
+                "incompatible purgery_version in process-run response for run {}/{}",
+                nickname.as_str(),
+                run_id.as_str(),
+            )
+        })?;
+    if resp.nickname != nickname.as_str() || resp.run_id != run_id.as_str() {
+        anyhow::bail!(
+            "process-run response envelope mismatch for run {}/{} \
+             (response nickname={}, run_id={})",
+            nickname.as_str(),
+            run_id.as_str(),
+            resp.nickname,
+            resp.run_id,
+        );
+    }
+    Ok(resp)
+}
+
+/// Terminate the local process-run worker before returning an error.
+/// Ensures no owned child is left running or unreaped on error paths.
+fn terminate_worker_on_error(worker: &mut Option<RemoteCommandHandle>) {
+    if let Some(mut w) = worker.take() {
+        let _ = w.terminate_and_reap();
+    }
+}
+
+enum ProcessorObservation<'a> {
+    Active,
+    Idle,
+    Unknown(&'a str),
+    Missing,
+}
+
+fn processor_observation(state: &RunStateResponse) -> ProcessorObservation<'_> {
+    match state.processor_state.as_deref() {
+        Some("active") => ProcessorObservation::Active,
+        Some("idle") => ProcessorObservation::Idle,
+        Some(other) => ProcessorObservation::Unknown(other),
+        None => ProcessorObservation::Missing,
+    }
+}
+
+/// Create a placeholder RunStateResponse that is never terminal.
+/// Used as initial value before the first real poll.
+fn dummy_run_state(nickname: &Nickname, run_id: &RunId) -> RunStateResponse {
+    RunStateResponse {
+        protocol_version: purgery_core::PROTOCOL_VERSION,
+        purgery_version: String::new(),
+        nickname: nickname.as_str().to_owned(),
+        run_id: run_id.as_str().to_owned(),
+        phase: "starting".to_string(),
+        terminal: false,
+        message: String::new(),
+        updated_at_unix_secs: 0,
+        observed_at_unix_secs: 0,
+        progress_state: None,
+        entry_index: None,
+        entry_total: None,
+        current_entry: None,
+        current_transform: None,
+        progress_status: None,
+        processor_state: None,
     }
 }
 
@@ -282,7 +862,7 @@ fn persist_client_run_state(
     phase: ClientRunPhase,
 ) -> Result<()> {
     let run_state = ClientRunState {
-        protocol_version: 1,
+        protocol_version: purgery_core::PROTOCOL_VERSION,
         purgery_version: purgery_core::current_purgery_version().to_string(),
         nickname: nickname.as_str().to_owned(),
         run_id: run_id.as_str().to_owned(),
@@ -504,8 +1084,8 @@ fn drain_one(runner: &RemoteRunner, state_dir: &str, state: &ClientRunState) -> 
                 phase = ClientRunPhase::WaitingForTerminalState;
             }
             ClientRunPhase::WaitingForTerminalState => {
-                debug!("waiting for terminal state");
-                wait_for_terminal(runner, host, server_cmd, &nickname, &run_id)?;
+                debug!("driving server processing to terminal");
+                drive_server_until_terminal(runner, host, server_cmd, &nickname, &run_id)?;
                 let status = read_status(runner, host, server_cmd, &nickname, &run_id)?;
                 if status.nickname != nickname || status.run_id != run_id {
                     anyhow::bail!("server status envelope does not match persisted run");
@@ -734,19 +1314,29 @@ impl Drop for HeartbeatGuard {
     }
 }
 
+/// Tracks whether the top-level invocation has already performed
+/// server version check and GC for a server-run sync.  Recursive
+/// split entries reuse the fact that these are already done.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ServerRunSetup {
+    Needed,
+    AlreadyDone,
+}
+
 pub(crate) fn run_sync(args: &SyncArgs) -> Result<()> {
     run_sync_with_runner(&RemoteRunner::real(), args)
 }
 
 pub(crate) fn run_sync_with_runner(runner: &RemoteRunner, args: &SyncArgs) -> Result<()> {
     let run_id = RunId::generate();
-    run_sync_with_run_id(runner, args, &run_id)
+    run_sync_with_run_id(runner, args, &run_id, ServerRunSetup::Needed)
 }
 
 pub(crate) fn run_sync_with_run_id(
     runner: &RemoteRunner,
     args: &SyncArgs,
     run_id: &RunId,
+    setup: ServerRunSetup,
 ) -> Result<()> {
     let state_dir = resolve_state_dir(args);
 
@@ -766,7 +1356,7 @@ pub(crate) fn run_sync_with_run_id(
     }
 
     if let Some(ref _pattern) = args.split {
-        return run_split(runner, args, run_id, &state_dir, &source_spec);
+        return run_split(runner, args, run_id, &state_dir, &source_spec, setup);
     }
 
     let remote = parse_destination(&args.destination)?;
@@ -837,9 +1427,25 @@ pub(crate) fn run_sync_with_run_id(
         delete_after_import: true,
     };
 
-    check_server_version(runner, &remote.host, server_cmd)
-        .with_context(|| "server version compatibility check failed")?;
+    match setup {
+        ServerRunSetup::Needed => {
+            check_server_version(runner, &remote.host, server_cmd)
+                .with_context(|| "server version compatibility check failed")?;
+
+            info!("running server GC");
+            if let Err(e) = runner.server_cmd(&remote.host, server_cmd, &["gc"]) {
+                warn!(error = %e, "server GC failed (non-fatal)");
+            } else {
+                debug!("server GC completed");
+            }
+        }
+        ServerRunSetup::AlreadyDone => {
+            debug!("server version and GC already handled by top-level split");
+        }
+    }
+
     info!("starting server run");
+
     let begin_resp = begin_run(runner, &remote.host, server_cmd, &nickname, run_id)?;
 
     let mut hb_guard = HeartbeatGuard::new(
@@ -928,8 +1534,8 @@ pub(crate) fn run_sync_with_run_id(
         ClientRunPhase::WaitingForTerminalState,
     )?;
 
-    info!("waiting for server processing");
-    wait_for_terminal(runner, &remote.host, server_cmd, &nickname, run_id)?;
+    info!("driving server processing");
+    drive_server_until_terminal(runner, &remote.host, server_cmd, &nickname, run_id)?;
 
     info!("reading run status");
     let status = read_status(runner, &remote.host, server_cmd, &nickname, run_id)?;
@@ -985,6 +1591,7 @@ fn run_split(
     _run_id: &RunId,
     state_dir: &str,
     source_spec: &classify::SourceSpec,
+    setup: ServerRunSetup,
 ) -> Result<()> {
     let pattern = args.split.as_deref().unwrap();
     split::validate_split_pattern(pattern).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1009,6 +1616,28 @@ fn run_split(
         info!("split pattern matched nothing");
         return Ok(());
     }
+
+    // Run server version check and GC once before processing any split
+    // entries, but only if this is a server-run sync (transform) and
+    // the top-level invocation hasn't already done it.
+    if has_transform {
+        match setup {
+            ServerRunSetup::Needed => {
+                check_server_version(runner, &target.host, &args.server_command)
+                    .with_context(|| "server version compatibility check failed")?;
+                info!("running server GC");
+                if let Err(e) = runner.server_cmd(&target.host, &args.server_command, &["gc"]) {
+                    warn!(error = %e, "server GC failed (non-fatal)");
+                } else {
+                    debug!("server GC completed");
+                }
+            }
+            ServerRunSetup::AlreadyDone => {
+                debug!("server version and GC already handled by top-level invocation");
+            }
+        }
+    }
+
     let base_dest = &args.destination;
     for root in &entry_roots {
         let suffix = split::split_target_suffix(&source_spec.operation_path, &root.path);
@@ -1024,7 +1653,13 @@ fn run_split(
             destination: split_dest,
         };
         let split_run_id = RunId::generate();
-        run_sync_with_run_id(runner, &split_args, &split_run_id)?;
+        // Tell each recursive entry that setup (version + GC) is already done.
+        run_sync_with_run_id(
+            runner,
+            &split_args,
+            &split_run_id,
+            ServerRunSetup::AlreadyDone,
+        )?;
     }
     Ok(())
 }
@@ -1081,7 +1716,10 @@ mod tests {
         let runner = RemoteRunner::fake();
         runner.add_response(
             "version",
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\n",
+            &format!(
+                "protocol_version = {}\npurgery_version = \"0.1.0-test\"\n",
+                purgery_core::PROTOCOL_VERSION
+            ),
         );
         runner
     }
@@ -1090,8 +1728,43 @@ mod tests {
         tmp.path().join("purgery").to_string_lossy().to_string()
     }
 
+    /// Base protocol + purgery_version TOML header for test responses.
+    fn resp_header() -> String {
+        format!(
+            "protocol_version = {}\npurgery_version = \"0.1.0-test\"\n",
+            purgery_core::PROTOCOL_VERSION
+        )
+    }
+
+    fn process_run_ok_toml(outcome: &str, run_id: &str) -> String {
+        format!(
+            r#"protocol_version = {}
+purgery_version = "0.1.0-test"
+nickname = "laptop"
+run_id = "{}"
+outcome = "{}"
+"#,
+            purgery_core::PROTOCOL_VERSION,
+            run_id,
+            outcome,
+        )
+    }
+
+    /// Helper for repeated processing-state TOML responses.
+    fn processing_state(run_id: &str, ts: u64) -> String {
+        format!(
+            "{}nickname = \"laptop\"\nrun_id = \"{run_id}\"\n\
+             phase = \"processing\"\nterminal = false\n\
+             message = \"run phase: processing\"\n\
+             processor_state = \"idle\"\n\
+             updated_at_unix_secs = {ts}\nobserved_at_unix_secs = {ts}\n",
+            resp_header()
+        )
+    }
+
     fn begin_resp_toml() -> String {
-        r#"protocol_version = 1
+        format!(
+            r#"protocol_version = {}
 purgery_version = "0.1.0-test"
 nickname = "laptop"
 run_id = "test-run"
@@ -1100,12 +1773,14 @@ files_dir = "/var/lib/purgery/work/laptop/incoming/test-run"
 run_config_path = "/var/lib/purgery/work/laptop/incoming/test-run/run.toml"
 manifest_path = "/var/lib/purgery/work/laptop/incoming/test-run/manifest.toml"
 heartbeat_interval_secs = 60
-"#
-        .to_string()
+"#,
+            purgery_core::PROTOCOL_VERSION
+        )
     }
 
     fn done_run_state_toml() -> String {
-        r#"protocol_version = 1
+        format!(
+            r#"protocol_version = {}
 purgery_version = "0.1.0-test"
 nickname = "laptop"
 run_id = "test-run"
@@ -1114,8 +1789,9 @@ terminal = true
 message = ""
 updated_at_unix_secs = 1000
 observed_at_unix_secs = 1000
-"#
-        .to_string()
+"#,
+            purgery_core::PROTOCOL_VERSION
+        )
     }
 
     fn done_status_toml() -> String {
@@ -1497,7 +2173,7 @@ state = "done"
     fn wait_for_terminal_errors_on_not_found() {
         // not_found is non-terminal; wait_for_terminal treats it as error.
         let response = RunStateResponse {
-            protocol_version: 1,
+            protocol_version: purgery_core::PROTOCOL_VERSION,
             purgery_version: "0.1.0-test".to_string(),
             nickname: "laptop".to_string(),
             run_id: "test-nf".to_string(),
@@ -1512,6 +2188,7 @@ state = "done"
             current_entry: None,
             current_transform: None,
             progress_status: None,
+            processor_state: None,
         };
         match response.phase.as_str() {
             "not_found" => {} // expected path
@@ -1575,7 +2252,10 @@ state = "done"
         runner.add_response("begin-run", &begin);
         runner.add_response(
             "prepare-run",
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
         );
         runner.add_response("heartbeat-run", "");
         runner.add_response("run-state", &done_run_state_toml());
@@ -1593,7 +2273,7 @@ state = "done"
         // Add finish-run response AFTER the hook (responses consumed FIFO)
         runner.add_response("finish-run", "");
 
-        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
         assert!(result.is_ok(), "sync must succeed");
 
         // finish-run hook fired → finish-run was called
@@ -1602,6 +2282,766 @@ state = "done"
         // have rejected it before finish-run
         let log = runner.command_log();
         assert!(log.iter().any(|c| c.contains("heartbeat-run")));
+    }
+
+    fn processing_state_with_processor(run_id: &str, ts: u64, state: &str) -> String {
+        format!(
+            r#"protocol_version = {}
+purgery_version = "0.1.0-test"
+nickname = "laptop"
+run_id = "{run_id}"
+phase = "processing"
+terminal = false
+message = "run phase: processing"
+processor_state = "{state}"
+updated_at_unix_secs = {ts}
+observed_at_unix_secs = {ts}
+"#,
+            purgery_core::PROTOCOL_VERSION
+        )
+    }
+
+    fn ready_run_state_toml() -> String {
+        format!(
+            r#"protocol_version = {}
+purgery_version = "0.1.0-test"
+nickname = "laptop"
+run_id = "test-run"
+phase = "ready"
+terminal = false
+message = "run phase: ready"
+updated_at_unix_secs = 1000
+observed_at_unix_secs = 1000
+"#,
+            purgery_core::PROTOCOL_VERSION
+        )
+    }
+
+    #[test]
+    fn transform_sync_calls_process_run_after_finish_run() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        // First run-state returns ready → triggers process-run
+        runner.add_response("run-state", &ready_run_state_toml());
+        // process-run response (empty on success)
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("processed", "test-run"),
+            },
+        );
+        // After process-run: run-state returns done
+        runner.add_response("run-state", &done_run_state_toml());
+        let status_toml =
+            "purgery_version = \"0.1.0-test\"\nrun_id = \"test-run\"\nnickname = \"laptop\"\nstate = \"done\"\n".to_string();
+        runner.add_response("status", &status_toml);
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(result.is_ok(), "sync must succeed");
+
+        let log = runner.command_log();
+        assert!(
+            log.iter().any(|c| c.contains("process-run")),
+            "command log must contain process-run: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|c| c.contains("process-once")),
+            "command log must NOT contain process-once: {log:?}"
+        );
+        // The process-run command must include the targeted nickname and run-id
+        assert!(
+            log.iter()
+                .filter(|c| c.contains("process-run"))
+                .any(|c| c.contains("--nickname") && c.contains("laptop")),
+            "process-run must include --nickname laptop: {log:?}"
+        );
+        assert!(
+            log.iter()
+                .filter(|c| c.contains("process-run"))
+                .any(|c| c.contains("--run-id") && c.contains("test-run")),
+            "process-run must include --run-id test-run: {log:?}"
+        );
+        assert!(
+            log.iter().any(|c| c.contains("finish-run")),
+            "command log must contain finish-run: {log:?}"
+        );
+        assert!(
+            log.iter().any(|c| c.contains("run-state")),
+            "command log must contain run-state: {log:?}"
+        );
+    }
+
+    #[test]
+    fn transform_sync_process_run_failure_is_surfaced() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        // run-state returns ready
+        runner.add_response("run-state", &ready_run_state_toml());
+        // process-run returns an error
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::RemoteFailure {
+                exit_code: Some(1),
+                stderr: "simulated process-run failure".to_string(),
+            },
+        );
+        // After process-run error, re-check: run is still ready
+        runner.add_response("run-state", &ready_run_state_toml());
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("process-run remote failure"),
+            "error must mention process-run remote failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn transform_sync_process_run_failure_is_ignored_when_run_terminal() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        // run-state returns ready
+        runner.add_response("run-state", &ready_run_state_toml());
+        // process-run returns an error
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::RemoteFailure {
+                exit_code: Some(1),
+                stderr: "simulated process-run failure".to_string(),
+            },
+        );
+        // After process-run error, re-check: run is now terminal
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
+        // Additional responses for terminal worker validation
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(
+            result.is_ok(),
+            "sync must succeed when process-run fails but run is terminal"
+        );
+    }
+
+    #[test]
+    fn process_run_error_is_preserved_when_followup_run_state_fails() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        // run-state returns ready (consumed by loop)
+        runner.add_response("run-state", &ready_run_state_toml());
+        // process-run returns an error (consumed by try_wait)
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::RemoteFailure {
+                exit_code: Some(1),
+                stderr: "simulated process-run failure".to_string(),
+            },
+        );
+        // Loop polls run-state again → still ready (non-terminal)
+        runner.add_response("run-state", &ready_run_state_toml());
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("process-run remote failure"),
+            "error must mention process-run remote failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn client_sees_ready_process_run_observes_processing_then_polls() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        // run-state returns ready → triggers process-run
+        runner.add_response("run-state", &ready_run_state_toml());
+        // process-run succeeds
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("processed", "test-run"),
+            },
+        );
+        // But another processor already claimed it — run-state shows processing
+        runner.add_response(
+            "run-state",
+            &format!("{}nickname = \"laptop\"\nrun_id = \"test-run\"\nphase = \"processing\"\nterminal = false\nmessage = \"run phase: processing\"\nupdated_at_unix_secs = 1000\nobserved_at_unix_secs = 1000\n", resp_header()),
+        );
+        // After polling, it becomes terminal
+        runner.add_response("run-state", &done_run_state_toml());
+        let status_toml =
+            "purgery_version = \"0.1.0-test\"\nrun_id = \"test-run\"\nnickname = \"laptop\"\nstate = \"done\"\n".to_string();
+        runner.add_response("status", &status_toml);
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(
+            result.is_ok(),
+            "sync must succeed even when process-run race loses: {result:?}"
+        );
+
+        let log = runner.command_log();
+        assert!(
+            log.iter().any(|c| c.contains("process-run")),
+            "command log must contain process-run: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|c| c.contains("process-once")),
+            "command log must NOT contain process-once: {log:?}"
+        );
+    }
+
+    #[test]
+    fn resume_drives_processing_when_run_is_ready() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        // Provide responses for drain_one path:
+        // 1. finish-run (already called during persistence below → drain skips it)
+        // Actually the persisted state will be WaitingForTerminalState,
+        // so drain_one goes straight to drive_server_until_terminal.
+        runner.add_response(
+            "run-state",
+            &ready_run_state_toml().replace("test-run", "test-resume-drive"),
+        );
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("processed", "test-resume-drive"),
+            },
+        );
+        runner.add_response(
+            "run-state",
+            &done_run_state_toml().replace("test-run", "test-resume-drive"),
+        );
+        runner.add_response(
+            "status",
+            &done_status_toml().replace("test-run", "test-resume-drive"),
+        );
+
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: RunId::new("test-resume-drive".into()).unwrap(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            entries: vec![],
+        };
+        let run_config = RunConfig {
+            purgery_version: "0.1.0-test".to_string(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            destination: DestinationPath::new(camino::Utf8PathBuf::from("rel")).unwrap(),
+            delete_after_import: true,
+        };
+
+        persist_client_run_state(
+            &state_dir,
+            &Nickname::new("laptop".into()).unwrap(),
+            &RunId::new("test-resume-drive".into()).unwrap(),
+            "host",
+            "purgery-server",
+            &manifest,
+            &run_config,
+            None,
+            ClientRunPhase::WaitingForTerminalState,
+        )
+        .unwrap();
+
+        let result = resume_runs(&runner, &state_dir);
+        assert!(result.is_ok(), "resume must drive processing and succeed");
+
+        let log = runner.command_log();
+        assert!(
+            log.iter().any(|c| c.contains("process-run")),
+            "resume must call process-run: {log:?}"
+        );
+    }
+
+    #[test]
+    fn resume_drives_processing_when_run_is_processing() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+
+        // First run-state call returns processing (run is already being
+        // processed by another server).  The client should call process-run
+        // on it and then poll until terminal.
+        runner.add_response("run-state", &processing_state("test-resume-proc", 1000));
+        // process-run succeeds
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("processed", "test-resume-proc"),
+            },
+        );
+        // After process-run, run-state returns done
+        runner.add_response(
+            "run-state",
+            &done_run_state_toml().replace("test-run", "test-resume-proc"),
+        );
+        runner.add_response(
+            "status",
+            &done_status_toml().replace("test-run", "test-resume-proc"),
+        );
+
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: RunId::new("test-resume-proc".into()).unwrap(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            entries: vec![],
+        };
+        let run_config = RunConfig {
+            purgery_version: "0.1.0-test".to_string(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            destination: DestinationPath::new(camino::Utf8PathBuf::from("rel")).unwrap(),
+            delete_after_import: true,
+        };
+
+        persist_client_run_state(
+            &state_dir,
+            &Nickname::new("laptop".into()).unwrap(),
+            &RunId::new("test-resume-proc".into()).unwrap(),
+            "host",
+            "purgery-server",
+            &manifest,
+            &run_config,
+            None,
+            ClientRunPhase::WaitingForTerminalState,
+        )
+        .unwrap();
+
+        let result = resume_runs(&runner, &state_dir);
+        assert!(result.is_ok(), "resume must drive processing and succeed");
+
+        let log = runner.command_log();
+        assert!(
+            log.iter().any(|c| c.contains("process-run")),
+            "resume must call process-run for processing run: {log:?}"
+        );
+    }
+
+    #[test]
+    fn processing_state_does_not_call_process_run_every_poll() {
+        // After the first process-run drive in the processing state,
+        // subsequent polls within the 60-second drive interval must
+        // not call process-run again.
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+
+        // First run-state call returns processing (idle) → triggers process-run
+        runner.add_response("run-state", &processing_state("test-backoff", 1000));
+        // process-run stays running for several polls, then exits.
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            10,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("processed", "test-backoff"),
+            },
+        );
+        // The supervisor keeps the same worker handle and does not respawn.
+        // trigger_start_run_and_recheck calls run-state again → still processing
+        runner.add_response("run-state", &processing_state("test-backoff", 1001));
+        // Second poll: run-state returns processing again
+        // (should NOT call process-run, just poll)
+        runner.add_response("run-state", &processing_state("test-backoff", 1002));
+        // Third poll: finally terminal
+        runner.add_response(
+            "run-state",
+            &done_run_state_toml().replace("test-run", "test-backoff"),
+        );
+        runner.add_response(
+            "status",
+            &done_status_toml().replace("test-run", "test-backoff"),
+        );
+        // Extra responses for terminal worker validation (worker still
+        // running after terminal observation).
+        runner.add_response(
+            "run-state",
+            &done_run_state_toml().replace("test-run", "test-backoff"),
+        );
+        runner.add_response(
+            "status",
+            &done_status_toml().replace("test-run", "test-backoff"),
+        );
+
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: RunId::new("test-backoff".into()).unwrap(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            entries: vec![],
+        };
+        let run_config = RunConfig {
+            purgery_version: "0.1.0-test".to_string(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            destination: DestinationPath::new(camino::Utf8PathBuf::from("rel")).unwrap(),
+            delete_after_import: true,
+        };
+
+        persist_client_run_state(
+            &state_dir,
+            &Nickname::new("laptop".into()).unwrap(),
+            &RunId::new("test-backoff".into()).unwrap(),
+            "host",
+            "purgery-server",
+            &manifest,
+            &run_config,
+            None,
+            ClientRunPhase::WaitingForTerminalState,
+        )
+        .unwrap();
+
+        let result = resume_runs(&runner, &state_dir);
+        assert!(result.is_ok(), "resume must succeed: {result:?}");
+
+        let log = runner.command_log();
+        let pr_count = log.iter().filter(|c| c.contains("process-run")).count();
+        assert_eq!(
+            pr_count, 1,
+            "must call process-run exactly once (first processing poll, not subsequent): {log:?}"
+        );
+    }
+
+    #[test]
+    fn ready_state_calls_process_run_immediately() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+
+        // run-state returns ready → always drives immediately
+        runner.add_response(
+            "run-state",
+            &ready_run_state_toml().replace("test-run", "test-always-ready"),
+        );
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("already_active", "test-always-ready"),
+            },
+        );
+        // After process-run: processing (another processor claimed it with active lock)
+        let active_proc = format!(
+            r#"protocol_version = {}
+purgery_version = "0.1.0-test"
+nickname = "laptop"
+run_id = "test-always-ready"
+phase = "processing"
+terminal = false
+message = "processing"
+processor_state = "active"
+updated_at_unix_secs = 1000
+observed_at_unix_secs = 1000
+"#,
+            purgery_core::PROTOCOL_VERSION
+        );
+        runner.add_response("run-state", &active_proc);
+        // Poll again: still processing with active processor (no process-run)
+        runner.add_response("run-state", &active_proc);
+        // Finally terminal
+        runner.add_response(
+            "run-state",
+            &done_run_state_toml().replace("test-run", "test-always-ready"),
+        );
+        runner.add_response(
+            "status",
+            &done_status_toml().replace("test-run", "test-always-ready"),
+        );
+
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: RunId::new("test-always-ready".into()).unwrap(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            entries: vec![],
+        };
+        let run_config = RunConfig {
+            purgery_version: "0.1.0-test".to_string(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            destination: DestinationPath::new(camino::Utf8PathBuf::from("rel")).unwrap(),
+            delete_after_import: true,
+        };
+
+        persist_client_run_state(
+            &state_dir,
+            &Nickname::new("laptop".into()).unwrap(),
+            &RunId::new("test-always-ready".into()).unwrap(),
+            "host",
+            "purgery-server",
+            &manifest,
+            &run_config,
+            None,
+            ClientRunPhase::WaitingForTerminalState,
+        )
+        .unwrap();
+
+        let result = resume_runs(&runner, &state_dir);
+        assert!(result.is_ok(), "resume must succeed: {result:?}");
+
+        let log = runner.command_log();
+        assert!(
+            log.iter().any(|c| c.contains("process-run")),
+            "ready state must call process-run: {log:?}"
+        );
+    }
+
+    #[test]
+    fn resume_processing_drives_immediately() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+
+        // First run-state call returns processing → must drive immediately
+        runner.add_response("run-state", &processing_state("test-resume-imm", 1000));
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("processed", "test-resume-imm"),
+            },
+        );
+        runner.add_response(
+            "run-state",
+            &done_run_state_toml().replace("test-run", "test-resume-imm"),
+        );
+        runner.add_response(
+            "status",
+            &done_status_toml().replace("test-run", "test-resume-imm"),
+        );
+
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: RunId::new("test-resume-imm".into()).unwrap(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            entries: vec![],
+        };
+        let run_config = RunConfig {
+            purgery_version: "0.1.0-test".to_string(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            destination: DestinationPath::new(camino::Utf8PathBuf::from("rel")).unwrap(),
+            delete_after_import: true,
+        };
+
+        persist_client_run_state(
+            &state_dir,
+            &Nickname::new("laptop".into()).unwrap(),
+            &RunId::new("test-resume-imm".into()).unwrap(),
+            "host",
+            "purgery-server",
+            &manifest,
+            &run_config,
+            None,
+            ClientRunPhase::WaitingForTerminalState,
+        )
+        .unwrap();
+
+        let result = resume_runs(&runner, &state_dir);
+        assert!(result.is_ok(), "resume must succeed: {result:?}");
+
+        let log = runner.command_log();
+        assert!(
+            log.iter().any(|c| c.contains("process-run")),
+            "must call process-run immediately on first processing observation: {log:?}"
+        );
+    }
+
+    #[test]
+    fn processing_state_process_run_error_is_surfaced() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+
+        // First run-state returns processing
+        runner.add_response("run-state", &processing_state("test-prerr", 1000));
+        // process-run fails
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::RemoteFailure {
+                exit_code: Some(1),
+                stderr: "simulated process-run failure".to_string(),
+            },
+        );
+        // Follow-up run-state is non-terminal (still processing)
+        runner.add_response("run-state", &processing_state("test-prerr", 1001));
+
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: RunId::new("test-prerr".into()).unwrap(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            entries: vec![],
+        };
+        let run_config = RunConfig {
+            purgery_version: "0.1.0-test".to_string(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            destination: DestinationPath::new(camino::Utf8PathBuf::from("rel")).unwrap(),
+            delete_after_import: true,
+        };
+
+        persist_client_run_state(
+            &state_dir,
+            &Nickname::new("laptop".into()).unwrap(),
+            &RunId::new("test-prerr".into()).unwrap(),
+            "host",
+            "purgery-server",
+            &manifest,
+            &run_config,
+            None,
+            ClientRunPhase::WaitingForTerminalState,
+        )
+        .unwrap();
+
+        let result = resume_runs(&runner, &state_dir);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("failed to resume"),
+            "must fail to resume due to process-run error: {err}"
+        );
+    }
+
+    #[test]
+    fn processing_state_process_run_error_ignored_only_if_followup_terminal() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+
+        // First run-state returns processing
+        runner.add_response("run-state", &processing_state("test-prterm", 1000));
+        // process-run fails
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::RemoteFailure {
+                exit_code: Some(1),
+                stderr: "simulated process-run failure".to_string(),
+            },
+        );
+        // But follow-up run-state is terminal (another processor finished it)
+        runner.add_response(
+            "run-state",
+            &done_run_state_toml().replace("test-run", "test-prterm"),
+        );
+        runner.add_response(
+            "status",
+            &done_status_toml().replace("test-run", "test-prterm"),
+        );
+        // Additional responses for terminal worker validation
+        runner.add_response(
+            "run-state",
+            &done_run_state_toml().replace("test-run", "test-prterm"),
+        );
+        runner.add_response(
+            "status",
+            &done_status_toml().replace("test-run", "test-prterm"),
+        );
+
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: RunId::new("test-prterm".into()).unwrap(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            entries: vec![],
+        };
+        let run_config = RunConfig {
+            purgery_version: "0.1.0-test".to_string(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            destination: DestinationPath::new(camino::Utf8PathBuf::from("rel")).unwrap(),
+            delete_after_import: true,
+        };
+
+        persist_client_run_state(
+            &state_dir,
+            &Nickname::new("laptop".into()).unwrap(),
+            &RunId::new("test-prterm".into()).unwrap(),
+            "host",
+            "purgery-server",
+            &manifest,
+            &run_config,
+            None,
+            ClientRunPhase::WaitingForTerminalState,
+        )
+        .unwrap();
+
+        let result = resume_runs(&runner, &state_dir);
+        assert!(
+            result.is_ok(),
+            "must succeed even when process-run fails if follow-up is terminal: {result:?}"
+        );
     }
 
     fn src_with_file(tmp: &tempfile::TempDir) -> String {
@@ -1674,7 +3114,10 @@ state = "done"
         runner.add_response("begin-run", &begin_resp_toml());
         runner.add_response(
             "prepare-run",
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
         );
         runner.add_rsync_error("laptop", "simulated rsync failure");
 
@@ -1696,7 +3139,10 @@ state = "done"
         runner.add_response("begin-run", &begin_resp_toml());
         runner.add_response(
             "prepare-run",
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
         );
         runner.add_rsync_error("laptop", "simulated rsync failure");
 
@@ -1738,7 +3184,10 @@ state = "done"
         runner.add_response("begin-run", &begin_resp_toml());
         runner.add_response(
             "prepare-run",
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
         );
         runner.add_error("finish-run", "simulated finish failure");
 
@@ -1776,7 +3225,10 @@ state = "done"
         runner.add_response("begin-run", &begin);
         runner.add_response(
             "prepare-run",
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
         );
         runner.add_error("heartbeat-run", "simulated heartbeat failure");
 
@@ -1835,7 +3287,10 @@ state = "done"
         runner.add_response("begin-run", &begin);
         runner.add_response(
             "prepare-run",
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-run\"\n",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
         );
         runner.add_response("heartbeat-run", "");
         runner.add_response("run-state", &done_run_state_toml());
@@ -1862,8 +3317,12 @@ state = "done"
         let result = Arc::new(Mutex::new(None::<Result<()>>));
         let result_clone = Arc::clone(&result);
         let sync_handle = std::thread::spawn(move || {
-            *result_clone.lock().unwrap() =
-                Some(run_sync_with_run_id(&runner_for_sync, &args, &run_id));
+            *result_clone.lock().unwrap() = Some(run_sync_with_run_id(
+                &runner_for_sync,
+                &args,
+                &run_id,
+                ServerRunSetup::Needed,
+            ));
         });
 
         // Wait for rsync hook to fire (staging in progress)
@@ -1925,14 +3384,17 @@ state = "done"
         // Server returns a resolved absolute destination.
         runner.add_response(
             "prepare-run",
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"laptop\"\nrun_id = \"test-resolved-dest\"\n\
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-resolved-dest\"\n\
              destination = \"/server/resolved/absolute/path\"\n",
+                resp_header()
+            ),
         );
         runner.add_response("heartbeat-run", "");
         // Make finish-run fail so UploadCompleteFinishPending persists.
         runner.add_error("finish-run", "simulated finish failure");
 
-        let result = run_sync_with_run_id(&runner, &args, &run_id);
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
         assert!(result.is_err(), "sync must fail when finish-run fails");
 
         // The persisted UploadCompleteFinishPending state must contain
@@ -2057,7 +3519,10 @@ state = "done"
         runner.add_response("begin-run", &begin);
         runner.add_response(
             "prepare-run",
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\nnickname = \"host\"\nrun_id = \"test-run\"\n",
+            &format!(
+                "{}nickname = \"host\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
         );
         runner.add_response("heartbeat-run", "");
         runner.add_response(
@@ -2069,7 +3534,7 @@ state = "done"
         runner.add_response("status", &status_toml);
         runner.add_response("finish-run", "");
 
-        run_sync_with_run_id(&runner, &args, &run_id).unwrap();
+        run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed).unwrap();
 
         let written = runner.written_files();
         let manifest_content = written
@@ -2431,5 +3896,1277 @@ state = "done"
                 );
             }
         }
+    }
+
+    // ── GC lifecycle tests ──────────────────────────────────────────
+
+    #[test]
+    fn gc_started_before_begin_run() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_spawned_cmd_exit(
+            "'gc'",
+            0,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("processed", "test-run"),
+            },
+        );
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        runner.add_response("run-state", &ready_run_state_toml());
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("processed", "test-run"),
+            },
+        );
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        if let Err(ref e) = result {
+            eprintln!("no_duplicate error: {e:#}");
+            panic!("no_duplicate: sync must succeed");
+        }
+
+        let log = runner.command_log();
+        let gc_pos = log.iter().position(|c| c.contains("'gc'"));
+        let begin_pos = log.iter().position(|c| c.contains("begin-run"));
+        assert!(gc_pos.is_some(), "gc must appear in command log: {log:?}");
+        assert!(begin_pos.is_some(), "begin-run must appear in command log");
+        assert!(
+            gc_pos.unwrap() < begin_pos.unwrap(),
+            "gc must appear before begin-run in command log"
+        );
+    }
+
+    #[test]
+    fn gc_success_does_not_affect_sync_success() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_spawned_cmd_exit(
+            "'gc'",
+            0,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("processed", "test-run"),
+            },
+        );
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("processed", "test-run"),
+            },
+        );
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(result.is_ok(), "sync should succeed");
+    }
+
+    #[test]
+    fn gc_remote_failure_logged_but_sync_succeeds() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_spawned_cmd_exit(
+            "'gc'",
+            0,
+            RemoteCommandExit::RemoteFailure {
+                exit_code: Some(1),
+                stderr: "simulated gc failure".to_string(),
+            },
+        );
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("processed", "test-run"),
+            },
+        );
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(
+            result.is_ok(),
+            "sync must succeed even when GC fails: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn gc_transport_failure_logged_but_sync_succeeds() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_spawned_cmd_exit(
+            "'gc'",
+            0,
+            RemoteCommandExit::TransportFailure {
+                exit_code: Some(255),
+                details: "ssh connection failed".to_string(),
+            },
+        );
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("processed", "test-run"),
+            },
+        );
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(
+            result.is_ok(),
+            "sync must succeed even when GC transport fails: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn transform_sync_error_still_settles_gc() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_spawned_cmd_exit(
+            "'gc'",
+            0,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("processed", "test-run"),
+            },
+        );
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_write_error("run.toml", "write failed during staging");
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(result.is_err(), "sync must fail when write fails");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("write failed during staging"),
+            "error must preserve original staging error, got: {err}"
+        );
+
+        let log = runner.command_log();
+        assert!(
+            log.iter().any(|c| c.contains("'gc'")),
+            "gc must appear in command log even after staging failure"
+        );
+    }
+
+    #[test]
+    fn passthrough_sync_does_not_start_gc() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let run_id = RunId::new("test-run".into()).unwrap();
+        let args = SyncArgs {
+            transform: None,
+            delete_after_import: false,
+            split: None,
+            state_dir: Some(state_dir),
+            source: src_with_file(&tmp),
+            destination: "host:dest".to_string(),
+            server_command: "purgery-server".to_string(),
+        };
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(result.is_ok(), "passthrough sync must succeed");
+
+        let log = runner.command_log();
+        assert!(
+            !log.iter().any(|c| c.contains("'gc'")),
+            "passthrough sync must not start GC: {log:?}"
+        );
+    }
+
+    #[test]
+    fn cleanup_sync_without_transform_does_not_start_gc() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let run_id = RunId::new("test-run".into()).unwrap();
+        let args = SyncArgs {
+            transform: None,
+            delete_after_import: true,
+            split: None,
+            state_dir: Some(state_dir),
+            source: src_with_file(&tmp),
+            destination: "host:dest".to_string(),
+            server_command: "purgery-server".to_string(),
+        };
+
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("processed", "test-run"),
+            },
+        );
+        runner.add_response("run-state", &done_run_state_toml());
+        let status = r#"purgery_version = "0.1.0-test"
+run_id = "test-run"
+nickname = "laptop"
+state = "done"
+
+[[entries]]
+local_path = "/tmp/test"
+relative_path = "test"
+status = "imported"
+"#
+        .to_string();
+        runner.add_response("status", &status);
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(result.is_ok(), "cleanup sync must succeed");
+
+        let log = runner.command_log();
+        assert!(
+            !log.iter().any(|c| c.contains("'gc'")),
+            "cleanup sync without transform must not start GC: {log:?}"
+        );
+    }
+
+    #[test]
+    fn no_start_gc_in_log() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_spawned_cmd_exit(
+            "'gc'",
+            0,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("processed", "test-run"),
+            },
+        );
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("processed", "test-run"),
+            },
+        );
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(result.is_ok());
+
+        let log = runner.command_log();
+        for cmd in &["start-run", "worker-run", "start-gc", "gc-worker"] {
+            assert!(
+                !log.iter().any(|c| c.contains(cmd)),
+                "forbidden command '{cmd}' found in log: {log:?}"
+            );
+        }
+    }
+
+    // ── Process-run regression tests ───────────────────────────────
+
+    #[test]
+    fn transform_sync_uses_process_run_not_start_run() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_spawned_cmd_exit(
+            "'gc'",
+            0,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("processed", "test-run"),
+            },
+        );
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        // Run-state must show non-terminal (ready) so process-run is spawned
+        runner.add_response("run-state", &ready_run_state_toml());
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("processed", "test-run"),
+            },
+        );
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(result.is_ok());
+
+        let log = runner.command_log();
+        assert!(
+            log.iter().any(|c| c.contains("process-run")),
+            "transform sync must spawn process-run: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|c| c.contains("start-run")),
+            "transform sync must not use start-run: {log:?}"
+        );
+    }
+
+    #[test]
+    fn transport_failure_restarts_process_run_when_ready() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_spawned_cmd_exit(
+            "'gc'",
+            0,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("processed", "test-run"),
+            },
+        );
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        runner.add_response("run-state", &ready_run_state_toml());
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::TransportFailure {
+                exit_code: Some(255),
+                details: "ssh failed".to_string(),
+            },
+        );
+        runner.add_response("run-state", &ready_run_state_toml());
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("processed", "test-run"),
+            },
+        );
+        runner.add_response("run-state", &ready_run_state_toml());
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(
+            result.is_ok(),
+            "sync should survive transport failure + restart"
+        );
+
+        let log = runner.command_log();
+        let pr_count = log.iter().filter(|c| c.contains("process-run")).count();
+        assert!(
+            pr_count >= 2,
+            "process-run must be restarted after transport failure, count={pr_count}: {log:?}"
+        );
+    }
+
+    #[test]
+    fn transport_failure_does_not_restart_when_processing_active() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_spawned_cmd_exit(
+            "'gc'",
+            0,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("processed", "test-run"),
+            },
+        );
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        runner.add_response("run-state", &ready_run_state_toml());
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("processed", "test-run"),
+            },
+        );
+        let active_processing = format!(
+            r#"protocol_version = {}
+purgery_version = "0.1.0-test"
+nickname = "laptop"
+run_id = "test-run"
+phase = "processing"
+terminal = false
+message = "processing"
+processor_state = "active"
+updated_at_unix_secs = 1000
+observed_at_unix_secs = 1000
+"#,
+            purgery_core::PROTOCOL_VERSION
+        );
+        runner.add_response("run-state", &active_processing);
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(result.is_ok(), "sync must succeed");
+
+        let log = runner.command_log();
+        let pr_count = log.iter().filter(|c| c.contains("process-run")).count();
+        assert!(
+            pr_count <= 2,
+            "process-run must not be respawned while processing is active, count={pr_count}: {log:?}"
+        );
+    }
+
+    #[test]
+    fn no_duplicate_process_run_while_handle_running() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_spawned_cmd_exit(
+            "'gc'",
+            0,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("processed", "test-run"),
+            },
+        );
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        runner.add_response("run-state", &ready_run_state_toml());
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            3,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("processed", "test-run"),
+            },
+        );
+        runner.add_response("run-state", &ready_run_state_toml());
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
+        // Extra responses for terminal worker validation
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(result.is_ok(), "sync must succeed");
+
+        let log = runner.command_log();
+        let pr_count = log.iter().filter(|c| c.contains("process-run")).count();
+        assert!(
+            pr_count == 1,
+            "process-run must be spawned exactly once (handle was still running), count={pr_count}: {log:?}"
+        );
+    }
+
+    // ── Server-run-setup tests ─────────────────────────────────────
+
+    #[test]
+    fn transform_split_matches_inits_gc_once_total() {
+        // Verify that when a top-level split sync calls run_sync_with_run_id
+        // for multiple entries, the ServerRunSetup prevents duplicate
+        // version check and GC.  We test this by calling the non-split
+        // path twice — once with Needed, once with AlreadyDone — and
+        // checking that version/GC appear only once total.
+
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+
+        // First call: ServerRunSetup::Needed — should run version + GC.
+        {
+            let runner = mk_runner();
+            let args = transform_args(&tmp, &state_dir);
+            runner.add_response(
+                "gc",
+                &format!(
+                    "protocol_version = {}\npurgery_version = \"0.1.0-test\"\n",
+                    purgery_core::PROTOCOL_VERSION
+                ),
+            );
+            runner.add_response("begin-run", &begin_resp_toml());
+            runner.add_response(
+                "prepare-run",
+                &format!(
+                    "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                    resp_header()
+                ),
+            );
+            runner.add_response("heartbeat-run", "");
+            runner.add_response("finish-run", "");
+            runner.add_response("run-state", &ready_run_state_toml());
+            runner.add_spawned_cmd_exit(
+                "process-run",
+                0,
+                RemoteCommandExit::Success {
+                    stdout: process_run_ok_toml("processed", "test-run"),
+                },
+            );
+            runner.add_response("run-state", &done_run_state_toml());
+            runner.add_response("status", &done_status_toml());
+
+            let run_id = RunId::new("test-run".into()).unwrap();
+            let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+            assert!(
+                result.is_ok(),
+                "first entry must succeed: {:?}",
+                result.err()
+            );
+        }
+
+        // Second call: ServerRunSetup::AlreadyDone — must NOT run
+        // version or GC again.
+        {
+            let runner = mk_runner();
+            let args = transform_args(&tmp, &state_dir);
+            runner.add_response("begin-run", &begin_resp_toml());
+            runner.add_response(
+                "prepare-run",
+                &format!(
+                    "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                    resp_header()
+                ),
+            );
+            runner.add_response("heartbeat-run", "");
+            runner.add_response("finish-run", "");
+            runner.add_response("run-state", &ready_run_state_toml());
+            runner.add_spawned_cmd_exit(
+                "process-run",
+                0,
+                RemoteCommandExit::Success {
+                    stdout: process_run_ok_toml("processed", "test-run"),
+                },
+            );
+            runner.add_response("run-state", &done_run_state_toml());
+            runner.add_response("status", &done_status_toml());
+
+            let run_id = RunId::new("test-run".into()).unwrap();
+            let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::AlreadyDone);
+            assert!(
+                result.is_ok(),
+                "second entry must succeed: {:?}",
+                result.err()
+            );
+
+            // The AlreadyDone variant must not have added version or gc.
+            let log = runner.command_log();
+            assert!(
+                !log.iter().any(|c| c.contains("'version'")),
+                "AlreadyDone call must not re-check version: {log:?}"
+            );
+            assert!(
+                !log.iter().any(|c| c.contains("'gc'")),
+                "AlreadyDone call must not re-run gc: {log:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn transform_split_no_matches_does_not_contact_server() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let src = tmp.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("a.txt"), "data").unwrap();
+
+        let args = SyncArgs {
+            transform: Some("transform".into()),
+            delete_after_import: true,
+            split: Some("*.mp4".into()),
+            state_dir: Some(state_dir),
+            source: src.to_string_lossy().to_string(),
+            destination: "laptop:rel".to_string(),
+            server_command: "purgery-server".to_string(),
+        };
+
+        let run_id = RunId::new("test-split-nomatch".into()).unwrap();
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(result.is_ok(), "no-match split must succeed");
+
+        let log = runner.command_log();
+        assert!(
+            !log.iter().any(|c| c.contains("'version'")),
+            "no-match split must not call version: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|c| c.contains("'gc'")),
+            "no-match split must not call gc: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|c| c.contains("begin-run")),
+            "no-match split must not call begin-run: {log:?}"
+        );
+    }
+
+    #[test]
+    fn passthrough_split_does_not_call_server_commands() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let src = tmp.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("a.mp4"), "data").unwrap();
+
+        let args = SyncArgs {
+            transform: None,
+            delete_after_import: false,
+            split: Some("*.mp4".into()),
+            state_dir: Some(state_dir),
+            source: src.to_string_lossy().to_string(),
+            destination: "host:/dest".to_string(),
+            server_command: "purgery-server".to_string(),
+        };
+
+        let run_id = RunId::new("test-passthrough-split".into()).unwrap();
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(result.is_ok(), "passthrough split must succeed");
+
+        let log = runner.command_log();
+        for cmd in &[
+            "'version'",
+            "'gc'",
+            "begin-run",
+            "prepare-run",
+            "finish-run",
+            "process-run",
+            "run-state",
+            "status",
+        ] {
+            assert!(
+                !log.iter().any(|c| c.contains(cmd)),
+                "passthrough split must not call {cmd}: {log:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn passthrough_cleanup_does_not_call_server_commands() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let file_path = tmp.path().join("video.mp4");
+        fs::write(&file_path, "data").unwrap();
+
+        let args = SyncArgs {
+            transform: None,
+            delete_after_import: true,
+            split: None,
+            state_dir: Some(state_dir),
+            source: file_path.to_string_lossy().to_string(),
+            destination: "host:/dest".to_string(),
+            server_command: "purgery-server".to_string(),
+        };
+
+        let run_id = RunId::new("test-passthrough-cleanup".into()).unwrap();
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(result.is_ok(), "passthrough with cleanup must succeed");
+
+        let log = runner.command_log();
+        for cmd in &[
+            "'version'",
+            "'gc'",
+            "begin-run",
+            "prepare-run",
+            "finish-run",
+            "process-run",
+            "run-state",
+            "status",
+        ] {
+            assert!(
+                !log.iter().any(|c| c.contains(cmd)),
+                "passthrough with cleanup must not call {cmd}: {log:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn normal_transform_calls_version_and_gc_once() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_response(
+            "gc",
+            &format!(
+                "protocol_version = {}\npurgery_version = \"0.1.0-test\"\n",
+                purgery_core::PROTOCOL_VERSION
+            ),
+        );
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        runner.add_response("run-state", &ready_run_state_toml());
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("processed", "test-run"),
+            },
+        );
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(
+            result.is_ok(),
+            "transform sync must succeed: {:?}",
+            result.err()
+        );
+
+        let log = runner.command_log();
+        assert!(
+            log.iter().any(|c| c.contains("'version'")),
+            "transform sync must call version: {log:?}"
+        );
+        assert!(
+            log.iter().any(|c| c.contains("'gc'")),
+            "transform sync must call gc: {log:?}"
+        );
+        assert!(
+            log.iter().any(|c| c.contains("begin-run")),
+            "transform sync must call begin-run: {log:?}"
+        );
+        assert!(
+            log.iter().any(|c| c.contains("process-run")),
+            "transform sync must call process-run: {log:?}"
+        );
+        assert!(
+            log.iter().any(|c| c.contains("status")),
+            "transform sync must call status: {log:?}"
+        );
+
+        let version_count = log.iter().filter(|c| c.contains("'version'")).count();
+        let gc_count = log.iter().filter(|c| c.contains("'gc'")).count();
+        assert_eq!(
+            version_count, 1,
+            "version called {version_count} times, expected 1"
+        );
+        assert_eq!(gc_count, 1, "gc called {gc_count} times, expected 1");
+    }
+
+    // ── Worker lifecycle tests ─────────────────────────────────────
+
+    #[test]
+    fn finish_worker_already_exited_does_not_hang() {
+        let runner = mk_runner();
+        // terminal validation needs run-state and status responses
+        let term_state = format!(
+            r#"protocol_version = {}
+purgery_version = "0.1.0-test"
+nickname = "laptop"
+run_id = "r"
+phase = "done"
+terminal = true
+message = ""
+updated_at_unix_secs = 1000
+observed_at_unix_secs = 1000
+"#,
+            purgery_core::PROTOCOL_VERSION
+        );
+        let term_status = r#"purgery_version = "0.1.0-test"
+run_id = "r"
+nickname = "laptop"
+state = "done"
+"#
+        .to_string();
+        runner.add_response("run-state", &term_state);
+        runner.add_response("status", &term_status);
+        runner.add_spawned_cmd_exit(
+            "worker-test",
+            0,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("processed", "r"),
+            },
+        );
+        let handle = runner
+            .spawn_server_cmd("host", "ps", &["worker-test"])
+            .unwrap();
+        let mut worker = Some(handle);
+        finish_worker_after_terminal(
+            &mut worker,
+            &Nickname::new("laptop".into()).unwrap(),
+            &RunId::new("r".into()).unwrap(),
+        );
+        assert!(worker.is_none(), "worker must be consumed");
+    }
+
+    #[test]
+    fn finish_worker_waits_gracefully_for_scripted_exit() {
+        let runner = mk_runner();
+        let term_state = format!(
+            r#"protocol_version = {}
+purgery_version = "0.1.0-test"
+nickname = "laptop"
+run_id = "r"
+phase = "done"
+terminal = true
+message = ""
+updated_at_unix_secs = 1000
+observed_at_unix_secs = 1000
+"#,
+            purgery_core::PROTOCOL_VERSION
+        );
+        let term_status = r#"purgery_version = "0.1.0-test"
+run_id = "r"
+nickname = "laptop"
+state = "done"
+"#
+        .to_string();
+        runner.add_response("run-state", &term_state);
+        runner.add_response("status", &term_status);
+        runner.add_spawned_cmd_exit(
+            "worker-test",
+            2,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("processed", "r"),
+            },
+        );
+        let handle = runner
+            .spawn_server_cmd("host", "ps", &["worker-test"])
+            .unwrap();
+        let mut worker = Some(handle);
+        finish_worker_after_terminal(
+            &mut worker,
+            &Nickname::new("laptop".into()).unwrap(),
+            &RunId::new("r".into()).unwrap(),
+        );
+        assert!(
+            worker.is_none(),
+            "worker must be consumed after graceful wait"
+        );
+    }
+
+    #[test]
+    fn finish_worker_terminates_when_worker_never_exits() {
+        let runner = mk_runner();
+        let handle = runner
+            .spawn_server_cmd("host", "ps", &["forever-worker"])
+            .unwrap();
+        let mut worker = Some(handle);
+        finish_worker_after_terminal(
+            &mut worker,
+            &Nickname::new("laptop".into()).unwrap(),
+            &RunId::new("r".into()).unwrap(),
+        );
+        assert!(
+            worker.is_none(),
+            "worker must be consumed after termination"
+        );
+    }
+
+    #[test]
+    fn finish_worker_is_noop_when_none() {
+        let mut worker: Option<RemoteCommandHandle> = None;
+        finish_worker_after_terminal(
+            &mut worker,
+            &Nickname::new("laptop".into()).unwrap(),
+            &RunId::new("r".into()).unwrap(),
+        );
+        assert!(worker.is_none());
+    }
+
+    #[test]
+    fn terminate_worker_on_error_clears_handle() {
+        let runner = mk_runner();
+        runner.add_spawned_cmd_exit(
+            "worker-test",
+            5,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("processed", "r"),
+            },
+        );
+        let handle = runner
+            .spawn_server_cmd("host", "ps", &["worker-test"])
+            .unwrap();
+        let mut worker = Some(handle);
+        terminate_worker_on_error(&mut worker);
+        assert!(
+            worker.is_none(),
+            "worker must be consumed after error termination"
+        );
+    }
+
+    #[test]
+    fn terminate_worker_on_error_noop_when_none() {
+        let mut worker: Option<RemoteCommandHandle> = None;
+        terminate_worker_on_error(&mut worker);
+        assert!(worker.is_none());
+    }
+
+    #[test]
+    fn terminal_state_with_running_worker_does_not_hang() {
+        // Integration-style test: drive_server_until_terminal sees
+        // terminal state while a process-run worker is still running.
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        // Script the transform flow.  The process-run exit is not
+        // scripted (worker runs forever), but the run-state should
+        // become terminal on the first poll, triggering the
+        // finish_worker_after_terminal path.
+        runner.add_response(
+            "gc",
+            &format!(
+                "protocol_version = {}\npurgery_version = \"0.1.0-test\"\n",
+                purgery_core::PROTOCOL_VERSION
+            ),
+        );
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        // Run-state returns terminal immediately → client should not spawn process-run.
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(
+            result.is_ok(),
+            "sync must succeed when run is already terminal: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn remote_failure_with_fresh_terminal_succeeds() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_response(
+            "gc",
+            &format!(
+                "protocol_version = {}\npurgery_version = \"0.1.0-test\"\n",
+                purgery_core::PROTOCOL_VERSION
+            ),
+        );
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        // Run-state shows ready → triggers process-run spawn
+        runner.add_response("run-state", &ready_run_state_toml());
+        // process-run returns remote failure
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::RemoteFailure {
+                exit_code: Some(1),
+                stderr: "simulated failure".to_string(),
+            },
+        );
+        // Fresh run-state shows terminal → should succeed
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
+        // Additional responses for terminal worker validation
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(
+            result.is_ok(),
+            "sync must succeed when process-run fails but fresh state is terminal: {:?}",
+            result.err()
+        );
+    }
+
+    // ── Processor state unknown/missing regression tests ───────────
+
+    #[test]
+    fn processing_unknown_processor_state_does_not_spawn() {
+        // A processing run with unknown processor_state and no local
+        // worker must not spawn process-run and must return an error.
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        // First poll returns processing with unknown processor_state
+        runner.add_response(
+            "run-state",
+            &processing_state_with_processor("test-run", 1000, "unknown"),
+        );
+        // No process-run exit is scripted — no spawn should happen.
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(
+            result.is_err(),
+            "unknown processor_state with no worker must produce error"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("processor ownership cannot be determined"),
+            "error must mention unclear processor ownership: {err}"
+        );
+
+        let log = runner.command_log();
+        let pr_count = log.iter().filter(|c| c.contains("process-run")).count();
+        assert_eq!(
+            pr_count, 0,
+            "no process-run must be spawned for unknown processor_state: {log:?}"
+        );
+    }
+
+    #[test]
+    fn processing_missing_processor_state_does_not_spawn() {
+        // A processing run with None processor_state and no local
+        // worker must not spawn process-run and must return an error.
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        // First poll returns processing with no processor_state field.
+        let no_proc_state = format!(
+            r#"protocol_version = {}
+purgery_version = "0.1.0-test"
+nickname = "laptop"
+run_id = "test-run"
+phase = "processing"
+terminal = false
+message = "run phase: processing"
+updated_at_unix_secs = 1000
+observed_at_unix_secs = 1000
+"#,
+            purgery_core::PROTOCOL_VERSION
+        );
+        runner.add_response("run-state", &no_proc_state);
+        // No process-run exit is scripted — no spawn should happen.
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(
+            result.is_err(),
+            "missing processor_state with no worker must produce error"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("processor ownership cannot be determined"),
+            "error must mention unclear processor ownership: {err}"
+        );
+
+        let log = runner.command_log();
+        let pr_count = log.iter().filter(|c| c.contains("process-run")).count();
+        assert_eq!(
+            pr_count, 0,
+            "no process-run must be spawned for missing processor_state: {log:?}"
+        );
+    }
+
+    #[test]
+    fn processing_idle_processor_state_spawns_process_run() {
+        // A processing run with idle processor_state and no local
+        // worker must spawn process-run.
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_response(
+            "gc",
+            &format!(
+                "protocol_version = {}\npurgery_version = \"0.1.0-test\"\n",
+                purgery_core::PROTOCOL_VERSION
+            ),
+        );
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        // First poll returns processing with idle processor_state
+        runner.add_response(
+            "run-state",
+            &processing_state_with_processor("test-run", 1000, "idle"),
+        );
+        // process-run exits with success → terminal
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("processed", "test-run"),
+            },
+        );
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
+        // Extra for terminal worker validation
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response("status", &done_status_toml());
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(
+            result.is_ok(),
+            "idle processor_state must spawn process-run: {:?}",
+            result.err()
+        );
+
+        let log = runner.command_log();
+        assert!(
+            log.iter().any(|c| c.contains("process-run")),
+            "process-run must be spawned for idle processor_state: {log:?}"
+        );
     }
 }

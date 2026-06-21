@@ -4,6 +4,268 @@ use std::collections::HashMap;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
+/// Result of a spawned remote command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RemoteCommandExit {
+    /// Command exited with status 0.  Includes captured stdout when
+    /// the runner captures it (e.g. for `process-run` responses).
+    Success { stdout: String },
+    /// Command exited with nonzero status (remote semantic failure).
+    RemoteFailure {
+        exit_code: Option<i32>,
+        stderr: String,
+    },
+    /// SSH transport failure (exit code 255, local spawn error, etc.).
+    TransportFailure {
+        exit_code: Option<i32>,
+        details: String,
+    },
+    /// Locally killed.
+    Killed,
+}
+
+/// A handle to a remotely spawned server command that may be long-running.
+pub(crate) struct RemoteCommandHandle {
+    kind: RemoteCommandHandleKind,
+    #[allow(dead_code)]
+    spawned_cmd_contains: String,
+}
+
+enum RemoteCommandHandleKind {
+    Real {
+        child: Option<std::process::Child>,
+        stdout_result: Option<Vec<u8>>,
+        stderr_result: Option<Vec<u8>>,
+        stdout_drainer: Option<std::thread::JoinHandle<Vec<u8>>>,
+        stderr_drainer: Option<std::thread::JoinHandle<Vec<u8>>>,
+    },
+    Fake {
+        remaining_polls: Arc<Mutex<Option<(u64, RemoteCommandExit)>>>,
+        exit: Arc<Mutex<Option<RemoteCommandExit>>>,
+    },
+}
+
+const MAX_STDOUT_BYTES: usize = 64 * 1024;
+const MAX_STDERR_BYTES: usize = 64 * 1024;
+
+/// Spawn a drainer thread that reads from a pipe and keeps a bounded
+/// tail of the output.  Used for both stdout and stderr of spawned commands.
+fn spawn_drainer<R: std::io::Read + Send + 'static>(
+    mut pipe: R,
+    max_bytes: usize,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::with_capacity(max_bytes);
+        let mut truncated = false;
+        let mut chunk = [0u8; 4096];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.len() > max_bytes {
+                        let excess = buf.len() - max_bytes;
+                        let _ = buf.drain(..excess);
+                        truncated = true;
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        if truncated {
+            let marker = format!("...(output truncated; showing last {max_bytes} bytes)...\n");
+            let mut result = Vec::with_capacity(marker.len() + buf.len());
+            result.extend_from_slice(marker.as_bytes());
+            result.extend_from_slice(&buf);
+            result
+        } else {
+            buf
+        }
+    })
+}
+
+impl RemoteCommandHandle {
+    /// Try to check if the command has exited. Returns `Ok(None)` if still running,
+    /// `Ok(Some(exit))` if finished, or `Err` on waitpid failure.
+    pub(crate) fn try_wait(&mut self) -> Result<Option<RemoteCommandExit>> {
+        match &mut self.kind {
+            RemoteCommandHandleKind::Real {
+                child,
+                stdout_result,
+                stderr_result,
+                stdout_drainer,
+                stderr_drainer,
+            } => {
+                if let Some(child) = child.as_mut() {
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            // Child has exited — both pipes have EOF'd, so
+                            // both drainer threads will finish imminently.
+                            let drained_stdout = stdout_drainer
+                                .take()
+                                .and_then(|h| h.join().ok())
+                                .unwrap_or_default();
+                            stdout_result.get_or_insert(drained_stdout);
+
+                            let drained_stderr = stderr_drainer
+                                .take()
+                                .and_then(|h| h.join().ok())
+                                .unwrap_or_default();
+                            stderr_result.get_or_insert(drained_stderr);
+
+                            let exit_code = status.code();
+                            if status.success() {
+                                let captured = stdout_result
+                                    .as_ref()
+                                    .map(|b| String::from_utf8_lossy(b).to_string())
+                                    .unwrap_or_default();
+                                Ok(Some(RemoteCommandExit::Success { stdout: captured }))
+                            } else if exit_code == Some(255) {
+                                let details = match stderr_result.as_ref() {
+                                    Some(b) if !b.is_empty() => {
+                                        let s = String::from_utf8_lossy(b);
+                                        format!("SSH exit code 255: {s}")
+                                    }
+                                    _ => "SSH exit code 255".to_string(),
+                                };
+                                Ok(Some(RemoteCommandExit::TransportFailure {
+                                    exit_code,
+                                    details,
+                                }))
+                            } else if let Some(code) = exit_code {
+                                let stderr = stderr_result
+                                    .as_ref()
+                                    .map(|b| String::from_utf8_lossy(b).to_string())
+                                    .unwrap_or_default();
+                                Ok(Some(RemoteCommandExit::RemoteFailure {
+                                    exit_code: Some(code),
+                                    stderr: stderr.trim().to_string(),
+                                }))
+                            } else {
+                                // status.code() == None means the process was
+                                // terminated by a signal — this is a local /
+                                // transport failure, not a remote semantic error.
+                                let details = match stderr_result.as_ref() {
+                                    Some(b) if !b.is_empty() => {
+                                        let s = String::from_utf8_lossy(b);
+                                        format!("local SSH process terminated by signal: {s}")
+                                    }
+                                    _ => "local SSH process terminated by signal".to_string(),
+                                };
+                                Ok(Some(RemoteCommandExit::TransportFailure {
+                                    exit_code: None,
+                                    details,
+                                }))
+                            }
+                        }
+                        Ok(None) => Ok(None),
+                        Err(e) => Ok(Some(RemoteCommandExit::TransportFailure {
+                            exit_code: None,
+                            details: format!("waitpid error: {e}"),
+                        })),
+                    }
+                } else {
+                    Ok(Some(RemoteCommandExit::Killed))
+                }
+            }
+            RemoteCommandHandleKind::Fake {
+                remaining_polls,
+                exit,
+            } => {
+                // Decrement the poll counter.
+                let mut rem = remaining_polls.lock().unwrap();
+                if let Some((count, ref result)) = rem.as_mut() {
+                    if *count == 0 {
+                        let res = result.clone();
+                        exit.lock().unwrap().get_or_insert(res);
+                        *rem = None;
+                    } else {
+                        *count -= 1;
+                    }
+                }
+                Ok(exit.lock().unwrap().clone())
+            }
+        }
+    }
+
+    /// Kill the local child process.  After calling this you must still
+    /// wait/reap the child and join the stderr drainer — this method alone
+    /// is not sufficient for full cleanup.  Prefer `terminate_and_reap`.
+    fn kill_raw(&mut self) -> Result<()> {
+        match &mut self.kind {
+            RemoteCommandHandleKind::Real { child, .. } => {
+                if let Some(child) = child.as_mut() {
+                    child.kill()?;
+                }
+                Ok(())
+            }
+            RemoteCommandHandleKind::Fake {
+                ref remaining_polls,
+                ref exit,
+            } => {
+                // Mark as killed so that wait() / terminate_and_reap
+                // can observe the exit.
+                exit.lock()
+                    .unwrap()
+                    .get_or_insert(RemoteCommandExit::Killed);
+                *remaining_polls.lock().unwrap() = None;
+                Ok(())
+            }
+        }
+    }
+
+    /// Block until the remote command exits.  For the real runner this
+    /// polls `try_wait` with a small delay.  For the fake runner it
+    /// returns the scripted exit (waiting if scripted with polls).
+    pub(crate) fn wait(&mut self) -> Result<RemoteCommandExit> {
+        loop {
+            match self.try_wait()? {
+                Some(exit) => return Ok(exit),
+                None => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        }
+    }
+
+    /// Wait up to `timeout` for the command to exit.  Returns
+    /// `Ok(Some(exit))` if the command exited within the timeout,
+    /// `Ok(None)` if still running.
+    pub(crate) fn wait_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<Option<RemoteCommandExit>> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match self.try_wait()? {
+                Some(exit) => return Ok(Some(exit)),
+                None => {
+                    if std::time::Instant::now() >= deadline {
+                        return Ok(None);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        }
+    }
+
+    /// Kill the command (if still running), wait for it to exit, and
+    /// join the stderr drainer.  After this call the handle is fully
+    /// reaped: no child or drainer remains running.
+    pub(crate) fn terminate_and_reap(&mut self) -> Result<RemoteCommandExit> {
+        // For the real runner, send kill then wait for exit + drainer.
+        let _ = self.kill_raw();
+        self.wait()
+    }
+}
+
+/// Information about a simulated spawned command for tests.
+#[allow(dead_code)]
+pub(crate) struct SpawnedCommandInfo {
+    pub cmd_contains: String,
+}
+
 /// Pre-scripted response for a remote server command.
 /// The `cmd_contains` string must be a substring of the full SSH command.
 #[derive(Debug, Clone)]
@@ -30,6 +292,7 @@ pub(crate) enum RemoteRunner {
 pub(crate) struct FakeState {
     responses: Mutex<Vec<ScriptedResponse>>,
     errors: Mutex<Vec<(String, String)>>,
+    spawned_cmd_exits: Mutex<Vec<(String, usize, RemoteCommandExit)>>,
     write_errors: Mutex<Vec<(String, String)>>,
     rsync_errors: Mutex<Vec<(String, String)>>,
     log: Mutex<Vec<String>>,
@@ -64,6 +327,7 @@ impl RemoteRunner {
             inner: Arc::new(FakeState {
                 responses: Mutex::new(Vec::new()),
                 errors: Mutex::new(Vec::new()),
+                spawned_cmd_exits: Mutex::new(Vec::new()),
                 write_errors: Mutex::new(Vec::new()),
                 rsync_errors: Mutex::new(Vec::new()),
                 log: Mutex::new(Vec::new()),
@@ -117,11 +381,32 @@ impl RemoteRunner {
     }
 
     #[allow(dead_code)]
-    #[allow(dead_code)]
     pub(crate) fn set_finish_run_hook(&self, hook: Box<dyn Fn() + Send>) {
         match self {
             RemoteRunner::Fake { inner } => {
                 inner.finish_run_hook.lock().unwrap().replace(hook);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Script a spawned command exit.  cmd_contains matches the command
+    /// substring, polls_before_exit is how many try_wait calls before
+    /// the command returns the given exit.
+    #[allow(dead_code)]
+    pub(crate) fn add_spawned_cmd_exit(
+        &self,
+        cmd_contains: &str,
+        polls_before_exit: usize,
+        exit: RemoteCommandExit,
+    ) {
+        match self {
+            RemoteRunner::Fake { inner } => {
+                inner.spawned_cmd_exits.lock().unwrap().push((
+                    cmd_contains.to_owned(),
+                    polls_before_exit,
+                    exit,
+                ));
             }
             _ => unreachable!(),
         }
@@ -226,15 +511,117 @@ impl RemoteRunner {
                         hook();
                     }
                 }
-                for resp in inner.responses.lock().unwrap().iter().rev() {
-                    if ssh_cmd.contains(&resp.cmd_contains) {
-                        return Ok(resp.stdout.clone());
-                    }
+                let mut responses = inner.responses.lock().unwrap();
+                let matched_idx = responses
+                    .iter()
+                    .position(|resp| ssh_cmd.contains(&resp.cmd_contains));
+                if let Some(idx) = matched_idx {
+                    let resp = responses.remove(idx);
+                    drop(responses);
+                    return Ok(resp.stdout);
                 }
                 anyhow::bail!(
                     "no scripted response for command (did you forget add_response?), \
                      cmd was: {ssh_cmd}"
                 )
+            }
+        }
+    }
+
+    /// Spawn a long-running remote command and return a handle for
+    /// concurrent supervision.  Used for `process-run`.
+    ///
+    /// The caller must poll `try_wait()` on the returned handle.
+    /// Do not use `.output()` — that blocks until the remote command exits.
+    pub(crate) fn spawn_server_cmd(
+        &self,
+        host: &str,
+        server_cmd: &str,
+        args: &[&str],
+    ) -> Result<RemoteCommandHandle> {
+        let full_cmd = {
+            let mut cmd = server_cmd.to_owned();
+            for a in args {
+                cmd.push(' ');
+                cmd.push_str(&shell_escape(a));
+            }
+            cmd
+        };
+        let ssh_cmd = format!("ssh -- {host} {full_cmd}");
+
+        match self {
+            RemoteRunner::Real => {
+                let mut child = Command::new("ssh")
+                    .arg("--")
+                    .arg(host)
+                    .arg(&full_cmd)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .with_context(|| format!("failed to spawn SSH command on {host}"))?;
+
+                // Take both stdout and stderr pipes and spawn drainer
+                // threads so the child never blocks on a full pipe buffer.
+                let stdout_pipe = child
+                    .stdout
+                    .take()
+                    .expect("stdout was piped, so it must be present");
+                let stdout_drainer = spawn_drainer(stdout_pipe, MAX_STDOUT_BYTES);
+
+                let stderr_pipe = child
+                    .stderr
+                    .take()
+                    .expect("stderr was piped, so it must be present");
+                let stderr_drainer = spawn_drainer(stderr_pipe, MAX_STDERR_BYTES);
+
+                Ok(RemoteCommandHandle {
+                    kind: RemoteCommandHandleKind::Real {
+                        child: Some(child),
+                        stdout_result: None,
+                        stderr_result: None,
+                        stdout_drainer: Some(stdout_drainer),
+                        stderr_drainer: Some(stderr_drainer),
+                    },
+                    spawned_cmd_contains: ssh_cmd,
+                })
+            }
+            RemoteRunner::Fake { inner } => {
+                inner.log.lock().unwrap().push(ssh_cmd.clone());
+                // Check for errors first.
+                for (ec, err) in inner.errors.lock().unwrap().iter() {
+                    if ssh_cmd.contains(ec.as_str()) {
+                        anyhow::bail!("{err}");
+                    }
+                }
+                // Find the next matching spawned command exit script.
+                let mut exits = inner.spawned_cmd_exits.lock().unwrap();
+                let idx = exits.iter().position(|(ec, _, _)| ssh_cmd.contains(ec));
+                if let Some(idx) = idx {
+                    let (_, polls, exit) = exits.remove(idx);
+                    let remaining = if exit == RemoteCommandExit::Killed {
+                        None
+                    } else {
+                        Some((polls as u64, exit))
+                    };
+                    let exit_cell = Arc::new(Mutex::new(None::<RemoteCommandExit>));
+                    Ok(RemoteCommandHandle {
+                        kind: RemoteCommandHandleKind::Fake {
+                            remaining_polls: Arc::new(Mutex::new(remaining)),
+                            exit: Arc::clone(&exit_cell),
+                        },
+                        spawned_cmd_contains: ssh_cmd,
+                    })
+                } else {
+                    // No exit scripted — command stays running forever.
+                    Ok(RemoteCommandHandle {
+                        kind: RemoteCommandHandleKind::Fake {
+                            remaining_polls: Arc::new(Mutex::new(None)),
+                            exit: Arc::new(Mutex::new(None)),
+                        },
+                        spawned_cmd_contains: ssh_cmd,
+                    })
+                }
             }
         }
     }
@@ -462,23 +849,35 @@ mod tests {
         let runner = RemoteRunner::fake();
         runner.add_response(
             "begin-run",
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\n",
+            &format!(
+                "protocol_version = {}\npurgery_version = \"0.1.0-test\"\n",
+                purgery_core::PROTOCOL_VERSION
+            ),
         );
         runner.add_response(
             "prepare-run",
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\n",
+            &format!(
+                "protocol_version = {}\npurgery_version = \"0.1.0-test\"\n",
+                purgery_core::PROTOCOL_VERSION
+            ),
         );
 
         let out = runner.server_cmd("host", "ps", &["begin-run"]).unwrap();
         assert_eq!(
             out,
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\n"
+            format!(
+                "protocol_version = {}\npurgery_version = \"0.1.0-test\"\n",
+                purgery_core::PROTOCOL_VERSION
+            )
         );
 
         let out = runner.server_cmd("host", "ps", &["prepare-run"]).unwrap();
         assert_eq!(
             out,
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\n"
+            format!(
+                "protocol_version = {}\npurgery_version = \"0.1.0-test\"\n",
+                purgery_core::PROTOCOL_VERSION
+            )
         );
 
         let log = runner.command_log();
@@ -498,7 +897,10 @@ mod tests {
         let runner = RemoteRunner::fake();
         runner.add_response(
             "begin-run",
-            "protocol_version = 1\npurgery_version = \"0.1.0-test\"\n",
+            &format!(
+                "protocol_version = {}\npurgery_version = \"0.1.0-test\"\n",
+                purgery_core::PROTOCOL_VERSION
+            ),
         );
         runner.add_error("begin-run", "simulated failure");
         let result = runner.server_cmd("host", "ps", &["begin-run"]);
@@ -664,5 +1066,143 @@ mod tests {
         let (recorded_includes, recorded_exclude) = &rule_sets[0];
         assert_eq!(*recorded_includes, includes);
         assert_eq!(*recorded_exclude, "*".to_string());
+    }
+
+    #[test]
+    fn wait_returns_success_for_scripted_exit() {
+        let runner = RemoteRunner::fake();
+        runner.add_spawned_cmd_exit(
+            "test-cmd",
+            2,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
+        let mut handle = runner
+            .spawn_server_cmd("host", "ps", &["test-cmd"])
+            .unwrap();
+        // wait() must block until the exit is available (after 2 poll calls).
+        let exit = handle.wait().unwrap();
+        assert_eq!(
+            exit,
+            RemoteCommandExit::Success {
+                stdout: String::new()
+            }
+        );
+    }
+
+    #[test]
+    fn wait_returns_transport_failure() {
+        let runner = RemoteRunner::fake();
+        runner.add_spawned_cmd_exit(
+            "test-cmd",
+            0,
+            RemoteCommandExit::TransportFailure {
+                exit_code: Some(255),
+                details: "connection refused".to_string(),
+            },
+        );
+        let mut handle = runner
+            .spawn_server_cmd("host", "ps", &["test-cmd"])
+            .unwrap();
+        let exit = handle.wait().unwrap();
+        assert_eq!(
+            exit,
+            RemoteCommandExit::TransportFailure {
+                exit_code: Some(255),
+                details: "connection refused".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn wait_returns_remote_failure() {
+        let runner = RemoteRunner::fake();
+        runner.add_spawned_cmd_exit(
+            "test-cmd",
+            1,
+            RemoteCommandExit::RemoteFailure {
+                exit_code: Some(1),
+                stderr: "error: something failed".to_string(),
+            },
+        );
+        let mut handle = runner
+            .spawn_server_cmd("host", "ps", &["test-cmd"])
+            .unwrap();
+        let exit = handle.wait().unwrap();
+        assert_eq!(
+            exit,
+            RemoteCommandExit::RemoteFailure {
+                exit_code: Some(1),
+                stderr: "error: something failed".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn wait_returns_killed_for_unscripted_command() {
+        let runner = RemoteRunner::fake();
+        let mut handle = runner
+            .spawn_server_cmd("host", "ps", &["unknown-cmd"])
+            .unwrap();
+        // No exit scripted — terminate_and_reap should set Killed.
+        let exit = handle.terminate_and_reap().unwrap();
+        assert_eq!(exit, RemoteCommandExit::Killed);
+    }
+
+    #[test]
+    fn wait_timeout_returns_exit_when_scripted() {
+        let runner = RemoteRunner::fake();
+        runner.add_spawned_cmd_exit(
+            "test-cmd",
+            1,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
+        let mut handle = runner
+            .spawn_server_cmd("host", "ps", &["test-cmd"])
+            .unwrap();
+        let exit = handle
+            .wait_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(
+            exit,
+            Some(RemoteCommandExit::Success {
+                stdout: String::new()
+            })
+        );
+    }
+
+    #[test]
+    fn wait_timeout_returns_none_for_unscripted() {
+        let runner = RemoteRunner::fake();
+        let mut handle = runner
+            .spawn_server_cmd("host", "ps", &["unknown-cmd"])
+            .unwrap();
+        let exit = handle
+            .wait_timeout(std::time::Duration::from_millis(1))
+            .unwrap();
+        assert_eq!(exit, None);
+    }
+
+    #[test]
+    fn terminate_and_reap_clears_fake_handle() {
+        let runner = RemoteRunner::fake();
+        runner.add_spawned_cmd_exit(
+            "test-cmd",
+            5,
+            RemoteCommandExit::Success {
+                stdout: String::new(),
+            },
+        );
+        let mut handle = runner
+            .spawn_server_cmd("host", "ps", &["test-cmd"])
+            .unwrap();
+        let exit = handle.terminate_and_reap().unwrap();
+        // terminate_and_reap calls kill_raw then wait.  kill_raw for the
+        // fake runner sets the exit to Killed immediately, so wait()
+        // observes Killed (not the scripted Success).
+        assert_eq!(exit, RemoteCommandExit::Killed);
     }
 }

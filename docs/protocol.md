@@ -20,18 +20,31 @@ Server runs are transform-only. Every manifest entry must have a transform.
 ```
 client: validate args (--transform requires --delete-after-import)
 client: generate run ID
+client: check server version compatibility
+client: run server GC best-effort (failure logged, not fatal)
 client: begin-run over SSH -> server creates incoming directory, returns paths
 client: write run.toml + manifest.toml to server incoming dir
 client: prepare-run over SSH -> server validates the destination, envelope, and requested transform
 client: rsync source entry to server staging area (files/<source-name>)
 client: persist local run state as upload_complete_finish_pending
 client: finish-run over SSH -> server moves incoming -> ready
+client: stop heartbeat
 client: persist local state as waiting_for_terminal_state
-client: wait using run-state; retry only on ready/processing
+client: spawn foreground process-run over SSH in a local supervised handle
+client: concurrently poll run-state; restart process-run on SSH transport failure
 client: on terminal: read status
 client: remove confirmed local original (server-confirmed cleanup)
 client: persist local state as cleanup_complete
 ```
+
+Transform sync is synchronous. The client drives the target run to a terminal state
+before returning. This may wait indefinitely; the client logs periodic progress
+but does not enforce a hard timeout. A transform can legitimately take a long
+time.
+
+The `version` command is always called before any server-run sync to ensure
+client–server protocol and version compatibility. GC and `begin-run` are not
+called before version validation.
 
 ### Path C: Split (with --split)
 
@@ -124,9 +137,10 @@ Source trailing slashes, `.`, and `..` are normalized before split discovery. `<
 | `heartbeat-run --nickname N --run-id R` | Extends incoming lease | (none) |
 | `run-state --nickname N --run-id R` | None | `RunStateResponse` TOML |
 | `status --nickname N --run-id R` | None | `RunStatus` TOML |
-| `process-once` | GC + recover + process one ready run | (none) |
-| `check` | None | (none) |
-| `gc` | Collects expired runs | (none) |
+| `process-run --nickname N --run-id R` | Foreground targeted processor: claims/processes the target ready run, recovers an abandoned target in processing, or no-op if already processing or terminal. Does not process unrelated runs. Does not run GC. | `ProcessRunResponse` TOML |
+| `process-once` | Run global GC, recover unlocked processing runs (respecting active processor locks), process ready runs | (none) |
+| `check` | Validate config and transforms | (none) |
+| `gc` | Foreground garbage-collection command. Server-run sync clients initiate it best-effort after server version check and before `begin-run`. Failure is logged but does not fail the sync. Also run by `process-once` for batch maintenance. | (none) |
 
 ## Run phases
 
@@ -135,14 +149,17 @@ incoming → ready → processing → done
                             ↘ failed
 ```
 
-A run moves from incoming to ready when the client calls `finish-run`. The server moves ready runs to processing internally during `process-once`. On completion, runs move to done or failed.
+A run moves from incoming to ready when the client calls `finish-run`. The server moves ready runs to processing via targeted `process-run` (triggered by the client) or batch `process-once` (operator/daemon). On completion, runs move to done or failed.
+
+A processing run may be actively mutated only by a process holding the run's `processor.lock`. If `process-run` or `process-once` observes a processing run and the lock is busy, it treats that run as actively owned and does not recover or replay it. If the lock is free, the run is considered abandoned and may be recovered.
 
 All protocol output goes to stdout as TOML. Logs go to stderr.
 
 ## BeginRunResponse
 
 ```toml
-protocol_version = 1
+protocol_version = 2
+purgery_version = "0.1.0"
 nickname = "laptop"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 incoming_dir = "/var/lib/purgery/work/laptop/incoming/01ARZ3NDEKTSV4RRFFQ69G5FAV"
@@ -155,6 +172,7 @@ heartbeat_interval_secs = 60
 ## Run config (run.toml)
 
 ```toml
+purgery_version = "0.1.0"
 nickname = "laptop"
 destination = "/archive"
 delete_after_import = true
@@ -175,6 +193,7 @@ For non-transform entries, the server commits the work entry directly to the bas
 A server-run manifest describes exactly one logical source entry and is uploaded only for transform runs. Direct passthrough never uploads a manifest.
 
 ```toml
+purgery_version = "0.1.0"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 
@@ -192,6 +211,10 @@ transform = "compress-video"
 For a directory source:
 
 ```toml
+purgery_version = "0.1.0"
+run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+nickname = "laptop"
+
 [[entries]]
 local_path = "/home/user/Videos"
 staged_path = "files/Videos"
@@ -207,6 +230,7 @@ transform = "compress-video"
 ## Status (status.toml)
 
 ```toml
+purgery_version = "0.1.0"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 nickname = "laptop"
 state = "done"
@@ -246,7 +270,8 @@ The nickname is operational metadata and does not appear in final_paths.
 ## RunStateResponse
 
 ```toml
-protocol_version = 1
+protocol_version = 2
+purgery_version = "0.1.0"
 nickname = "laptop"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 phase = "processing"
@@ -261,12 +286,42 @@ Phases: `incoming`, `ready`, `processing`, `done`, `failed`, `corrupt`, `not_fou
 - Non-terminal (`terminal = false`): `incoming`, `ready`, `processing`, `corrupt`, `not_found`.
 `not_found` means the server does not know about the run; it is not a terminal success and the client treats it as an error.
 
+## ProcessRunResponse
+
+The `process-run` subcommand prints `ProcessRunResponse` TOML on stdout on success.
+
+```toml
+protocol_version = 2
+purgery_version = "0.1.0"
+nickname = "laptop"
+run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+outcome = "processed"
+run_phase = "done"
+status_state = "done"
+message = "run processed successfully"
+```
+
+### Outcome values
+
+| Outcome | Meaning |
+|---------|---------|
+| `processed` | The run was claimed and driven to a terminal state (done or failed). |
+| `already_terminal` | The target was already in a terminal phase when `process-run` was called. |
+| `already_active` | The target is being processed by another process holding the processor lock. |
+| `claim_in_progress` | Another process holds the ready-run claim lock. |
+
+### Phase vs. state
+
+- `run_phase` — filesystem/protocol phase (`ready`, `processing`, `done`, `failed`). Never contains `partial`.
+- `status_state` — terminal `RunStatus.state` (`done`, `partial`, `failed`). Only present when terminal status is known. May differ from `run_phase`: for example a `partial` run may reside in the `failed/` directory, in which case `run_phase = "failed"` and `status_state = "partial"`.
+
 ## Client run state persistence
 
 The client persists per-run state under `{state_dir}/runs/{nickname}-{run_id}/state.toml`. This enables crash-safe resume of waiting and cleanup.
 
 ```toml
-protocol_version = 1
+protocol_version = 2
+purgery_version = "0.1.0"
 nickname = "laptop"
 run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 host = "user@server"
@@ -287,11 +342,13 @@ Phases: `upload_complete_finish_pending`, `waiting_for_terminal_state`, `termina
 
 Purgery uses two independent version concepts.
 
-### `protocol_version`
+### `protocol_version` (wire protocol)
 
-The protocol version describes the shape or family of machine-readable protocol messages and durable file envelopes. It must match exactly for client–server communication and for durable-file deserialization. Increment it when the wire format or durable-file structure changes.
+The `protocol_version` in server command responses describes the client/server wire protocol family. It must match exactly for client–server communication; the client validates it against its own `PROTOCOL_VERSION` constant.
 
-Current value: `1`.
+Current value: `2`.
+
+Persisted internal files (`lease.toml`, `progress.toml`, `state.toml`) carry their own independent schema version constants — they are not affected by wire protocol bumps unless their on-disk format actually changes.
 
 ### `purgery_version`
 
@@ -314,7 +371,7 @@ Examples:
 Before starting or resuming a server-backed operation, the client calls the server `version` command. The response is TOML:
 
 ```toml
-protocol_version = 1
+protocol_version = 2
 purgery_version = "0.1.0"
 ```
 
