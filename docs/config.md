@@ -97,7 +97,7 @@ Placeholder expansion substitutes resolved paths into the argument vector direct
 
 When invoking tools that parse their own options (e.g., ffmpeg, ImageMagick), filenames beginning with `-` may be misinterpreted as option flags by the subprocess. Recommended mitigations:
 
-- Use `--` before the filename argument if the tool supports it (e.g., `args = ["--input", "--", "{input}"]`).
+- Use `--` before the filename argument if the tool supports it (e.g., `args = ["--verbose", "--", "{input}"]`).
 - Prefix the filename with `./` when the tool accepts relative paths.
 
 Filenames containing spaces, newlines, or non-ASCII characters are handled correctly because argv-style invocation passes each argument as a separate C string without shell word splitting.
