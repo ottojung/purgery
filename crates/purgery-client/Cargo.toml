@@ -10,7 +10,7 @@ purgery-core = { path = "../purgery-core" }
 anyhow = "1"
 camino = { version = "1", features = ["serde1"] }
 walkdir = "2"
-sha2 = "0.10"
+sha2 = "0.11"
 toml = "1.1"
 tracing = "0.1"
 libc = "0.2"
