@@ -51,17 +51,21 @@ fn auto_nickname() -> Result<Nickname> {
         .or_else(|_| std::env::var("LOGNAME"))
         .ok();
     let hostname = get_hostname();
+    auto_nickname_from(username.as_deref(), hostname.as_deref())
+}
 
-    let raw = match (&username, &hostname) {
+/// Pure helper that builds a nickname from optional username and hostname.
+/// Exported for testing without environment dependencies.
+fn auto_nickname_from(username: Option<&str>, hostname: Option<&str>) -> Result<Nickname> {
+    let raw = match (username, hostname) {
         (Some(u), Some(h)) => format!("{u}-{h}"),
-        (None, Some(h)) => h.clone(),
-        (Some(u), None) => u.clone(),
+        (None, Some(h)) => h.to_owned(),
+        (Some(u), None) => u.to_owned(),
         (None, None) => {
             return Nickname::new("client".to_owned())
                 .map_err(|e| anyhow::anyhow!("failed to generate auto nickname: {e}"))
         }
     };
-
     let sanitized = sanitize_nickname(&raw);
     Nickname::new(sanitized)
         .or_else(|_| Nickname::new("client".to_owned()))
@@ -69,12 +73,21 @@ fn auto_nickname() -> Result<Nickname> {
 }
 
 fn get_hostname() -> Option<String> {
-    std::process::Command::new("hostname")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    let mut buf = [0i8; 256];
+    let ret = unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len()) };
+    if ret != 0 {
+        return None;
+    }
+    // Find the null terminator.
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    let name = std::ffi::CStr::from_bytes_until_nul(
+        &buf[..end].iter().map(|&c| c as u8).collect::<Vec<_>>(),
+    )
+    .ok()
+    .and_then(|c| c.to_str().ok())
+    .map(|s| s.to_owned())
+    .filter(|s| !s.is_empty())?;
+    Some(name)
 }
 
 fn sanitize_nickname(raw: &str) -> String {
@@ -5356,11 +5369,72 @@ observed_at_unix_secs = 1000
     }
 
     #[test]
-    fn auto_nickname_falls_back_to_client() {
-        // Without USER/LOGNAME env vars and without hostname, should
-        // fall back to "client". In CI we can't remove these, but
-        // sanitize_nickname of empty string returns "client".
-        assert_eq!(sanitize_nickname(""), "client");
+    fn auto_nickname_from_builds_correct_nickname() {
+        assert_eq!(
+            auto_nickname_from(Some("user"), Some("host"))
+                .unwrap()
+                .as_str(),
+            "user-host",
+            "user + host",
+        );
+        assert_eq!(
+            auto_nickname_from(None, Some("host")).unwrap().as_str(),
+            "host",
+            "host only",
+        );
+        assert_eq!(
+            auto_nickname_from(Some("user"), None).unwrap().as_str(),
+            "user",
+            "user only",
+        );
+        assert_eq!(
+            auto_nickname_from(None, None).unwrap().as_str(),
+            "client",
+            "none + none falls back to client",
+        );
+    }
+
+    #[test]
+    fn auto_nickname_from_sanitizes_values() {
+        // Spaces and dots are replaced; consecutive separators collapse.
+        assert_eq!(
+            auto_nickname_from(Some("my user"), Some("host.local"))
+                .unwrap()
+                .as_str(),
+            "my-user-host-local",
+        );
+    }
+
+    #[test]
+    fn auto_nickname_from_fails_on_empty_sanitized() {
+        // A username that sanitizes to nothing should still succeed
+        // (sanitize_nickname falls back to "client").
+        assert_eq!(
+            auto_nickname_from(Some("___"), None).unwrap().as_str(),
+            "client",
+        );
+    }
+
+    #[test]
+    fn explicit_nickname_is_not_automatically_sanitized() {
+        // Invalid explicit nicknames must fail — no silent sanitization.
+        let result = Nickname::new("bad nickname!".into());
+        assert!(
+            result.is_err(),
+            "explicit invalid nickname must be rejected"
+        );
+    }
+
+    #[test]
+    fn auto_nickname_is_independent_of_destination() {
+        // The auto-generated nickname must not contain the destination host.
+        // This test verifies that deriving from the destination is gone.
+        let nick = auto_nickname_from(Some("alice"), Some("my-laptop")).unwrap();
+        assert_eq!(nick.as_str(), "alice-my-laptop");
+        assert!(
+            !nick.as_str().contains("server"),
+            "nickname must not contain destination host"
+        );
     }
 
     #[test]
