@@ -85,7 +85,11 @@ fn get_hostname() -> Option<String> {
 fn hostname_from_bytes(bytes: &[u8]) -> Option<String> {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     let name = String::from_utf8_lossy(&bytes[..end]).trim().to_owned();
-    if name.is_empty() { None } else { Some(name) }
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
 }
 
 fn sanitize_nickname(raw: &str) -> String {
