@@ -73,21 +73,19 @@ fn auto_nickname_from(username: Option<&str>, hostname: Option<&str>) -> Result<
 }
 
 fn get_hostname() -> Option<String> {
-    let mut buf = [0i8; 256];
+    let mut buf = [0 as libc::c_char; 256];
     let ret = unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len()) };
     if ret != 0 {
         return None;
     }
-    // Find the null terminator.
-    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    let name = std::ffi::CStr::from_bytes_until_nul(
-        &buf[..end].iter().map(|&c| c as u8).collect::<Vec<_>>(),
-    )
-    .ok()
-    .and_then(|c| c.to_str().ok())
-    .map(|s| s.to_owned())
-    .filter(|s| !s.is_empty())?;
-    Some(name)
+    let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len()) };
+    hostname_from_bytes(bytes)
+}
+
+fn hostname_from_bytes(bytes: &[u8]) -> Option<String> {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    let name = String::from_utf8_lossy(&bytes[..end]).trim().to_owned();
+    if name.is_empty() { None } else { Some(name) }
 }
 
 fn sanitize_nickname(raw: &str) -> String {
@@ -5366,6 +5364,21 @@ observed_at_unix_secs = 1000
         assert_eq!(sanitize_nickname("user@host"), "user-host");
         assert_eq!(sanitize_nickname("hello world"), "hello-world");
         assert_eq!(sanitize_nickname("a.b.c"), "a-b-c");
+    }
+
+    #[test]
+    fn hostname_from_bytes_parses_c_strings() {
+        let buf = b"my-host\0extra stuff";
+        assert_eq!(hostname_from_bytes(buf).as_deref(), Some("my-host"));
+
+        let buf = b"my-host";
+        assert_eq!(hostname_from_bytes(buf).as_deref(), Some("my-host"));
+
+        let buf = b"\0trailing stuff";
+        assert!(hostname_from_bytes(buf).is_none());
+
+        let buf = b"   \0";
+        assert!(hostname_from_bytes(buf).is_none());
     }
 
     #[test]
