@@ -39,20 +39,72 @@ fn parse_destination(destination: &str) -> Result<RemoteDestination> {
     })
 }
 
-fn derive_nickname(destination: &str) -> Result<Nickname> {
-    let remote = parse_destination(destination)?;
-    let sanitized: String = remote
-        .host
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
+fn choose_nickname(args: &SyncArgs) -> Result<Nickname> {
+    if let Some(name) = &args.nickname {
+        return Nickname::new(name.clone()).map_err(|e| anyhow::anyhow!("invalid --nickname: {e}"));
+    }
+    auto_nickname()
+}
+
+fn auto_nickname() -> Result<Nickname> {
+    let username = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .ok();
+    let hostname = get_hostname();
+
+    let raw = match (&username, &hostname) {
+        (Some(u), Some(h)) => format!("{u}-{h}"),
+        (None, Some(h)) => h.clone(),
+        (Some(u), None) => u.clone(),
+        (None, None) => {
+            return Nickname::new("client".to_owned())
+                .map_err(|e| anyhow::anyhow!("failed to generate auto nickname: {e}"))
+        }
+    };
+
+    let sanitized = sanitize_nickname(&raw);
+    Nickname::new(sanitized)
+        .or_else(|_| Nickname::new("client".to_owned()))
+        .map_err(|e| anyhow::anyhow!("failed to generate auto nickname: {e}"))
+}
+
+fn get_hostname() -> Option<String> {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn sanitize_nickname(raw: &str) -> String {
+    let mut result = String::new();
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            result.push(ch);
+        } else {
+            result.push('-');
+        }
+    }
+
+    let mut deduped = String::new();
+    for ch in result.chars() {
+        if ch == '-' || ch == '_' {
+            let last_is_sep = deduped.chars().last().is_some_and(|c| c == '-' || c == '_');
+            if !last_is_sep {
+                deduped.push(ch);
             }
-        })
-        .collect();
-    Ok(Nickname::new(sanitized).or_else(|_| Nickname::new("default".to_owned()))?)
+        } else {
+            deduped.push(ch);
+        }
+    }
+
+    let trimmed = deduped.trim_matches(|c: char| c == '-' || c == '_');
+    if trimmed.is_empty() {
+        "client".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn check_server_version(runner: &RemoteRunner, host: &str, server_cmd: &str) -> Result<()> {
@@ -1355,12 +1407,21 @@ pub(crate) fn run_sync_with_run_id(
         anyhow::bail!("--delete-after-import is required when --transform is used");
     }
 
+    let nickname = choose_nickname(args)?;
+
     if let Some(ref _pattern) = args.split {
-        return run_split(runner, args, run_id, &state_dir, &source_spec, setup);
+        return run_split(
+            runner,
+            args,
+            run_id,
+            &state_dir,
+            &source_spec,
+            setup,
+            &nickname,
+        );
     }
 
     let remote = parse_destination(&args.destination)?;
-    let nickname = derive_nickname(&args.destination)?;
 
     info!(
         nickname = %nickname.as_str(),
@@ -1592,6 +1653,7 @@ fn run_split(
     state_dir: &str,
     source_spec: &classify::SourceSpec,
     setup: ServerRunSetup,
+    nickname: &Nickname,
 ) -> Result<()> {
     let pattern = args.split.as_deref().unwrap();
     split::validate_split_pattern(pattern).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1647,6 +1709,7 @@ fn run_split(
             transform: args.transform.clone(),
             delete_after_import: args.delete_after_import,
             split: None,
+            nickname: Some(nickname.as_str().to_owned()),
             state_dir: Some(state_dir.to_owned()),
             server_command: args.server_command.clone(),
             source: root.path.clone(),
@@ -1848,6 +1911,7 @@ state = "done"
             transform: Some("compress".into()),
             delete_after_import: false,
             split: None,
+            nickname: None,
             state_dir: Some(state_dir),
             source: src_dir_str(&tmp),
             destination: "host:dest".to_string(),
@@ -3056,6 +3120,7 @@ observed_at_unix_secs = 1000
             transform: Some("transform".into()),
             delete_after_import: true,
             split: None,
+            nickname: Some("laptop".to_owned()),
             state_dir: Some(state_dir.to_owned()),
             source: src_with_file(tmp),
             destination: "laptop:rel".to_string(),
@@ -3432,6 +3497,7 @@ observed_at_unix_secs = 1000
             transform: None,
             delete_after_import: false,
             split: None,
+            nickname: None,
             state_dir: Some(state_dir),
             source: src_slash,
             destination: "host:/dest".to_string(),
@@ -3468,6 +3534,7 @@ observed_at_unix_secs = 1000
             transform: None,
             delete_after_import: true,
             split: None,
+            nickname: None,
             state_dir: Some(state_dir.clone()),
             source: src_slash,
             destination: "host:/dest".to_string(),
@@ -3504,6 +3571,7 @@ observed_at_unix_secs = 1000
             transform: Some("transform".into()),
             delete_after_import: true,
             split: None,
+            nickname: Some("host".to_owned()),
             state_dir: Some(state_dir.clone()),
             source: src_slash,
             destination: "host:/dest".to_string(),
@@ -3511,7 +3579,6 @@ observed_at_unix_secs = 1000
         };
         let run_id = RunId::new("test-run".into()).unwrap();
 
-        // Destination is "host:/dest" → nickname = "host"
         let begin = begin_resp_toml().replace("laptop", "host").replace(
             "heartbeat_interval_secs = 60",
             "heartbeat_interval_secs = 1",
@@ -3557,6 +3624,7 @@ observed_at_unix_secs = 1000
                 transform: None,
                 delete_after_import: false,
                 split: None,
+                nickname: None,
                 state_dir: Some(mk_state_dir(&tmp)),
                 source: "/".to_string(),
                 destination: "host:/dest".to_string(),
@@ -3577,6 +3645,7 @@ observed_at_unix_secs = 1000
                 transform: None,
                 delete_after_import: true,
                 split: None,
+                nickname: None,
                 state_dir: Some(mk_state_dir(&tmp)),
                 source: "/".to_string(),
                 destination: "host:/dest".to_string(),
@@ -3597,6 +3666,7 @@ observed_at_unix_secs = 1000
                 transform: Some("transform".into()),
                 delete_after_import: true,
                 split: None,
+                nickname: None,
                 state_dir: Some(mk_state_dir(&tmp)),
                 source: "/".to_string(),
                 destination: "host:/dest".to_string(),
@@ -3614,6 +3684,7 @@ observed_at_unix_secs = 1000
                 transform: None,
                 delete_after_import: false,
                 split: Some("*.mp4".to_string()),
+                nickname: None,
                 state_dir: Some(mk_state_dir(&tmp)),
                 source: "/".to_string(),
                 destination: "host:/dest".to_string(),
@@ -3641,6 +3712,7 @@ observed_at_unix_secs = 1000
             transform: None,
             delete_after_import: false,
             split: Some("*.mp4".to_string()),
+            nickname: None,
             state_dir: Some(state_dir),
             source: src.to_str().unwrap().to_string(),
             destination: "host:/dest".to_string(),
@@ -3694,6 +3766,7 @@ observed_at_unix_secs = 1000
             transform: None,
             delete_after_import: false,
             split: Some("*.mp4".to_string()),
+            nickname: None,
             state_dir: Some(state_dir.clone()),
             source: src.to_str().unwrap().to_string(),
             destination: "host:/dest".to_string(),
@@ -3736,6 +3809,7 @@ observed_at_unix_secs = 1000
             transform: None,
             delete_after_import: false,
             split: Some(".".to_string()),
+            nickname: None,
             state_dir: Some(state_dir),
             source: src.to_str().unwrap().to_string(),
             destination: "host:/dest".to_string(),
@@ -3769,6 +3843,7 @@ observed_at_unix_secs = 1000
             transform: None,
             delete_after_import: false,
             split: Some("*.mp4".to_string()),
+            nickname: None,
             state_dir: Some(state_dir),
             source: src.to_str().unwrap().to_string(),
             destination: "host:/dest".to_string(),
@@ -3810,6 +3885,7 @@ observed_at_unix_secs = 1000
             transform: None,
             delete_after_import: false,
             split: Some("*.mp4".to_string()),
+            nickname: None,
             state_dir: Some(state_dir),
             source: src.to_str().unwrap().to_string(),
             destination: "host:/dest".to_string(),
@@ -3839,6 +3915,7 @@ observed_at_unix_secs = 1000
                 transform: None,
                 delete_after_import: false,
                 split: Some(bad.to_string()),
+                nickname: None,
                 state_dir: Some(state_dir.clone()),
                 source: src.clone(),
                 destination: "host:/dest".to_string(),
@@ -3867,6 +3944,7 @@ observed_at_unix_secs = 1000
                     transform: None,
                     delete_after_import: true,
                     split: Some(bad.to_string()),
+                    nickname: None,
                     state_dir: Some(state_dir.clone()),
                     source: src.clone(),
                     destination: "host:/dest".to_string(),
@@ -3884,6 +3962,7 @@ observed_at_unix_secs = 1000
                     transform: Some("transform".into()),
                     delete_after_import: true,
                     split: Some(bad.to_string()),
+                    nickname: None,
                     state_dir: Some(state_dir.clone()),
                     source: src.clone(),
                     destination: "host:/dest".to_string(),
@@ -4123,6 +4202,7 @@ observed_at_unix_secs = 1000
             transform: None,
             delete_after_import: false,
             split: None,
+            nickname: None,
             state_dir: Some(state_dir),
             source: src_with_file(&tmp),
             destination: "host:dest".to_string(),
@@ -4149,6 +4229,7 @@ observed_at_unix_secs = 1000
             transform: None,
             delete_after_import: true,
             split: None,
+            nickname: None,
             state_dir: Some(state_dir),
             source: src_with_file(&tmp),
             destination: "host:dest".to_string(),
@@ -4583,6 +4664,7 @@ observed_at_unix_secs = 1000
             transform: Some("transform".into()),
             delete_after_import: true,
             split: Some("*.mp4".into()),
+            nickname: None,
             state_dir: Some(state_dir),
             source: src.to_string_lossy().to_string(),
             destination: "laptop:rel".to_string(),
@@ -4621,6 +4703,7 @@ observed_at_unix_secs = 1000
             transform: None,
             delete_after_import: false,
             split: Some("*.mp4".into()),
+            nickname: None,
             state_dir: Some(state_dir),
             source: src.to_string_lossy().to_string(),
             destination: "host:/dest".to_string(),
@@ -4661,6 +4744,7 @@ observed_at_unix_secs = 1000
             transform: None,
             delete_after_import: true,
             split: None,
+            nickname: None,
             state_dir: Some(state_dir),
             source: file_path.to_string_lossy().to_string(),
             destination: "host:/dest".to_string(),
@@ -5168,5 +5252,325 @@ observed_at_unix_secs = 1000
             log.iter().any(|c| c.contains("process-run")),
             "process-run must be spawned for idle processor_state: {log:?}"
         );
+    }
+
+    // ── Nickname tests ──────────────────────────────────────────────
+
+    #[test]
+    fn explicit_nickname_is_used_in_server_commands() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let run_id = RunId::new("test-run".into()).unwrap();
+        let args = SyncArgs {
+            transform: Some("transform".into()),
+            delete_after_import: true,
+            split: None,
+            nickname: Some("vitalik-framework-laptop".to_owned()),
+            state_dir: Some(state_dir.clone()),
+            source: src_with_file(&tmp),
+            destination: "server:/dest".to_string(),
+            server_command: "purgery-server".to_string(),
+        };
+
+        // begin-run response must match the nickname
+        let begin = begin_resp_toml()
+            .replace("laptop", "vitalik-framework-laptop")
+            .replace(
+                "heartbeat_interval_secs = 60",
+                "heartbeat_interval_secs = 1",
+            );
+        runner.add_response("begin-run", &begin);
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"vitalik-framework-laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        runner.add_response(
+            "run-state",
+            &done_run_state_toml().replace("laptop", "vitalik-framework-laptop"),
+        );
+        let status_toml = "purgery_version = \"0.1.0-test\"\nrun_id = \"test-run\"\nnickname = \"vitalik-framework-laptop\"\nstate = \"done\"\n".to_string();
+        runner.add_response("status", &status_toml);
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(
+            result.is_ok(),
+            "explicit nickname sync must succeed: {:?}",
+            result.err()
+        );
+
+        let log = runner.command_log();
+        assert!(
+            log.iter().any(|c| c.contains("vitalik-framework-laptop")),
+            "commands must use explicit nickname: {log:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_explicit_nickname_is_rejected() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = SyncArgs {
+            transform: Some("transform".into()),
+            delete_after_import: true,
+            split: None,
+            nickname: Some("bad nickname!".to_owned()),
+            state_dir: Some(state_dir),
+            source: src_with_file(&tmp),
+            destination: "host:dest".to_string(),
+            server_command: "purgery-server".to_string(),
+        };
+
+        let result = run_sync_with_runner(&runner, &args);
+        assert!(result.is_err(), "invalid nickname must be rejected");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("invalid --nickname"),
+            "error must mention --nickname: {err}"
+        );
+    }
+
+    #[test]
+    fn sanitize_nickname_collapses_separators() {
+        assert_eq!(sanitize_nickname("a..b"), "a-b");
+        assert_eq!(sanitize_nickname("a---b"), "a-b");
+        assert_eq!(sanitize_nickname("---a"), "a");
+        assert_eq!(sanitize_nickname("a___b"), "a_b");
+        assert_eq!(sanitize_nickname("a_-_b"), "a_b");
+        assert_eq!(sanitize_nickname("a-_-b"), "a-b");
+        assert_eq!(sanitize_nickname("---"), "client");
+        assert_eq!(sanitize_nickname(""), "client");
+    }
+
+    #[test]
+    fn sanitize_nickname_replaces_invalid_chars() {
+        assert_eq!(sanitize_nickname("user@host"), "user-host");
+        assert_eq!(sanitize_nickname("hello world"), "hello-world");
+        assert_eq!(sanitize_nickname("a.b.c"), "a-b-c");
+    }
+
+    #[test]
+    fn auto_nickname_falls_back_to_client() {
+        // Without USER/LOGNAME env vars and without hostname, should
+        // fall back to "client". In CI we can't remove these, but
+        // sanitize_nickname of empty string returns "client".
+        assert_eq!(sanitize_nickname(""), "client");
+    }
+
+    #[test]
+    fn split_mode_preserves_explicit_nickname() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let src = tmp.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("a.txt"), "data").unwrap();
+        fs::write(src.join("b.txt"), "data").unwrap();
+
+        let args = SyncArgs {
+            transform: None,
+            delete_after_import: false,
+            split: Some("*.txt".into()),
+            nickname: Some("my-laptop".to_owned()),
+            state_dir: Some(state_dir),
+            source: src.to_string_lossy().to_string(),
+            destination: "server:/dest".to_string(),
+            server_command: "purgery-server".to_string(),
+        };
+
+        let run_id = RunId::new("split-parent".into()).unwrap();
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(
+            result.is_ok(),
+            "passthrough split with explicit nickname must succeed: {:?}",
+            result.err()
+        );
+
+        let log = runner.command_log();
+        assert_eq!(log.len(), 1, "passthrough split uses one command");
+        assert!(
+            !log.iter()
+                .any(|c| c.contains("ssh") || c.contains("begin-run")),
+            "passthrough split must not contact server: {log:?}"
+        );
+    }
+
+    #[test]
+    fn split_mode_preserves_explicit_nickname_in_transform() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = SyncArgs {
+            transform: Some("transform".into()),
+            delete_after_import: true,
+            split: None,
+            nickname: Some("my-laptop".to_owned()),
+            state_dir: Some(state_dir),
+            source: src_with_file(&tmp),
+            destination: "server:/dest".to_string(),
+            server_command: "purgery-server".to_string(),
+        };
+
+        let begin = begin_resp_toml()
+            .replace("laptop", "my-laptop")
+            .replace("test-run", "split-child")
+            .replace(
+                "heartbeat_interval_secs = 60",
+                "heartbeat_interval_secs = 1",
+            );
+        runner.add_response("begin-run", &begin);
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"my-laptop\"\nrun_id = \"split-child\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        runner.add_response(
+            "run-state",
+            &done_run_state_toml()
+                .replace("laptop", "my-laptop")
+                .replace("test-run", "split-child"),
+        );
+        let status = "purgery_version = \"0.1.0-test\"\nrun_id = \"split-child\"\nnickname = \"my-laptop\"\nstate = \"done\"\n".to_string();
+        runner.add_response("status", &status);
+
+        let run_id = RunId::new("split-child".into()).unwrap();
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::AlreadyDone);
+        assert!(
+            result.is_ok(),
+            "split child with explicit nickname must succeed: {:?}",
+            result.err()
+        );
+
+        let log = runner.command_log();
+        assert!(
+            log.iter().any(|c| c.contains("my-laptop")),
+            "split child command must use explicit nickname: {log:?}"
+        );
+    }
+
+    #[test]
+    fn split_mode_discovery_only_checks_server_once() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+
+        // First call: ServerRunSetup::Needed
+        {
+            let runner = mk_runner();
+            let args = SyncArgs {
+                transform: Some("transform".into()),
+                delete_after_import: true,
+                split: None,
+                nickname: Some("laptop".to_owned()),
+                state_dir: Some(state_dir.clone()),
+                source: src_with_file(&tmp),
+                destination: "laptop:rel".to_string(),
+                server_command: "purgery-server".to_string(),
+            };
+            runner.add_response(
+                "version",
+                &format!(
+                    "protocol_version = {}\npurgery_version = \"0.1.0-test\"\n",
+                    purgery_core::PROTOCOL_VERSION
+                ),
+            );
+            runner.add_response(
+                "gc",
+                &format!(
+                    "protocol_version = {}\npurgery_version = \"0.1.0-test\"\n",
+                    purgery_core::PROTOCOL_VERSION
+                ),
+            );
+            runner.add_response("begin-run", &begin_resp_toml());
+            runner.add_response(
+                "prepare-run",
+                &format!(
+                    "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                    resp_header()
+                ),
+            );
+            runner.add_response("heartbeat-run", "");
+            runner.add_response("finish-run", "");
+            runner.add_response("run-state", &ready_run_state_toml());
+            runner.add_spawned_cmd_exit(
+                "process-run",
+                0,
+                RemoteCommandExit::Success {
+                    stdout: process_run_ok_toml("processed", "test-run"),
+                },
+            );
+            runner.add_response("run-state", &done_run_state_toml());
+            runner.add_response("status", &done_status_toml());
+
+            let run_id = RunId::new("test-run".into()).unwrap();
+            let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+            assert!(
+                result.is_ok(),
+                "first entry must succeed: {:?}",
+                result.err()
+            );
+        }
+
+        // Second call: ServerRunSetup::AlreadyDone
+        {
+            let runner = mk_runner();
+            let args = SyncArgs {
+                transform: Some("transform".into()),
+                delete_after_import: true,
+                split: None,
+                nickname: Some("laptop".to_owned()),
+                state_dir: Some(state_dir),
+                source: src_with_file(&tmp),
+                destination: "laptop:rel".to_string(),
+                server_command: "purgery-server".to_string(),
+            };
+            runner.add_response("begin-run", &begin_resp_toml());
+            runner.add_response(
+                "prepare-run",
+                &format!(
+                    "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                    resp_header()
+                ),
+            );
+            runner.add_response("heartbeat-run", "");
+            runner.add_response("finish-run", "");
+            runner.add_response("run-state", &ready_run_state_toml());
+            runner.add_spawned_cmd_exit(
+                "process-run",
+                0,
+                RemoteCommandExit::Success {
+                    stdout: process_run_ok_toml("processed", "test-run"),
+                },
+            );
+            runner.add_response("run-state", &done_run_state_toml());
+            runner.add_response("status", &done_status_toml());
+
+            let run_id = RunId::new("test-run".into()).unwrap();
+            let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::AlreadyDone);
+            assert!(
+                result.is_ok(),
+                "second entry must succeed: {:?}",
+                result.err()
+            );
+
+            let log = runner.command_log();
+            assert!(
+                !log.iter().any(|c| c.contains("'version'")),
+                "AlreadyDone call must not re-check version: {log:?}"
+            );
+            assert!(
+                !log.iter().any(|c| c.contains("'gc'")),
+                "AlreadyDone call must not re-run gc: {log:?}"
+            );
+        }
     }
 }
