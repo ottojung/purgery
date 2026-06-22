@@ -63,6 +63,10 @@ struct SyncArgs {
     #[arg(long)]
     split: Option<String>,
 
+    /// Source/client identifier for server-side namespace (default: auto from local identity)
+    #[arg(long)]
+    nickname: Option<String>,
+
     /// Directory for client state files (default: XDG_STATE_HOME/purgery)
     #[arg(long)]
     state_dir: Option<String>,
@@ -365,5 +369,35 @@ mod tests {
         ]);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_parses_sync_with_nickname() {
+        let args = Cli::try_parse_from([
+            "purgery-client",
+            "sync",
+            "--nickname",
+            "vitalik-framework-laptop",
+            "--",
+            "/src",
+            "host:dest",
+        ])
+        .unwrap();
+        match args.command {
+            Command::Sync(s) => {
+                assert_eq!(s.nickname, Some("vitalik-framework-laptop".to_string()));
+            }
+        }
+    }
+
+    #[test]
+    fn cli_nickname_is_none_when_absent() {
+        let args =
+            Cli::try_parse_from(["purgery-client", "sync", "--", "/src", "host:dest"]).unwrap();
+        match args.command {
+            Command::Sync(s) => {
+                assert!(s.nickname.is_none());
+            }
+        }
     }
 }

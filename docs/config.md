@@ -156,6 +156,40 @@ Each descendant's identity follows the same rules: regular files capture size, m
 - Passthrough files with `--delete-after-import`: SHA failure is fatal during cleanup identity capture.
 - Pure passthrough pre-rsync cleanup ledger capture: a regular file whose SHA cannot be computed is skipped (not added to the ledger).
 
+## Client nickname
+
+`purgery-client sync` accepts an optional `--nickname NAME` flag.
+
+The nickname identifies the source/client namespace on the server:
+
+```text
+nickname    = source/client namespace
+run_id      = unique operation identity
+destination = final import target
+```
+
+The nickname is **not** the remote host. It is a stable local identifier so the
+server can distinguish runs from different sources.
+
+If `--nickname` is omitted, the client derives a nickname automatically from
+the local username and hostname, for example:
+
+```shell
+USER=alice hostname=my-laptop  →  nickname=alice-my-laptop
+```
+
+No persistent client identity file is written.
+
+Use `--nickname` when you want an explicit, stable identifier:
+
+```shell
+purgery-client sync --nickname framework-laptop -- ~/Videos user@server:/archive
+```
+
+Invalid nicknames (containing spaces, special characters, etc.) are rejected
+with a clear error. See `Nickname` validation rules for the allowed character
+set.
+
 ## Trust boundary assumptions
 
 Purgery's security model assumes:
