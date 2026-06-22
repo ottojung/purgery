@@ -53,7 +53,7 @@ purgery-client sync \
   -- ~/Videos user@server:/archive
 ```
 
-The above will match all files in `~/Videos` and send them one-by-one, compressing on the server, and then deleting the originals.
+The above will match all video files in `~/Videos` and send them one-by-one, compressing on the server, and then deleting the originals.
 
 ## What Purgery is not
 
