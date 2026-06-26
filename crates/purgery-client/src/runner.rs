@@ -686,14 +686,17 @@ impl RemoteRunner {
         match self {
             RemoteRunner::Real => {
                 let rsync_args = purgery_core::build_rsync_args(source, &rsync_dest);
-                let status = Command::new("rsync")
-                    .args(&rsync_args)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .with_context(|| {
-                        format!("failed to execute rsync: {source} -> {host}:{remote_dir}")
-                    })?;
+                let mut cmd = Command::new("rsync");
+                cmd.args(&rsync_args).stdout(std::process::Stdio::null());
+                // Only inherit stderr (SSH motd/banner) when debug is enabled.
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    cmd.stderr(std::process::Stdio::inherit());
+                } else {
+                    cmd.stderr(std::process::Stdio::null());
+                }
+                let status = cmd.status().with_context(|| {
+                    format!("failed to execute rsync: {source} -> {host}:{remote_dir}")
+                })?;
                 if !status.success() {
                     anyhow::bail!("rsync failed: {source} -> {host}:{remote_dir}");
                 }
@@ -753,16 +756,18 @@ impl RemoteRunner {
 
         match self {
             RemoteRunner::Real => {
-                let status = Command::new("rsync")
-                    .args(&args)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .with_context(|| {
-                        format!(
-                            "failed to execute rsync filter transfer: {source} -> {host}:{remote_dir}"
-                        )
-                    })?;
+                let mut cmd = Command::new("rsync");
+                cmd.args(&args).stdout(std::process::Stdio::null());
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    cmd.stderr(std::process::Stdio::inherit());
+                } else {
+                    cmd.stderr(std::process::Stdio::null());
+                }
+                let status = cmd.status().with_context(|| {
+                    format!(
+                        "failed to execute rsync filter transfer: {source} -> {host}:{remote_dir}"
+                    )
+                })?;
                 if !status.success() {
                     anyhow::bail!("rsync filter transfer failed: {source} -> {host}:{remote_dir}");
                 }
