@@ -661,6 +661,19 @@ work_dir = "/universe/tmp/purgery"
         assert!(result.is_err());
     }
 
+    #[test]
+    fn server_config_accepts_relative_work_dir() {
+        let toml = r#"
+work_dir = "relative/path/to/purgery"
+"#;
+        let config = ServerConfig::from_toml(toml).unwrap();
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(
+            config.work_dir.as_str(),
+            format!("{}/relative/path/to/purgery", home.trim_end_matches('/'))
+        );
+    }
+
     // ── Manifest tests ──
 
     #[test]
@@ -1032,6 +1045,7 @@ unknown_field = "value"
                 "--inplace",
                 "--mkpath",
                 "--archive",
+                "--human-readable",
                 "--info=progress2,stats2",
                 "--protect-args",
                 "--",

@@ -1,3 +1,4 @@
+use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::str::FromStr;
@@ -203,7 +204,7 @@ impl FromStr for ColorMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ServerConfigFile {
-    pub work_dir: PurgeryRoot,
+    pub work_dir: Utf8PathBuf,
     #[serde(default)]
     pub transform: Vec<TransformDefinition>,
     #[serde(default)]
@@ -237,8 +238,22 @@ impl ServerConfig {
 
             transforms.insert(td.name.clone(), td);
         }
+
+        let work_dir = if config.work_dir.is_relative() {
+            match std::env::var("HOME") {
+                Ok(home) => Utf8PathBuf::from(home).join(&config.work_dir),
+                Err(_) => {
+                    return Err(ConfigError::Invalid(
+                        "HOME not set, cannot resolve relative work_dir".into(),
+                    ))
+                }
+            }
+        } else {
+            config.work_dir
+        };
+
         Ok(Self {
-            work_dir: config.work_dir,
+            work_dir: PurgeryRoot::new(work_dir)?,
             transforms,
             gc: config.gc,
             logging: config.logging,
