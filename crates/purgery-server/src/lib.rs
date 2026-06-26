@@ -4030,10 +4030,9 @@ delete_after_import = true
     }
 
     #[test]
-    fn transform_outputs_produced_in_work_area_before_destination_write() {
-        // A subprocess creates output files; cwd is the work-area parent so
-        // relative-path outputs land inside the work area. Purgery validates
-        // expected outputs are under the work area before finalizing.
+    fn transform_writes_expected_outputs_directly_to_target_directory() {
+        // The subprocess writes directly to the target directory.
+        // Purgery only verifies that the declared expected output exists afterward.
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
 

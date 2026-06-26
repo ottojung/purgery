@@ -77,4 +77,4 @@ With `--delete-after-import` or `--transform`, the client discovers candidates u
 
 Direct passthrough imports (rsync) overlay the destination tree without deleting absent destination entries. Directories merge, regular files replace conflicting files or empty directories, and symlinks are placed as symlinks with literal targets.
 
-Transform entries instead rely on the transform program to write outputs directly to destination paths. Purgery checks declared `expected_outputs` after subprocess exit and records their paths in status.
+Transform entries instead rely on the transform program to write outputs directly to destination paths. Purgery checks declared `expected_outputs` after subprocess exit and records their paths in status. Relative `expected_outputs` resolve against the run destination; absolute `expected_outputs` are used as-is. `expected_outputs = []` is valid and records no final paths.

@@ -254,6 +254,6 @@ Publication to the destination differs by run mode:
 
 - **Transform run:** The transform program writes outputs directly to the resolved expected output paths. Purgery checks that each declared `expected_outputs` exists after successful subprocess exit and records those paths in status. The source entry is consumed by the transform flow. If `expected_outputs = []`, successful subprocess exit alone is sufficient; no output-existence check is performed.
 
-Symlink targets are stored and recreated literally. Neither staged symlinks nor destination symlinks are traversed as directories.
+In direct passthrough, symlink sources are transferred as symlinks with literal targets. In transform runs, any symlink outputs are created by the transform program; Purgery only checks that declared symlink outputs exist. Neither staged symlinks nor destination symlinks are traversed as directories.
 
 For transform runs, a crash can expose partial output at the destination. The run remains in `processing/` without a terminal status and `process-once` replays it until the transform completes successfully. The operation is not an all-or-nothing filesystem transaction.

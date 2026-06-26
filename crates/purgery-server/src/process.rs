@@ -211,6 +211,14 @@ fn process_manifest_entry(
     entry_total: usize,
     destination: &DestinationPath,
 ) -> EntryOutcome {
+    let Some(transform_name) = entry.transform.as_deref() else {
+        return failed_entry(
+            entry,
+            "server-side non-transform imports are not supported; entry must have a transform"
+                .to_string(),
+        );
+    };
+
     let expected_staged = Utf8Path::new("files").join(entry.relative_path.as_str());
     let Ok(expected_staged) = NormalizedRelativePath::new(expected_staged) else {
         return failed_entry(entry, "failed to normalize expected staged path");
@@ -264,14 +272,6 @@ fn process_manifest_entry(
         }
         ManifestEntryKind::Directory => {}
     }
-
-    let Some(transform_name) = entry.transform.as_deref() else {
-        return failed_entry(
-            entry,
-            "server-side non-transform imports are not supported; entry must have a transform"
-                .to_string(),
-        );
-    };
 
     let destination_root = destination.as_path();
     let final_path = destination.join(&entry.relative_path);
