@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use purgery_core::{
     BeginRunResponse, ClientRunPhase, ClientRunState, DestinationPath, DurableCleanupState,
-    Manifest, Nickname, PrepareRunResponse, RunConfig, RunId, RunStateResponse, RunStatus,
+    EntryStatusEntry, FileStatus, Manifest, Nickname, PrepareRunResponse, RunConfig, RunId,
+    RunState, RunStateResponse, RunStatus,
 };
+use std::fmt::Write;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -1020,6 +1022,7 @@ fn resume_runs(runner: &RemoteRunner, state_dir: &str) -> Result<()> {
     entries.sort_by_key(|e| e.file_name());
 
     let mut any_error = false;
+    let mut first_drain_error: Option<String> = None;
 
     for entry in entries {
         let state_path = entry.path().join("state.toml");
@@ -1090,13 +1093,23 @@ fn resume_runs(runner: &RemoteRunner, state_dir: &str) -> Result<()> {
                     "failed to resume run {}/{}: {e}",
                     run_state.nickname, run_state.run_id
                 );
+                if first_drain_error.is_none() {
+                    first_drain_error = Some(format!("{e:#}"));
+                }
                 any_error = true;
             }
         }
     }
 
     if any_error {
-        anyhow::bail!("failed to resume one or more prior run states; refusing to start new sync");
+        match first_drain_error {
+            Some(details) => anyhow::bail!(
+                "failed to resume one or more prior run states; refusing to start new sync: {details}",
+            ),
+            None => anyhow::bail!(
+                "failed to resume one or more prior run states; refusing to start new sync",
+            ),
+        }
     }
     Ok(())
 }
@@ -1210,6 +1223,7 @@ fn drain_one(runner: &RemoteRunner, state_dir: &str, state: &ClientRunState) -> 
                     &run_config,
                     &status,
                 )?;
+                ensure_successful_status(&status)?;
                 return Ok(());
             }
             ClientRunPhase::CleanupComplete => return Ok(()),
@@ -1265,6 +1279,90 @@ fn process_cleanup_from_status(
     )?;
     remove_client_run_state(state_dir, nickname, run_id);
     Ok(())
+}
+
+/// Check that a terminal `RunStatus` represents user-level sync success.
+///
+/// Returns `Ok(())` only when `status.state` is `RunState::Done`.
+/// Returns `Err` with diagnostics when the state is `Partial` or `Failed`.
+///
+/// The error message includes:
+/// - nickname and run_id
+/// - status state
+/// - top-level `status.error` if present
+/// - counts of imported/failed/skipped entries
+/// - details for the first few failed or skipped entries
+fn ensure_successful_status(status: &RunStatus) -> Result<()> {
+    match &status.state {
+        RunState::Done => return Ok(()),
+        RunState::Partial | RunState::Failed => {}
+    }
+
+    let mut detail = format!(
+        "sync completed with unsuccessful server status: run {}/{} state={}",
+        status.nickname.as_str(),
+        status.run_id.as_str(),
+        status.state.as_str(),
+    );
+
+    if let Some(ref err) = status.error {
+        let _ = write!(detail, "; server error: {err}");
+    }
+
+    let imported = status
+        .entries
+        .iter()
+        .filter(|e| e.status == FileStatus::Imported)
+        .count();
+    let failed = status
+        .entries
+        .iter()
+        .filter(|e| e.status == FileStatus::Failed)
+        .count();
+    let skipped = status
+        .entries
+        .iter()
+        .filter(|e| e.status == FileStatus::Skipped)
+        .count();
+
+    let _ = write!(
+        detail,
+        "; imported={imported} failed={failed} skipped={skipped}"
+    );
+
+    const MAX_LISTED_ENTRIES: usize = 5;
+    let problem_entries: Vec<&EntryStatusEntry> = status
+        .entries
+        .iter()
+        .filter(|e| e.status == FileStatus::Failed || e.status == FileStatus::Skipped)
+        .take(MAX_LISTED_ENTRIES)
+        .collect();
+
+    for entry in &problem_entries {
+        let _ = write!(detail, "; entry relative_path=\"{}\"", entry.relative_path,);
+        if let Some(ref t) = entry.transform {
+            let _ = write!(detail, " transform=\"{t}\"");
+        }
+        if let Some(ref err) = entry.error {
+            let _ = write!(detail, " error=\"{err}\"");
+        }
+    }
+
+    let problem_entry_count = status
+        .entries
+        .iter()
+        .filter(|e| e.status == FileStatus::Failed || e.status == FileStatus::Skipped)
+        .count();
+
+    if problem_entry_count > MAX_LISTED_ENTRIES {
+        let _ = write!(
+            detail,
+            "; ({} more failed/skipped entries not shown)",
+            problem_entry_count - MAX_LISTED_ENTRIES,
+        );
+    }
+
+    Err(anyhow::anyhow!("{detail}"))
 }
 
 // ── Main sync entry point ──────────────────────────────────────────────
@@ -1650,6 +1748,8 @@ pub(crate) fn run_sync_with_run_id(
         ClientRunPhase::CleanupComplete,
     )?;
     remove_client_run_state(&state_dir, &nickname, run_id);
+
+    ensure_successful_status(&status)?;
 
     info!(state = %status.state.as_str(), "sync complete");
     Ok(())
@@ -5663,5 +5763,451 @@ observed_at_unix_secs = 1000
                 "AlreadyDone call must not re-run gc: {log:?}"
             );
         }
+    }
+
+    #[test]
+    fn fresh_transform_sync_fails_for_failed_terminal_state() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        runner.add_response("run-state", &ready_run_state_toml());
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("processed", "test-run"),
+            },
+        );
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response(
+            "status",
+            &failed_status_toml().replace("test-run-failed", "test-run"),
+        );
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(result.is_err(), "sync must fail for failed state");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("unsuccessful server status"),
+            "error must mention status: {msg}"
+        );
+        assert!(
+            msg.contains("failed"),
+            "error must contain state name: {msg}"
+        );
+    }
+
+    #[test]
+    fn fresh_transform_sync_fails_for_partial_terminal_state() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+        let args = transform_args(&tmp, &state_dir);
+        let run_id = RunId::new("test-run".into()).unwrap();
+
+        runner.add_response("begin-run", &begin_resp_toml());
+        runner.add_response(
+            "prepare-run",
+            &format!(
+                "{}nickname = \"laptop\"\nrun_id = \"test-run\"\n",
+                resp_header()
+            ),
+        );
+        runner.add_response("heartbeat-run", "");
+        runner.add_response("finish-run", "");
+        runner.add_response("run-state", &ready_run_state_toml());
+        runner.add_spawned_cmd_exit(
+            "process-run",
+            0,
+            RemoteCommandExit::Success {
+                stdout: process_run_ok_toml("processed", "test-run"),
+            },
+        );
+        runner.add_response("run-state", &done_run_state_toml());
+        runner.add_response(
+            "status",
+            &partial_status_toml().replace("test-run-partial", "test-run"),
+        );
+
+        let result = run_sync_with_run_id(&runner, &args, &run_id, ServerRunSetup::Needed);
+        assert!(result.is_err(), "sync must fail for partial state");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("unsuccessful server status"),
+            "error must mention status: {msg}"
+        );
+        assert!(
+            msg.contains("partial"),
+            "error must contain state name: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_status_seen_fails_for_failed_state() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+
+        let status = RunStatus {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: RunId::new("test-tss-fail".into()).unwrap(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            state: RunState::Failed,
+            entries: vec![],
+            error: Some("transform failed".to_string()),
+        };
+        let terminal_status = toml::to_string(&status).unwrap();
+
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: RunId::new("test-tss-fail".into()).unwrap(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            entries: vec![],
+        };
+        let run_config = RunConfig {
+            purgery_version: "0.1.0-test".to_string(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            destination: DestinationPath::new(camino::Utf8PathBuf::from("rel")).unwrap(),
+            delete_after_import: true,
+        };
+
+        persist_client_run_state(
+            &state_dir,
+            &Nickname::new("laptop".into()).unwrap(),
+            &RunId::new("test-tss-fail".into()).unwrap(),
+            "host",
+            "purgery-server",
+            &manifest,
+            &run_config,
+            Some(&terminal_status),
+            ClientRunPhase::TerminalStatusSeen,
+        )
+        .unwrap();
+
+        let result = resume_runs(&runner, &state_dir);
+        assert!(result.is_err(), "resume must fail for failed state");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("unsuccessful server status"),
+            "error must contain ensure_successful_status diagnostic: {msg}"
+        );
+        assert!(
+            msg.contains("failed"),
+            "error must contain state name: {msg}"
+        );
+        assert!(
+            msg.contains("transform failed"),
+            "error must include server error: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminal_status_seen_fails_for_partial_state() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+
+        let status = RunStatus {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: RunId::new("test-tss-part".into()).unwrap(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            state: RunState::Partial,
+            entries: vec![EntryStatusEntry {
+                kind: purgery_core::ManifestEntryKind::RegularFile,
+                local_path: "local.txt".to_string(),
+                relative_path: "dir/file.txt".to_string(),
+                status: FileStatus::Failed,
+                final_paths: vec![],
+                transform: Some("test-cp".to_string()),
+                error: Some("transform failed".to_string()),
+            }],
+            error: Some("some entries failed".to_string()),
+        };
+        let terminal_status = toml::to_string(&status).unwrap();
+
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: RunId::new("test-tss-part".into()).unwrap(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            entries: vec![],
+        };
+        let run_config = RunConfig {
+            purgery_version: "0.1.0-test".to_string(),
+            nickname: Nickname::new("laptop".into()).unwrap(),
+            destination: DestinationPath::new(camino::Utf8PathBuf::from("rel")).unwrap(),
+            delete_after_import: true,
+        };
+
+        persist_client_run_state(
+            &state_dir,
+            &Nickname::new("laptop".into()).unwrap(),
+            &RunId::new("test-tss-part".into()).unwrap(),
+            "host",
+            "purgery-server",
+            &manifest,
+            &run_config,
+            Some(&terminal_status),
+            ClientRunPhase::TerminalStatusSeen,
+        )
+        .unwrap();
+
+        let result = resume_runs(&runner, &state_dir);
+        assert!(result.is_err(), "resume must fail for partial state");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("unsuccessful server status"),
+            "error must contain ensure_successful_status diagnostic: {msg}"
+        );
+        assert!(
+            msg.contains("partial"),
+            "error must contain state name: {msg}"
+        );
+        assert!(
+            msg.contains("some entries failed"),
+            "error must include server error: {msg}"
+        );
+    }
+
+    #[test]
+    fn cleanup_deletes_imported_file_preserves_failed_for_partial_status() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+
+        let imported_path = tmp.path().join("imported.txt");
+        let failed_path = tmp.path().join("failed.txt");
+        fs::write(&imported_path, "imported content").unwrap();
+        fs::write(&failed_path, "failed content").unwrap();
+
+        let imported_sha = cleanup::compute_sha256(&imported_path).unwrap();
+        let imported_meta = fs::metadata(&imported_path).unwrap();
+        let imported_mtime = imported_meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+
+        let failed_sha = cleanup::compute_sha256(&failed_path).unwrap();
+        let failed_meta = fs::metadata(&failed_path).unwrap();
+        let failed_mtime = failed_meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("test-cleanup-partial".into()).unwrap();
+
+        let cleanup_state = DurableCleanupState {
+            purgery_version: "0.1.0-test".to_string(),
+            nickname: nickname.as_str().to_owned(),
+            operation_id: run_id.as_str().to_owned(),
+            entries: vec![
+                purgery_core::CleanupEntry {
+                    relative_path: "rel/imported.txt".to_string(),
+                    local_path: imported_path.to_string_lossy().to_string(),
+                    kind: purgery_core::ManifestEntryKind::RegularFile,
+                    size: imported_meta.len(),
+                    mtime_ns: imported_mtime,
+                    sha256: Some(imported_sha),
+                    link_target: None,
+                    import_confirmed: false,
+                    cleaned: false,
+                },
+                purgery_core::CleanupEntry {
+                    relative_path: "rel/failed.txt".to_string(),
+                    local_path: failed_path.to_string_lossy().to_string(),
+                    kind: purgery_core::ManifestEntryKind::RegularFile,
+                    size: failed_meta.len(),
+                    mtime_ns: failed_mtime,
+                    sha256: Some(failed_sha),
+                    link_target: None,
+                    import_confirmed: false,
+                    cleaned: false,
+                },
+            ],
+        };
+        cleanup::write_cleanup_state(&cleanup_state, &state_dir).unwrap();
+
+        let status = RunStatus {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            state: RunState::Partial,
+            entries: vec![
+                EntryStatusEntry {
+                    kind: purgery_core::ManifestEntryKind::RegularFile,
+                    local_path: imported_path.to_string_lossy().to_string(),
+                    relative_path: "rel/imported.txt".to_string(),
+                    status: FileStatus::Imported,
+                    final_paths: vec![],
+                    transform: Some("test-cp".to_string()),
+                    error: None,
+                },
+                EntryStatusEntry {
+                    kind: purgery_core::ManifestEntryKind::RegularFile,
+                    local_path: failed_path.to_string_lossy().to_string(),
+                    relative_path: "rel/failed.txt".to_string(),
+                    status: FileStatus::Failed,
+                    final_paths: vec![],
+                    transform: Some("test-cp".to_string()),
+                    error: Some("permission denied".to_string()),
+                },
+            ],
+            error: Some("some entries failed".to_string()),
+        };
+        let terminal_status = toml::to_string(&status).unwrap();
+
+        let runner = mk_runner();
+
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![],
+        };
+        let run_config = RunConfig {
+            purgery_version: "0.1.0-test".to_string(),
+            nickname: nickname.clone(),
+            destination: DestinationPath::new(camino::Utf8PathBuf::from("rel")).unwrap(),
+            delete_after_import: true,
+        };
+
+        persist_client_run_state(
+            &state_dir,
+            &nickname,
+            &run_id,
+            "host",
+            "purgery-server",
+            &manifest,
+            &run_config,
+            Some(&terminal_status),
+            ClientRunPhase::TerminalStatusSeen,
+        )
+        .unwrap();
+
+        // Verify both files exist before resume
+        assert!(
+            imported_path.exists(),
+            "imported file must exist before resume"
+        );
+        assert!(failed_path.exists(), "failed file must exist before resume");
+
+        let result = resume_runs(&runner, &state_dir);
+        assert!(result.is_err(), "resume must fail for partial state");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("unsuccessful server status"),
+            "error must contain ensure_successful_status diagnostic: {msg}"
+        );
+
+        // Imported file must be deleted; failed file must survive
+        assert!(
+            !imported_path.exists(),
+            "imported file must be deleted by cleanup"
+        );
+        assert!(failed_path.exists(), "failed file must survive cleanup");
+    }
+
+    #[test]
+    fn ensure_successful_status_accepts_done() {
+        let status = RunStatus {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: RunId::new("r".into()).unwrap(),
+            nickname: Nickname::new("n".into()).unwrap(),
+            state: RunState::Done,
+            entries: vec![],
+            error: None,
+        };
+        assert!(ensure_successful_status(&status).is_ok());
+    }
+
+    #[test]
+    fn ensure_successful_status_rejects_failed() {
+        let status = RunStatus {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: RunId::new("r".into()).unwrap(),
+            nickname: Nickname::new("n".into()).unwrap(),
+            state: RunState::Failed,
+            entries: vec![],
+            error: Some("boom".to_string()),
+        };
+        let err = ensure_successful_status(&status).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("failed"));
+        assert!(msg.contains("boom"));
+    }
+
+    #[test]
+    fn ensure_successful_status_rejects_partial() {
+        let status = RunStatus {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: RunId::new("r".into()).unwrap(),
+            nickname: Nickname::new("n".into()).unwrap(),
+            state: RunState::Partial,
+            entries: vec![],
+            error: Some("not all done".to_string()),
+        };
+        let err = ensure_successful_status(&status).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("partial"));
+        assert!(msg.contains("not all done"));
+    }
+
+    fn failed_status_toml() -> String {
+        r#"purgery_version = "0.1.0-test"
+run_id = "test-run-failed"
+nickname = "laptop"
+state = "failed"
+error = "transform pipeline error"
+
+[[entries]]
+kind = "regular_file"
+local_path = "src.txt"
+relative_path = "rel/dst.txt"
+status = "failed"
+transform = "test-cp"
+error = "transform command failed with exit code 1"
+"#
+        .to_string()
+    }
+
+    fn partial_status_toml() -> String {
+        r#"purgery_version = "0.1.0-test"
+run_id = "test-run-partial"
+nickname = "laptop"
+state = "partial"
+error = "some entries failed"
+
+[[entries]]
+kind = "regular_file"
+local_path = "ok.txt"
+relative_path = "rel/ok.txt"
+status = "imported"
+transform = "test-cp"
+
+[[entries]]
+kind = "regular_file"
+local_path = "bad.txt"
+relative_path = "rel/bad.txt"
+status = "failed"
+transform = "test-cp"
+error = "permission denied"
+"#
+        .to_string()
     }
 }
