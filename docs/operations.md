@@ -230,9 +230,25 @@ This is used for client `ssh`, `rsync`, and server transform `program` values.
 
 `process-once` recovers runs already in `processing/` before claiming runs from `ready/`. Operators do not need to move phase directories manually after a crash. Recovery uses staged files and filesystem status only; see [Crash Safety and Idempotent Imports](design/crash-safety-and-idempotence.md).
 
+## Publication semantics
+
+Purgery has different publication contracts in different modes.
+
+### Direct passthrough
+
+Direct passthrough is rsync-style publication. The client invokes rsync directly against the destination. No server run is created, no manifest is uploaded, and no terminal server status exists.
+
+This is not atomic publication. Interrupted transfers can leave partial contents at the exact destination path according to rsync behavior and the flags Purgery uses. In direct passthrough with `--delete-after-import`, successful rsync exit is the import confirmation used to authorize local cleanup.
+
+### Transform runs
+
+Transform runs are server-run/status-tracked operations. The server records terminal status after processing.
+
+For transform outputs, Purgery still does not perform atomic final publication. The transform program writes final outputs itself. Purgery checks declared `expected_outputs` after successful subprocess exit and records those paths in status. If atomic output matters, the transform program must implement it.
+
 ## Final-storage overlay
 
-Each run overlays its uploaded source onto the destination with recursive archive-mode rsync semantics and no delete option. The source entry base final path is `<destination>/<source_entry_name>`. For non-transform entries, the work entry is committed to the base final path. For transform entries, only the expected outputs are committed; the original source is consumed by the transform flow. Each expected transform output resolves according to its pattern: relative patterns resolve against `<DESTINATION>`, absolute patterns are used as-is. `{target_directory}` is allowed and expands to the entry's target parent directory. Existing directories are merged, regular files and symlinks replace compatible destination entries.
+Each run overlays its uploaded source onto the destination with recursive archive-mode rsync semantics and no delete option. The source entry base final path is `<destination>/<source_entry_name>`. For transform entries, only the expected outputs are committed; the original source is consumed by the transform flow. Each expected transform output resolves according to its pattern: relative patterns resolve against `<DESTINATION>`, absolute patterns are used as-is. `{target_directory}` is allowed and expands to the entry's target parent directory. Existing directories are merged, regular files and symlinks replace compatible destination entries.
 
 Symlink targets are stored and recreated literally. Neither staged symlinks nor destination symlinks are traversed as directories. Transforming applies to the source entry, regardless of kind.
 

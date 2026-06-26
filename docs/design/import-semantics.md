@@ -26,9 +26,24 @@ The run destination is final storage. `{target_directory}` is `<destination>` (t
 - If the expanded path is relative, it is resolved against `<DESTINATION>` (the run destination root).
 - `{target_directory}` is allowed and expands to the entry's target parent path.
 
-Transform programs are responsible for placing outputs at the resolved expected output paths. After the subprocess exits successfully, Purgery checks that each declared expected output exists. Purgery does not move or commit transform outputs.
+### Transform finalization contract
 
-Purgery does not sandbox transform output paths. The transform program is trusted server configuration and runs with the server's OS permissions. Purgery only verifies and reports the paths configured by the server admin.
+Transforms are trusted final writers.
+
+For transform runs, Purgery does not move or commit transform outputs. The configured transform program is responsible for writing its outputs directly to the final paths implied by `expected_outputs`. The transform program runs with the server process permissions and is trusted server-admin configuration. Purgery does not sandbox transform output paths — it only verifies and reports the paths configured by the server admin.
+
+That means the transform program must:
+
+- create parent directories when needed;
+- avoid leaving bad partial outputs, or implement its own temporary-file-and-rename discipline;
+- decide what to do if an output path already exists;
+- preserve whatever permissions, timestamps, or metadata it cares about.
+
+After the subprocess exits successfully, Purgery resolves `expected_outputs` and checks that each declared output path exists and is a supported filesystem entry. That check is not an atomic publication mechanism.
+
+`expected_outputs = []` is valid. In that case, successful subprocess exit is sufficient for the entry to be marked imported, and `final_paths` is empty. This supports verification-only or deletion-only transforms.
+
+Purgery does not stage, rename, move, or commit transform outputs. Local cleanup after a successful transform run is authorised by terminal server status reporting imported entries — not by the presence of final output files.
 
 Transformed inputs are consumed by the transform flow and are never committed as final outputs. A transform produces exactly the declared `expected_outputs`. If `expected_outputs = []`, no output-existence checks are performed; successful subprocess exit is sufficient for the entry to be marked `imported`. This allows intentionally deletion-only or verification-only transforms.
 

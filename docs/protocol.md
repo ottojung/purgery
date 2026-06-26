@@ -184,8 +184,6 @@ The source entry base final path is `<destination>/<source_entry_name>`. `{targe
 
 Transform programs are responsible for placing outputs at the resolved expected output paths. Purgery does not move or commit transform outputs. After the transform exits successfully, Purgery checks that each declared expected output exists. `expected_outputs` are path patterns: relative patterns resolve against `<DESTINATION>`, absolute patterns are used as-is, and `{target_directory}` is allowed.
 
-For non-transform entries, the server commits the work entry directly to the base final path.
-
 `work_dir` is never final storage.
 
 ## Manifest (manifest.toml)
@@ -246,8 +244,6 @@ transform = "compress-video"
 ### Final path computation
 
 The source entry base final path is `<destination>/<source_entry_name>`. `{target_directory}` is `<destination>`.
-
-For non-transform entries, the server commits the work entry to the base final path.
 
 For transform entries, `final_paths` in the status records the resolved expected output paths whose existence Purgery confirmed after the transform. Relative `expected_outputs` resolve against `<DESTINATION>`, absolute paths are used as-is, and `{target_directory}` is allowed. If `expected_outputs = []`, no paths are checked and `final_paths` is empty. Purgery does not move or commit transform outputs; it only checks that declared expected outputs exist. Transformed inputs are consumed by the transform flow and are never committed as final outputs.
 
