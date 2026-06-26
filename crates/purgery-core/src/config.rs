@@ -215,7 +215,7 @@ struct ServerConfigFile {
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
-    pub work_dir: PurgeryRoot,
+    pub work_dir: ServerWorkDir,
     pub transforms: BTreeMap<String, TransformDefinition>,
     pub gc: GCConfig,
     pub logging: LoggingConfig,
@@ -253,7 +253,7 @@ impl ServerConfig {
         };
 
         Ok(Self {
-            work_dir: PurgeryRoot::new(work_dir)?,
+            work_dir: ServerWorkDir::new(work_dir)?,
             transforms,
             gc: config.gc,
             logging: config.logging,

@@ -9,7 +9,7 @@ use tracing::{info, warn};
 #[cfg_attr(not(test), allow(unused_imports))]
 use camino::Utf8Path;
 #[cfg_attr(not(test), allow(unused_imports))]
-use purgery_core::{FileStatus, Manifest, ManifestEntryKind, PurgeryRoot, RunState};
+use purgery_core::{FileStatus, Manifest, ManifestEntryKind, RunState, ServerWorkDir};
 
 mod commit;
 mod gc;
@@ -792,7 +792,7 @@ mod tests {
     fn test_server_config(work_dir: &Utf8Path) -> ServerConfig {
         fs::create_dir_all(work_dir).unwrap();
         ServerConfig {
-            work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
+            work_dir: ServerWorkDir::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             transforms: BTreeMap::new(),
             logging: Default::default(),
@@ -1052,7 +1052,7 @@ delete_after_import = true
     fn test_find_ready_runs_empty() {
         let tmp = tempfile::tempdir().unwrap();
         let root =
-            PurgeryRoot::new(Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap())
+            ServerWorkDir::new(Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap())
                 .unwrap();
         let runs = find_ready_runs(&root).unwrap();
         assert!(runs.is_empty());
@@ -1062,7 +1062,7 @@ delete_after_import = true
     fn test_find_ready_runs_with_entries() {
         let tmp = tempfile::tempdir().unwrap();
         let root =
-            PurgeryRoot::new(Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap())
+            ServerWorkDir::new(Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap())
                 .unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
 
@@ -1254,7 +1254,7 @@ delete_after_import = true
     #[test]
     fn test_transforms_path_with_spaces() {
         let server_config = ServerConfig {
-            work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
+            work_dir: ServerWorkDir::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
             transforms: single_transform(
                 "compress-video",
@@ -1284,7 +1284,7 @@ delete_after_import = true
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
 
         let server_config = ServerConfig {
-            work_dir: PurgeryRoot::new(work_dir.as_str().into()).unwrap(),
+            work_dir: ServerWorkDir::new(work_dir.as_str().into()).unwrap(),
             gc: Default::default(),
             transforms: single_transform(
                 "compress-video",
@@ -1360,7 +1360,7 @@ delete_after_import = true
         fs::write(&work_path, b"video").unwrap();
 
         let server_config = ServerConfig {
-            work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
+            work_dir: ServerWorkDir::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
             transforms: single_transform(
                 "compress-video",
@@ -1390,7 +1390,7 @@ delete_after_import = true
         fs::write(&compressed, b"compressed").unwrap();
 
         let server_config = ServerConfig {
-            work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
+            work_dir: ServerWorkDir::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
             transforms: single_transform(
                 "compress-video",
@@ -1780,7 +1780,7 @@ delete_after_import = true
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
 
         let server_config = ServerConfig {
-            work_dir: PurgeryRoot::new(work_dir.as_str().into()).unwrap(),
+            work_dir: ServerWorkDir::new(work_dir.as_str().into()).unwrap(),
             gc: Default::default(),
             transforms: single_transform(
                 "compress-video",
@@ -1867,7 +1867,7 @@ delete_after_import = true
         .unwrap();
 
         let server_config = ServerConfig {
-            work_dir: PurgeryRoot::new(work_dir.as_str().into()).unwrap(),
+            work_dir: ServerWorkDir::new(work_dir.as_str().into()).unwrap(),
             gc: Default::default(),
             transforms: single_transform(
                 "compress-video",
@@ -1966,7 +1966,7 @@ delete_after_import = true
         .unwrap();
 
         let server_config = ServerConfig {
-            work_dir: PurgeryRoot::new(work_dir.as_str().into()).unwrap(),
+            work_dir: ServerWorkDir::new(work_dir.as_str().into()).unwrap(),
             gc: Default::default(),
             transforms: single_transform(
                 "compress-video",
@@ -2050,7 +2050,7 @@ delete_after_import = true
         let tmp = tempfile::tempdir().unwrap();
         let _root_path = tmp.path().join("storage");
         let server_config = ServerConfig {
-            work_dir: PurgeryRoot::new(
+            work_dir: ServerWorkDir::new(
                 Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
             )
             .unwrap(),
@@ -2080,7 +2080,7 @@ delete_after_import = true
         let tmp = tempfile::tempdir().unwrap();
         let _root_path = tmp.path().join("storage");
         let server_config = ServerConfig {
-            work_dir: PurgeryRoot::new(
+            work_dir: ServerWorkDir::new(
                 Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
             )
             .unwrap(),
@@ -2136,7 +2136,7 @@ delete_after_import = true
         let tmp = tempfile::tempdir().unwrap();
         let _root_path = tmp.path().join("storage");
         let server_config = ServerConfig {
-            work_dir: PurgeryRoot::new(
+            work_dir: ServerWorkDir::new(
                 Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
             )
             .unwrap(),
@@ -2156,7 +2156,7 @@ delete_after_import = true
         let tmp = tempfile::tempdir().unwrap();
         let _root_path = tmp.path().join("storage");
         let server_config = ServerConfig {
-            work_dir: PurgeryRoot::new(
+            work_dir: ServerWorkDir::new(
                 Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
             )
             .unwrap(),
@@ -2192,7 +2192,7 @@ delete_after_import = true
         let tmp = tempfile::tempdir().unwrap();
         let _root_path = tmp.path().join("storage");
         let server_config = ServerConfig {
-            work_dir: PurgeryRoot::new(
+            work_dir: ServerWorkDir::new(
                 Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
             )
             .unwrap(),
@@ -2615,7 +2615,7 @@ delete_after_import = true
         let tmp = tempfile::tempdir().unwrap();
         let _root_path = tmp.path().join("storage");
         let server_config = ServerConfig {
-            work_dir: PurgeryRoot::new(
+            work_dir: ServerWorkDir::new(
                 Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap(),
             )
             .unwrap(),
@@ -2884,7 +2884,7 @@ delete_after_import = true
 
     fn expected_output_test_plan() -> ServerConfig {
         ServerConfig {
-            work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
+            work_dir: ServerWorkDir::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
             transforms: single_transform(
                 "generate",
@@ -3226,7 +3226,7 @@ delete_after_import = true
         fs::write(&compressed, b"output").unwrap();
 
         let server_config = ServerConfig {
-            work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
+            work_dir: ServerWorkDir::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
             transforms: single_transform(
                 "compress",
@@ -3398,7 +3398,7 @@ delete_after_import = true
         fs::write(&compressed, b"output").unwrap();
 
         let server_config = ServerConfig {
-            work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
+            work_dir: ServerWorkDir::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
             transforms: single_transform(
                 "compress",
@@ -3494,7 +3494,7 @@ delete_after_import = true
         fs::write(work_path.with_file_name("input.out"), b"output").unwrap();
 
         let server_config = ServerConfig {
-            work_dir: PurgeryRoot::new("/tmp/purgery".into()).unwrap(),
+            work_dir: ServerWorkDir::new("/tmp/purgery".into()).unwrap(),
             gc: Default::default(),
             transforms: single_transform(
                 "compress",
@@ -4371,7 +4371,7 @@ delete_after_import = true
         let run_id = RunId::new("test-partial".into()).unwrap();
 
         let config = ServerConfig {
-            work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
+            work_dir: ServerWorkDir::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             transforms: single_transform(
                 "always-fail",
@@ -4463,7 +4463,7 @@ delete_after_import = true
         fs::create_dir_all(&work_dir).unwrap();
 
         let server_config = ServerConfig {
-            work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
+            work_dir: ServerWorkDir::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             transforms: single_transform(
                 "echo-args",
@@ -4806,7 +4806,7 @@ delete_after_import = true
         fs::create_dir_all(&work_dir).unwrap();
 
         let server_config = ServerConfig {
-            work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
+            work_dir: ServerWorkDir::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             transforms: single_transform(
                 "make-symlink",
@@ -5094,7 +5094,7 @@ delete_after_import = true
         fs::create_dir_all(&work_dir).unwrap();
 
         let server_config = ServerConfig {
-            work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
+            work_dir: ServerWorkDir::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             transforms: single_transform(
                 "make-tree",
@@ -5772,7 +5772,7 @@ delete_after_import = true
         fs::create_dir_all(&work_dir).unwrap();
 
         let server_config = ServerConfig {
-            work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
+            work_dir: ServerWorkDir::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             transforms: single_transform(
                 "copy-cmd",
@@ -5897,7 +5897,7 @@ delete_after_import = true
         fs::create_dir_all(&work_dir).unwrap();
 
         let server_config = ServerConfig {
-            work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
+            work_dir: ServerWorkDir::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             transforms: single_transform(
                 "copy-cmd",
@@ -6058,7 +6058,7 @@ delete_after_import = true
         let run_id = RunId::new("test-pp-symlink".into()).unwrap();
 
         let config = ServerConfig {
-            work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
+            work_dir: ServerWorkDir::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             transforms: single_transform(
                 "test-step",
@@ -6133,7 +6133,7 @@ delete_after_import = true
         let run_id = RunId::new("test-pp-dir".into()).unwrap();
 
         let config = ServerConfig {
-            work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
+            work_dir: ServerWorkDir::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             transforms: single_transform(
                 "test-step",
@@ -6209,7 +6209,7 @@ delete_after_import = true
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
 
         let config = ServerConfig {
-            work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
+            work_dir: ServerWorkDir::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             transforms: single_transform(
                 "noop",
@@ -6295,7 +6295,7 @@ delete_after_import = true
         .unwrap();
 
         let config = ServerConfig {
-            work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
+            work_dir: ServerWorkDir::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             transforms: single_transform(
                 "place-at-dest",
@@ -6425,7 +6425,7 @@ delete_after_import = true
         .unwrap();
 
         let config = ServerConfig {
-            work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
+            work_dir: ServerWorkDir::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             transforms: single_transform(
                 "compress",
@@ -6628,7 +6628,7 @@ delete_after_import = true
         .unwrap();
 
         let config = ServerConfig {
-            work_dir: PurgeryRoot::new(work_dir.to_owned()).unwrap(),
+            work_dir: ServerWorkDir::new(work_dir.to_owned()).unwrap(),
             gc: Default::default(),
             transforms: single_transform(
                 "write-absolute",

@@ -215,17 +215,30 @@ impl FromStr for RunId {
     }
 }
 
-// ── Absolute path newtypes ───────────────────────────────────────────
+// ── Server work directory ──────────────────────────────────────────────
+
+/// The server's absolute working directory for all runtime data.
+///
+/// Every run (incoming, ready, processing, done, failed) is organised
+/// under a sub-tree rooted at this path:
+///
+/// ```text
+/// <work_dir>/<nickname>/<phase>/<run_id>/
+/// ```
+///
+/// The absolute-path invariant is established at the config boundary
+/// (`ServerConfig::from_toml`), which resolves relative TOML paths
+/// against `$HOME` before calling `ServerWorkDir::new`.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PurgeryRoot(Utf8PathBuf);
+pub struct ServerWorkDir(Utf8PathBuf);
 
-impl PurgeryRoot {
+impl ServerWorkDir {
     pub fn new(path: Utf8PathBuf) -> Result<Self, PathValidationError> {
         if !path.is_absolute() {
             return Err(PathValidationError::NotAbsolute);
         }
-        Ok(PurgeryRoot(path))
+        Ok(ServerWorkDir(path))
     }
 
     pub fn as_path(&self) -> &Utf8Path {
@@ -247,16 +260,16 @@ impl PurgeryRoot {
     }
 }
 
-impl Serialize for PurgeryRoot {
+impl Serialize for ServerWorkDir {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.0.serialize(serializer)
     }
 }
 
-impl<'de> Deserialize<'de> for PurgeryRoot {
+impl<'de> Deserialize<'de> for ServerWorkDir {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let p = Utf8PathBuf::deserialize(deserializer)?;
-        PurgeryRoot::new(p).map_err(serde::de::Error::custom)
+        ServerWorkDir::new(p).map_err(serde::de::Error::custom)
     }
 }
 

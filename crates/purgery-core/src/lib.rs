@@ -201,7 +201,7 @@ pub fn build_rsync_args(source: &str, destination: &str) -> Vec<String> {
 
 // ── Work Area ────────────────────────────────────────────────────────
 
-pub fn work_dir(work_dir: &PurgeryRoot, nickname: &Nickname, run_id: &RunId) -> Utf8PathBuf {
+pub fn work_dir(work_dir: &ServerWorkDir, nickname: &Nickname, run_id: &RunId) -> Utf8PathBuf {
     work_dir
         .run_dir(nickname, run_id, RunPhase::Processing)
         .join("work")
@@ -444,24 +444,24 @@ mod tests {
         assert!(RunId::new(id.as_str().to_owned()).is_ok());
     }
 
-    // ── PurgeryRoot tests ──
+    // ── ServerWorkDir tests ──
 
     #[test]
     fn work_dir_absolute_valid() {
         let p = Utf8PathBuf::from("/universe/tmp/purgery");
-        let r = PurgeryRoot::new(p.clone()).unwrap();
+        let r = ServerWorkDir::new(p.clone()).unwrap();
         assert_eq!(r.as_path(), &p);
     }
 
     #[test]
     fn work_dir_relative_is_error() {
         let p = Utf8PathBuf::from("tmp/purgy");
-        assert_eq!(PurgeryRoot::new(p), Err(PathValidationError::NotAbsolute));
+        assert_eq!(ServerWorkDir::new(p), Err(PathValidationError::NotAbsolute));
     }
 
     #[test]
     fn work_dir_path_helpers() {
-        let root = PurgeryRoot::new("/tmp/purgery".into()).unwrap();
+        let root = ServerWorkDir::new("/tmp/purgery".into()).unwrap();
         let nick = Nickname::new("laptop".into()).unwrap();
         let run = RunId::new("run1".into()).unwrap();
         assert_eq!(
@@ -1229,10 +1229,10 @@ unknown_field = "value"
 
     #[test]
     fn work_dir_returns_correct_path() {
-        let purgery_root = PurgeryRoot::new(Utf8PathBuf::from("/tmp/purgery")).unwrap();
+        let server_work_dir = ServerWorkDir::new(Utf8PathBuf::from("/tmp/purgery")).unwrap();
         let nick = Nickname::new("laptop".into()).unwrap();
         let run = RunId::new("run1".into()).unwrap();
-        let wd = work_dir(&purgery_root, &nick, &run);
+        let wd = work_dir(&server_work_dir, &nick, &run);
         assert_eq!(wd.as_str(), "/tmp/purgery/laptop/processing/run1/work");
     }
 

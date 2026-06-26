@@ -47,7 +47,7 @@ Use newtypes for values that carry invariants:
 | `Nickname` | Non-empty, alphanumeric + `-` `_` only |
 | `RunId` | Non-empty, [A-Za-z0-9._-] |
 | `ServerRoot` | Absolute path |
-| `PurgeryRoot` | Absolute path |
+| `ServerWorkDir` | Absolute path |
 | `RelativeDestinationPath` | Relative, no `..`, no empty components |
 | `NormalizedRelativePath` | Relative, no `..`, no empty components |
 

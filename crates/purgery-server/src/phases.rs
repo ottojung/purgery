@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use camino::Utf8Path;
 use purgery_core::{
-    current_purgery_version, Nickname, ProcessingProgress, PurgeryRoot, RunId, RunPhase, RunState,
-    RunStatus, ServerConfig, PROTOCOL_VERSION,
+    current_purgery_version, Nickname, ProcessingProgress, RunId, RunPhase, RunState, RunStatus,
+    ServerConfig, ServerWorkDir, PROTOCOL_VERSION,
 };
 use std::fs;
 use std::os::unix::io::AsRawFd;
@@ -360,7 +360,7 @@ pub(crate) fn write_progress(
 }
 
 pub(crate) fn write_run_failure(
-    work_dir: &PurgeryRoot,
+    work_dir: &ServerWorkDir,
     nickname: &Nickname,
     run_id: &RunId,
     error_msg: &str,
@@ -414,7 +414,7 @@ pub(crate) fn write_run_failure(
 }
 
 pub(crate) fn find_runs_in_phase(
-    work_dir: &PurgeryRoot,
+    work_dir: &ServerWorkDir,
     phase: RunPhase,
 ) -> Result<Vec<(Nickname, RunId)>> {
     let mut runs = Vec::new();
@@ -468,11 +468,11 @@ pub(crate) fn find_runs_in_phase(
     Ok(runs)
 }
 
-pub fn find_ready_runs(work_dir: &PurgeryRoot) -> Result<Vec<(Nickname, RunId)>> {
+pub fn find_ready_runs(work_dir: &ServerWorkDir) -> Result<Vec<(Nickname, RunId)>> {
     find_runs_in_phase(work_dir, RunPhase::Ready)
 }
 
-pub fn find_processing_runs(work_dir: &PurgeryRoot) -> Result<Vec<(Nickname, RunId)>> {
+pub fn find_processing_runs(work_dir: &ServerWorkDir) -> Result<Vec<(Nickname, RunId)>> {
     find_runs_in_phase(work_dir, RunPhase::Processing)
 }
 
@@ -514,7 +514,7 @@ pub(crate) fn finalize_processing_run(
     Ok(())
 }
 
-pub fn move_to_failed(work_dir: &PurgeryRoot, nickname: &Nickname, run_id: &RunId) -> Result<()> {
+pub fn move_to_failed(work_dir: &ServerWorkDir, nickname: &Nickname, run_id: &RunId) -> Result<()> {
     let processing_path = work_dir.run_dir(nickname, run_id, RunPhase::Processing);
     let failed_path = work_dir.run_dir(nickname, run_id, RunPhase::Failed);
 
