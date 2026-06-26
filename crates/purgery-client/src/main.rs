@@ -4,6 +4,7 @@ compile_error!("Purgery is Unix-only — it requires rsync, SSH, and Unix filesy
 use anyhow::Result;
 use clap::Parser;
 use purgery_core::{ColorMode, LogFormat, LogLevel, LoggingConfig};
+use tracing::error;
 
 mod classify;
 mod cleanup;
@@ -167,7 +168,10 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Sync(args) => {
-            run::run_sync(&args)?;
+            if let Err(e) = run::run_sync(&args) {
+                error!("{e:#}");
+                std::process::exit(1);
+            }
         }
     }
     Ok(())
