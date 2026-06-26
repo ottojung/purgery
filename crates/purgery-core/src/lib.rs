@@ -190,6 +190,7 @@ pub fn build_rsync_args(source: &str, destination: &str) -> Vec<String> {
         "--inplace".to_string(),
         "--mkpath".to_string(),
         "--archive".to_string(),
+        "--info=progress2".to_string(),
         "--protect-args".to_string(),
         "--".to_string(),
         source.to_string(),
