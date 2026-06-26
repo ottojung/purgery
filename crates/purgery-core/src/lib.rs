@@ -286,28 +286,29 @@ pub fn init_logging(
                 .with_ansi(false)
                 .try_init()?;
         }
-        LogFormat::Compact => {
-            let fmt = tracing_subscriber::fmt()
-                .with_max_level(level_filter)
-                .compact()
-                .with_writer(std::io::stderr)
-                .with_ansi(use_color);
+        LogFormat::Compact | LogFormat::Pretty => {
             if show_details {
-                fmt.with_file(true).with_line_number(true).try_init()?;
+                tracing_subscriber::fmt()
+                    .with_max_level(level_filter)
+                    .pretty()
+                    .with_writer(std::io::stderr)
+                    .with_ansi(use_color)
+                    .with_file(true)
+                    .with_line_number(true)
+                    .try_init()?;
             } else {
-                fmt.without_time().try_init()?;
-            }
-        }
-        LogFormat::Pretty => {
-            let fmt = tracing_subscriber::fmt()
-                .with_max_level(level_filter)
-                .pretty()
-                .with_writer(std::io::stderr)
-                .with_ansi(use_color);
-            if show_details {
-                fmt.with_file(true).with_line_number(true).try_init()?;
-            } else {
-                fmt.without_time().try_init()?;
+                tracing_subscriber::fmt()
+                    .with_max_level(level_filter)
+                    .with_writer(std::io::stderr)
+                    .with_ansi(use_color)
+                    .without_time()
+                    .with_target(true)
+                    .with_level(true)
+                    .with_file(false)
+                    .with_line_number(false)
+                    .with_thread_ids(false)
+                    .with_thread_names(false)
+                    .try_init()?;
             }
         }
     }
