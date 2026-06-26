@@ -759,10 +759,13 @@ impl RemoteRunner {
         match self {
             RemoteRunner::Real => {
                 let mut cmd = Command::new("rsync");
-                cmd.args(&args).stdout(std::process::Stdio::null());
-                if tracing::enabled!(tracing::Level::DEBUG) {
+                cmd.args(&args);
+                let dbg = tracing::level_filters::LevelFilter::current() >= tracing::Level::DEBUG;
+                if dbg {
+                    cmd.stdout(std::process::Stdio::inherit());
                     cmd.stderr(std::process::Stdio::inherit());
                 } else {
+                    cmd.stdout(std::process::Stdio::null());
                     cmd.stderr(std::process::Stdio::null());
                 }
                 let status = cmd.status().with_context(|| {
