@@ -45,7 +45,7 @@ After the subprocess exits successfully, Purgery resolves `expected_outputs` and
 
 Purgery does not stage, rename, move, or commit transform outputs. Local cleanup after a successful transform run is authorised by terminal server status reporting imported entries — not by the presence of final output files.
 
-Transformed inputs are consumed by the transform flow and are never committed as final outputs. A transform produces exactly the declared `expected_outputs`. If `expected_outputs = []`, no output-existence checks are performed; successful subprocess exit is sufficient for the entry to be marked `imported`. This allows intentionally deletion-only or verification-only transforms.
+Transformed inputs are consumed by the transform flow and are never placed as final outputs. A transform produces exactly the declared `expected_outputs`. If `expected_outputs = []`, no output-existence checks are performed; successful subprocess exit is sufficient for the entry to be marked `imported`. This allows intentionally deletion-only or verification-only transforms.
 
 Examples:
 
@@ -73,6 +73,8 @@ With `--delete-after-import` or `--transform`, the client discovers candidates u
 
 `<SOURCE>` itself is matched as the relative sentinel `"."`. Source trailing slashes, `.`, and `..` are normalized before split discovery.
 
-## Destination overlay
+## Destination effects
 
-Imports overlay the destination tree without deleting absent destination entries. Directories merge, regular files replace conflicting files or empty directories, and symlinks are committed as symlinks with literal targets.
+Direct passthrough imports (rsync) overlay the destination tree without deleting absent destination entries. Directories merge, regular files replace conflicting files or empty directories, and symlinks are placed as symlinks with literal targets.
+
+Transform entries instead rely on the transform program to write outputs directly to destination paths. Purgery checks declared `expected_outputs` after subprocess exit and records their paths in status.

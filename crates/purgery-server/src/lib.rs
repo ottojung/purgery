@@ -1094,7 +1094,7 @@ delete_after_import = true
     }
 
     #[test]
-    fn processing_no_transform_entry_is_not_committed_to_final_storage() {
+    fn processing_no_transform_entry_rejected_before_destination_write() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let config = test_server_config(&work_dir);
@@ -1138,7 +1138,7 @@ delete_after_import = true
         // rejected and moved the run to failed
         process_run(&config, &nickname, &run_id).unwrap();
 
-        // Run must NOT write to final storage
+        // Run must NOT write to destination
         assert!(
             !final_path.exists(),
             "no-transform run must not create final destination file"
@@ -1495,7 +1495,7 @@ delete_after_import = true
     }
 
     #[test]
-    fn test_transform_produces_only_expected_outputs() {
+    fn apply_transform_produces_only_expected_outputs() {
         let tmp = tempfile::tempdir().unwrap();
         let work_area = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
         let work_path = work_area.join("video.mp4");
@@ -1535,7 +1535,7 @@ delete_after_import = true
     }
 
     #[test]
-    fn regular_file_commit_produces_only_expected_final_paths() {
+    fn regular_file_transform_produces_only_expected_final_paths() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let nickname = Nickname::new("laptop".into()).unwrap();
@@ -1944,10 +1944,10 @@ delete_after_import = true
         );
     }
 
-    // ── Transform end-to-end: only expected outputs committed ──
+    // ── Transform end-to-end: only expected outputs produced ──
 
     #[test]
-    fn test_transform_commits_only_expected_outputs() {
+    fn test_transform_produces_only_expected_outputs() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
 
@@ -2046,7 +2046,7 @@ delete_after_import = true
     }
 
     #[test]
-    fn test_transform_commits_expected_output() {
+    fn test_transform_produces_expected_output() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
 
@@ -4030,10 +4030,10 @@ delete_after_import = true
     }
 
     #[test]
-    fn transform_outputs_produced_in_work_area_before_commit_to_final() {
+    fn transform_outputs_produced_in_work_area_before_destination_write() {
         // A subprocess creates output files; cwd is the work-area parent so
         // relative-path outputs land inside the work area. Purgery validates
-        // expected outputs are under the work area before committing.
+        // expected outputs are under the work area before finalizing.
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
 
@@ -4170,7 +4170,7 @@ delete_after_import = true
         );
 
         // Move from Ready to Processing and write a partial final file to
-        // simulate interrupted materialization.
+        // simulate interrupted transform output.
         let processing_path = config
             .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Processing);
@@ -4238,9 +4238,9 @@ delete_after_import = true
 
     #[test]
     #[cfg(unix)]
-    fn transform_symlink_output_committed_without_operational_paths() {
+    fn transform_symlink_output_produced_without_operational_paths() {
         // A transform subprocess produces a symlink as output.
-        // The symlink entry is moved from the work area to the final path.
+        // The symlink is produced in the work area and placed at the final path.
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
 
@@ -4611,11 +4611,11 @@ delete_after_import = true
         assert_root_contains_exactly(server_config.work_dir.as_path(), &expected);
     }
 
-    /// For transform outputs, the work-area outputs are consumed by
-    /// materialization. The staged original still exists but the
-    /// work-area output is gone after successful commit.
+    /// For transform outputs, the work-area outputs are removed after a
+    /// successful transform. The staged original still exists but the
+    /// work-area output is gone.
     #[test]
-    fn transform_work_area_outputs_consumed_after_materialization() {
+    fn transform_work_area_outputs_removed_after_successful_transform() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
 
@@ -4688,7 +4688,7 @@ delete_after_import = true
         assert_eq!(fs::read_to_string(&staged_after).unwrap(), "binary data");
 
         // Work area must be removed for done runs (outputs are consumed
-        // by materialization).
+        // by transform).
         let work_done_root = done_path.join("work");
         assert!(!work_done_root.exists());
     }
@@ -5058,7 +5058,7 @@ delete_after_import = false
         );
     }
 
-    // ── No-commit (skip move) tests for transformed entries ──
+    // ── Empty expected_outputs tests for transformed entries ──
 
     #[test]
     fn transform_empty_expected_outputs_succeeds_with_empty_final_paths() {

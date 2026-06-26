@@ -245,7 +245,7 @@ transform = "compress-video"
 
 The source entry base final path is `<destination>/<source_entry_name>`. `{target_directory}` is `<destination>`.
 
-For transform entries, `final_paths` in the status records the resolved expected output paths whose existence Purgery confirmed after the transform. Relative `expected_outputs` resolve against `<DESTINATION>`, absolute paths are used as-is, and `{target_directory}` is allowed. If `expected_outputs = []`, no paths are checked and `final_paths` is empty. Purgery does not move or commit transform outputs; it only checks that declared expected outputs exist. Transformed inputs are consumed by the transform flow and are never committed as final outputs.
+For transform entries, `final_paths` in the status records the resolved expected output paths whose existence Purgery confirmed after the transform. Relative `expected_outputs` resolve against `<DESTINATION>`, absolute paths are used as-is, and `{target_directory}` is allowed. If `expected_outputs = []`, no paths are checked and `final_paths` is empty. Purgery does not move or commit transform outputs; it only checks that declared expected outputs exist. Transformed inputs are consumed by the transform flow and are never placed as final outputs.
 
 Examples:
 

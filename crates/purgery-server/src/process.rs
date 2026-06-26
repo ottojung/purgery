@@ -265,6 +265,14 @@ fn process_manifest_entry(
         ManifestEntryKind::Directory => {}
     }
 
+    let Some(transform_name) = entry.transform.as_deref() else {
+        return failed_entry(
+            entry,
+            "server-side non-transform imports are not supported; entry must have a transform"
+                .to_string(),
+        );
+    };
+
     let destination_root = destination.as_path();
     let final_path = destination.join(&entry.relative_path);
     if !path_is_within_root(&final_path, destination_root) {
@@ -276,14 +284,6 @@ fn process_manifest_entry(
     let work_path = match prepare_work_entry(entry, &source_path, work_area) {
         Ok(p) => p,
         Err(error) => return failed_entry(entry, error.to_string()),
-    };
-
-    let Some(transform_name) = entry.transform.as_deref() else {
-        return failed_entry(
-            entry,
-            "server-side non-transform imports are not supported; entry must have a transform"
-                .to_string(),
-        );
     };
 
     let Some(target_directory) = final_path.parent() else {
@@ -667,66 +667,46 @@ pub fn process_processing_run(
         "",
     );
 
-    let mut outcomes: Vec<EntryOutcome> = Vec::new();
-    // Map: directory entry relative_path -> its outcome index.
-    let mut dir_outcomes: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
+    let entry = &manifest.entries[0];
+    write_progress_best_effort(
+        &processing_path,
+        nickname,
+        run_id,
+        "processing_entry",
+        0,
+        1,
+        entry.relative_path.as_str(),
+        "",
+    );
 
-    for (entry_idx, entry) in manifest.entries.iter().enumerate() {
-        write_progress_best_effort(
-            &processing_path,
-            nickname,
-            run_id,
-            "processing_entry",
-            entry_idx,
-            manifest.entries.len(),
-            entry.relative_path.as_str(),
-            "",
-        );
+    let outcome = process_manifest_entry(
+        config,
+        entry,
+        nickname,
+        run_id,
+        &processing_path,
+        &work_area,
+        0,
+        1,
+        &run_config.destination,
+    );
 
-        outcomes.push(process_manifest_entry(
-            config,
-            entry,
-            nickname,
-            run_id,
-            &processing_path,
-            &work_area,
-            entry_idx,
-            manifest.entries.len(),
-            &run_config.destination,
-        ));
-
-        if entry.kind == ManifestEntryKind::Directory {
-            dir_outcomes.insert(entry.relative_path.as_str().to_owned(), outcomes.len() - 1);
-        }
-    }
-
-    let all_imported = outcomes
-        .iter()
-        .all(|outcome| matches!(outcome, EntryOutcome::Success { .. }));
-    let any_imported = outcomes
-        .iter()
-        .any(|outcome| matches!(outcome, EntryOutcome::Success { .. }));
-    let run_state = if all_imported {
-        RunState::Done
-    } else if any_imported {
-        RunState::Partial
-    } else {
-        RunState::Failed
+    let run_state = match &outcome {
+        EntryOutcome::Success { .. } => RunState::Done,
+        EntryOutcome::Failure { .. } => RunState::Failed,
     };
 
-    if run_state == RunState::Done {
+    if matches!(outcome, EntryOutcome::Success { .. }) {
         let _ = fs::remove_dir_all(&work_area);
     }
 
-    // Best-effort publishing_status progress before terminal status publication
     write_progress_best_effort(
         &processing_path,
         nickname,
         run_id,
         "publishing_status",
         0,
-        manifest.entries.len(),
+        1,
         "",
         "",
     );
@@ -737,7 +717,7 @@ pub fn process_processing_run(
         run_id: run_id.clone(),
         nickname: nickname.clone(),
         state: run_state.clone(),
-        entries: outcomes.into_iter().map(EntryOutcome::into_entry).collect(),
+        entries: vec![outcome.into_entry()],
         error: None,
     };
     let status_toml = run_status

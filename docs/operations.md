@@ -246,10 +246,14 @@ Transform runs are server-run/status-tracked operations. The server records term
 
 For transform outputs, Purgery still does not perform atomic final publication. The transform program writes final outputs itself. Purgery checks declared `expected_outputs` after successful subprocess exit and records those paths in status. If atomic output matters, the transform program must implement it.
 
-## Final-storage overlay
+## Destination effects
 
-Each run overlays its uploaded source onto the destination with recursive archive-mode rsync semantics and no delete option. The source entry base final path is `<destination>/<source_entry_name>`. For transform entries, only the expected outputs are committed; the original source is consumed by the transform flow. Each expected transform output resolves according to its pattern: relative patterns resolve against `<DESTINATION>`, absolute patterns are used as-is. `{target_directory}` is allowed and expands to the entry's target parent directory. Existing directories are merged, regular files and symlinks replace compatible destination entries.
+Publication to the destination differs by run mode:
 
-Symlink targets are stored and recreated literally. Neither staged symlinks nor destination symlinks are traversed as directories. Transforming applies to the source entry, regardless of kind.
+- **Direct passthrough (no transform):** rsync writes the source entry directly to `<destination>/<source_entry_name>` with archive-mode semantics. Existing directories merge, regular files and symlinks replace destination entries. Non-atomic: interrupted rsync can leave partial contents at the destination path.
 
-A crash can expose a prefix of the entry overlay. This is expected: the run remains in `processing/` without a terminal status and `process-once` replays it until the final tree converges. The operation is not an all-or-nothing filesystem transaction.
+- **Transform run:** The transform program writes outputs directly to the resolved expected output paths. Purgery checks that each declared `expected_outputs` exists after successful subprocess exit and records those paths in status. The source entry is consumed by the transform flow. If `expected_outputs = []`, successful subprocess exit alone is sufficient; no output-existence check is performed.
+
+Symlink targets are stored and recreated literally. Neither staged symlinks nor destination symlinks are traversed as directories.
+
+For transform runs, a crash can expose partial output at the destination. The run remains in `processing/` without a terminal status and `process-once` replays it until the transform completes successfully. The operation is not an all-or-nothing filesystem transaction.
