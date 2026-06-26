@@ -23,4 +23,4 @@ Transformed inputs are consumed by the transform flow and are never committed as
 
 ## Storage separation
 
-`work_dir` owns incoming files, phase directories, manifests, leases, progress, status, and work areas. Final entries are committed only beneath the destination recorded in `run.toml`, whether that destination is absolute or relative. For non-transform entries, the server moves the work entry to its final path. For transform entries, the transform program places outputs at the configured expected output paths; the server does not move or commit transform outputs.
+`work_dir` owns incoming files, phase directories, manifests, leases, progress, status, and work areas. Transform outputs are written by the transform program itself. The destination for relative `expected_outputs` is the run destination recorded in `run.toml`; absolute `expected_outputs` are used as-is. The server does not move or commit transform outputs.

@@ -230,10 +230,30 @@ This is used for client `ssh`, `rsync`, and server transform `program` values.
 
 `process-once` recovers runs already in `processing/` before claiming runs from `ready/`. Operators do not need to move phase directories manually after a crash. Recovery uses staged files and filesystem status only; see [Crash Safety and Idempotent Imports](design/crash-safety-and-idempotence.md).
 
-## Final-storage overlay
+## Publication semantics
 
-Each run overlays its uploaded source onto the destination with recursive archive-mode rsync semantics and no delete option. The source entry base final path is `<destination>/<source_entry_name>`. For non-transform entries, the work entry is committed to the base final path. For transform entries, only the expected outputs are committed; the original source is consumed by the transform flow. Each expected transform output resolves according to its pattern: relative patterns resolve against `<DESTINATION>`, absolute patterns are used as-is. `{target_directory}` is allowed and expands to the entry's target parent directory. Existing directories are merged, regular files and symlinks replace compatible destination entries.
+Purgery has different publication contracts in different modes.
 
-Symlink targets are stored and recreated literally. Neither staged symlinks nor destination symlinks are traversed as directories. Transforming applies to the source entry, regardless of kind.
+### Direct passthrough
 
-A crash can expose a prefix of the entry overlay. This is expected: the run remains in `processing/` without a terminal status and `process-once` replays it until the final tree converges. The operation is not an all-or-nothing filesystem transaction.
+Direct passthrough is rsync-style publication. The client invokes rsync directly against the destination. No server run is created, no manifest is uploaded, and no terminal server status exists.
+
+This is not atomic publication. Interrupted transfers can leave partial contents at the exact destination path according to rsync behavior and the flags Purgery uses. In direct passthrough with `--delete-after-import`, successful rsync exit is the import confirmation used to authorize local cleanup.
+
+### Transform runs
+
+Transform runs are server-run/status-tracked operations. The server records terminal status after processing.
+
+For transform outputs, Purgery still does not perform atomic final publication. The transform program writes final outputs itself. Purgery checks declared `expected_outputs` after successful subprocess exit and records those paths in status. If atomic output matters, the transform program must implement it.
+
+## Destination effects
+
+Publication to the destination differs by run mode:
+
+- **Direct passthrough (no transform):** rsync writes the source entry directly to `<destination>/<source_entry_name>` with archive-mode semantics. Existing directories merge, regular files and symlinks replace destination entries. Non-atomic: interrupted rsync can leave partial contents at the destination path.
+
+- **Transform run:** The transform program writes outputs directly to the resolved expected output paths. Purgery checks that each declared `expected_outputs` exists after successful subprocess exit and records those paths in status. The source entry is consumed by the transform flow. If `expected_outputs = []`, successful subprocess exit alone is sufficient; no output-existence check is performed.
+
+In direct passthrough, symlink sources are transferred as symlinks with literal targets. In transform runs, any symlink outputs are created by the transform program; Purgery only checks that declared symlink outputs exist. Neither staged symlinks nor destination symlinks are traversed as directories.
+
+For transform runs, a crash can expose partial output at the destination. The run remains in `processing/` without a terminal status and `process-once` replays it until the transform completes successfully. The operation is not an all-or-nothing filesystem transaction.

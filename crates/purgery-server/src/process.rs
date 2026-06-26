@@ -9,7 +9,6 @@ use std::fmt;
 use std::fs;
 use tracing::{info, span, warn, Level};
 
-use crate::commit::commit_output_entry;
 use crate::gc::run_gc;
 use crate::phases::{
     finalize_processing_run, move_to_failed, write_progress_best_effort, write_run_failure,
@@ -212,6 +211,14 @@ fn process_manifest_entry(
     entry_total: usize,
     destination: &DestinationPath,
 ) -> EntryOutcome {
+    let Some(transform_name) = entry.transform.as_deref() else {
+        return failed_entry(
+            entry,
+            "server-side non-transform imports are not supported; entry must have a transform"
+                .to_string(),
+        );
+    };
+
     let expected_staged = Utf8Path::new("files").join(entry.relative_path.as_str());
     let Ok(expected_staged) = NormalizedRelativePath::new(expected_staged) else {
         return failed_entry(entry, "failed to normalize expected staged path");
@@ -279,20 +286,6 @@ fn process_manifest_entry(
         Err(error) => return failed_entry(entry, error.to_string()),
     };
 
-    if entry.transform.is_none() {
-        let final_destination = final_path.as_str().to_owned();
-        return match commit_output_entry(&work_path, &final_path, destination_root, run_id) {
-            Ok(_) => EntryOutcome::Success {
-                kind: entry.kind,
-                local_path: entry.local_path.as_str().to_owned(),
-                relative_path: entry.relative_path.as_str().to_owned(),
-                final_paths: vec![final_destination],
-                transform: None,
-            },
-            Err(error) => failed_entry(entry, error),
-        };
-    }
-
     let Some(target_directory) = final_path.parent() else {
         return failed_entry(
             entry,
@@ -313,7 +306,6 @@ fn process_manifest_entry(
             update.current_transform,
         );
     };
-    let transform_name = entry.transform.as_deref().unwrap();
     let resolved = match config.transforms.get(transform_name) {
         Some(def) => ResolvedTransform {
             name: transform_name.to_owned(),
@@ -639,7 +631,15 @@ pub fn process_processing_run(
             }
         };
 
-    // Phase 2 — version is compatible, mutate work area
+    // Phase 2 — validate transform-run requirements before any mutation
+    if let Err(e) = crate::validate_transform_run(config, &manifest, &run_config) {
+        let msg = format!("{e}");
+        warn!("{}", msg);
+        write_run_failure(&config.work_dir, nickname, run_id, &msg)?;
+        return Err(ProcessingError::Other(anyhow::anyhow!(msg)));
+    }
+
+    // Phase 3 — version is compatible, mutate work area
     let work_area = work_dir(&config.work_dir, nickname, run_id);
     if let Err(error) = fs::remove_dir_all(&work_area) {
         if error.kind() != std::io::ErrorKind::NotFound {
@@ -667,66 +667,46 @@ pub fn process_processing_run(
         "",
     );
 
-    let mut outcomes: Vec<EntryOutcome> = Vec::new();
-    // Map: directory entry relative_path -> its outcome index.
-    let mut dir_outcomes: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
+    let entry = &manifest.entries[0];
+    write_progress_best_effort(
+        &processing_path,
+        nickname,
+        run_id,
+        "processing_entry",
+        0,
+        1,
+        entry.relative_path.as_str(),
+        "",
+    );
 
-    for (entry_idx, entry) in manifest.entries.iter().enumerate() {
-        write_progress_best_effort(
-            &processing_path,
-            nickname,
-            run_id,
-            "processing_entry",
-            entry_idx,
-            manifest.entries.len(),
-            entry.relative_path.as_str(),
-            "",
-        );
+    let outcome = process_manifest_entry(
+        config,
+        entry,
+        nickname,
+        run_id,
+        &processing_path,
+        &work_area,
+        0,
+        1,
+        &run_config.destination,
+    );
 
-        outcomes.push(process_manifest_entry(
-            config,
-            entry,
-            nickname,
-            run_id,
-            &processing_path,
-            &work_area,
-            entry_idx,
-            manifest.entries.len(),
-            &run_config.destination,
-        ));
-
-        if entry.kind == ManifestEntryKind::Directory {
-            dir_outcomes.insert(entry.relative_path.as_str().to_owned(), outcomes.len() - 1);
-        }
-    }
-
-    let all_imported = outcomes
-        .iter()
-        .all(|outcome| matches!(outcome, EntryOutcome::Success { .. }));
-    let any_imported = outcomes
-        .iter()
-        .any(|outcome| matches!(outcome, EntryOutcome::Success { .. }));
-    let run_state = if all_imported {
-        RunState::Done
-    } else if any_imported {
-        RunState::Partial
-    } else {
-        RunState::Failed
+    let run_state = match &outcome {
+        EntryOutcome::Success { .. } => RunState::Done,
+        EntryOutcome::Failure { .. } => RunState::Failed,
     };
 
-    if run_state == RunState::Done {
+    if matches!(outcome, EntryOutcome::Success { .. }) {
         let _ = fs::remove_dir_all(&work_area);
     }
 
-    // Best-effort publishing_status progress before terminal status publication
     write_progress_best_effort(
         &processing_path,
         nickname,
         run_id,
         "publishing_status",
         0,
-        manifest.entries.len(),
+        1,
         "",
         "",
     );
@@ -737,7 +717,7 @@ pub fn process_processing_run(
         run_id: run_id.clone(),
         nickname: nickname.clone(),
         state: run_state.clone(),
-        entries: outcomes.into_iter().map(EntryOutcome::into_entry).collect(),
+        entries: vec![outcome.into_entry()],
         error: None,
     };
     let status_toml = run_status

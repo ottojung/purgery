@@ -86,7 +86,26 @@ Transforms are defined as an array of tables using `[[transform]]`. Each named t
 - If the expanded path is absolute, it is used as-is.
 - If the expanded path is relative, it is resolved against `<DESTINATION>` (the run destination root).
 
-Purgery does not move or commit transform outputs. The transform program is responsible for placing outputs at the resolved paths. After the transform exits successfully, Purgery checks each declared expected output exists. Transformed inputs are consumed by the transform flow and are never committed as final outputs. `expected_outputs` may be empty (for verification-only or deletion-only transforms).
+### Transform finalization contract
+
+Transforms are trusted final writers.
+
+For transform runs, Purgery does not move or commit transform outputs. The configured transform program is responsible for writing its outputs directly to the final paths implied by `expected_outputs`.
+
+That means the transform program must:
+
+- create parent directories when needed;
+- avoid leaving bad partial outputs, or implement its own temporary-file-and-rename discipline;
+- decide what to do if an output path already exists;
+- preserve whatever permissions, timestamps, or metadata it cares about.
+
+After the subprocess exits successfully, Purgery resolves `expected_outputs` and checks that each declared output path exists and is a supported filesystem entry. That check is not an atomic publication mechanism.
+
+`expected_outputs = []` is valid. In that case, successful subprocess exit is sufficient for the entry to be marked imported, and `final_paths` is empty. This supports verification-only or deletion-only transforms.
+
+The transform program runs with the server process permissions and is trusted server-admin configuration. Purgery does not sandbox transform output paths.
+
+Purgery does not stage, rename, move, or commit transform outputs. Local cleanup after a successful transform run is authorised by terminal server status reporting imported entries — not by the presence of final output files.
 
 ### Subprocess safety
 
@@ -117,7 +136,6 @@ Final path computation:
 
 - The source entry base final path is `<destination>/<source_entry_name>`.
 - `{target_directory}` is the parent directory of the base final path: `<destination>`.
-- For non-transform entries, the work entry is committed to the base final path.
 - For transform entries, the transform program places outputs in `{target_directory}`. Purgery does not move or commit outputs.
 - `work_dir` is never final storage.
 
