@@ -688,6 +688,8 @@ impl RemoteRunner {
                 let rsync_args = purgery_core::build_rsync_args(source, &rsync_dest);
                 let status = Command::new("rsync")
                     .args(&rsync_args)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
                     .status()
                     .with_context(|| {
                         format!("failed to execute rsync: {source} -> {host}:{remote_dir}")
@@ -753,6 +755,8 @@ impl RemoteRunner {
             RemoteRunner::Real => {
                 let status = Command::new("rsync")
                     .args(&args)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
                     .status()
                     .with_context(|| {
                         format!(
