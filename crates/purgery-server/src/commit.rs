@@ -205,25 +205,3 @@ pub(crate) fn commit_directory_tree(
 
     Ok(root_disp)
 }
-
-pub(crate) fn commit_output_entry(
-    source: &Utf8Path,
-    final_path: &Utf8Path,
-    destination_root: &Utf8Path,
-    run_id: &purgery_core::RunId,
-) -> Result<CommitDisposition, String> {
-    let meta = fs::symlink_metadata(source.as_std_path())
-        .map_err(|e| format!("failed to inspect output entry: {e}"))?;
-    if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
-        commit_directory_tree(source, final_path, destination_root, run_id)
-    } else if meta.file_type().is_file() {
-        commit_regular_file_entry(source, final_path, destination_root, run_id)
-    } else if meta.file_type().is_symlink() {
-        commit_symlink_entry(source, final_path, destination_root, run_id)
-    } else {
-        Err(format!(
-            "unsupported output entry type: {}",
-            source.as_str()
-        ))
-    }
-}
