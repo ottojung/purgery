@@ -687,11 +687,13 @@ impl RemoteRunner {
             RemoteRunner::Real => {
                 let rsync_args = purgery_core::build_rsync_args(source, &rsync_dest);
                 let mut cmd = Command::new("rsync");
-                cmd.args(&rsync_args).stdout(std::process::Stdio::null());
-                // Only inherit stderr (SSH motd/banner) when debug is enabled.
-                if tracing::enabled!(tracing::Level::DEBUG) {
+                cmd.args(&rsync_args);
+                let dbg = tracing::level_filters::LevelFilter::current() >= tracing::Level::DEBUG;
+                if dbg {
+                    cmd.stdout(std::process::Stdio::inherit());
                     cmd.stderr(std::process::Stdio::inherit());
                 } else {
+                    cmd.stdout(std::process::Stdio::null());
                     cmd.stderr(std::process::Stdio::null());
                 }
                 let status = cmd.status().with_context(|| {
