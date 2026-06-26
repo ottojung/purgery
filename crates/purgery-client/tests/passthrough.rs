@@ -2,6 +2,18 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
+fn has_cleanup_file(state_dir: &std::path::Path) -> bool {
+    let dir = match std::fs::read_dir(state_dir) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    dir.flatten().any(|e| {
+        e.file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with("cleanup-"))
+    })
+}
+
 fn write_executable(path: &std::path::Path, body: &str) {
     fs::write(path, body).unwrap();
     let mut permissions = fs::metadata(path).unwrap().permissions();
@@ -122,19 +134,8 @@ fn passthrough_cleanup_deletes_only_an_unchanged_original() {
 
     assert!(status.success());
     assert!(!file.exists());
-    let has_cleanup_file = || -> bool {
-        let dir = match std::fs::read_dir(tmp.path().join("state")) {
-            Ok(d) => d,
-            Err(_) => return false,
-        };
-        dir.flatten().any(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| n.starts_with("cleanup-"))
-        })
-    };
     assert!(
-        !has_cleanup_file(),
+        !has_cleanup_file(&tmp.path().join("state")),
         "no leftover cleanup-*.toml after completed passthrough cleanup"
     );
 }
@@ -170,19 +171,8 @@ fn passthrough_cleanup_preserves_an_original_changed_during_rsync() {
 
     assert!(status.success());
     assert_eq!(fs::read_to_string(file).unwrap(), "changed");
-    let has_cleanup_file = || -> bool {
-        let dir = match std::fs::read_dir(tmp.path().join("state")) {
-            Ok(d) => d,
-            Err(_) => return false,
-        };
-        dir.flatten().any(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| n.starts_with("cleanup-"))
-        })
-    };
     assert!(
-        has_cleanup_file(),
+        has_cleanup_file(&tmp.path().join("state")),
         "cleanup-*.toml should remain after incomplete passthrough cleanup"
     );
 }

@@ -311,15 +311,10 @@ pub(crate) fn process_cleanup_state_file_and_retire(
 ) -> Result<CleanupOutcome> {
     let outcome = process_cleanup_state_file(state_path)?;
     if matches!(outcome, CleanupOutcome::Complete) {
-        if let Err(e) = fs::remove_file(state_path.as_std_path()) {
-            warn!(
-                path = %state_path,
-                error = %e,
-                "failed to remove completed cleanup state file"
-            );
-        } else {
-            info!(path = %state_path, "retired completed cleanup state file");
-        }
+        fs::remove_file(state_path.as_std_path()).with_context(|| {
+            format!("failed to remove completed cleanup state file: {state_path}")
+        })?;
+        info!(path = %state_path, "retired completed cleanup state file");
     }
     Ok(outcome)
 }
@@ -1285,5 +1280,41 @@ mod tests {
         assert!(!tracked.exists(), "tracked file should be deleted");
         assert!(untracked.exists(), "untracked file must remain");
         assert!(dir.exists(), "directory with untracked content must remain");
+    }
+
+    #[test]
+    fn resume_pending_cleanups_removes_stale_completed_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().to_str().unwrap();
+
+        let entry = CleanupEntry {
+            relative_path: "stale.txt".to_owned(),
+            local_path: tmp.path().join("stale.txt").to_str().unwrap().to_owned(),
+            kind: ManifestEntryKind::RegularFile,
+            size: 0,
+            mtime_ns: 0,
+            sha256: None,
+            link_target: None,
+            import_confirmed: true,
+            cleaned: true,
+        };
+        let state = DurableCleanupState {
+            purgery_version: "0.1.0-test".to_string(),
+            nickname: "host".to_owned(),
+            operation_id: "run-resume-stale".to_owned(),
+            entries: vec![entry],
+        };
+        let state_path = write_cleanup_state(&state, state_dir).unwrap();
+        assert!(
+            state_path.exists(),
+            "stale state file must exist before resume"
+        );
+
+        resume_pending_cleanups(state_dir).unwrap();
+
+        assert!(
+            !state_path.exists(),
+            "stale completed state file must be removed by resume"
+        );
     }
 }
