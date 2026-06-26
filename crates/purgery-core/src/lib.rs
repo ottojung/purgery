@@ -267,6 +267,9 @@ pub fn init_logging(
         LogLevel::Trace => tracing_subscriber::filter::LevelFilter::TRACE,
     };
 
+    // Only show source location and timestamp at debug or trace level.
+    let show_details = matches!(config.level, LogLevel::Debug | LogLevel::Trace);
+
     let is_terminal = atty::is(atty::Stream::Stderr);
     let use_color = match config.color {
         ColorMode::Always => true,
@@ -284,20 +287,28 @@ pub fn init_logging(
                 .try_init()?;
         }
         LogFormat::Compact => {
-            tracing_subscriber::fmt()
+            let fmt = tracing_subscriber::fmt()
                 .with_max_level(level_filter)
                 .compact()
                 .with_writer(std::io::stderr)
-                .with_ansi(use_color)
-                .try_init()?;
+                .with_ansi(use_color);
+            if show_details {
+                fmt.with_file(true).with_line_number(true).try_init()?;
+            } else {
+                fmt.without_time().try_init()?;
+            }
         }
         LogFormat::Pretty => {
-            tracing_subscriber::fmt()
+            let fmt = tracing_subscriber::fmt()
                 .with_max_level(level_filter)
                 .pretty()
                 .with_writer(std::io::stderr)
-                .with_ansi(use_color)
-                .try_init()?;
+                .with_ansi(use_color);
+            if show_details {
+                fmt.with_file(true).with_line_number(true).try_init()?;
+            } else {
+                fmt.without_time().try_init()?;
+            }
         }
     }
     Ok(())
@@ -1019,6 +1030,7 @@ unknown_field = "value"
                 "--inplace",
                 "--mkpath",
                 "--archive",
+                "--info=progress2,stats2",
                 "--protect-args",
                 "--",
                 "/home/user/Videos",
