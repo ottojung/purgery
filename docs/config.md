@@ -79,10 +79,9 @@ Transforms are defined as an array of tables using `[[transform]]`. Each named t
 | `{parent}` | Work-area parent directory |
 | `{file_name}` | Input file name with extension |
 | `{file_stem}` | Input file name without extension |
-| `{stem}` | Deprecated alias for `{file_stem}` |
 | `{target_directory}` | Directory where this entry's non-transform final path would be placed |
 
-`args` may use `{input}`, `{parent}`, `{file_name}`, `{file_stem}`, `{stem}`, and `{target_directory}`. `expected_outputs` may use `{file_name}`, `{file_stem}`, `{stem}`, and `{target_directory}`. After placeholder expansion:
+`args` may use `{input}`, `{parent}`, `{file_name}`, `{file_stem}`, and `{target_directory}`. `expected_outputs` may use `{file_name}`, `{file_stem}`, and `{target_directory}`. After placeholder expansion:
 
 - If the expanded path is absolute, it is used as-is.
 - If the expanded path is relative, it is resolved against `<DESTINATION>` (the run destination root).

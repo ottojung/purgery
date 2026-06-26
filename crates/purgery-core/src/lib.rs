@@ -1288,7 +1288,7 @@ unknown_field = "value"
             kind: TransformKind::Subprocess,
             program: "ffmpeg".into(),
             args: vec!["--input".into(), "{input}".into()],
-            expected_outputs: vec!["{stem}.Z.webm".into()],
+            expected_outputs: vec!["{file_stem}.Z.webm".into()],
         };
         let work_path = Utf8Path::new("/work/videos/video.mp4");
         let args = td.build_args(work_path, Utf8Path::new("/dest"));
@@ -1302,7 +1302,7 @@ unknown_field = "value"
             kind: TransformKind::Subprocess,
             program: "ffmpeg".into(),
             args: vec![],
-            expected_outputs: vec!["{stem}.Z.webm".into()],
+            expected_outputs: vec!["{file_stem}.Z.webm".into()],
         };
         let work_path = Utf8Path::new("/work/videos/video.mp4");
         let dest_root = Utf8Path::new("/dest");
@@ -1373,7 +1373,7 @@ color = "never"
 
     #[test]
     fn validate_expected_output_accepts_stem_placeholder() {
-        assert!(validate_expected_output_name("{stem}.out").is_ok());
+        assert!(validate_expected_output_name("{file_stem}.out").is_ok());
     }
 
     #[test]
@@ -1424,7 +1424,7 @@ color = "never"
     #[test]
     fn validate_expected_output_accepts_subdirectory() {
         assert!(validate_expected_output_name("subdir/{file_stem}.out").is_ok());
-        assert!(validate_expected_output_name("a/b/c/{stem}.ext").is_ok());
+        assert!(validate_expected_output_name("a/b/c/{file_stem}.ext").is_ok());
     }
 
     #[test]
@@ -1451,7 +1451,7 @@ color = "never"
             kind: TransformKind::Subprocess,
             program: "ffmpeg".into(),
             args: vec!["--output-dir".into(), "{target_directory}".into()],
-            expected_outputs: vec!["{stem}.Z.webm".into()],
+            expected_outputs: vec!["{file_stem}.Z.webm".into()],
         };
         let work_path = Utf8Path::new("/work/videos/video.mp4");
         let target_dir = Utf8Path::new("/archive/videos");
@@ -1466,7 +1466,7 @@ color = "never"
             kind: TransformKind::Subprocess,
             program: "true".into(),
             args: vec![],
-            expected_outputs: vec!["{stem}.Z.webm".into()],
+            expected_outputs: vec!["{file_stem}.Z.webm".into()],
         };
         let work_path = Utf8Path::new("/work/videos/video.mp4");
         let dest_root = Utf8Path::new("/dest");
@@ -1485,7 +1485,7 @@ color = "never"
             kind: TransformKind::Subprocess,
             program: "true".into(),
             args: vec![],
-            expected_outputs: vec!["/mnt/output/{stem}.out".into()],
+            expected_outputs: vec!["/mnt/output/{file_stem}.out".into()],
         };
         let work_path = Utf8Path::new("/work/videos/video.mp4");
         let dest_root = Utf8Path::new("/dest");
@@ -1504,7 +1504,7 @@ color = "never"
             kind: TransformKind::Subprocess,
             program: "true".into(),
             args: vec![],
-            expected_outputs: vec!["compressed/{stem}.out".into()],
+            expected_outputs: vec!["compressed/{file_stem}.out".into()],
         };
         let work_path = Utf8Path::new("/work/videos/video.mp4");
         let dest_root = Utf8Path::new("/dest");
@@ -1523,7 +1523,7 @@ color = "never"
             kind: TransformKind::Subprocess,
             program: "true".into(),
             args: vec![],
-            expected_outputs: vec!["{target_directory}/{stem}.out".into()],
+            expected_outputs: vec!["{target_directory}/{file_stem}.out".into()],
         };
         let work_path = Utf8Path::new("/work/videos/video.mp4");
         let dest_root = Utf8Path::new("/dest");

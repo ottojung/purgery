@@ -49,7 +49,7 @@ fn find_config() -> Result<String> {
 #[derive(Parser)]
 #[command(
     name = "purgery-server",
-    about = "Purgery server: process staged uploads and move files to final storage",
+    about = "Purgery server: processes uploaded files through transform pipelines and reports run status",
     version = env!("CARGO_PKG_VERSION")
 )]
 struct Cli {

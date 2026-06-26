@@ -56,7 +56,6 @@ impl TransformDefinition {
             .replace("{parent}", parent)
             .replace("{file_name}", file_name)
             .replace("{file_stem}", file_stem)
-            .replace("{stem}", file_stem)
     }
 
     pub fn build_args(&self, work_path: &Utf8Path, target_directory: &Utf8Path) -> Vec<String> {
@@ -119,7 +118,7 @@ pub fn validate_expected_output_name(name: &str) -> Result<(), String> {
     }
     if name.contains("{input}") || name.contains("{parent}") {
         return Err("expected output name must not use {{input}} or {{parent}} \
-             placeholders; only {{file_name}}, {{file_stem}}, {{stem}}, and \
+             placeholders; only {{file_name}}, {{file_stem}}, and \
              {{target_directory}} are allowed"
             .into());
     }
