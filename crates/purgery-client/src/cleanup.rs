@@ -7,6 +7,15 @@ use std::io::Read;
 use std::path::Path;
 use tracing::{info, warn};
 
+/// Outcome of processing a single cleanup state file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CleanupOutcome {
+    /// Every entry has been cleaned — the state file can be retired.
+    Complete,
+    /// At least one entry remains unconfirmed or has not been cleaned.
+    StillPending,
+}
+
 pub(crate) fn state_dir_path(state_dir: &str) -> Result<Utf8PathBuf> {
     let path = Utf8PathBuf::from(state_dir);
     fs::create_dir_all(path.as_std_path())
@@ -176,20 +185,27 @@ pub(crate) fn resume_pending_cleanups(state_dir: &str) -> Result<()> {
             }
         };
         let before = state.entries.iter().filter(|e| e.cleaned).count();
-        if let Err(e) = process_cleanup_state_file(&state_path) {
-            warn!(path = %state_path, error = %e, "failed to process cleanup state");
-        } else if let Ok(new_content) = fs::read_to_string(state_path.as_std_path()) {
-            if let Ok(new_state) = toml::from_str::<DurableCleanupState>(&new_content) {
-                if purgery_core::require_compatible_purgery_version(
-                    &new_state.purgery_version,
-                    "cleanup state",
-                )
-                .is_err()
-                {
-                    continue;
+        let total = state.entries.len();
+        match process_cleanup_state_file_and_retire(&state_path) {
+            Err(e) => warn!(path = %state_path, error = %e, "failed to process cleanup state"),
+            Ok(CleanupOutcome::Complete) => {
+                deleted_total += total - before;
+            }
+            Ok(CleanupOutcome::StillPending) => {
+                if let Ok(new_content) = fs::read_to_string(state_path.as_std_path()) {
+                    if let Ok(new_state) = toml::from_str::<DurableCleanupState>(&new_content) {
+                        if purgery_core::require_compatible_purgery_version(
+                            &new_state.purgery_version,
+                            "cleanup state",
+                        )
+                        .is_err()
+                        {
+                            continue;
+                        }
+                        let after = new_state.entries.iter().filter(|e| e.cleaned).count();
+                        deleted_total += after - before;
+                    }
                 }
-                let after = new_state.entries.iter().filter(|e| e.cleaned).count();
-                deleted_total += after - before;
             }
         }
     }
@@ -216,7 +232,7 @@ pub(crate) fn compute_sha256(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-pub(crate) fn process_cleanup_state_file(state_path: &Utf8Path) -> Result<()> {
+pub(crate) fn process_cleanup_state_file(state_path: &Utf8Path) -> Result<CleanupOutcome> {
     let content = fs::read_to_string(state_path.as_std_path())
         .with_context(|| format!("failed to read cleanup state: {state_path}"))?;
     // Probe raw TOML for version to distinguish old/incompatible state
@@ -260,16 +276,52 @@ pub(crate) fn process_cleanup_state_file(state_path: &Utf8Path) -> Result<()> {
             continue;
         }
         let local_path = Path::new(&state.entries[i].local_path);
-        if let Err(e) = fs::remove_dir(local_path) {
-            warn!(path = %state.entries[i].local_path, error = %e, "failed to remove directory");
-        } else {
-            info!(path = %state.entries[i].local_path, "removed empty directory");
-            state.entries[i].cleaned = true;
-            write_cleanup_state_atomic(state_path, &state)?;
+        match fs::remove_dir(local_path) {
+            Ok(()) => {
+                info!(path = %state.entries[i].local_path, "removed empty directory");
+                state.entries[i].cleaned = true;
+                write_cleanup_state_atomic(state_path, &state)?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                state.entries[i].cleaned = true;
+                write_cleanup_state_atomic(state_path, &state)?;
+            }
+            Err(e) => {
+                warn!(path = %state.entries[i].local_path, error = %e, "failed to remove directory");
+            }
         }
     }
 
-    Ok(())
+    let all_cleaned = state.entries.iter().all(|e| e.cleaned);
+    if all_cleaned {
+        Ok(CleanupOutcome::Complete)
+    } else {
+        Ok(CleanupOutcome::StillPending)
+    }
+}
+
+/// Process a cleanup state file and retire it when all entries are cleaned.
+///
+/// Shared lifecycle primitive used by all call sites (direct passthrough,
+/// transform path, transform recovery, and resume).  Retiring the file
+/// when `Complete` prevents stale state files from accumulating and allows
+/// crash recovery to skip already‑finished cleanups.
+pub(crate) fn process_cleanup_state_file_and_retire(
+    state_path: &Utf8Path,
+) -> Result<CleanupOutcome> {
+    let outcome = process_cleanup_state_file(state_path)?;
+    if matches!(outcome, CleanupOutcome::Complete) {
+        if let Err(e) = fs::remove_file(state_path.as_std_path()) {
+            warn!(
+                path = %state_path,
+                error = %e,
+                "failed to remove completed cleanup state file"
+            );
+        } else {
+            info!(path = %state_path, "retired completed cleanup state file");
+        }
+    }
+    Ok(outcome)
 }
 
 /// Returns true if the entry at index i was successfully cleaned.
@@ -349,6 +401,7 @@ fn can_remove_directory(entries: &[CleanupEntry], dir_idx: usize) -> bool {
 
     let reader = match fs::read_dir(local_path) {
         Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
         Err(_) => return false,
     };
 
@@ -1058,5 +1111,179 @@ mod tests {
 
         assert!(file.exists(), "changed descendant file must remain");
         assert!(dir.exists(), "directory with changed content must remain");
+    }
+
+    #[test]
+    fn cleanup_outcome_complete_retires_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("a.txt");
+        fs::write(&file, "hello").unwrap();
+
+        let mut entry = cleanup_entry(&file);
+        entry.import_confirmed = true;
+        let state = DurableCleanupState {
+            purgery_version: "0.1.0-test".to_string(),
+            nickname: "host".to_owned(),
+            operation_id: "run-complete".to_owned(),
+            entries: vec![entry],
+        };
+        let state_path = write_cleanup_state(&state, tmp.path().to_str().unwrap()).unwrap();
+
+        let outcome = process_cleanup_state_file_and_retire(&state_path).unwrap();
+        assert_eq!(outcome, CleanupOutcome::Complete);
+        assert!(!state_path.exists(), "completed state file must be retired");
+    }
+
+    #[test]
+    fn cleanup_outcome_stale_complete_retires_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("a.txt");
+        fs::write(&file, "hello").unwrap();
+
+        let mut entry = cleanup_entry(&file);
+        entry.import_confirmed = true;
+        entry.cleaned = true;
+        let state = DurableCleanupState {
+            purgery_version: "0.1.0-test".to_string(),
+            nickname: "host".to_owned(),
+            operation_id: "run-stale".to_owned(),
+            entries: vec![entry],
+        };
+        let state_path = write_cleanup_state(&state, tmp.path().to_str().unwrap()).unwrap();
+
+        let outcome = process_cleanup_state_file_and_retire(&state_path).unwrap();
+        assert_eq!(outcome, CleanupOutcome::Complete);
+        assert!(
+            !state_path.exists(),
+            "stale completed state file must be retired"
+        );
+    }
+
+    #[test]
+    fn cleanup_outcome_partial_pending_keeps_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_a = tmp.path().join("a.txt");
+        fs::write(&file_a, "hello").unwrap();
+        let file_b = tmp.path().join("b.txt");
+        fs::write(&file_b, "world").unwrap();
+
+        let mut entry_a = cleanup_entry(&file_a);
+        entry_a.import_confirmed = true;
+        let mut entry_b = cleanup_entry(&file_b);
+        entry_b.import_confirmed = true;
+
+        // Change file_b after capture so it won't be cleaned.
+        fs::write(&file_b, "modified").unwrap();
+
+        let state = DurableCleanupState {
+            purgery_version: "0.1.0-test".to_string(),
+            nickname: "host".to_owned(),
+            operation_id: "run-partial".to_owned(),
+            entries: vec![entry_a, entry_b],
+        };
+        let state_path = write_cleanup_state(&state, tmp.path().to_str().unwrap()).unwrap();
+
+        let outcome = process_cleanup_state_file_and_retire(&state_path).unwrap();
+        assert_eq!(outcome, CleanupOutcome::StillPending);
+        assert!(state_path.exists(), "partial state file must remain");
+
+        // file_a should have been cleaned, file_b preserved.
+        assert!(!file_a.exists(), "unchanged file must be deleted");
+        assert!(file_b.exists(), "changed file must be preserved");
+    }
+
+    #[test]
+    fn cleanup_outcome_unconfirmed_no_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("a.txt");
+        fs::write(&file, "secret").unwrap();
+
+        let mut entry = cleanup_entry(&file);
+        entry.import_confirmed = false;
+        let state = DurableCleanupState {
+            purgery_version: "0.1.0-test".to_string(),
+            nickname: "host".to_owned(),
+            operation_id: "run-unconfirmed".to_owned(),
+            entries: vec![entry],
+        };
+        let state_path = write_cleanup_state(&state, tmp.path().to_str().unwrap()).unwrap();
+
+        let outcome = process_cleanup_state_file_and_retire(&state_path).unwrap();
+        assert_eq!(outcome, CleanupOutcome::StillPending);
+        assert!(state_path.exists(), "unconfirmed state file must remain");
+        assert!(file.exists(), "unconfirmed file must not be deleted");
+    }
+
+    #[test]
+    fn cleanup_outcome_missing_confirmed_dir_cleaned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ghost");
+        let dir_str = dir.to_str().unwrap().to_owned();
+
+        let entry = CleanupEntry {
+            relative_path: "ghost".to_owned(),
+            local_path: dir_str,
+            kind: ManifestEntryKind::Directory,
+            size: 0,
+            mtime_ns: 0,
+            sha256: None,
+            link_target: None,
+            import_confirmed: true,
+            cleaned: false,
+        };
+        let state = DurableCleanupState {
+            purgery_version: "0.1.0-test".to_string(),
+            nickname: "host".to_owned(),
+            operation_id: "run-ghost".to_owned(),
+            entries: vec![entry],
+        };
+        let state_path = write_cleanup_state(&state, tmp.path().to_str().unwrap()).unwrap();
+
+        let outcome = process_cleanup_state_file(&state_path).unwrap();
+        assert_eq!(
+            outcome,
+            CleanupOutcome::Complete,
+            "missing confirmed dir should be treated as cleaned"
+        );
+
+        let content = fs::read_to_string(state_path.as_std_path()).unwrap();
+        let saved: DurableCleanupState = toml::from_str(&content).unwrap();
+        assert!(saved.entries[0].cleaned, "entry must be marked cleaned");
+    }
+
+    #[test]
+    fn cleanup_outcome_directory_with_untracked_content_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("subdir");
+        fs::create_dir(&dir).unwrap();
+        let tracked = dir.join("a.txt");
+        fs::write(&tracked, "tracked").unwrap();
+        let untracked = dir.join("untracked.txt");
+        fs::write(&untracked, "untracked").unwrap();
+
+        let file_sha = compute_sha256(&tracked).unwrap();
+        let mut entries = vec![dir_entry(&dir), file_entry(&tracked, &file_sha)];
+        for e in &mut entries {
+            e.import_confirmed = true;
+        }
+
+        let state = DurableCleanupState {
+            purgery_version: "0.1.0-test".to_string(),
+            nickname: "host".to_owned(),
+            operation_id: "run-untracked".to_owned(),
+            entries,
+        };
+        let state_path = write_cleanup_state(&state, tmp.path().to_str().unwrap()).unwrap();
+
+        let outcome = process_cleanup_state_file_and_retire(&state_path).unwrap();
+        assert_eq!(outcome, CleanupOutcome::StillPending);
+        assert!(
+            state_path.exists(),
+            "state file with untracked content must remain"
+        );
+
+        assert!(!tracked.exists(), "tracked file should be deleted");
+        assert!(untracked.exists(), "untracked file must remain");
+        assert!(dir.exists(), "directory with untracked content must remain");
     }
 }

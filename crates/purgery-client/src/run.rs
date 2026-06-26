@@ -1257,7 +1257,7 @@ fn process_cleanup_from_status(
     let cleanup_path = camino::Utf8PathBuf::from(state_dir).join(&cleanup_filename);
     if cleanup_path.as_std_path().exists() {
         cleanup::confirm_imports_from_status(&cleanup_path, status)?;
-        cleanup::process_cleanup_state_file(&cleanup_path)?;
+        cleanup::process_cleanup_state_file_and_retire(&cleanup_path)?;
     } else if run_config.delete_after_import && !manifest.entries.is_empty() {
         anyhow::bail!(
             "cleanup state file '{cleanup_filename}' is required for run {}/{} \
@@ -1586,7 +1586,7 @@ pub(crate) fn run_sync_with_run_id(
         )?;
         if let Some(ref state_path) = cleanup_state_path {
             cleanup::confirm_all_imports(state_path)?;
-            cleanup::process_cleanup_state_file(state_path)?;
+            cleanup::process_cleanup_state_file_and_retire(state_path)?;
         }
         info!("sync complete");
         return Ok(());
@@ -1733,7 +1733,7 @@ pub(crate) fn run_sync_with_run_id(
 
     if let Some(ref state_path) = cleanup_state_path {
         cleanup::confirm_imports_from_status(state_path, &status)?;
-        cleanup::process_cleanup_state_file(state_path)?;
+        cleanup::process_cleanup_state_file_and_retire(state_path)?;
     }
 
     persist_client_run_state(
@@ -3656,7 +3656,8 @@ observed_at_unix_secs = 1000
             server_command: "purgery-server".to_string(),
         };
         run_sync_with_runner(&runner, &args).unwrap();
-        // Cleanup state file must use the normalized source entry name.
+        // The cleanup state file is retired on completion — no stale
+        // files should remain after a fully successful pass.
         let cleanup_files: Vec<_> =
             fs::read_dir(camino::Utf8PathBuf::from(&state_dir).as_std_path())
                 .unwrap()
@@ -3668,8 +3669,8 @@ observed_at_unix_secs = 1000
                 })
                 .collect();
         assert!(
-            !cleanup_files.is_empty(),
-            "cleanup state file must be created"
+            cleanup_files.is_empty(),
+            "cleanup state file must be retired on completion"
         );
     }
 
