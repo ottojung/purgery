@@ -220,7 +220,7 @@ The client's `--server-command` value is a trusted command name executed on the 
 
 Executable resolution follows these rules:
 
-- **Absolute path**: follow symlinks, require target exists and is a regular file, require executable bit set on Unix.
+- **Absolute path**: follow symlinks, require target exists and is a regular file, require executable bit set on GNU.
 - **Relative name**: searched in `PATH`; follow symlinks, require target is regular file, require executable bit set.
 - **Directories** are rejected. **Broken symlinks** are rejected.
 
