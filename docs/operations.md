@@ -188,29 +188,26 @@ The heartbeat updates `last_heartbeat_unix_secs` and extends `expires_at_unix_se
 [gc]
 incoming_lease_secs = 1800
 heartbeat_interval_secs = 60
+ready_retention_secs = 3600
+processing_retention_secs = 3600
+done_retention_secs = 3600
+failed_retention_secs = 86400
+orphan_retention_secs = 86400
 ```
 
 ## Server-side GC
 
 ```sh
-purgery-server gc --config server.toml
+purgery-server gc --config server.toml --log-level debug
 ```
 
-GC scans incoming directories for expired runs. A run is expired if:
+GC collects expired server work state across `incoming`, `ready`, `processing`, `done`, and `failed`. `work_dir` is temporary operational state: it is not final storage, an archive, or a permanent history database.
 
-1. Its `lease.toml` exists and `expires_at_unix_secs` is in the past.
-2. No lease exists and the directory mtime is more than `2 × incoming_lease_secs` old.
+`incoming` uploads expire by lease. Expired uploads are removed with their staged payloads. `ready` requests are queued work and expire after `ready_retention_secs`. `processing` requests are recoverable while unlocked and inside `processing_retention_secs`; locked processing is never deleted underneath an active holder, but an expired locked request produces a warning and the next GC after the lock disappears can remove it.
 
-Collection process:
+Successful `done` requests keep only bounded terminal metadata (`status.toml`, `run.toml`, and `manifest.toml`) for `done_retention_secs`. Successful terminal state does not retain `files/`, `work/`, leases, progress, processor locks, or temporary `*.tmp` files. Failed requests may retain more material for `failed_retention_secs` so operators can inspect failures, then the entire failed directory is deleted. Malformed, incompatible, or unknown request directories are treated as orphans: fresh state is retained for `orphan_retention_secs`, logged with a warning, and old orphan state is removed.
 
-1. Rename `incoming/<run_id>` → `failed/<run_id>` (atomic claim).
-2. Write `status.toml` with `state = "failed"` and appropriate error message.
-3. Remove `files/` to reclaim disk.
-4. Keep metadata: `lease.toml`, `run.toml`, `manifest.toml`, `status.toml`.
-
-If `failed/<run_id>` already exists, the abandoned run is moved to a GC quarantine path instead of merging directories. The same status and file cleanup is applied to quarantined runs.
-
-GC is run by `process-once` before batch recovery/processing. Transform sync clients also initiate GC before `begin-run` as a best-effort foreground command. `begin-run` itself does not perform GC — this avoids duplicating GC when a transform sync client and an operator both trigger it.
+At `debug` or `trace`, GC logs meaningful decisions with client nickname, run id, phase, whether the request is retained or expired, seconds until deletion or past expiry, the action taken, and skip reasons such as an active processing lock. GC is run by `process-once` before batch recovery/processing. Transform sync clients also initiate GC before `begin-run` as a best-effort foreground command.
 
 ## `--server-command` trust model
 

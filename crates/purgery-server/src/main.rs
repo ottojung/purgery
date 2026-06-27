@@ -108,7 +108,7 @@ enum Command {
     Check,
     /// Bootstrap server internal directories under work_dir
     Bootstrap,
-    /// Run garbage collection on expired incoming runs
+    /// Collect expired server work state across all request phases
     Gc,
     /// Validate an incoming transform run plan
     PrepareRun {

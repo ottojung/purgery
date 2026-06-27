@@ -11,6 +11,11 @@ use crate::ConfigError;
 
 const DEFAULT_INCOMING_LEASE_SECS: u64 = 1800;
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 60;
+const DEFAULT_READY_RETENTION_SECS: u64 = 3600;
+const DEFAULT_PROCESSING_RETENTION_SECS: u64 = 3600;
+const DEFAULT_DONE_RETENTION_SECS: u64 = 3600;
+const DEFAULT_FAILED_RETENTION_SECS: u64 = 86400;
+const DEFAULT_ORPHAN_RETENTION_SECS: u64 = 86400;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -19,6 +24,16 @@ pub struct GCConfig {
     pub incoming_lease_secs: u64,
     #[serde(default = "default_heartbeat_interval_secs")]
     pub heartbeat_interval_secs: u64,
+    #[serde(default = "default_ready_retention_secs")]
+    pub ready_retention_secs: u64,
+    #[serde(default = "default_processing_retention_secs")]
+    pub processing_retention_secs: u64,
+    #[serde(default = "default_done_retention_secs")]
+    pub done_retention_secs: u64,
+    #[serde(default = "default_failed_retention_secs")]
+    pub failed_retention_secs: u64,
+    #[serde(default = "default_orphan_retention_secs")]
+    pub orphan_retention_secs: u64,
 }
 
 impl Default for GCConfig {
@@ -26,6 +41,11 @@ impl Default for GCConfig {
         GCConfig {
             incoming_lease_secs: DEFAULT_INCOMING_LEASE_SECS,
             heartbeat_interval_secs: DEFAULT_HEARTBEAT_INTERVAL_SECS,
+            ready_retention_secs: DEFAULT_READY_RETENTION_SECS,
+            processing_retention_secs: DEFAULT_PROCESSING_RETENTION_SECS,
+            done_retention_secs: DEFAULT_DONE_RETENTION_SECS,
+            failed_retention_secs: DEFAULT_FAILED_RETENTION_SECS,
+            orphan_retention_secs: DEFAULT_ORPHAN_RETENTION_SECS,
         }
     }
 }
@@ -36,6 +56,21 @@ fn default_incoming_lease_secs() -> u64 {
 
 fn default_heartbeat_interval_secs() -> u64 {
     DEFAULT_HEARTBEAT_INTERVAL_SECS
+}
+fn default_ready_retention_secs() -> u64 {
+    DEFAULT_READY_RETENTION_SECS
+}
+fn default_processing_retention_secs() -> u64 {
+    DEFAULT_PROCESSING_RETENTION_SECS
+}
+fn default_done_retention_secs() -> u64 {
+    DEFAULT_DONE_RETENTION_SECS
+}
+fn default_failed_retention_secs() -> u64 {
+    DEFAULT_FAILED_RETENTION_SECS
+}
+fn default_orphan_retention_secs() -> u64 {
+    DEFAULT_ORPHAN_RETENTION_SECS
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -508,9 +508,12 @@ pub(crate) fn finalize_processing_run(
         )
     })?;
 
-    // Clean up the processor lock file in the destination.
-    let lock_path = dest_path.join("processor.lock");
-    let _ = fs::remove_file(lock_path.as_std_path());
+    if matches!(state, RunState::Done) {
+        crate::gc::prune_success_terminal(&dest_path)?;
+    } else {
+        let lock_path = dest_path.join("processor.lock");
+        let _ = fs::remove_file(lock_path.as_std_path());
+    }
     Ok(())
 }
 
