@@ -13,7 +13,7 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use crate::classify;
-use crate::cleanup;
+use crate::cleanup::{self, CleanupOutcome};
 use crate::runner::{RemoteCommandExit, RemoteCommandHandle, RemoteRunner};
 use crate::split;
 use crate::SyncArgs;
@@ -1114,6 +1114,33 @@ fn resume_runs(runner: &RemoteRunner, state_dir: &str) -> Result<()> {
     Ok(())
 }
 
+/// Finalize a CleanupComplete resume without contacting the server.
+///
+/// CleanupComplete means the server has already finished its work;
+/// only local state remains: retire the completed cleanup file and
+/// remove the client run state.
+fn finish_cleanup_complete_resume(
+    state_dir: &str,
+    nickname: &Nickname,
+    run_id: &RunId,
+) -> Result<()> {
+    let cleanup_filename = format!("cleanup-{}-{}.toml", nickname.as_str(), run_id.as_str());
+    let cleanup_path = camino::Utf8PathBuf::from(state_dir).join(&cleanup_filename);
+
+    if cleanup_path.exists() {
+        if let Err(e) = cleanup::process_cleanup_state_file_and_retire(&cleanup_path) {
+            warn!(
+                path = %cleanup_path,
+                error = %e,
+                "failed to retire cleanup state during resume of CleanupComplete"
+            );
+        }
+    }
+
+    remove_client_run_state(state_dir, nickname, run_id);
+    Ok(())
+}
+
 /// Drain a single persisted run state to completion or error.
 /// Returns Ok(()) when the run is fully resolved (cleanup complete, state removed).
 fn drain_one(runner: &RemoteRunner, state_dir: &str, state: &ClientRunState) -> Result<()> {
@@ -1131,6 +1158,14 @@ fn drain_one(runner: &RemoteRunner, state_dir: &str, state: &ClientRunState) -> 
         .with_context(|| "failed to parse persisted run config")?;
     purgery_core::require_compatible_purgery_version(&run_config.purgery_version, "run config")
         .with_context(|| "incompatible persisted run config version")?;
+
+    // CleanupComplete recovery is purely local: the server has already
+    // returned a terminal status and the client has persisted the result.
+    // Handle it before check_server_version so that resume does not
+    // require server availability once CleanupComplete is committed.
+    if state.phase == ClientRunPhase::CleanupComplete {
+        return finish_cleanup_complete_resume(state_dir, &nickname, &run_id);
+    }
 
     check_server_version(runner, host, server_cmd)
         .with_context(|| "server version check failed while resuming persisted run")?;
@@ -1226,7 +1261,9 @@ fn drain_one(runner: &RemoteRunner, state_dir: &str, state: &ClientRunState) -> 
                 ensure_successful_status(&status)?;
                 return Ok(());
             }
-            ClientRunPhase::CleanupComplete => return Ok(()),
+            ClientRunPhase::CleanupComplete => {
+                return finish_cleanup_complete_resume(state_dir, &nickname, &run_id);
+            }
             ClientRunPhase::Abandoned => {
                 warn!("abandoned run state, removing");
                 return Ok(());
@@ -1255,9 +1292,12 @@ fn process_cleanup_from_status(
 ) -> Result<()> {
     let cleanup_filename = format!("cleanup-{}-{}.toml", nickname.as_str(), run_id.as_str());
     let cleanup_path = camino::Utf8PathBuf::from(state_dir).join(&cleanup_filename);
-    if cleanup_path.as_std_path().exists() {
+    let cleanup_complete = if cleanup_path.as_std_path().exists() {
         cleanup::confirm_imports_from_status(&cleanup_path, status)?;
-        cleanup::process_cleanup_state_file(&cleanup_path)?;
+        matches!(
+            cleanup::process_cleanup_state_file(&cleanup_path)?,
+            CleanupOutcome::Complete
+        )
     } else if run_config.delete_after_import && !manifest.entries.is_empty() {
         anyhow::bail!(
             "cleanup state file '{cleanup_filename}' is required for run {}/{} \
@@ -1265,7 +1305,9 @@ fn process_cleanup_from_status(
             nickname.as_str(),
             run_id.as_str()
         );
-    }
+    } else {
+        false
+    };
     persist_client_run_state(
         state_dir,
         nickname,
@@ -1277,6 +1319,9 @@ fn process_cleanup_from_status(
         None,
         ClientRunPhase::CleanupComplete,
     )?;
+    if cleanup_complete {
+        cleanup::retire_cleanup_state_file(&cleanup_path)?;
+    }
     remove_client_run_state(state_dir, nickname, run_id);
     Ok(())
 }
@@ -1586,7 +1631,7 @@ pub(crate) fn run_sync_with_run_id(
         )?;
         if let Some(ref state_path) = cleanup_state_path {
             cleanup::confirm_all_imports(state_path)?;
-            cleanup::process_cleanup_state_file(state_path)?;
+            cleanup::process_cleanup_state_file_and_retire(state_path)?;
         }
         info!("sync complete");
         return Ok(());
@@ -1731,10 +1776,15 @@ pub(crate) fn run_sync_with_run_id(
         ClientRunPhase::TerminalStatusSeen,
     )?;
 
-    if let Some(ref state_path) = cleanup_state_path {
+    let cleanup_complete = if let Some(ref state_path) = cleanup_state_path {
         cleanup::confirm_imports_from_status(state_path, &status)?;
-        cleanup::process_cleanup_state_file(state_path)?;
-    }
+        matches!(
+            cleanup::process_cleanup_state_file(state_path)?,
+            CleanupOutcome::Complete
+        )
+    } else {
+        false
+    };
 
     persist_client_run_state(
         &state_dir,
@@ -1747,6 +1797,11 @@ pub(crate) fn run_sync_with_run_id(
         None,
         ClientRunPhase::CleanupComplete,
     )?;
+    if cleanup_complete {
+        if let Some(ref state_path) = cleanup_state_path {
+            cleanup::retire_cleanup_state_file(state_path)?;
+        }
+    }
     remove_client_run_state(&state_dir, &nickname, run_id);
 
     ensure_successful_status(&status)?;
@@ -2151,6 +2206,162 @@ state = "done"
             !run_dir.as_std_path().exists(),
             "run state should be removed after successful drain"
         );
+    }
+
+    #[test]
+    fn drain_one_cleanup_complete_removes_run_state_and_retires_cleanup_file() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = mk_runner();
+
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("test-cc-resume".into()).unwrap();
+
+        let entry = purgery_core::CleanupEntry {
+            relative_path: "some/file.txt".to_owned(),
+            local_path: tmp
+                .path()
+                .join("some/file.txt")
+                .to_str()
+                .unwrap()
+                .to_owned(),
+            kind: purgery_core::ManifestEntryKind::RegularFile,
+            size: 0,
+            mtime_ns: 0,
+            sha256: None,
+            link_target: None,
+            import_confirmed: true,
+            cleaned: true,
+        };
+        let cleanup_state = DurableCleanupState {
+            purgery_version: "0.1.0-test".to_string(),
+            nickname: nickname.as_str().to_owned(),
+            operation_id: run_id.as_str().to_owned(),
+            entries: vec![entry],
+        };
+        let cleanup_path = cleanup::write_cleanup_state(&cleanup_state, &state_dir).unwrap();
+        assert!(
+            cleanup_path.as_std_path().exists(),
+            "cleanup file must exist before resume"
+        );
+
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![],
+        };
+        let run_config = RunConfig {
+            purgery_version: "0.1.0-test".to_string(),
+            nickname: nickname.clone(),
+            destination: DestinationPath::new(camino::Utf8PathBuf::from("rel")).unwrap(),
+            delete_after_import: true,
+        };
+        persist_client_run_state(
+            &state_dir,
+            &nickname,
+            &run_id,
+            "host",
+            "purgery-server",
+            &manifest,
+            &run_config,
+            None,
+            ClientRunPhase::CleanupComplete,
+        )
+        .unwrap();
+
+        let run_dir = camino::Utf8PathBuf::from(&state_dir)
+            .join("runs")
+            .join("laptop-test-cc-resume");
+        assert!(
+            run_dir.as_std_path().exists(),
+            "run state dir must exist before resume"
+        );
+
+        let result = resume_runs(&runner, &state_dir);
+        assert!(result.is_ok(), "resume failed: {:?}", result.err());
+
+        assert!(
+            !cleanup_path.as_std_path().exists(),
+            "cleanup file must be retired after CleanupComplete resume"
+        );
+        assert!(
+            !run_dir.as_std_path().exists(),
+            "run state dir must be removed after CleanupComplete resume"
+        );
+    }
+
+    #[test]
+    fn resume_cleanup_complete_without_server_version_response() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = RemoteRunner::fake();
+        // No version response is registered — any server call would fail.
+
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("test-cc-no-server".into()).unwrap();
+
+        // Write a completed cleanup file so retire succeeds.
+        let entry = purgery_core::CleanupEntry {
+            relative_path: "some/file.txt".to_owned(),
+            local_path: tmp
+                .path()
+                .join("some/file.txt")
+                .to_str()
+                .unwrap()
+                .to_owned(),
+            kind: purgery_core::ManifestEntryKind::RegularFile,
+            size: 0,
+            mtime_ns: 0,
+            sha256: None,
+            link_target: None,
+            import_confirmed: true,
+            cleaned: true,
+        };
+        let cleanup_state = DurableCleanupState {
+            purgery_version: "0.1.0-test".to_string(),
+            nickname: nickname.as_str().to_owned(),
+            operation_id: run_id.as_str().to_owned(),
+            entries: vec![entry],
+        };
+        let cleanup_path = cleanup::write_cleanup_state(&cleanup_state, &state_dir).unwrap();
+        assert!(cleanup_path.as_std_path().exists());
+
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![],
+        };
+        let run_config = RunConfig {
+            purgery_version: "0.1.0-test".to_string(),
+            nickname: nickname.clone(),
+            destination: DestinationPath::new(camino::Utf8PathBuf::from("rel")).unwrap(),
+            delete_after_import: true,
+        };
+        persist_client_run_state(
+            &state_dir,
+            &nickname,
+            &run_id,
+            "host",
+            "purgery-server",
+            &manifest,
+            &run_config,
+            None,
+            ClientRunPhase::CleanupComplete,
+        )
+        .unwrap();
+
+        let run_dir = camino::Utf8PathBuf::from(&state_dir)
+            .join("runs")
+            .join("laptop-test-cc-no-server");
+        assert!(run_dir.as_std_path().exists());
+
+        let result = resume_runs(&runner, &state_dir);
+        assert!(result.is_ok(), "resume failed: {:?}", result.err());
+
+        assert!(!cleanup_path.as_std_path().exists());
+        assert!(!run_dir.as_std_path().exists());
     }
 
     #[test]
@@ -3656,7 +3867,8 @@ observed_at_unix_secs = 1000
             server_command: "purgery-server".to_string(),
         };
         run_sync_with_runner(&runner, &args).unwrap();
-        // Cleanup state file must use the normalized source entry name.
+        // The cleanup state file is retired on completion — no stale
+        // files should remain after a fully successful pass.
         let cleanup_files: Vec<_> =
             fs::read_dir(camino::Utf8PathBuf::from(&state_dir).as_std_path())
                 .unwrap()
@@ -3668,8 +3880,8 @@ observed_at_unix_secs = 1000
                 })
                 .collect();
         assert!(
-            !cleanup_files.is_empty(),
-            "cleanup state file must be created"
+            cleanup_files.is_empty(),
+            "cleanup state file must be retired on completion"
         );
     }
 
