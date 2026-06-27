@@ -39,7 +39,7 @@ expected_outputs = ["{target_directory}/{file_stem}.Z.webm"]
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `work_dir` | yes | Absolute path to Purgery's working/state directory. Contains all non-final server state: incoming runs, ready/processing/done/failed runs, lease files, manifests, status files, transform work areas, and temporary files used for atomic writes |
+| `work_dir` | yes | Path to Purgery's working/state directory. Contains all non-final server state: incoming runs, ready/processing/done/failed runs, lease files, manifests, status files, transform work areas, and temporary files used for atomic writes |
 | `gc` | no | GC configuration (see below) |
 | `transform` | no | Transforming configuration (see below) |
 
