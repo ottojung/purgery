@@ -25,6 +25,7 @@ pub fn run_gc(config: &ServerConfig) -> Result<()> {
             continue;
         };
         let Ok(nickname) = Nickname::new(name.to_owned()) else {
+            collect_invalid_nickname_dir(config, name, &nickname_path, now)?;
             continue;
         };
         for phase in [
@@ -42,6 +43,24 @@ pub fn run_gc(config: &ServerConfig) -> Result<()> {
                 now,
             )?;
         }
+    }
+    Ok(())
+}
+
+fn collect_invalid_nickname_dir(
+    config: &ServerConfig,
+    name: &str,
+    path: &std::path::Path,
+    now: u64,
+) -> Result<()> {
+    let utf8_path = Utf8PathBuf::from_path_buf(path.to_path_buf()).unwrap();
+    let expiry = mtime_secs(&utf8_path)?.saturating_add(config.gc.orphan_retention_secs);
+    if now >= expiry {
+        warn!(dirname=%name, reason="invalid nickname", seconds_past_expiry=now.saturating_sub(expiry), action="delete", "gc: removing invalid top-level work_dir directory");
+        fs::remove_dir_all(path)
+            .with_context(|| format!("failed to remove invalid top-level directory: {}", name))?;
+    } else {
+        warn!(dirname=%name, reason="invalid nickname", seconds_until_deletion=expiry.saturating_sub(now), action="retain", "gc: retaining invalid top-level work_dir directory under orphan policy");
     }
     Ok(())
 }
@@ -203,19 +222,44 @@ fn collect_done(
     run_path: &Utf8Path,
     now: u64,
 ) -> Result<()> {
+    let original_mtime = mtime_secs(run_path)?;
+    let expiry = original_mtime.saturating_add(config.gc.done_retention_secs);
+    let expired = now >= expiry;
+
+    if expired {
+        log_decision(
+            nickname,
+            run_id,
+            RunPhase::Done,
+            true,
+            now,
+            expiry,
+            "retention",
+        );
+        return remove_run(
+            run_path,
+            nickname,
+            run_id,
+            RunPhase::Done,
+            "retention expired",
+        );
+    }
+
     if terminal_state(run_path).is_ok_and(|state| state == RunState::Done) {
         prune_success_terminal(run_path)
             .with_context(|| format!("failed to prune successful terminal state: {run_path}"))?;
     }
-    expire_by_mtime(
-        config,
+
+    log_decision(
         nickname,
         run_id,
         RunPhase::Done,
-        run_path,
+        false,
         now,
-        config.gc.done_retention_secs,
-    )
+        expiry,
+        "retention",
+    );
+    Ok(())
 }
 
 fn terminal_state(run_path: &Utf8Path) -> Result<RunState> {
@@ -349,6 +393,7 @@ mod tests {
     use camino::Utf8PathBuf;
     use purgery_core::{GCConfig, RunState, RunStatus, ServerWorkDir};
     use std::collections::BTreeMap;
+    use std::os::unix::io::AsRawFd;
 
     fn config(work_dir: Utf8PathBuf) -> ServerConfig {
         ServerConfig {
@@ -376,6 +421,14 @@ mod tests {
             entries: vec![],
             error: None,
         }
+    }
+
+    fn set_dir_mtime(path: &Utf8Path, secs_since_epoch: i64) {
+        filetime::set_file_mtime(
+            path.as_std_path(),
+            filetime::FileTime::from_unix_time(secs_since_epoch, 0),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -471,5 +524,294 @@ mod tests {
 
         assert!(incoming.exists());
         assert!(incoming.join("files").exists());
+    }
+
+    #[test]
+    fn gc_removes_old_malformed_incoming_after_orphan_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = config(Utf8PathBuf::from_path_buf(tmp.path().join("work")).unwrap());
+        cfg.gc.orphan_retention_secs = 3600;
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("old-bad".into()).unwrap();
+        let incoming = cfg.work_dir.run_dir(&nickname, &run_id, RunPhase::Incoming);
+        fs::create_dir_all(incoming.join("files")).unwrap();
+        fs::write(incoming.join("lease.toml"), "not toml").unwrap();
+
+        let now = unix_now();
+        set_dir_mtime(&incoming, now as i64 - 7200);
+
+        run_gc(&cfg).unwrap();
+
+        assert!(!incoming.exists(), "old orphan incoming must be removed");
+    }
+
+    #[test]
+    fn gc_expired_done_dir_deleted_without_pruning_refresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = config(Utf8PathBuf::from_path_buf(tmp.path().join("work")).unwrap());
+        cfg.gc.done_retention_secs = 3600;
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("expired-done".into()).unwrap();
+        let done = cfg.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
+        fs::create_dir_all(done.join("files/a")).unwrap();
+        fs::create_dir_all(done.join("work")).unwrap();
+        fs::write(done.join("files/a/input.txt"), "payload").unwrap();
+        fs::write(done.join("lease.toml"), "lease").unwrap();
+        fs::write(done.join("progress.toml"), "progress").unwrap();
+        fs::write(done.join("processor.lock"), "lock").unwrap();
+        fs::write(done.join("run.toml"), "destination = \"x\"\n").unwrap();
+        fs::write(done.join("manifest.toml"), "entries = []\n").unwrap();
+        fs::write(
+            done.join("status.toml"),
+            status(&nickname, &run_id, RunState::Done)
+                .to_toml()
+                .unwrap(),
+        )
+        .unwrap();
+
+        let now = unix_now();
+        set_dir_mtime(&done, now as i64 - 7200);
+
+        run_gc(&cfg).unwrap();
+
+        assert!(
+            !done.exists(),
+            "expired done directory with stale payload must be fully deleted, not merely pruned"
+        );
+    }
+
+    #[test]
+    fn gc_removes_old_invalid_top_level_nickname_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = config(Utf8PathBuf::from_path_buf(tmp.path().join("work")).unwrap());
+        cfg.gc.orphan_retention_secs = 3600;
+        let invalid_dir = cfg.work_dir.as_path().join("bad!nick name");
+        fs::create_dir_all(invalid_dir.join("incoming/some-run")).unwrap();
+
+        let now = unix_now();
+        set_dir_mtime(&invalid_dir, now as i64 - 7200);
+
+        run_gc(&cfg).unwrap();
+
+        assert!(
+            !invalid_dir.exists(),
+            "old invalid top-level directory must be removed"
+        );
+    }
+
+    #[test]
+    fn gc_retains_fresh_invalid_top_level_nickname_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = config(Utf8PathBuf::from_path_buf(tmp.path().join("work")).unwrap());
+        cfg.gc.orphan_retention_secs = 86400;
+        let invalid_dir = cfg.work_dir.as_path().join("bad!nick name");
+        fs::create_dir_all(invalid_dir.join("incoming/some-run")).unwrap();
+
+        run_gc(&cfg).unwrap();
+
+        assert!(
+            invalid_dir.exists(),
+            "fresh invalid top-level directory must be retained under orphan policy"
+        );
+    }
+
+    #[test]
+    fn gc_does_not_delete_locked_processing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = config(Utf8PathBuf::from_path_buf(tmp.path().join("work")).unwrap());
+        cfg.gc.processing_retention_secs = 0;
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("locked-processing".into()).unwrap();
+        let processing = cfg
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        fs::create_dir_all(processing.join("files")).unwrap();
+
+        let lock_path = processing.join("processor.lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path.as_std_path())
+            .unwrap();
+        let fd = lock_file.as_raw_fd();
+        let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(ret, 0, "must acquire lock for test");
+
+        run_gc(&cfg).unwrap();
+
+        assert!(
+            processing.exists(),
+            "locked processing must not be deleted even if expired"
+        );
+
+        drop(lock_file);
+    }
+
+    #[test]
+    fn gc_removes_expired_unlocked_processing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = config(Utf8PathBuf::from_path_buf(tmp.path().join("work")).unwrap());
+        cfg.gc.processing_retention_secs = 0;
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("old-processing".into()).unwrap();
+        let processing = cfg
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        fs::create_dir_all(processing.join("files")).unwrap();
+
+        run_gc(&cfg).unwrap();
+
+        assert!(
+            !processing.exists(),
+            "expired unlocked processing must be removed"
+        );
+    }
+
+    #[test]
+    fn fresh_done_with_stale_payload_is_pruned_not_deleted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = config(Utf8PathBuf::from_path_buf(tmp.path().join("work")).unwrap());
+        cfg.gc.done_retention_secs = 86400;
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("fresh-done".into()).unwrap();
+        let done = cfg.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
+        fs::create_dir_all(done.join("files/a")).unwrap();
+        fs::create_dir_all(done.join("work")).unwrap();
+        fs::write(done.join("files/a/input.txt"), "payload").unwrap();
+        fs::write(done.join("lease.toml"), "lease").unwrap();
+        fs::write(done.join("progress.toml"), "progress").unwrap();
+        fs::write(done.join("processor.lock"), "lock").unwrap();
+        fs::write(done.join("run.toml"), "destination = \"x\"\n").unwrap();
+        fs::write(done.join("manifest.toml"), "entries = []\n").unwrap();
+        fs::write(
+            done.join("status.toml"),
+            status(&nickname, &run_id, RunState::Done)
+                .to_toml()
+                .unwrap(),
+        )
+        .unwrap();
+
+        run_gc(&cfg).unwrap();
+
+        assert!(done.exists(), "fresh done directory must remain");
+        assert!(
+            done.join("status.toml").exists(),
+            "status.toml must remain observable"
+        );
+        assert!(
+            done.join("run.toml").exists(),
+            "run.toml must remain observable"
+        );
+        assert!(
+            done.join("manifest.toml").exists(),
+            "manifest.toml must remain observable"
+        );
+        assert!(
+            !done.join("files").exists(),
+            "staged payload must be pruned"
+        );
+        assert!(!done.join("work").exists(), "work area must be pruned");
+        assert!(!done.join("lease.toml").exists(), "lease must be pruned");
+        assert!(
+            !done.join("progress.toml").exists(),
+            "progress must be pruned"
+        );
+        assert!(
+            !done.join("processor.lock").exists(),
+            "processor.lock must be pruned"
+        );
+    }
+
+    #[test]
+    fn done_not_in_done_state_is_still_expired_by_mtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = config(Utf8PathBuf::from_path_buf(tmp.path().join("work")).unwrap());
+        cfg.gc.done_retention_secs = 0;
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("done-failed".into()).unwrap();
+        let done = cfg.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
+        fs::create_dir_all(done.join("files")).unwrap();
+        fs::write(
+            done.join("status.toml"),
+            status(&nickname, &run_id, RunState::Failed)
+                .to_toml()
+                .unwrap(),
+        )
+        .unwrap();
+
+        run_gc(&cfg).unwrap();
+
+        assert!(
+            !done.exists(),
+            "done dir with Failed state must still expire by mtime"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn finalization_succeeds_even_when_pruning_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = config(Utf8PathBuf::from_path_buf(tmp.path().join("work")).unwrap());
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("prune-fail".into()).unwrap();
+        let processing = cfg
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        fs::create_dir_all(processing.join("files/sub")).unwrap();
+        fs::create_dir_all(processing.join("work")).unwrap();
+        fs::write(processing.join("files/sub/x.txt"), "payload").unwrap();
+        fs::write(
+            processing.join("status.toml"),
+            status(&nickname, &run_id, RunState::Done)
+                .to_toml()
+                .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            processing.join("run.toml"),
+            r#"purgery_version = "0.1.0-test"
+nickname = "laptop"
+destination = "/tmp/dest"
+delete_after_import = true
+"#,
+        )
+        .unwrap();
+        fs::write(processing.join("manifest.toml"), "entries = []\n").unwrap();
+        fs::write(processing.join("lease.toml"), "lease").unwrap();
+        fs::write(processing.join("progress.toml"), "progress").unwrap();
+        fs::write(processing.join("processor.lock"), "lock").unwrap();
+
+        std::fs::set_permissions(
+            processing.join("files").as_std_path(),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+
+        let result =
+            crate::phases::finalize_processing_run(&cfg, &nickname, &run_id, &RunState::Done);
+        assert!(
+            result.is_ok(),
+            "finalize_processing_run must return Ok even when pruning fails: {result:?}"
+        );
+
+        let done = cfg.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
+        assert!(done.exists(), "done dir must exist after finalization");
+        assert!(
+            done.join("status.toml").exists(),
+            "status.toml must be present in done dir"
+        );
+        let status_content = fs::read_to_string(done.join("status.toml")).unwrap();
+        let s = RunStatus::from_toml(&status_content).unwrap();
+        assert_eq!(s.state, RunState::Done, "run must remain terminal Done");
+
+        // Restore permissions so tempdir cleanup can proceed
+        let _ = std::fs::set_permissions(
+            done.join("files").as_std_path(),
+            std::fs::Permissions::from_mode(0o755),
+        );
     }
 }

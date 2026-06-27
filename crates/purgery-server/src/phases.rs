@@ -509,7 +509,15 @@ pub(crate) fn finalize_processing_run(
     })?;
 
     if matches!(state, RunState::Done) {
-        crate::gc::prune_success_terminal(&dest_path)?;
+        if let Err(e) = crate::gc::prune_success_terminal(&dest_path) {
+            warn!(
+                nickname = %nickname.as_str(),
+                run_id = %run_id.as_str(),
+                phase = %dest_phase.as_str(),
+                error = %e,
+                "failed to prune successful terminal state after finalization; GC will retry",
+            );
+        }
     } else {
         let lock_path = dest_path.join("processor.lock");
         let _ = fs::remove_file(lock_path.as_std_path());
