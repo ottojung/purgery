@@ -13,7 +13,7 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use crate::classify;
-use crate::cleanup;
+use crate::cleanup::{self, CleanupOutcome};
 use crate::runner::{RemoteCommandExit, RemoteCommandHandle, RemoteRunner};
 use crate::split;
 use crate::SyncArgs;
@@ -1255,9 +1255,12 @@ fn process_cleanup_from_status(
 ) -> Result<()> {
     let cleanup_filename = format!("cleanup-{}-{}.toml", nickname.as_str(), run_id.as_str());
     let cleanup_path = camino::Utf8PathBuf::from(state_dir).join(&cleanup_filename);
-    if cleanup_path.as_std_path().exists() {
+    let cleanup_complete = if cleanup_path.as_std_path().exists() {
         cleanup::confirm_imports_from_status(&cleanup_path, status)?;
-        cleanup::process_cleanup_state_file_and_retire(&cleanup_path)?;
+        matches!(
+            cleanup::process_cleanup_state_file(&cleanup_path)?,
+            CleanupOutcome::Complete
+        )
     } else if run_config.delete_after_import && !manifest.entries.is_empty() {
         anyhow::bail!(
             "cleanup state file '{cleanup_filename}' is required for run {}/{} \
@@ -1265,7 +1268,9 @@ fn process_cleanup_from_status(
             nickname.as_str(),
             run_id.as_str()
         );
-    }
+    } else {
+        false
+    };
     persist_client_run_state(
         state_dir,
         nickname,
@@ -1277,6 +1282,9 @@ fn process_cleanup_from_status(
         None,
         ClientRunPhase::CleanupComplete,
     )?;
+    if cleanup_complete {
+        cleanup::retire_cleanup_state_file(&cleanup_path)?;
+    }
     remove_client_run_state(state_dir, nickname, run_id);
     Ok(())
 }
@@ -1731,10 +1739,15 @@ pub(crate) fn run_sync_with_run_id(
         ClientRunPhase::TerminalStatusSeen,
     )?;
 
-    if let Some(ref state_path) = cleanup_state_path {
+    let cleanup_complete = if let Some(ref state_path) = cleanup_state_path {
         cleanup::confirm_imports_from_status(state_path, &status)?;
-        cleanup::process_cleanup_state_file_and_retire(state_path)?;
-    }
+        matches!(
+            cleanup::process_cleanup_state_file(state_path)?,
+            CleanupOutcome::Complete
+        )
+    } else {
+        false
+    };
 
     persist_client_run_state(
         &state_dir,
@@ -1747,6 +1760,11 @@ pub(crate) fn run_sync_with_run_id(
         None,
         ClientRunPhase::CleanupComplete,
     )?;
+    if cleanup_complete {
+        if let Some(ref state_path) = cleanup_state_path {
+            cleanup::retire_cleanup_state_file(state_path)?;
+        }
+    }
     remove_client_run_state(&state_dir, &nickname, run_id);
 
     ensure_successful_status(&status)?;

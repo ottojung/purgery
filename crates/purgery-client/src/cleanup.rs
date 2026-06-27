@@ -186,9 +186,21 @@ pub(crate) fn resume_pending_cleanups(state_dir: &str) -> Result<()> {
         };
         let before = state.entries.iter().filter(|e| e.cleaned).count();
         let total = state.entries.len();
-        match process_cleanup_state_file_and_retire(&state_path) {
+        match process_cleanup_state_file(&state_path) {
             Err(e) => warn!(path = %state_path, error = %e, "failed to process cleanup state"),
             Ok(CleanupOutcome::Complete) => {
+                // Do not retire a completed cleanup file while a client run
+                // state still exists for it — the run machine's inline path
+                // (process_cleanup_from_status) needs the file to advance
+                // TerminalStatusSeen → CleanupComplete.  Only retire
+                // orphaned files whose run state is already gone.
+                let run_filename = format!("run-{}-{}.toml", state.nickname, state.operation_id);
+                let run_path = dir.join(&run_filename);
+                if !run_path.exists() {
+                    if let Err(e) = retire_cleanup_state_file(&state_path) {
+                        warn!(path = %state_path, error = %e, "failed to retire completed cleanup state file");
+                    }
+                }
                 deleted_total += total - before;
             }
             Ok(CleanupOutcome::StillPending) => {
@@ -300,21 +312,33 @@ pub(crate) fn process_cleanup_state_file(state_path: &Utf8Path) -> Result<Cleanu
     }
 }
 
+/// Remove a cleanup state file that is no longer needed.
+///
+/// Used by the transform/server-run flow **after** `CleanupComplete` has been
+/// persisted, so a crash before the removal leaves the completed file in
+/// place where `resume_pending_cleanups` or the next inline pass can
+/// safely retire it.
+pub(crate) fn retire_cleanup_state_file(state_path: &Utf8Path) -> Result<()> {
+    fs::remove_file(state_path.as_std_path())
+        .with_context(|| format!("failed to remove cleanup state file: {state_path}"))?;
+    info!(path = %state_path, "retired completed cleanup state file");
+    Ok(())
+}
+
 /// Process a cleanup state file and retire it when all entries are cleaned.
 ///
-/// Shared lifecycle primitive used by all call sites (direct passthrough,
-/// transform path, transform recovery, and resume).  Retiring the file
-/// when `Complete` prevents stale state files from accumulating and allows
-/// crash recovery to skip already‑finished cleanups.
+/// Suitable for the direct passthrough path, which has no client run state
+/// to protect.  For the transform/server-run path use
+/// [`process_cleanup_state_file`] directly and call
+/// [`retire_cleanup_state_file`] **after** persisting `CleanupComplete`, so
+/// that a crash between the two steps does not orphan a completed cleanup
+/// with `TerminalStatusSeen` still on disk.
 pub(crate) fn process_cleanup_state_file_and_retire(
     state_path: &Utf8Path,
 ) -> Result<CleanupOutcome> {
     let outcome = process_cleanup_state_file(state_path)?;
     if matches!(outcome, CleanupOutcome::Complete) {
-        fs::remove_file(state_path.as_std_path()).with_context(|| {
-            format!("failed to remove completed cleanup state file: {state_path}")
-        })?;
-        info!(path = %state_path, "retired completed cleanup state file");
+        retire_cleanup_state_file(state_path)?;
     }
     Ok(outcome)
 }
@@ -1315,6 +1339,43 @@ mod tests {
         assert!(
             !state_path.exists(),
             "stale completed state file must be removed by resume"
+        );
+    }
+
+    #[test]
+    fn resume_pending_cleanups_preserves_file_when_run_state_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().to_str().unwrap();
+
+        let entry = CleanupEntry {
+            relative_path: "done.txt".to_owned(),
+            local_path: tmp.path().join("done.txt").to_str().unwrap().to_owned(),
+            kind: ManifestEntryKind::RegularFile,
+            size: 0,
+            mtime_ns: 0,
+            sha256: None,
+            link_target: None,
+            import_confirmed: true,
+            cleaned: true,
+        };
+        let state = DurableCleanupState {
+            purgery_version: "0.1.0-test".to_string(),
+            nickname: "myhost".to_owned(),
+            operation_id: "run-active".to_owned(),
+            entries: vec![entry],
+        };
+        let state_path = write_cleanup_state(&state, state_dir).unwrap();
+
+        // Create a corresponding client run state file so resume
+        // knows this cleanup is not orphaned.
+        let run_path = tmp.path().join("run-myhost-run-active.toml");
+        fs::write(&run_path, "phase = \"TerminalStatusSeen\"\n").unwrap();
+
+        resume_pending_cleanups(state_dir).unwrap();
+
+        assert!(
+            state_path.exists(),
+            "completed cleanup file must survive resume when run state is present"
         );
     }
 }
