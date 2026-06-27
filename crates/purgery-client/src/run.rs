@@ -1114,6 +1114,33 @@ fn resume_runs(runner: &RemoteRunner, state_dir: &str) -> Result<()> {
     Ok(())
 }
 
+/// Finalize a CleanupComplete resume without contacting the server.
+///
+/// CleanupComplete means the server has already finished its work;
+/// only local state remains: retire the completed cleanup file and
+/// remove the client run state.
+fn finish_cleanup_complete_resume(
+    state_dir: &str,
+    nickname: &Nickname,
+    run_id: &RunId,
+) -> Result<()> {
+    let cleanup_filename = format!("cleanup-{}-{}.toml", nickname.as_str(), run_id.as_str());
+    let cleanup_path = camino::Utf8PathBuf::from(state_dir).join(&cleanup_filename);
+
+    if cleanup_path.exists() {
+        if let Err(e) = cleanup::process_cleanup_state_file_and_retire(&cleanup_path) {
+            warn!(
+                path = %cleanup_path,
+                error = %e,
+                "failed to retire cleanup state during resume of CleanupComplete"
+            );
+        }
+    }
+
+    remove_client_run_state(state_dir, nickname, run_id);
+    Ok(())
+}
+
 /// Drain a single persisted run state to completion or error.
 /// Returns Ok(()) when the run is fully resolved (cleanup complete, state removed).
 fn drain_one(runner: &RemoteRunner, state_dir: &str, state: &ClientRunState) -> Result<()> {
@@ -1131,6 +1158,14 @@ fn drain_one(runner: &RemoteRunner, state_dir: &str, state: &ClientRunState) -> 
         .with_context(|| "failed to parse persisted run config")?;
     purgery_core::require_compatible_purgery_version(&run_config.purgery_version, "run config")
         .with_context(|| "incompatible persisted run config version")?;
+
+    // CleanupComplete recovery is purely local: the server has already
+    // returned a terminal status and the client has persisted the result.
+    // Handle it before check_server_version so that resume does not
+    // require server availability once CleanupComplete is committed.
+    if state.phase == ClientRunPhase::CleanupComplete {
+        return finish_cleanup_complete_resume(state_dir, &nickname, &run_id);
+    }
 
     check_server_version(runner, host, server_cmd)
         .with_context(|| "server version check failed while resuming persisted run")?;
@@ -1227,25 +1262,7 @@ fn drain_one(runner: &RemoteRunner, state_dir: &str, state: &ClientRunState) -> 
                 return Ok(());
             }
             ClientRunPhase::CleanupComplete => {
-                // Retire the cleanup state file if present, then remove
-                // the run state.  A crash between
-                // persist_client_run_state(CleanupComplete) and
-                // retire_cleanup_state_file in the transform path would
-                // otherwise strand both on disk.
-                let cleanup_filename =
-                    format!("cleanup-{}-{}.toml", nickname.as_str(), run_id.as_str());
-                let cleanup_path = camino::Utf8PathBuf::from(state_dir).join(&cleanup_filename);
-                if cleanup_path.exists() {
-                    if let Err(e) = cleanup::process_cleanup_state_file_and_retire(&cleanup_path) {
-                        warn!(
-                            path = %cleanup_path,
-                            error = %e,
-                            "failed to retire cleanup state during resume of CleanupComplete"
-                        );
-                    }
-                }
-                remove_client_run_state(state_dir, &nickname, &run_id);
-                return Ok(());
+                return finish_cleanup_complete_resume(state_dir, &nickname, &run_id);
             }
             ClientRunPhase::Abandoned => {
                 warn!("abandoned run state, removing");
@@ -2272,6 +2289,79 @@ state = "done"
             !run_dir.as_std_path().exists(),
             "run state dir must be removed after CleanupComplete resume"
         );
+    }
+
+    #[test]
+    fn resume_cleanup_complete_without_server_version_response() {
+        let tmp = tempdir().unwrap();
+        let state_dir = mk_state_dir(&tmp);
+        let runner = RemoteRunner::fake();
+        // No version response is registered — any server call would fail.
+
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("test-cc-no-server".into()).unwrap();
+
+        // Write a completed cleanup file so retire succeeds.
+        let entry = purgery_core::CleanupEntry {
+            relative_path: "some/file.txt".to_owned(),
+            local_path: tmp
+                .path()
+                .join("some/file.txt")
+                .to_str()
+                .unwrap()
+                .to_owned(),
+            kind: purgery_core::ManifestEntryKind::RegularFile,
+            size: 0,
+            mtime_ns: 0,
+            sha256: None,
+            link_target: None,
+            import_confirmed: true,
+            cleaned: true,
+        };
+        let cleanup_state = DurableCleanupState {
+            purgery_version: "0.1.0-test".to_string(),
+            nickname: nickname.as_str().to_owned(),
+            operation_id: run_id.as_str().to_owned(),
+            entries: vec![entry],
+        };
+        let cleanup_path = cleanup::write_cleanup_state(&cleanup_state, &state_dir).unwrap();
+        assert!(cleanup_path.as_std_path().exists());
+
+        let manifest = Manifest {
+            purgery_version: "0.1.0-test".to_string(),
+            run_id: run_id.clone(),
+            nickname: nickname.clone(),
+            entries: vec![],
+        };
+        let run_config = RunConfig {
+            purgery_version: "0.1.0-test".to_string(),
+            nickname: nickname.clone(),
+            destination: DestinationPath::new(camino::Utf8PathBuf::from("rel")).unwrap(),
+            delete_after_import: true,
+        };
+        persist_client_run_state(
+            &state_dir,
+            &nickname,
+            &run_id,
+            "host",
+            "purgery-server",
+            &manifest,
+            &run_config,
+            None,
+            ClientRunPhase::CleanupComplete,
+        )
+        .unwrap();
+
+        let run_dir = camino::Utf8PathBuf::from(&state_dir)
+            .join("runs")
+            .join("laptop-test-cc-no-server");
+        assert!(run_dir.as_std_path().exists());
+
+        let result = resume_runs(&runner, &state_dir);
+        assert!(result.is_ok(), "resume failed: {:?}", result.err());
+
+        assert!(!cleanup_path.as_std_path().exists());
+        assert!(!run_dir.as_std_path().exists());
     }
 
     #[test]
