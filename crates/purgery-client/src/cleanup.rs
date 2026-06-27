@@ -194,9 +194,13 @@ pub(crate) fn resume_pending_cleanups(state_dir: &str) -> Result<()> {
                 // (process_cleanup_from_status) needs the file to advance
                 // TerminalStatusSeen → CleanupComplete.  Only retire
                 // orphaned files whose run state is already gone.
-                let run_filename = format!("run-{}-{}.toml", state.nickname, state.operation_id);
-                let run_path = dir.join(&run_filename);
-                if !run_path.exists() {
+                // Run state is persisted at:
+                //   state_dir/runs/{nickname}-{run_id}/state.toml
+                let run_state_path = dir
+                    .join("runs")
+                    .join(format!("{}-{}", state.nickname, state.operation_id))
+                    .join("state.toml");
+                if !run_state_path.exists() {
                     if let Err(e) = retire_cleanup_state_file(&state_path) {
                         warn!(path = %state_path, error = %e, "failed to retire completed cleanup state file");
                     }
@@ -1368,8 +1372,14 @@ mod tests {
 
         // Create a corresponding client run state file so resume
         // knows this cleanup is not orphaned.
-        let run_path = tmp.path().join("run-myhost-run-active.toml");
-        fs::write(&run_path, "phase = \"TerminalStatusSeen\"\n").unwrap();
+        // Run state lives at: state_dir/runs/{nickname}-{run_id}/state.toml
+        let run_dir = tmp.path().join("runs").join("myhost-run-active");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::write(
+            run_dir.join("state.toml"),
+            "phase = \"TerminalStatusSeen\"\n",
+        )
+        .unwrap();
 
         resume_pending_cleanups(state_dir).unwrap();
 
