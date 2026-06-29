@@ -1,11 +1,84 @@
 use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
-use purgery_core::{Nickname, RunId, RunPhase, RunState, RunStatus, ServerConfig};
+use purgery_core::{
+    check_toml_version, Nickname, RunId, RunPhase, RunState, RunStatus, ServerConfig,
+    TomlVersionCheck,
+};
 use std::fs;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
 use crate::phases::probe_processor_lock_readonly;
+
+/// Describes the expiry basis for a server work-state item.
+struct ExpiryDecision {
+    expired: bool,
+    expiry_unix_secs: u64,
+    reason: &'static str,
+}
+
+/// Compute expiry from a file's mtime + retention window.
+fn expiry_from_mtime(
+    path: &Utf8Path,
+    retention_secs: u64,
+    now: u64,
+    reason: &'static str,
+) -> Result<ExpiryDecision> {
+    let mtime = mtime_secs(path)?;
+    let expiry = mtime.saturating_add(retention_secs);
+    Ok(ExpiryDecision {
+        expired: now >= expiry,
+        expiry_unix_secs: expiry,
+        reason,
+    })
+}
+
+/// Compute expiry from a `status.toml` mtime + retention window.
+/// If status.toml is missing, malformed, or incompatible, falls back
+/// to orphan retention so that bad state cannot extend its own lifetime.
+fn expiry_from_status_mtime(
+    status_path: &Utf8Path,
+    retention_secs: u64,
+    config: &ServerConfig,
+    run_path: &Utf8Path,
+    now: u64,
+    reason: &'static str,
+) -> Result<ExpiryDecision> {
+    match fs::read_to_string(status_path.as_std_path()) {
+        Ok(content) => {
+            if !check_toml_version_is_compatible(&content) {
+                return orphan_expiry(config, run_path, now, "incompatible terminal status");
+            }
+            match RunStatus::from_toml(&content) {
+                Ok(_status) => expiry_from_mtime(status_path, retention_secs, now, reason),
+                Err(_) => orphan_expiry(config, run_path, now, "malformed terminal status"),
+            }
+        }
+        Err(_) => orphan_expiry(config, run_path, now, "missing terminal status"),
+    }
+}
+
+/// Check that a TOML document's `purgery_version` is present and
+/// major/minor-compatible with the current code.
+fn check_toml_version_is_compatible(content: &str) -> bool {
+    matches!(check_toml_version(content), TomlVersionCheck::Compatible)
+}
+
+/// Compute orphan expiry from directory mtime + orphan retention window.
+fn orphan_expiry(
+    config: &ServerConfig,
+    run_path: &Utf8Path,
+    now: u64,
+    reason: &'static str,
+) -> Result<ExpiryDecision> {
+    let mtime = mtime_secs(run_path)?;
+    let expiry = mtime.saturating_add(config.gc.orphan_retention_secs);
+    Ok(ExpiryDecision {
+        expired: now >= expiry,
+        expiry_unix_secs: expiry,
+        reason,
+    })
+}
 
 pub fn run_gc(config: &ServerConfig) -> Result<()> {
     let root = config.work_dir.as_path();
@@ -54,13 +127,13 @@ fn collect_invalid_nickname_dir(
     now: u64,
 ) -> Result<()> {
     let utf8_path = Utf8PathBuf::from_path_buf(path.to_path_buf()).unwrap();
-    let expiry = mtime_secs(&utf8_path)?.saturating_add(config.gc.orphan_retention_secs);
-    if now >= expiry {
-        warn!(dirname=%name, reason="invalid nickname", seconds_past_expiry=now.saturating_sub(expiry), action="delete", "gc: removing invalid top-level work_dir directory");
+    let d = orphan_expiry(config, &utf8_path, now, "invalid nickname")?;
+    if d.expired {
+        warn!(dirname=%name, reason="invalid nickname", seconds_past_expiry=now.saturating_sub(d.expiry_unix_secs), action="delete", "gc: removing invalid top-level work_dir directory");
         fs::remove_dir_all(path)
             .with_context(|| format!("failed to remove invalid top-level directory: {}", name))?;
     } else {
-        warn!(dirname=%name, reason="invalid nickname", seconds_until_deletion=expiry.saturating_sub(now), action="retain", "gc: retaining invalid top-level work_dir directory under orphan policy");
+        warn!(dirname=%name, reason="invalid nickname", seconds_until_deletion=d.expiry_unix_secs.saturating_sub(now), action="retain", "gc: retaining invalid top-level work_dir directory under orphan policy");
     }
     Ok(())
 }
@@ -125,16 +198,46 @@ fn collect_run(
         ),
         RunPhase::Processing => collect_processing(config, nickname, run_id, run_path, now),
         RunPhase::Done => collect_done(config, nickname, run_id, run_path, now),
-        RunPhase::Failed => expire_by_mtime(
-            config,
+        RunPhase::Failed => collect_failed(config, nickname, run_id, run_path, now),
+    }
+}
+
+fn collect_failed(
+    config: &ServerConfig,
+    nickname: &Nickname,
+    run_id: &RunId,
+    run_path: &Utf8Path,
+    now: u64,
+) -> Result<()> {
+    let status_path = run_path.join("status.toml");
+    let decision = expiry_from_status_mtime(
+        &status_path,
+        config.gc.failed_retention_secs,
+        config,
+        run_path,
+        now,
+        "failed retention",
+    )?;
+
+    log_decision(
+        nickname,
+        run_id,
+        RunPhase::Failed,
+        decision.expired,
+        now,
+        decision.expiry_unix_secs,
+        decision.reason,
+    );
+    if decision.expired {
+        remove_run(
+            run_path,
             nickname,
             run_id,
-            phase,
-            run_path,
-            now,
-            config.gc.failed_retention_secs,
-        ),
+            RunPhase::Failed,
+            "retention expired",
+        )?;
     }
+    Ok(())
 }
 
 fn collect_incoming(
@@ -145,31 +248,152 @@ fn collect_incoming(
     now: u64,
 ) -> Result<()> {
     let lease_path = run_path.join("lease.toml");
-    let (expired, reason, expiry) = match fs::read_to_string(lease_path.as_std_path()) {
-        Ok(content) => match toml::from_str::<purgery_core::LeaseFile>(&content) {
-            Ok(lease) if lease.nickname == nickname.as_str() && lease.run_id == run_id.as_str() => {
-                (
-                    now >= lease.expires_at_unix_secs,
-                    "lease",
-                    lease.expires_at_unix_secs,
-                )
+
+    // Classify the lease before trusting its expiry.
+    let content = match fs::read_to_string(lease_path.as_std_path()) {
+        Ok(c) => c,
+        Err(_) => {
+            let d = orphan_expiry(config, run_path, now, "missing lease")?;
+            log_decision(
+                nickname,
+                run_id,
+                RunPhase::Incoming,
+                d.expired,
+                now,
+                d.expiry_unix_secs,
+                d.reason,
+            );
+            if d.expired {
+                remove_run(
+                    run_path,
+                    nickname,
+                    run_id,
+                    RunPhase::Incoming,
+                    "missing lease",
+                )?;
             }
-            Ok(_) => orphan_expiry(config, run_path, now, "lease envelope mismatch")?,
-            Err(_) => orphan_expiry(config, run_path, now, "malformed lease")?,
-        },
-        Err(_) => orphan_expiry(config, run_path, now, "missing lease")?,
+            return Ok(());
+        }
     };
+
+    // 1. Check purgery_version compatibility.
+    if !check_toml_version_is_compatible(&content) {
+        let d = orphan_expiry(config, run_path, now, "incompatible purgery_version")?;
+        log_decision(
+            nickname,
+            run_id,
+            RunPhase::Incoming,
+            d.expired,
+            now,
+            d.expiry_unix_secs,
+            d.reason,
+        );
+        if d.expired {
+            remove_run(
+                run_path,
+                nickname,
+                run_id,
+                RunPhase::Incoming,
+                "incompatible lease version",
+            )?;
+        }
+        return Ok(());
+    }
+
+    // 2. Deserialize as LeaseFile.
+    let lease: purgery_core::LeaseFile = match toml::from_str(&content) {
+        Ok(lease) => lease,
+        Err(_) => {
+            let d = orphan_expiry(config, run_path, now, "malformed lease")?;
+            log_decision(
+                nickname,
+                run_id,
+                RunPhase::Incoming,
+                d.expired,
+                now,
+                d.expiry_unix_secs,
+                d.reason,
+            );
+            if d.expired {
+                remove_run(
+                    run_path,
+                    nickname,
+                    run_id,
+                    RunPhase::Incoming,
+                    "malformed lease",
+                )?;
+            }
+            return Ok(());
+        }
+    };
+
+    // 3. Check protocol_version.
+    if lease.protocol_version != purgery_core::PROTOCOL_VERSION {
+        let d = orphan_expiry(config, run_path, now, "protocol_version mismatch")?;
+        log_decision(
+            nickname,
+            run_id,
+            RunPhase::Incoming,
+            d.expired,
+            now,
+            d.expiry_unix_secs,
+            d.reason,
+        );
+        if d.expired {
+            remove_run(
+                run_path,
+                nickname,
+                run_id,
+                RunPhase::Incoming,
+                "protocol version mismatch",
+            )?;
+        }
+        return Ok(());
+    }
+
+    // 4. Check envelope.
+    if lease.nickname != nickname.as_str() || lease.run_id != run_id.as_str() {
+        let d = orphan_expiry(config, run_path, now, "lease envelope mismatch")?;
+        log_decision(
+            nickname,
+            run_id,
+            RunPhase::Incoming,
+            d.expired,
+            now,
+            d.expiry_unix_secs,
+            d.reason,
+        );
+        if d.expired {
+            remove_run(
+                run_path,
+                nickname,
+                run_id,
+                RunPhase::Incoming,
+                "lease envelope mismatch",
+            )?;
+        }
+        return Ok(());
+    }
+
+    // Valid current lease — use its expiry.
+    let expired = now >= lease.expires_at_unix_secs;
     log_decision(
         nickname,
         run_id,
         RunPhase::Incoming,
         expired,
         now,
-        expiry,
-        reason,
+        lease.expires_at_unix_secs,
+        "lease",
     );
     if expired {
-        remove_run(run_path, nickname, run_id, RunPhase::Incoming, reason)?;
+        remove_run(
+            run_path,
+            nickname,
+            run_id,
+            RunPhase::Incoming,
+            "lease expired",
+        )?;
     }
     Ok(())
 }
@@ -222,19 +446,25 @@ fn collect_done(
     run_path: &Utf8Path,
     now: u64,
 ) -> Result<()> {
-    let original_mtime = mtime_secs(run_path)?;
-    let expiry = original_mtime.saturating_add(config.gc.done_retention_secs);
-    let expired = now >= expiry;
+    let status_path = run_path.join("status.toml");
+    let decision = expiry_from_status_mtime(
+        &status_path,
+        config.gc.done_retention_secs,
+        config,
+        run_path,
+        now,
+        "done retention",
+    )?;
 
-    if expired {
+    if decision.expired {
         log_decision(
             nickname,
             run_id,
             RunPhase::Done,
             true,
             now,
-            expiry,
-            "retention",
+            decision.expiry_unix_secs,
+            decision.reason,
         );
         return remove_run(
             run_path,
@@ -245,9 +475,17 @@ fn collect_done(
         );
     }
 
-    if terminal_state(run_path).is_ok_and(|state| state == RunState::Done) {
-        prune_success_terminal(run_path)
-            .with_context(|| format!("failed to prune successful terminal state: {run_path}"))?;
+    // Only prune when status is valid, compatible, and exactly Done.
+    if let Ok(content) = fs::read_to_string(status_path.as_std_path()) {
+        if check_toml_version_is_compatible(&content) {
+            if let Ok(status) = RunStatus::from_toml(&content) {
+                if status.state == RunState::Done {
+                    prune_success_terminal(run_path).with_context(|| {
+                        format!("failed to prune successful terminal state: {run_path}")
+                    })?;
+                }
+            }
+        }
     }
 
     log_decision(
@@ -256,17 +494,10 @@ fn collect_done(
         RunPhase::Done,
         false,
         now,
-        expiry,
-        "retention",
+        decision.expiry_unix_secs,
+        decision.reason,
     );
     Ok(())
-}
-
-fn terminal_state(run_path: &Utf8Path) -> Result<RunState> {
-    let status_path = run_path.join("status.toml");
-    let status = RunStatus::from_toml(&fs::read_to_string(status_path.as_std_path())?)
-        .with_context(|| format!("failed to read terminal status: {status_path}"))?;
-    Ok(status.state)
 }
 
 pub(crate) fn prune_success_terminal(run_path: &Utf8Path) -> Result<()> {
@@ -316,27 +547,17 @@ fn collect_unknown(
     run_path: &Utf8Path,
     run_id: &str,
     now: u64,
-    reason: &str,
+    reason: &'static str,
 ) -> Result<()> {
-    let expiry = mtime_secs(run_path)?.saturating_add(config.gc.orphan_retention_secs);
-    if now >= expiry {
-        warn!(nickname=%nickname.as_str(), run_id, phase=%phase.as_str(), reason, seconds_past_expiry=now.saturating_sub(expiry), "gc: removing unknown request state");
+    let d = orphan_expiry(config, run_path, now, reason)?;
+    if d.expired {
+        warn!(nickname=%nickname.as_str(), run_id, phase=%phase.as_str(), reason, seconds_past_expiry=now.saturating_sub(d.expiry_unix_secs), "gc: removing unknown request state");
         fs::remove_dir_all(run_path.as_std_path())
             .with_context(|| format!("failed to remove orphan request: {run_path}"))?;
     } else {
-        warn!(nickname=%nickname.as_str(), run_id, phase=%phase.as_str(), reason, seconds_until_deletion=expiry.saturating_sub(now), "gc: retaining unknown request state under orphan policy");
+        warn!(nickname=%nickname.as_str(), run_id, phase=%phase.as_str(), reason, seconds_until_deletion=d.expiry_unix_secs.saturating_sub(now), "gc: retaining unknown request state under orphan policy");
     }
     Ok(())
-}
-
-fn orphan_expiry(
-    config: &ServerConfig,
-    run_path: &Utf8Path,
-    now: u64,
-    reason: &'static str,
-) -> Result<(bool, &'static str, u64)> {
-    let expiry = mtime_secs(run_path)?.saturating_add(config.gc.orphan_retention_secs);
-    Ok((now >= expiry, reason, expiry))
 }
 
 fn remove_run(
@@ -571,6 +792,9 @@ mod tests {
 
         let now = unix_now();
         set_dir_mtime(&done, now as i64 - 7200);
+        // status.toml mtime must also be old — directory mtime alone no longer
+        // controls terminal retention.
+        set_dir_mtime(&done.join("status.toml"), now as i64 - 7200);
 
         run_gc(&cfg).unwrap();
 
@@ -812,6 +1036,296 @@ delete_after_import = true
         let _ = std::fs::set_permissions(
             done.join("files").as_std_path(),
             std::fs::Permissions::from_mode(0o755),
+        );
+    }
+
+    // ── Blocker 1: terminal retention uses status.toml mtime ──────
+
+    #[test]
+    fn pruning_does_not_extend_done_retention() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = config(Utf8PathBuf::from_path_buf(tmp.path().join("work")).unwrap());
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("prune-extend".into()).unwrap();
+        let done = cfg.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
+        fs::create_dir_all(done.join("files")).unwrap();
+        fs::write(
+            done.join("status.toml"),
+            status(&nickname, &run_id, RunState::Done)
+                .to_toml()
+                .unwrap(),
+        )
+        .unwrap();
+        fs::write(done.join("run.toml"), "destination = \"x\"\n").unwrap();
+        fs::write(done.join("manifest.toml"), "entries = []\n").unwrap();
+
+        let now = unix_now();
+        // Set status.toml mtime so that based on status mtime the run is expired,
+        // but based on directory mtime it would not be.
+        set_dir_mtime(&done.join("status.toml"), now as i64 - 7200);
+        cfg.gc.done_retention_secs = 3600;
+
+        run_gc(&cfg).unwrap();
+
+        assert!(
+            !done.exists(),
+            "done directory must be deleted based on status.toml mtime, not directory mtime"
+        );
+    }
+
+    #[test]
+    fn fresh_done_pruning_does_not_refresh_future_expiry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = config(Utf8PathBuf::from_path_buf(tmp.path().join("work")).unwrap());
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("prune-future".into()).unwrap();
+        let done = cfg.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
+        fs::create_dir_all(done.join("files")).unwrap();
+        fs::create_dir_all(done.join("work")).unwrap();
+        fs::write(done.join("files/x.txt"), "payload").unwrap();
+        fs::write(
+            done.join("status.toml"),
+            status(&nickname, &run_id, RunState::Done)
+                .to_toml()
+                .unwrap(),
+        )
+        .unwrap();
+        fs::write(done.join("run.toml"), "destination = \"x\"\n").unwrap();
+        fs::write(done.join("manifest.toml"), "entries = []\n").unwrap();
+        fs::write(done.join("lease.toml"), "lease").unwrap();
+        fs::write(done.join("progress.toml"), "progress").unwrap();
+        fs::write(done.join("processor.lock"), "lock").unwrap();
+
+        let now = unix_now();
+        // status.toml mtime is fresh — within retention.
+        set_dir_mtime(&done.join("status.toml"), now as i64 - 600);
+        cfg.gc.done_retention_secs = 3600;
+
+        // First GC: prune payload.  This mutates the directory (refreshes mtime).
+        run_gc(&cfg).unwrap();
+        assert!(done.exists(), "fresh done must survive first GC");
+        assert!(
+            !done.join("files").exists(),
+            "payload must be pruned on first GC"
+        );
+
+        // Now advance status.toml mtime past retention while directory mtime is fresh.
+        set_dir_mtime(&done.join("status.toml"), now as i64 - 7200);
+        // Refresh directory mtime to simulate pruning's effect.
+        set_dir_mtime(&done, now as i64 - 100);
+
+        // Second GC: must use status.toml mtime, not directory mtime.
+        run_gc(&cfg).unwrap();
+
+        assert!(
+            !done.exists(),
+            "done must be deleted based on status.toml mtime, ignoring directory mtime refresh from pruning"
+        );
+    }
+
+    #[test]
+    fn malformed_done_status_uses_orphan_retention() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = config(Utf8PathBuf::from_path_buf(tmp.path().join("work")).unwrap());
+        cfg.gc.done_retention_secs = 0; // would expire immediately if status were valid
+        cfg.gc.orphan_retention_secs = 86400; // orphan window is long
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("malformed-done".into()).unwrap();
+        let done = cfg.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
+        fs::create_dir_all(done.join("files")).unwrap();
+        fs::write(done.join("status.toml"), "not valid toml").unwrap();
+
+        run_gc(&cfg).unwrap();
+
+        assert!(
+            done.exists(),
+            "malformed done status must be retained under orphan policy, not deleted by done retention"
+        );
+    }
+
+    #[test]
+    fn failed_retention_uses_status_mtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = config(Utf8PathBuf::from_path_buf(tmp.path().join("work")).unwrap());
+        cfg.gc.failed_retention_secs = 3600;
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("failed-by-status".into()).unwrap();
+        let failed = cfg.work_dir.run_dir(&nickname, &run_id, RunPhase::Failed);
+        fs::create_dir_all(failed.join("files")).unwrap();
+        fs::write(
+            failed.join("status.toml"),
+            status(&nickname, &run_id, RunState::Failed)
+                .to_toml()
+                .unwrap(),
+        )
+        .unwrap();
+
+        let now = unix_now();
+        // status.toml mtime is old enough to exceed retention.
+        set_dir_mtime(&failed.join("status.toml"), now as i64 - 7200);
+        // Directory mtime is fresh — directory-mtime logic would retain it.
+        set_dir_mtime(&failed, now as i64 - 100);
+
+        run_gc(&cfg).unwrap();
+
+        assert!(
+            !failed.exists(),
+            "failed directory must be deleted based on status.toml mtime, not directory mtime"
+        );
+    }
+
+    // ── Blocker 2: incoming lease validation ──────────────────────
+
+    fn incoming_lease(
+        nickname: &Nickname,
+        run_id: &RunId,
+        expires: u64,
+        protocol_version: u32,
+        purgery_version: &str,
+    ) -> String {
+        format!(
+            r#"protocol_version = {}
+purgery_version = "{}"
+nickname = "{}"
+run_id = "{}"
+created_at_unix_secs = 0
+last_heartbeat_unix_secs = 0
+expires_at_unix_secs = {}
+"#,
+            protocol_version,
+            purgery_version,
+            nickname.as_str(),
+            run_id.as_str(),
+            expires
+        )
+    }
+
+    #[test]
+    fn incompatible_lease_expiry_not_trusted_fresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = config(Utf8PathBuf::from_path_buf(tmp.path().join("work")).unwrap());
+        cfg.gc.orphan_retention_secs = 86400;
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("incompat-fresh".into()).unwrap();
+        let incoming = cfg.work_dir.run_dir(&nickname, &run_id, RunPhase::Incoming);
+        fs::create_dir_all(incoming.join("files")).unwrap();
+        fs::write(
+            incoming.join("lease.toml"),
+            incoming_lease(
+                &nickname,
+                &run_id,
+                9999999999999,
+                purgery_core::PROTOCOL_VERSION,
+                "99.0.0",
+            ),
+        )
+        .unwrap();
+
+        run_gc(&cfg).unwrap();
+
+        assert!(
+            incoming.exists(),
+            "incompatible lease with huge future expiry must be retained under orphan policy"
+        );
+    }
+
+    #[test]
+    fn incompatible_lease_removed_after_orphan_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = config(Utf8PathBuf::from_path_buf(tmp.path().join("work")).unwrap());
+        cfg.gc.orphan_retention_secs = 3600;
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("incompat-old".into()).unwrap();
+        let incoming = cfg.work_dir.run_dir(&nickname, &run_id, RunPhase::Incoming);
+        fs::create_dir_all(incoming.join("files")).unwrap();
+        fs::write(
+            incoming.join("lease.toml"),
+            incoming_lease(
+                &nickname,
+                &run_id,
+                9999999999999,
+                purgery_core::PROTOCOL_VERSION,
+                "99.0.0",
+            ),
+        )
+        .unwrap();
+
+        let now = unix_now();
+        set_dir_mtime(&incoming, now as i64 - 7200);
+
+        run_gc(&cfg).unwrap();
+
+        assert!(
+            !incoming.exists(),
+            "incompatible lease must be removed after orphan window, regardless of lease expiry"
+        );
+    }
+
+    #[test]
+    fn protocol_mismatch_lease_uses_orphan_retention() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = config(Utf8PathBuf::from_path_buf(tmp.path().join("work")).unwrap());
+        cfg.gc.orphan_retention_secs = 3600;
+        cfg.gc.incoming_lease_secs = 86400;
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("proto-mismatch".into()).unwrap();
+        let incoming = cfg.work_dir.run_dir(&nickname, &run_id, RunPhase::Incoming);
+        fs::create_dir_all(incoming.join("files")).unwrap();
+        // Valid purgery_version but wrong protocol_version.
+        fs::write(
+            incoming.join("lease.toml"),
+            incoming_lease(
+                &nickname,
+                &run_id,
+                9999999999999,
+                999, // wrong protocol version
+                "0.1.0-test",
+            ),
+        )
+        .unwrap();
+
+        let now = unix_now();
+        set_dir_mtime(&incoming, now as i64 - 7200);
+
+        run_gc(&cfg).unwrap();
+
+        assert!(
+            !incoming.exists(),
+            "protocol-mismatched lease must be removed after orphan window"
+        );
+    }
+
+    #[test]
+    fn envelope_mismatch_lease_uses_orphan_retention() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = config(Utf8PathBuf::from_path_buf(tmp.path().join("work")).unwrap());
+        cfg.gc.orphan_retention_secs = 3600;
+        cfg.gc.incoming_lease_secs = 86400;
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("env-mismatch".into()).unwrap();
+        let incoming = cfg.work_dir.run_dir(&nickname, &run_id, RunPhase::Incoming);
+        fs::create_dir_all(incoming.join("files")).unwrap();
+        // Valid version and protocol but wrong nickname.
+        fs::write(
+            incoming.join("lease.toml"),
+            incoming_lease(
+                &Nickname::new("other".into()).unwrap(),
+                &run_id,
+                9999999999999,
+                purgery_core::PROTOCOL_VERSION,
+                "0.1.0-test",
+            ),
+        )
+        .unwrap();
+
+        let now = unix_now();
+        set_dir_mtime(&incoming, now as i64 - 7200);
+
+        run_gc(&cfg).unwrap();
+
+        assert!(
+            !incoming.exists(),
+            "envelope-mismatched lease must be removed after orphan window"
         );
     }
 }
