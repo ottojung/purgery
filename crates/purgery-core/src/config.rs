@@ -342,6 +342,83 @@ pub struct PrepareRunResponse {
     pub destination: Option<String>,
 }
 
+// ── Protocol Error Envelope ──────────────────────────────────────────
+
+/// Machine-readable error envelope written on stdout when a
+/// client-invoked protocol command fails for a Purgery reason.
+///
+/// The server prints this TOML to stdout and exits nonzero.  The
+/// client parses it to report a clean Purgery error instead of
+/// scraping SSH stderr for human-readable error lines.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProtocolErrorResponse {
+    pub protocol_version: u32,
+    pub purgery_version: String,
+    pub command: String,
+    /// Always `false` on error; clients should reject `ok = true`.
+    pub ok: bool,
+    pub error: ProtocolErrorDetail,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProtocolErrorDetail {
+    /// Stable machine-readable code:
+    /// `run_plan_invalid`, `server_config_invalid`, `invalid_request`, `server_error`.
+    pub code: String,
+    /// Human-readable detail (may include full error chain).
+    pub message: String,
+}
+
+/// Parse and validate a `ProtocolErrorResponse` from stdout.
+///
+/// Returns `Ok(ProtocolErrorResponse)` if the deserialized envelope passes
+/// all validation checks:
+///
+/// - `protocol_version` matches `crate::PROTOCOL_VERSION`
+/// - `purgery_version` is major/minor compatible with the current package
+/// - `command` matches `expected_command`
+/// - `ok == false`
+/// - `error.message` is not empty
+///
+/// On any validation failure, returns `Err(String)` with a diagnostic.
+/// This function never inspects stderr — it operates solely on stdout.
+pub fn parse_protocol_error_response(
+    stdout: &str,
+    expected_command: &str,
+) -> std::result::Result<ProtocolErrorResponse, String> {
+    let resp: ProtocolErrorResponse =
+        toml::from_str(stdout).map_err(|e| format!("failed to parse protocol error TOML: {e}"))?;
+
+    if resp.protocol_version != crate::PROTOCOL_VERSION {
+        return Err(format!(
+            "protocol error envelope has protocol_version {}; expected {}",
+            resp.protocol_version,
+            crate::PROTOCOL_VERSION,
+        ));
+    }
+
+    crate::require_compatible_purgery_version(&resp.purgery_version, "protocol error envelope")
+        .map_err(|e| format!("incompatible purgery_version in protocol error envelope: {e}"))?;
+
+    if resp.command != expected_command {
+        return Err(format!(
+            "protocol error envelope is for command '{}' but expected '{}'",
+            resp.command, expected_command,
+        ));
+    }
+
+    if resp.ok {
+        return Err("protocol error envelope has ok=true; expected ok=false".to_owned());
+    }
+
+    if resp.error.message.trim().is_empty() {
+        return Err("protocol error envelope has empty error.message".to_owned());
+    }
+
+    Ok(resp)
+}
+
 // ── Run State / Progress ─────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

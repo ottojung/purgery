@@ -1,8 +1,99 @@
 use anyhow::{Context, Result};
-use purgery_core::{shell_escape, BeginRunResponse, PrepareRunResponse, RunStateResponse};
+use purgery_core::{
+    parse_protocol_error_response, shell_escape, BeginRunResponse, PrepareRunResponse,
+    RunStateResponse,
+};
 use std::collections::HashMap;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+
+/// Classified result of a raw remote server command execution.
+///
+/// The caller uses this to distinguish SSH transport failures from remote
+/// command failures (which may carry a machine-readable Purgery error
+/// envelope on stdout) from local execution failures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RawServerCommandResult {
+    /// Command exited with status 0.
+    Success { stdout: String, stderr: String },
+    /// Remote command exited nonzero (not exit code 255).
+    /// stdout may contain a `ProtocolErrorResponse` envelope.
+    RemoteFailure {
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+    },
+    /// SSH transport failure (exit code 255, `status.code() == None`, etc.).
+    TransportFailure {
+        exit_code: Option<i32>,
+        stderr: String,
+    },
+    /// Process terminated by signal (status.code() == None).
+    Signaled { stderr: String },
+}
+
+impl RawServerCommandResult {
+    /// Interpret this raw result as a protocol command outcome.
+    ///
+    /// - `Success` -> returns stdout.
+    /// - `RemoteFailure` -> attempts to parse a `ProtocolErrorResponse` from
+    ///   stdout; if valid, returns a clean Purgery-level error; otherwise
+    ///   returns a remote-command-failure diagnostic.
+    /// - `TransportFailure` -> returns a transport-failure error message.
+    /// - `Signaled` -> returns a signal-termination error message.
+    pub(crate) fn into_protocol_result(self, host: &str, cmd_hint: &str) -> Result<String> {
+        match self {
+            RawServerCommandResult::Success { stdout, .. } => Ok(stdout),
+            RawServerCommandResult::RemoteFailure {
+                exit_code,
+                stdout,
+                stderr,
+            } => match parse_protocol_error_response(&stdout, cmd_hint) {
+                Ok(resp) => {
+                    anyhow::bail!("{} failed on {}: {}", cmd_hint, host, resp.error.message,)
+                }
+                Err(_parse_err) => {
+                    if stderr.is_empty() {
+                        anyhow::bail!(
+                            "server command {cmd_hint} on {host} exited with status {exit_code} \
+                                 without a valid Purgery error response",
+                        );
+                    }
+                    anyhow::bail!(
+                        "server command {cmd_hint} on {host} exited with status {exit_code} \
+                             without a valid Purgery error response; server stderr: {}",
+                        stderr.trim(),
+                    );
+                }
+            },
+            RawServerCommandResult::TransportFailure { exit_code, stderr } => {
+                let code_display = exit_code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                if stderr.is_empty() {
+                    anyhow::bail!(
+                        "SSH transport failure for {cmd_hint} on {host} (exit code {code_display})",
+                    );
+                }
+                anyhow::bail!(
+                    "SSH transport failure for {cmd_hint} on {host} (exit code {code_display}): {}",
+                    stderr.trim(),
+                );
+            }
+            RawServerCommandResult::Signaled { stderr } => {
+                if stderr.is_empty() {
+                    anyhow::bail!(
+                        "local SSH process terminated by signal for {cmd_hint} on {host}",
+                    );
+                }
+                anyhow::bail!(
+                    "local SSH process terminated by signal for {cmd_hint} on {host}: {}",
+                    stderr.trim(),
+                );
+            }
+        }
+    }
+}
 
 /// Result of a spawned remote command.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11,8 +102,11 @@ pub(crate) enum RemoteCommandExit {
     /// the runner captures it (e.g. for `process-run` responses).
     Success { stdout: String },
     /// Command exited with nonzero status (remote semantic failure).
+    /// Contains both stdout (may carry a `ProtocolErrorResponse`) and
+    /// stderr (human diagnostics only — never parsed for semantics).
     RemoteFailure {
         exit_code: Option<i32>,
+        stdout: String,
         stderr: String,
     },
     /// SSH transport failure (exit code 255, local spawn error, etc.).
@@ -134,12 +228,17 @@ impl RemoteCommandHandle {
                                     details,
                                 }))
                             } else if let Some(code) = exit_code {
+                                let stdout = stdout_result
+                                    .as_ref()
+                                    .map(|b| String::from_utf8_lossy(b).to_string())
+                                    .unwrap_or_default();
                                 let stderr = stderr_result
                                     .as_ref()
                                     .map(|b| String::from_utf8_lossy(b).to_string())
                                     .unwrap_or_default();
                                 Ok(Some(RemoteCommandExit::RemoteFailure {
                                     exit_code: Some(code),
+                                    stdout: stdout.trim().to_string(),
                                     stderr: stderr.trim().to_string(),
                                 }))
                             } else {
@@ -274,6 +373,14 @@ struct ScriptedResponse {
     stdout: String,
 }
 
+/// Pre-scripted raw output for a remote server command, including
+/// exit code.  Used to simulate protocol error envelopes in tests.
+#[derive(Debug, Clone)]
+struct ScriptedRawOutput {
+    cmd_contains: String,
+    output: RawServerCommandResult,
+}
+
 /// A command-execution backend that either runs real SSH/rsync or returns
 /// scripted responses for testing.
 ///
@@ -291,6 +398,7 @@ pub(crate) enum RemoteRunner {
 
 pub(crate) struct FakeState {
     responses: Mutex<Vec<ScriptedResponse>>,
+    raw_responses: Mutex<Vec<ScriptedRawOutput>>,
     errors: Mutex<Vec<(String, String)>>,
     spawned_cmd_exits: Mutex<Vec<(String, usize, RemoteCommandExit)>>,
     write_errors: Mutex<Vec<(String, String)>>,
@@ -326,6 +434,7 @@ impl RemoteRunner {
         RemoteRunner::Fake {
             inner: Arc::new(FakeState {
                 responses: Mutex::new(Vec::new()),
+                raw_responses: Mutex::new(Vec::new()),
                 errors: Mutex::new(Vec::new()),
                 spawned_cmd_exits: Mutex::new(Vec::new()),
                 write_errors: Mutex::new(Vec::new()),
@@ -346,6 +455,20 @@ impl RemoteRunner {
                 inner.responses.lock().unwrap().push(ScriptedResponse {
                     cmd_contains: cmd_contains.to_owned(),
                     stdout: stdout.to_owned(),
+                });
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Script a raw response including exit code, stdout, and stderr.
+    #[allow(dead_code)]
+    pub(crate) fn add_raw_response(&self, cmd_contains: &str, output: RawServerCommandResult) {
+        match self {
+            RemoteRunner::Fake { inner } => {
+                inner.raw_responses.lock().unwrap().push(ScriptedRawOutput {
+                    cmd_contains: cmd_contains.to_owned(),
+                    output,
                 });
             }
             _ => unreachable!(),
@@ -472,9 +595,26 @@ impl RemoteRunner {
         }
     }
 
-    /// Run a purgery-server command on the remote host via SSH.
-    /// Returns stdout on success.
+    /// Run a purgery-server command on the remote host via SSH and
+    /// interpret the result as a protocol command.  Returns stdout on
+    /// success (exit 0).  On nonzero exit, attempts to parse a
+    /// `ProtocolErrorResponse` from stdout as a clean Purgery error;
+    /// otherwise falls back to a remote-command-failure diagnostic.
     pub(crate) fn server_cmd(&self, host: &str, server_cmd: &str, args: &[&str]) -> Result<String> {
+        let raw = self.server_cmd_raw(host, server_cmd, args)?;
+        let cmd_hint = args.first().copied().unwrap_or("server");
+        raw.into_protocol_result(host, cmd_hint)
+    }
+
+    /// Execute a purgery-server command on the remote host via SSH
+    /// and return the raw result without any protocol-level interpretation.
+    /// The result classifies SSH transport failures vs. remote command failures.
+    pub(crate) fn server_cmd_raw(
+        &self,
+        host: &str,
+        server_cmd: &str,
+        args: &[&str],
+    ) -> Result<RawServerCommandResult> {
         let full_cmd = {
             let mut cmd = server_cmd.to_owned();
             for a in args {
@@ -493,17 +633,43 @@ impl RemoteRunner {
                     .arg(&full_cmd)
                     .output()
                     .with_context(|| format!("failed to execute SSH command on {host}"))?;
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    anyhow::bail!("SSH command on {host} failed: {stderr}");
+                let exit_code = output.status.code();
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                if output.status.success() {
+                    Ok(RawServerCommandResult::Success { stdout, stderr })
+                } else if exit_code == Some(255) {
+                    Ok(RawServerCommandResult::TransportFailure { exit_code, stderr })
+                } else if let Some(code) = exit_code {
+                    Ok(RawServerCommandResult::RemoteFailure {
+                        exit_code: code,
+                        stdout,
+                        stderr,
+                    })
+                } else {
+                    Ok(RawServerCommandResult::Signaled { stderr })
                 }
-                Ok(String::from_utf8_lossy(&output.stdout).to_string())
             }
             RemoteRunner::Fake { inner } => {
                 inner.log.lock().unwrap().push(ssh_cmd.clone());
+
+                // Check raw responses first (allows scripting arbitrary exit codes).
+                {
+                    let mut raw = inner.raw_responses.lock().unwrap();
+                    if let Some(idx) = raw.iter().position(|r| ssh_cmd.contains(&r.cmd_contains)) {
+                        let matched = raw.remove(idx);
+                        drop(raw);
+                        return Ok(matched.output);
+                    }
+                }
+
                 for (ec, err) in inner.errors.lock().unwrap().iter() {
                     if ssh_cmd.contains(ec.as_str()) {
-                        anyhow::bail!("{err}");
+                        return Ok(RawServerCommandResult::RemoteFailure {
+                            exit_code: 1,
+                            stdout: String::new(),
+                            stderr: err.clone(),
+                        });
                     }
                 }
                 if ssh_cmd.contains("finish-run") {
@@ -518,7 +684,10 @@ impl RemoteRunner {
                 if let Some(idx) = matched_idx {
                     let resp = responses.remove(idx);
                     drop(responses);
-                    return Ok(resp.stdout);
+                    return Ok(RawServerCommandResult::Success {
+                        stdout: resp.stdout,
+                        stderr: String::new(),
+                    });
                 }
                 anyhow::bail!(
                     "no scripted response for command (did you forget add_response?), \
@@ -1137,6 +1306,7 @@ mod tests {
             1,
             RemoteCommandExit::RemoteFailure {
                 exit_code: Some(1),
+                stdout: String::new(),
                 stderr: "error: something failed".to_string(),
             },
         );
@@ -1148,6 +1318,7 @@ mod tests {
             exit,
             RemoteCommandExit::RemoteFailure {
                 exit_code: Some(1),
+                stdout: String::new(),
                 stderr: "error: something failed".to_string(),
             }
         );
@@ -1218,5 +1389,276 @@ mod tests {
         // fake runner sets the exit to Killed immediately, so wait()
         // observes Killed (not the scripted Success).
         assert_eq!(exit, RemoteCommandExit::Killed);
+    }
+
+    // ── Protocol error envelope tests ─────────────────────────────────
+
+    fn protocol_error_toml(code: &str, message: &str) -> String {
+        format!(
+            r#"protocol_version = {}
+purgery_version = "0.1.0-test"
+command = "prepare-run"
+ok = false
+
+[error]
+code = "{}"
+message = "{}"
+"#,
+            purgery_core::PROTOCOL_VERSION,
+            code,
+            message.replace('"', r#"\""#),
+        )
+    }
+
+    fn protocol_error_toml_for(command: &str, code: &str, message: &str) -> String {
+        format!(
+            r#"protocol_version = {}
+purgery_version = "0.1.0-test"
+command = "{}"
+ok = false
+
+[error]
+code = "{}"
+message = "{}"
+"#,
+            purgery_core::PROTOCOL_VERSION,
+            command,
+            code,
+            message.replace('"', r#"\""#),
+        )
+    }
+
+    #[test]
+    fn server_cmd_success_returns_stdout() {
+        let runner = RemoteRunner::fake();
+        runner.add_response("prepare-run", "stdout content");
+        let result = runner.server_cmd("host", "ps", &["prepare-run"]);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "stdout content");
+    }
+
+    #[test]
+    fn server_cmd_nonzero_exit_with_protocol_error_returns_clean_error() {
+        let runner = RemoteRunner::fake();
+        let output = RawServerCommandResult::RemoteFailure {
+            exit_code: 1,
+            stdout: protocol_error_toml(
+                "run_plan_invalid",
+                "transform 'identity' not defined on server",
+            ),
+            stderr: "some SSH banner noise".to_string(),
+        };
+        runner.add_raw_response("prepare-run", output);
+        let result = runner.server_cmd("host", "ps", &["prepare-run"]);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("prepare-run failed on host"),
+            "error must mention command and host: {msg}"
+        );
+        assert!(
+            msg.contains("transform 'identity' not defined on server"),
+            "error must contain server error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn server_cmd_nonzero_exit_without_protocol_error_is_remote_failure() {
+        let runner = RemoteRunner::fake();
+        runner.add_error("prepare-run", "something failed");
+        let result = runner.server_cmd("host", "ps", &["prepare-run"]);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("server command prepare-run on host exited with status"),
+            "must report raw failure: {msg}"
+        );
+    }
+
+    #[test]
+    fn server_cmd_stderr_with_error_but_no_envelope_is_not_parsed() {
+        // Regression: stderr containing "Error:" must NOT be treated as
+        // a Purgery error.  Only a valid ProtocolErrorResponse on stdout
+        // may be interpreted as a clean Purgery error.
+        let runner = RemoteRunner::fake();
+        let output = RawServerCommandResult::RemoteFailure {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "Error: run plan validation failed".to_string(),
+        };
+        runner.add_raw_response("prepare-run", output);
+        let result = runner.server_cmd("host", "ps", &["prepare-run"]);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("without a valid Purgery error response"),
+            "must not interpret stderr Error: line as Purgery error: {msg}"
+        );
+        assert!(
+            msg.contains("run plan validation failed"),
+            "raw stderr should appear as diagnostic: {msg}"
+        );
+    }
+
+    #[test]
+    fn server_cmd_ssh_exit_255_is_transport_failure() {
+        let runner = RemoteRunner::fake();
+        let output = RawServerCommandResult::TransportFailure {
+            exit_code: Some(255),
+            stderr: "ssh: connect to host host port 22: Connection refused".to_string(),
+        };
+        runner.add_raw_response("some-command", output);
+        let result = runner.server_cmd("host", "ps", &["some-command"]);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("SSH transport failure"),
+            "must report as transport failure: {msg}"
+        );
+        assert!(
+            !msg.contains("without a valid Purgery error response"),
+            "transport failures must NOT mention 'without a valid Purgery error response': {msg}"
+        );
+        assert!(
+            msg.contains("Connection refused"),
+            "transport failure diagnostic stderr should be included: {msg}"
+        );
+    }
+
+    #[test]
+    fn server_cmd_protocol_error_wrong_command_is_rejected() {
+        let runner = RemoteRunner::fake();
+        // Envelope says command="begin-run" but we invoke "prepare-run".
+        let output = RawServerCommandResult::RemoteFailure {
+            exit_code: 1,
+            stdout: protocol_error_toml_for("begin-run", "server_error", "some error"),
+            stderr: String::new(),
+        };
+        runner.add_raw_response("prepare-run", output);
+        let result = runner.server_cmd("host", "ps", &["prepare-run"]);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("without a valid Purgery error response"),
+            "wrong-command envelope must fall back to raw failure: {msg}"
+        );
+    }
+
+    #[test]
+    fn server_cmd_protocol_error_wrong_version_is_rejected() {
+        let runner = RemoteRunner::fake();
+        let wrong_version = r#"protocol_version = 999
+purgery_version = "0.1.0-test"
+command = "prepare-run"
+ok = false
+
+[error]
+code = "server_error"
+message = "some error"
+"#
+        .to_string();
+        let output = RawServerCommandResult::RemoteFailure {
+            exit_code: 1,
+            stdout: wrong_version,
+            stderr: String::new(),
+        };
+        runner.add_raw_response("prepare-run", output);
+        let result = runner.server_cmd("host", "ps", &["prepare-run"]);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("without a valid Purgery error response"),
+            "wrong-protocol-version envelope must fall back to raw failure: {msg}"
+        );
+    }
+
+    #[test]
+    fn server_cmd_protocol_error_incompatible_purgery_version_is_rejected() {
+        let runner = RemoteRunner::fake();
+        let incompatible = format!(
+            r#"protocol_version = {}
+purgery_version = "99.99.0"
+command = "prepare-run"
+ok = false
+
+[error]
+code = "server_error"
+message = "some error"
+"#,
+            purgery_core::PROTOCOL_VERSION
+        );
+        let output = RawServerCommandResult::RemoteFailure {
+            exit_code: 1,
+            stdout: incompatible,
+            stderr: String::new(),
+        };
+        runner.add_raw_response("prepare-run", output);
+        let result = runner.server_cmd("host", "ps", &["prepare-run"]);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("without a valid Purgery error response"),
+            "incompatible purgery_version envelope must fall back to raw failure: {msg}"
+        );
+    }
+
+    #[test]
+    fn server_cmd_protocol_error_ok_true_is_rejected() {
+        let runner = RemoteRunner::fake();
+        let ok_true = format!(
+            r#"protocol_version = {}
+purgery_version = "0.1.0-test"
+command = "prepare-run"
+ok = true
+
+[error]
+code = "server_error"
+message = "some error"
+"#,
+            purgery_core::PROTOCOL_VERSION
+        );
+        let output = RawServerCommandResult::RemoteFailure {
+            exit_code: 1,
+            stdout: ok_true,
+            stderr: String::new(),
+        };
+        runner.add_raw_response("prepare-run", output);
+        let result = runner.server_cmd("host", "ps", &["prepare-run"]);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("without a valid Purgery error response"),
+            "ok=true envelope must fall back to raw failure: {msg}"
+        );
+    }
+
+    #[test]
+    fn server_cmd_protocol_error_empty_message_is_rejected() {
+        let runner = RemoteRunner::fake();
+        let empty_msg = format!(
+            r#"protocol_version = {}
+purgery_version = "0.1.0-test"
+command = "prepare-run"
+ok = false
+
+[error]
+code = "server_error"
+message = ""
+"#,
+            purgery_core::PROTOCOL_VERSION
+        );
+        let output = RawServerCommandResult::RemoteFailure {
+            exit_code: 1,
+            stdout: empty_msg,
+            stderr: String::new(),
+        };
+        runner.add_raw_response("prepare-run", output);
+        let result = runner.server_cmd("host", "ps", &["prepare-run"]);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("without a valid Purgery error response"),
+            "empty-message envelope must fall back to raw failure: {msg}"
+        );
     }
 }

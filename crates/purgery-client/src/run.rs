@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use purgery_core::{
-    BeginRunResponse, ClientRunPhase, ClientRunState, DestinationPath, DurableCleanupState,
-    EntryStatusEntry, FileStatus, Manifest, Nickname, PrepareRunResponse, RunConfig, RunId,
-    RunState, RunStateResponse, RunStatus,
+    parse_protocol_error_response, BeginRunResponse, ClientRunPhase, ClientRunState,
+    DestinationPath, DurableCleanupState, EntryStatusEntry, FileStatus, Manifest, Nickname,
+    PrepareRunResponse, RunConfig, RunId, RunState, RunStateResponse, RunStatus,
 };
 use std::fmt::Write;
 use std::fs;
@@ -429,13 +429,21 @@ fn drive_server_until_terminal_with_interval(
                                     }
                                     state = fresh;
                                 }
-                                RemoteCommandExit::RemoteFailure { stderr, .. } => {
-                                    let err_msg = format!(
-                                        "process-run remote failure for run {}/{}: {}",
-                                        nickname.as_str(),
-                                        run_id.as_str(),
-                                        stderr,
-                                    );
+                                RemoteCommandExit::RemoteFailure { stdout, stderr, .. } => {
+                                    let err_msg =
+                                        match parse_protocol_error_response(&stdout, "process-run")
+                                        {
+                                            Ok(protocol_err) => format!(
+                                                "process-run failed on {}: {}",
+                                                host, protocol_err.error.message,
+                                            ),
+                                            Err(_) => format!(
+                                                "process-run remote failure for run {}/{}: {}",
+                                                nickname.as_str(),
+                                                run_id.as_str(),
+                                                stderr,
+                                            ),
+                                        };
                                     // Re-poll run-state before deciding — the run may
                                     // have become terminal or active since we last checked.
                                     // Assign to `state` so subsequent loop logic uses
@@ -472,7 +480,7 @@ fn drive_server_until_terminal_with_interval(
                                                  so the client refused to recover/restart",
                                                 nickname.as_str(),
                                                 run_id.as_str(),
-                                                stderr,
+                                                err_msg,
                                                 raw,
                                             );
                                             terminate_worker_on_error(&mut worker);
@@ -2802,6 +2810,7 @@ observed_at_unix_secs = 1000
             0,
             RemoteCommandExit::RemoteFailure {
                 exit_code: Some(1),
+                stdout: String::new(),
                 stderr: "simulated process-run failure".to_string(),
             },
         );
@@ -2843,6 +2852,7 @@ observed_at_unix_secs = 1000
             0,
             RemoteCommandExit::RemoteFailure {
                 exit_code: Some(1),
+                stdout: String::new(),
                 stderr: "simulated process-run failure".to_string(),
             },
         );
@@ -2886,6 +2896,7 @@ observed_at_unix_secs = 1000
             0,
             RemoteCommandExit::RemoteFailure {
                 exit_code: Some(1),
+                stdout: String::new(),
                 stderr: "simulated process-run failure".to_string(),
             },
         );
@@ -3324,6 +3335,7 @@ observed_at_unix_secs = 1000
             0,
             RemoteCommandExit::RemoteFailure {
                 exit_code: Some(1),
+                stdout: String::new(),
                 stderr: "simulated process-run failure".to_string(),
             },
         );
@@ -3379,6 +3391,7 @@ observed_at_unix_secs = 1000
             0,
             RemoteCommandExit::RemoteFailure {
                 exit_code: Some(1),
+                stdout: String::new(),
                 stderr: "simulated process-run failure".to_string(),
             },
         );
@@ -4411,6 +4424,7 @@ observed_at_unix_secs = 1000
             0,
             RemoteCommandExit::RemoteFailure {
                 exit_code: Some(1),
+                stdout: String::new(),
                 stderr: "simulated gc failure".to_string(),
             },
         );
@@ -5399,6 +5413,7 @@ state = "done"
             0,
             RemoteCommandExit::RemoteFailure {
                 exit_code: Some(1),
+                stdout: String::new(),
                 stderr: "simulated failure".to_string(),
             },
         );
