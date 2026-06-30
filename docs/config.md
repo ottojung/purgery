@@ -26,6 +26,11 @@ work_dir = "/var/lib/purgery/work"
 [gc]
 incoming_lease_secs = 1800
 heartbeat_interval_secs = 60
+ready_retention_secs = 3600
+processing_retention_secs = 3600
+done_retention_secs = 3600
+failed_retention_secs = 86400
+orphan_retention_secs = 86400
 
 [[transform]]
 name = "compress-video"
@@ -55,8 +60,20 @@ expected_outputs = ["{target_directory}/{file_stem}.Z.webm"]
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `incoming_lease_secs` | `1800` | Lease duration for incoming runs |
+| `incoming_lease_secs` | `1800` | Lease duration for resumable `incoming` uploads |
 | `heartbeat_interval_secs` | `60` | Recommended heartbeat interval |
+| `ready_retention_secs` | `3600` | Maximum time queued `ready` work may remain before GC expires it |
+| `processing_retention_secs` | `3600` | Maximum unlocked `processing` recovery window before GC expires it; locked expired processing is warned about and retained until the lock is gone |
+| `done_retention_secs` | `3600` | Terminal observation window for successful `done` metadata |
+| `failed_retention_secs` | `86400` | Debugging window for `failed` requests before deletion |
+| `orphan_retention_secs` | `86400` | Grace window for malformed, incompatible, or unknown request state before deletion |
+
+
+### Server work-state lifecycle
+
+`work_dir` is temporary operational state, not final storage, an archive, or permanent history. Request directories move through `incoming`, `ready`, `processing`, and terminal `done` or `failed` phases. `incoming`, `ready`, and unlocked `processing` are resumable only inside their retention windows. `done` and `failed` are terminal and exist only so clients and operators can observe outcomes briefly.
+
+GC owns expired server work state in every phase. Terminal retention (`done`, `failed`) is measured from `status.toml` mtime, providing a stable clock that is not extended by GC's own pruning actions. Successful `done` requests keep `status.toml`, `run.toml`, and `manifest.toml` for `done_retention_secs`, but GC and finalization remove staged/control material such as `files/`, `work/`, `lease.toml`, `progress.toml`, `processor.lock`, and `*.tmp`. Expired terminal directories are deleted entirely; pruning within a run does not refresh the retention clock. Failed requests may keep payload/work material for `failed_retention_secs` for inspection. Incompatible or protocol-mismatched leases are not trusted for expiry and are governed by orphan retention. Malformed, incompatible, or unknown request directories are retained only for `orphan_retention_secs`; GC logs that it cannot understand them and then removes them after the grace window. Invalid top-level nickname directories under `work_dir` are also governed by `orphan_retention_secs` and logged with a warning.
 
 ### Transform config
 

@@ -1564,19 +1564,7 @@ delete_after_import = true
             config
                 .work_dir
                 .as_path()
-                .join("laptop/done/test-tmp-commit/files"),
-            config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-tmp-commit/files/test.mp4"),
-            config
-                .work_dir
-                .as_path()
                 .join("laptop/done/test-tmp-commit/manifest.toml"),
-            config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-tmp-commit/progress.toml"),
             config
                 .work_dir
                 .as_path()
@@ -2698,13 +2686,17 @@ delete_after_import = true
 
         run_gc(&config).unwrap();
 
+        assert!(
+            !incoming.exists(),
+            "expired incoming payloads must be removed"
+        );
         let failed = config
             .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Failed);
-        assert!(!failed.join("files").exists());
-        let status =
-            RunStatus::from_toml(&fs::read_to_string(failed.join("status.toml")).unwrap()).unwrap();
-        assert_eq!(status.state, RunState::Failed);
+        assert!(
+            !failed.exists(),
+            "gc removes abandoned incoming work state directly"
+        );
     }
 
     /// begin-run output must be parseable as BeginRunResponse TOML.
@@ -3954,19 +3946,7 @@ delete_after_import = true
             config
                 .work_dir
                 .as_path()
-                .join("laptop/done/test-run-final-only/files"),
-            config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-run-final-only/files/test.mp4"),
-            config
-                .work_dir
-                .as_path()
                 .join("laptop/done/test-run-final-only/manifest.toml"),
-            config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-run-final-only/progress.toml"),
             config
                 .work_dir
                 .as_path()
@@ -4117,19 +4097,7 @@ delete_after_import = true
             server_config
                 .work_dir
                 .as_path()
-                .join("laptop/done/test-pp-cwd/files"),
-            server_config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-pp-cwd/files/input.dat"),
-            server_config
-                .work_dir
-                .as_path()
                 .join("laptop/done/test-pp-cwd/manifest.toml"),
-            server_config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-pp-cwd/progress.toml"),
             server_config
                 .work_dir
                 .as_path()
@@ -4208,19 +4176,7 @@ delete_after_import = true
             config
                 .work_dir
                 .as_path()
-                .join("laptop/done/test-replay/files"),
-            config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-replay/files/test.mp4"),
-            config
-                .work_dir
-                .as_path()
                 .join("laptop/done/test-replay/manifest.toml"),
-            config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-replay/progress.toml"),
             config
                 .work_dir
                 .as_path()
@@ -4322,19 +4278,7 @@ delete_after_import = true
             server_config
                 .work_dir
                 .as_path()
-                .join("laptop/done/test-pp-symlink/files"),
-            server_config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-pp-symlink/files/input.dat"),
-            server_config
-                .work_dir
-                .as_path()
                 .join("laptop/done/test-pp-symlink/manifest.toml"),
-            server_config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-pp-symlink/progress.toml"),
             server_config
                 .work_dir
                 .as_path()
@@ -4451,19 +4395,7 @@ delete_after_import = true
             server_config
                 .work_dir
                 .as_path()
-                .join("laptop/done/test-pp-dir/files"),
-            server_config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-pp-dir/files/input.dat"),
-            server_config
-                .work_dir
-                .as_path()
                 .join("laptop/done/test-pp-dir/manifest.toml"),
-            server_config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-pp-dir/progress.toml"),
             server_config
                 .work_dir
                 .as_path()
@@ -4583,19 +4515,7 @@ delete_after_import = true
             server_config
                 .work_dir
                 .as_path()
-                .join("laptop/done/test-pp-destination/files"),
-            server_config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-pp-destination/files/input.bin"),
-            server_config
-                .work_dir
-                .as_path()
                 .join("laptop/done/test-pp-destination/manifest.toml"),
-            server_config
-                .work_dir
-                .as_path()
-                .join("laptop/done/test-pp-destination/progress.toml"),
             server_config
                 .work_dir
                 .as_path()
@@ -4681,10 +4601,10 @@ delete_after_import = true
             .run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(done_path.exists());
 
-        // Staged original must still exist.
-        let staged_after = done_path.join("files/input.bin");
-        assert!(staged_after.exists());
-        assert_eq!(fs::read_to_string(&staged_after).unwrap(), "binary data");
+        assert!(
+            !done_path.join("files").exists(),
+            "successful terminal runs must not retain staged payloads"
+        );
 
         // Work area must be removed for done runs (outputs are consumed
         // by transform).
@@ -5934,17 +5854,18 @@ expires_at_unix_secs = 9999999999999
             .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Incoming);
         fs::create_dir_all(&incoming).unwrap();
+        let lease = purgery_core::LeaseFile {
+            protocol_version: purgery_core::PROTOCOL_VERSION,
+            purgery_version: purgery_core::current_purgery_version().to_string(),
+            nickname: "laptop".into(),
+            run_id: "gc-lease-expired".into(),
+            created_at_unix_secs: 0,
+            last_heartbeat_unix_secs: 0,
+            expires_at_unix_secs: 1,
+        };
         fs::write(
             incoming.join("lease.toml"),
-            format!(
-                r#"purgery_version = "0.1.0-test"
-protocol_version = {}
-nickname = "laptop"
-run_id = "gc-lease-expired"
-expires_at_unix_secs = 1
-"#,
-                purgery_core::PROTOCOL_VERSION
-            ),
+            toml::to_string(&lease).unwrap(),
         )
         .unwrap();
 
@@ -5952,7 +5873,6 @@ expires_at_unix_secs = 1
         let result = run_gc(&config);
         assert!(result.is_ok(), "run_gc must succeed: {result:?}");
 
-        // Incoming run should be moved to failed
         assert!(
             !incoming.exists(),
             "incoming run must be collected when lease is expired and compatible"
@@ -5961,8 +5881,8 @@ expires_at_unix_secs = 1
             .work_dir
             .run_dir(&nickname, &run_id, RunPhase::Failed);
         assert!(
-            failed.exists(),
-            "expired compatible lease must move to failed"
+            !failed.exists(),
+            "expired incoming work is deleted, not archived"
         );
     }
 

@@ -140,7 +140,7 @@ Source trailing slashes, `.`, and `..` are normalized before split discovery. `<
 | `process-run --nickname N --run-id R` | Foreground targeted processor: claims/processes the target ready run, recovers an abandoned target in processing, or no-op if already processing or terminal. Does not process unrelated runs. Does not run GC. | `ProcessRunResponse` TOML |
 | `process-once` | Run global GC, recover unlocked processing runs (respecting active processor locks), process ready runs | (none) |
 | `check` | Validate config and transforms | (none) |
-| `gc` | Foreground garbage-collection command. Server-run sync clients initiate it best-effort after server version check and before `begin-run`. Failure is logged but does not fail the sync. Also run by `process-once` for batch maintenance. | (none) |
+| `gc` | Foreground garbage-collection command for expired server work state across all request phases. Server-run sync clients initiate it best-effort after server version check and before `begin-run`; `process-once` runs it before recovery/processing. | (none) |
 
 ## Run phases
 
@@ -149,9 +149,11 @@ incoming → ready → processing → done
                             ↘ failed
 ```
 
-A run moves from incoming to ready when the client calls `finish-run`. The server moves ready runs to processing via targeted `process-run` (triggered by the client) or batch `process-once` (operator/daemon). On completion, runs move to done or failed.
+A run moves from incoming to ready when the client calls `finish-run`. The server moves ready runs to processing via targeted `process-run` (triggered by the client) or batch `process-once` (operator/daemon). On completion, runs move to done or failed. `incoming`, `ready`, and unlocked `processing` are resumable only within their GC retention windows. `done` and `failed` are terminal observation states, not permanent archives.
 
-A processing run may be actively mutated only by a process holding the run's `processor.lock`. If `process-run` or `process-once` observes a processing run and the lock is busy, it treats that run as actively owned and does not recover or replay it. If the lock is free, the run is considered abandoned and may be recovered.
+A processing run may be actively mutated only by a process holding the run's `processor.lock`. If `process-run` or `process-once` observes a processing run and the lock is busy, it treats that run as actively owned and does not recover or replay it. GC follows the same safety rule: locked processing is not deleted underneath the lock holder, and an expired locked run is warned about until a later GC can remove it after the lock is gone. If the lock is free, the run is considered abandoned and may be recovered or expired by GC.
+
+`work_dir` contains bounded operational state only. Successful terminal requests may remain briefly as metadata for observation, but they do not retain uploaded staged payloads indefinitely. Terminal retention (`done`, `failed`) is measured from `status.toml` mtime — a stable clock that is not extended by GC's own pruning actions. During the `done_retention_secs` window, successful `done` directories keep `status.toml`, `run.toml`, and `manifest.toml`; GC/finalization removes `files/`, `work/`, `lease.toml`, `progress.toml`, `processor.lock`, and `*.tmp`. Expired terminal directories are deleted entirely; pruning within a run does not refresh the retention clock. Failed directories may retain more material for `failed_retention_secs` and are then deleted. Without a valid `status.toml`, terminal directories fall under orphan retention. Incompatible or protocol-mismatched incoming leases are not trusted for expiry — they are governed by orphan retention even if their `expires_at_unix_secs` is far in the future. Malformed, incompatible, or unknown request state is retained only for `orphan_retention_secs` and GC logs the orphan policy before eventual removal. GC may delete expired unlocked processing state before recovery is attempted; operators who want a longer crash-recovery window should increase `processing_retention_secs`. Invalid top-level directories under `work_dir` are governed by `orphan_retention_secs`, not silently skipped.
 
 All protocol output goes to stdout as TOML. Logs go to stderr.
 
