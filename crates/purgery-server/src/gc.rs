@@ -33,28 +33,84 @@ fn expiry_from_mtime(
     })
 }
 
-/// Compute expiry from a `status.toml` mtime + retention window.
-/// If status.toml is missing, malformed, or incompatible, falls back
-/// to orphan retention so that bad state cannot extend its own lifetime.
-fn expiry_from_status_mtime(
+/// Outcome of classifying a terminal `status.toml` for GC purposes.
+enum TerminalStatusClassification {
+    /// Valid terminal status matching the expected nickname, run_id, and
+    /// phase-acceptable state.  The inner string identifies the reason
+    /// for logging (e.g. "done retention", "failed retention").
+    ValidTerminal { reason: &'static str },
+    /// Status is missing, malformed, incompatible, does not match the
+    /// directory envelope, or has an unexpected state for the phase.
+    Orphan,
+}
+
+/// Classify a terminal `status.toml` for GC.
+///
+/// Returns `ValidTerminal` only when:
+/// - the file is readable, TOML is valid, `purgery_version` is compatible
+/// - `RunStatus` deserializes successfully
+/// - nickname and run_id match the directory path
+/// - the status state is acceptable for the phase (`Done`/`Partial` for
+///   `done/`, `Failed` for `failed/`)
+///
+/// Everything else returns `Orphan`, making the directory subject to
+/// orphan retention rather than normal terminal retention.
+fn classify_terminal_status(
     status_path: &Utf8Path,
+    nickname: &Nickname,
+    run_id: &RunId,
+    phase: RunPhase,
+) -> TerminalStatusClassification {
+    let content = match fs::read_to_string(status_path.as_std_path()) {
+        Ok(c) => c,
+        Err(_) => return TerminalStatusClassification::Orphan,
+    };
+    if !check_toml_version_is_compatible(&content) {
+        return TerminalStatusClassification::Orphan;
+    }
+    let status = match RunStatus::from_toml(&content) {
+        Ok(s) => s,
+        Err(_) => return TerminalStatusClassification::Orphan,
+    };
+    if status.nickname != *nickname || status.run_id != *run_id {
+        return TerminalStatusClassification::Orphan;
+    }
+    let state_ok = match phase {
+        RunPhase::Done => matches!(status.state, RunState::Done | RunState::Partial),
+        RunPhase::Failed => status.state == RunState::Failed,
+        _ => false,
+    };
+    if !state_ok {
+        return TerminalStatusClassification::Orphan;
+    }
+    let reason = match phase {
+        RunPhase::Done => "done retention",
+        RunPhase::Failed => "failed retention",
+        _ => "terminal retention",
+    };
+    TerminalStatusClassification::ValidTerminal { reason }
+}
+
+/// Compute expiry for a terminal-phase run directory using `status.toml`
+/// mtime when the status is valid, falling back to orphan retention.
+#[allow(clippy::too_many_arguments)]
+fn expiry_for_terminal(
+    status_path: &Utf8Path,
+    run_path: &Utf8Path,
     retention_secs: u64,
     config: &ServerConfig,
-    run_path: &Utf8Path,
+    nickname: &Nickname,
+    run_id: &RunId,
+    phase: RunPhase,
     now: u64,
-    reason: &'static str,
 ) -> Result<ExpiryDecision> {
-    match fs::read_to_string(status_path.as_std_path()) {
-        Ok(content) => {
-            if !check_toml_version_is_compatible(&content) {
-                return orphan_expiry(config, run_path, now, "incompatible terminal status");
-            }
-            match RunStatus::from_toml(&content) {
-                Ok(_status) => expiry_from_mtime(status_path, retention_secs, now, reason),
-                Err(_) => orphan_expiry(config, run_path, now, "malformed terminal status"),
-            }
+    match classify_terminal_status(status_path, nickname, run_id, phase) {
+        TerminalStatusClassification::ValidTerminal { reason } => {
+            expiry_from_mtime(status_path, retention_secs, now, reason)
         }
-        Err(_) => orphan_expiry(config, run_path, now, "missing terminal status"),
+        TerminalStatusClassification::Orphan => {
+            orphan_expiry(config, run_path, now, "invalid terminal status")
+        }
     }
 }
 
@@ -210,13 +266,15 @@ fn collect_failed(
     now: u64,
 ) -> Result<()> {
     let status_path = run_path.join("status.toml");
-    let decision = expiry_from_status_mtime(
+    let decision = expiry_for_terminal(
         &status_path,
+        run_path,
         config.gc.failed_retention_secs,
         config,
-        run_path,
+        nickname,
+        run_id,
+        RunPhase::Failed,
         now,
-        "failed retention",
     )?;
 
     log_decision(
@@ -447,13 +505,15 @@ fn collect_done(
     now: u64,
 ) -> Result<()> {
     let status_path = run_path.join("status.toml");
-    let decision = expiry_from_status_mtime(
+    let decision = expiry_for_terminal(
         &status_path,
+        run_path,
         config.gc.done_retention_secs,
         config,
-        run_path,
+        nickname,
+        run_id,
+        RunPhase::Done,
         now,
-        "done retention",
     )?;
 
     if decision.expired {
@@ -475,11 +535,14 @@ fn collect_done(
         );
     }
 
-    // Only prune when status is valid, compatible, and exactly Done.
+    // Only prune when status is valid, envelope matches, and exactly Done.
     if let Ok(content) = fs::read_to_string(status_path.as_std_path()) {
         if check_toml_version_is_compatible(&content) {
             if let Ok(status) = RunStatus::from_toml(&content) {
-                if status.state == RunState::Done {
+                if status.nickname == *nickname
+                    && status.run_id == *run_id
+                    && status.state == RunState::Done
+                {
                     prune_success_terminal(run_path).with_context(|| {
                         format!("failed to prune successful terminal state: {run_path}")
                     })?;
@@ -949,10 +1012,11 @@ mod tests {
     }
 
     #[test]
-    fn done_not_in_done_state_is_still_expired_by_mtime() {
+    fn done_status_not_done_is_orphan_not_expired_by_done_retention() {
         let tmp = tempfile::tempdir().unwrap();
         let mut cfg = config(Utf8PathBuf::from_path_buf(tmp.path().join("work")).unwrap());
-        cfg.gc.done_retention_secs = 0;
+        cfg.gc.done_retention_secs = 0; // would expire valid done immediately
+        cfg.gc.orphan_retention_secs = 86400; // orphan window long
         let nickname = Nickname::new("laptop".into()).unwrap();
         let run_id = RunId::new("done-failed".into()).unwrap();
         let done = cfg.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
@@ -968,8 +1032,8 @@ mod tests {
         run_gc(&cfg).unwrap();
 
         assert!(
-            !done.exists(),
-            "done dir with Failed state must still expire by mtime"
+            done.exists(),
+            "done dir with Failed status must be retained under orphan policy, not deleted by done retention"
         );
     }
 
@@ -1326,6 +1390,144 @@ expires_at_unix_secs = {}
         assert!(
             !incoming.exists(),
             "envelope-mismatched lease must be removed after orphan window"
+        );
+    }
+
+    // ── Terminal status envelope and state validation ──────────────
+
+    #[test]
+    fn done_status_wrong_nickname_retained_under_orphan_fresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = config(Utf8PathBuf::from_path_buf(tmp.path().join("work")).unwrap());
+        cfg.gc.done_retention_secs = 0; // would expire immediately if valid
+        cfg.gc.orphan_retention_secs = 86400; // orphan window long
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("wrong-nick".into()).unwrap();
+        let done = cfg.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
+        fs::create_dir_all(done.join("files")).unwrap();
+        // Write a valid status.toml but with wrong nickname.
+        let s = status(
+            &Nickname::new("other".into()).unwrap(),
+            &run_id,
+            RunState::Done,
+        );
+        fs::write(done.join("status.toml"), s.to_toml().unwrap()).unwrap();
+
+        run_gc(&cfg).unwrap();
+
+        assert!(
+            done.exists(),
+            "done with wrong nickname must be retained under orphan policy, not deleted by done retention"
+        );
+    }
+
+    #[test]
+    fn done_status_wrong_nickname_deleted_after_orphan_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = config(Utf8PathBuf::from_path_buf(tmp.path().join("work")).unwrap());
+        cfg.gc.done_retention_secs = 3600;
+        cfg.gc.orphan_retention_secs = 3600;
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("wrong-nick-old".into()).unwrap();
+        let done = cfg.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
+        fs::create_dir_all(done.join("files")).unwrap();
+        let s = status(
+            &Nickname::new("other".into()).unwrap(),
+            &run_id,
+            RunState::Done,
+        );
+        fs::write(done.join("status.toml"), s.to_toml().unwrap()).unwrap();
+
+        let now = unix_now();
+        set_dir_mtime(&done, now as i64 - 7200);
+
+        run_gc(&cfg).unwrap();
+
+        assert!(
+            !done.exists(),
+            "done with wrong nickname must be deleted after orphan window, not by done retention"
+        );
+    }
+
+    #[test]
+    fn failed_status_wrong_nickname_deleted_after_orphan_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = config(Utf8PathBuf::from_path_buf(tmp.path().join("work")).unwrap());
+        cfg.gc.failed_retention_secs = 3600;
+        cfg.gc.orphan_retention_secs = 3600;
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("fail-wrong-nick".into()).unwrap();
+        let failed = cfg.work_dir.run_dir(&nickname, &run_id, RunPhase::Failed);
+        fs::create_dir_all(failed.join("files")).unwrap();
+        let s = status(
+            &Nickname::new("other".into()).unwrap(),
+            &run_id,
+            RunState::Failed,
+        );
+        fs::write(failed.join("status.toml"), s.to_toml().unwrap()).unwrap();
+
+        let now = unix_now();
+        set_dir_mtime(&failed, now as i64 - 7200);
+
+        run_gc(&cfg).unwrap();
+
+        assert!(
+            !failed.exists(),
+            "failed with wrong nickname must be deleted after orphan window"
+        );
+    }
+
+    #[test]
+    fn done_status_says_failed_treated_as_orphan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = config(Utf8PathBuf::from_path_buf(tmp.path().join("work")).unwrap());
+        cfg.gc.done_retention_secs = 0; // would expire immediately
+        cfg.gc.orphan_retention_secs = 86400; // orphan window long
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("done-failed-state".into()).unwrap();
+        let done = cfg.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
+        fs::create_dir_all(done.join("files")).unwrap();
+        // status says Failed but directory is in done/ — orphan.
+        fs::write(
+            done.join("status.toml"),
+            status(&nickname, &run_id, RunState::Failed)
+                .to_toml()
+                .unwrap(),
+        )
+        .unwrap();
+
+        run_gc(&cfg).unwrap();
+
+        assert!(
+            done.exists(),
+            "done/ with Failed status must be retained under orphan policy"
+        );
+    }
+
+    #[test]
+    fn failed_status_says_done_treated_as_orphan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = config(Utf8PathBuf::from_path_buf(tmp.path().join("work")).unwrap());
+        cfg.gc.failed_retention_secs = 0; // would expire immediately
+        cfg.gc.orphan_retention_secs = 86400; // orphan window long
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("fail-done-state".into()).unwrap();
+        let failed = cfg.work_dir.run_dir(&nickname, &run_id, RunPhase::Failed);
+        fs::create_dir_all(failed.join("files")).unwrap();
+        // status says Done but directory is in failed/ — orphan.
+        fs::write(
+            failed.join("status.toml"),
+            status(&nickname, &run_id, RunState::Done)
+                .to_toml()
+                .unwrap(),
+        )
+        .unwrap();
+
+        run_gc(&cfg).unwrap();
+
+        assert!(
+            failed.exists(),
+            "failed/ with Done status must be retained under orphan policy"
         );
     }
 }
