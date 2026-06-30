@@ -321,23 +321,6 @@ impl RemoteRunner {
         RemoteRunner::Real
     }
 
-    fn extract_purgery_error(stderr: &str) -> Option<&str> {
-        stderr.lines().find_map(|line| {
-            line.trim()
-                .strip_prefix("Error:")
-                .map(str::trim)
-                .filter(|message| !message.is_empty())
-        })
-    }
-
-    fn server_cmd_failure(host: &str, stderr: &str) -> anyhow::Error {
-        if let Some(message) = Self::extract_purgery_error(stderr) {
-            anyhow::anyhow!("Purgery error on {host}: {message}")
-        } else {
-            anyhow::anyhow!("SSH command on {host} failed: {stderr}")
-        }
-    }
-
     #[allow(dead_code)]
     pub(crate) fn fake() -> Self {
         RemoteRunner::Fake {
@@ -512,7 +495,7 @@ impl RemoteRunner {
                     .with_context(|| format!("failed to execute SSH command on {host}"))?;
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
-                    return Err(Self::server_cmd_failure(host, stderr.as_ref()));
+                    anyhow::bail!("SSH command on {host} failed: {stderr}");
                 }
                 Ok(String::from_utf8_lossy(&output.stdout).to_string())
             }
@@ -940,30 +923,6 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("simulated failure"));
-    }
-
-    #[test]
-    fn server_cmd_failure_reports_purgery_error_from_stderr() {
-        let err = RemoteRunner::server_cmd_failure(
-            "host",
-            "2026-06-30T00:00:00Z  WARN ignored\nError: run plan validation failed: transform 'typo' not defined on server\n",
-        );
-        assert_eq!(
-            err.to_string(),
-            "Purgery error on host: run plan validation failed: transform 'typo' not defined on server"
-        );
-    }
-
-    #[test]
-    fn server_cmd_failure_preserves_generic_ssh_failure() {
-        let err = RemoteRunner::server_cmd_failure(
-            "host",
-            "ssh: connect to host host port 22: Connection refused",
-        );
-        assert_eq!(
-            err.to_string(),
-            "SSH command on host failed: ssh: connect to host host port 22: Connection refused"
-        );
     }
 
     #[test]
