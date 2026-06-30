@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use purgery_core::{
-    BeginRunResponse, ClientRunPhase, ClientRunState, DestinationPath, DurableCleanupState,
-    EntryStatusEntry, FileStatus, Manifest, Nickname, PrepareRunResponse, RunConfig, RunId,
-    RunState, RunStateResponse, RunStatus,
+    parse_protocol_error_response, BeginRunResponse, ClientRunPhase, ClientRunState,
+    DestinationPath, DurableCleanupState, EntryStatusEntry, FileStatus, Manifest, Nickname,
+    PrepareRunResponse, RunConfig, RunId, RunState, RunStateResponse, RunStatus,
 };
 use std::fmt::Write;
 use std::fs;
@@ -430,22 +430,20 @@ fn drive_server_until_terminal_with_interval(
                                     state = fresh;
                                 }
                                 RemoteCommandExit::RemoteFailure { stdout, stderr, .. } => {
-                                    let err_msg = if let Ok(protocol_err) =
-                                        toml::from_str::<purgery_core::ProtocolErrorResponse>(
-                                            &stdout,
-                                        ) {
-                                        format!(
-                                            "{} failed on {}: {}",
-                                            "process-run", host, protocol_err.error.message,
-                                        )
-                                    } else {
-                                        format!(
-                                            "process-run remote failure for run {}/{}: {}",
-                                            nickname.as_str(),
-                                            run_id.as_str(),
-                                            stderr,
-                                        )
-                                    };
+                                    let err_msg =
+                                        match parse_protocol_error_response(&stdout, "process-run")
+                                        {
+                                            Ok(protocol_err) => format!(
+                                                "process-run failed on {}: {}",
+                                                host, protocol_err.error.message,
+                                            ),
+                                            Err(_) => format!(
+                                                "process-run remote failure for run {}/{}: {}",
+                                                nickname.as_str(),
+                                                run_id.as_str(),
+                                                stderr,
+                                            ),
+                                        };
                                     // Re-poll run-state before deciding — the run may
                                     // have become terminal or active since we last checked.
                                     // Assign to `state` so subsequent loop logic uses
@@ -724,13 +722,6 @@ pub(crate) fn finish_worker_after_terminal(
                     run_id = %run_id.as_str(),
                     "process-run remote failure after terminal state: {stderr}",
                 );
-                if !stderr.is_empty() {
-                    warn!(
-                        nickname = %nickname.as_str(),
-                        run_id = %run_id.as_str(),
-                        "process-run stderr after terminal state: {stderr}",
-                    );
-                }
             }
             RemoteCommandExit::TransportFailure { details, .. } => {
                 warn!(

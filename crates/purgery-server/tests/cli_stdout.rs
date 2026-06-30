@@ -1,4 +1,4 @@
-use purgery_core::{BeginRunResponse, Nickname, RunId, RunState, RunStatus};
+use purgery_core::{BeginRunResponse, Nickname, ProtocolErrorResponse, RunId, RunState, RunStatus};
 use std::fs;
 use std::process::Command;
 
@@ -102,4 +102,99 @@ fn verbose_conflicts_with_explicit_log_level() {
 
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be used with"));
+}
+
+#[test]
+fn protocol_command_without_config_emits_protocol_error() {
+    let output = Command::new(env!("CARGO_BIN_EXE_purgery-server"))
+        .args(["begin-run", "--nickname", "laptop", "--run-id", "no-config"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let envelope: ProtocolErrorResponse =
+        toml::from_slice(&output.stdout).expect("should be valid protocol error TOML");
+    assert!(!envelope.ok);
+    assert_eq!(envelope.command, "begin-run");
+    assert_eq!(envelope.error.code, "server_config_invalid");
+    assert!(
+        !envelope.error.message.is_empty(),
+        "error message should be non-empty",
+    );
+}
+
+#[test]
+fn operator_command_without_config_emits_cli_error() {
+    let output = Command::new(env!("CARGO_BIN_EXE_purgery-server"))
+        .args(["check"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    // Operator commands should emit plain stderr, not a protocol TOML envelope on stdout.
+    assert!(
+        !output.stderr.is_empty(),
+        "operator command should report failure on stderr",
+    );
+    let have_protocol_envelope: Result<ProtocolErrorResponse, _> = toml::from_slice(&output.stdout);
+    assert!(
+        have_protocol_envelope.is_err(),
+        "operator command should not emit protocol TOML on stdout",
+    );
+}
+
+#[test]
+fn protocol_command_with_invalid_nickname_emits_invalid_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = write_config(&temp);
+    let output = Command::new(env!("CARGO_BIN_EXE_purgery-server"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "begin-run",
+            "--nickname",
+            "invalid nickname!!!",
+            "--run-id",
+            "test-request",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let envelope: ProtocolErrorResponse =
+        toml::from_slice(&output.stdout).expect("should be valid protocol error TOML");
+    assert_eq!(envelope.error.code, "invalid_request");
+    assert!(
+        envelope.error.message.contains("invalid nickname"),
+        "error message should mention invalid nickname, got: {}",
+        envelope.error.message,
+    );
+}
+
+#[test]
+fn prepare_run_config_invalid_emits_run_plan_invalid() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = write_config(&temp);
+    // No run directory prepared, so prepare-run should fail with run_plan_invalid.
+    let output = Command::new(env!("CARGO_BIN_EXE_purgery-server"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "prepare-run",
+            "--nickname",
+            "laptop",
+            "--run-id",
+            "no-directory",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let envelope: ProtocolErrorResponse =
+        toml::from_slice(&output.stdout).expect("should be valid protocol error TOML");
+    assert_eq!(envelope.error.code, "run_plan_invalid");
+    assert!(
+        !envelope.error.message.is_empty(),
+        "error message should be non-empty",
+    );
 }
