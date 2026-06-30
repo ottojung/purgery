@@ -106,7 +106,12 @@ fn verbose_conflicts_with_explicit_log_level() {
 
 #[test]
 fn protocol_command_without_config_emits_protocol_error() {
+    let empty_home = tempfile::tempdir().unwrap();
+    let empty_xdg = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_purgery-server"))
+        .env_remove("PURGERY_SERVER_CONFIG_PATH")
+        .env("HOME", empty_home.path().as_os_str())
+        .env("XDG_CONFIG_HOME", empty_xdg.path().as_os_str())
         .args(["begin-run", "--nickname", "laptop", "--run-id", "no-config"])
         .output()
         .unwrap();
@@ -125,7 +130,12 @@ fn protocol_command_without_config_emits_protocol_error() {
 
 #[test]
 fn operator_command_without_config_emits_cli_error() {
+    let empty_home = tempfile::tempdir().unwrap();
+    let empty_xdg = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_purgery-server"))
+        .env_remove("PURGERY_SERVER_CONFIG_PATH")
+        .env("HOME", empty_home.path().as_os_str())
+        .env("XDG_CONFIG_HOME", empty_xdg.path().as_os_str())
         .args(["check"])
         .output()
         .unwrap();

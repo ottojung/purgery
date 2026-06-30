@@ -480,7 +480,7 @@ fn drive_server_until_terminal_with_interval(
                                                  so the client refused to recover/restart",
                                                 nickname.as_str(),
                                                 run_id.as_str(),
-                                                stderr,
+                                                err_msg,
                                                 raw,
                                             );
                                             terminate_worker_on_error(&mut worker);
