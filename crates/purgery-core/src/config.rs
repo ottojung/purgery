@@ -342,6 +342,34 @@ pub struct PrepareRunResponse {
     pub destination: Option<String>,
 }
 
+// ── Protocol Error Envelope ──────────────────────────────────────────
+
+/// Machine-readable error envelope written on stdout when a
+/// client-invoked protocol command fails for a Purgery reason.
+///
+/// The server prints this TOML to stdout and exits nonzero.  The
+/// client parses it to report a clean Purgery error instead of
+/// scraping SSH stderr for human-readable error lines.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProtocolErrorResponse {
+    pub protocol_version: u32,
+    pub purgery_version: String,
+    pub command: String,
+    /// Always `false` on error; clients should reject `ok = true`.
+    pub ok: bool,
+    pub error: ProtocolErrorDetail,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProtocolErrorDetail {
+    /// Stable machine-readable code:
+    /// `run_plan_invalid`, `server_config_invalid`, `invalid_request`, `server_error`.
+    pub code: String,
+    /// Human-readable detail (may include full error chain).
+    pub message: String,
+}
+
 // ── Run State / Progress ─────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

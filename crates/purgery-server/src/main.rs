@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use purgery_core::{ColorMode, LogFormat, LogLevel, Nickname, RunId, ServerConfig};
+use purgery_core::{
+    ColorMode, LogFormat, LogLevel, Nickname, ProtocolErrorResponse, RunId, ServerConfig,
+};
 use purgery_server::{
     begin_run, bootstrap, finish_run, heartbeat_run, prepare_run, process_once_raw,
     process_run_target, read_run_status, run_gc, run_state, server_check, version_response,
@@ -166,6 +168,35 @@ fn apply_cli_overrides(log_cfg: &mut purgery_core::LoggingConfig, cli: &Cli) -> 
     Ok(())
 }
 
+/// Print a machine-readable protocol error envelope to stdout and
+/// exit with code 1.  The client parses this instead of scraping stderr.
+fn exit_with_protocol_error(command: &str, err: anyhow::Error) -> ! {
+    let envelope = ProtocolErrorResponse {
+        protocol_version: purgery_core::PROTOCOL_VERSION,
+        purgery_version: purgery_core::current_purgery_version().to_string(),
+        command: command.to_owned(),
+        ok: false,
+        error: purgery_core::ProtocolErrorDetail {
+            code: "server_error".to_string(),
+            message: format!("{err:#}"),
+        },
+    };
+    if let Ok(toml_str) = toml::to_string(&envelope) {
+        print!("{toml_str}");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+    }
+    std::process::exit(1);
+}
+
+/// Run a protocol command closure; on error, emit the machine-readable
+/// error envelope and exit instead of letting `?` propagate.
+fn run_protocol(command: &str, f: impl FnOnce() -> Result<()>) {
+    if let Err(e) = f() {
+        exit_with_protocol_error(command, e);
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -199,21 +230,30 @@ fn main() -> Result<()> {
             process_once_raw(&server_config)?;
         }
         Command::BeginRun { nickname, run_id } => {
-            let nickname = Nickname::new(nickname).with_context(|| "invalid nickname")?;
-            let run_id = RunId::new(run_id).with_context(|| "invalid run ID")?;
-            let response = begin_run(&server_config, &nickname, &run_id)?;
-            print!("{response}");
+            run_protocol("begin-run", || {
+                let nickname = Nickname::new(nickname).with_context(|| "invalid nickname")?;
+                let run_id = RunId::new(run_id).with_context(|| "invalid run ID")?;
+                let response = begin_run(&server_config, &nickname, &run_id)?;
+                print!("{response}");
+                Ok(())
+            });
         }
         Command::FinishRun { nickname, run_id } => {
-            let nickname = Nickname::new(nickname).with_context(|| "invalid nickname")?;
-            let run_id = RunId::new(run_id).with_context(|| "invalid run ID")?;
-            finish_run(&server_config, &nickname, &run_id)?;
+            run_protocol("finish-run", || {
+                let nickname = Nickname::new(nickname).with_context(|| "invalid nickname")?;
+                let run_id = RunId::new(run_id).with_context(|| "invalid run ID")?;
+                finish_run(&server_config, &nickname, &run_id)?;
+                Ok(())
+            });
         }
         Command::Status { nickname, run_id } => {
-            let nickname = Nickname::new(nickname).with_context(|| "invalid nickname")?;
-            let run_id = RunId::new(run_id).with_context(|| "invalid run ID")?;
-            let status = read_run_status(&server_config, &nickname, &run_id)?;
-            print!("{}", status.to_toml()?);
+            run_protocol("status", || {
+                let nickname = Nickname::new(nickname).with_context(|| "invalid nickname")?;
+                let run_id = RunId::new(run_id).with_context(|| "invalid run ID")?;
+                let status = read_run_status(&server_config, &nickname, &run_id)?;
+                print!("{}", status.to_toml()?);
+                Ok(())
+            });
         }
         Command::Check => {
             server_check(&server_config)?;
@@ -225,35 +265,47 @@ fn main() -> Result<()> {
             run_gc(&server_config)?;
         }
         Command::PrepareRun { nickname, run_id } => {
-            let nickname = Nickname::new(nickname).with_context(|| "invalid nickname")?;
-            let run_id = RunId::new(run_id).with_context(|| "invalid run ID")?;
-            let response = prepare_run(&server_config, &nickname, &run_id)?;
-            print!("{response}");
+            run_protocol("prepare-run", || {
+                let nickname = Nickname::new(nickname).with_context(|| "invalid nickname")?;
+                let run_id = RunId::new(run_id).with_context(|| "invalid run ID")?;
+                let response = prepare_run(&server_config, &nickname, &run_id)?;
+                print!("{response}");
+                Ok(())
+            });
         }
         Command::HeartbeatRun { nickname, run_id } => {
-            let nickname = Nickname::new(nickname).with_context(|| "invalid nickname")?;
-            let run_id = RunId::new(run_id).with_context(|| "invalid run ID")?;
-            heartbeat_run(&server_config, &nickname, &run_id)?;
+            run_protocol("heartbeat-run", || {
+                let nickname = Nickname::new(nickname).with_context(|| "invalid nickname")?;
+                let run_id = RunId::new(run_id).with_context(|| "invalid run ID")?;
+                heartbeat_run(&server_config, &nickname, &run_id)?;
+                Ok(())
+            });
         }
         Command::RunState { nickname, run_id } => {
-            let nickname = Nickname::new(nickname).with_context(|| "invalid nickname")?;
-            let run_id = RunId::new(run_id).with_context(|| "invalid run ID")?;
-            let response = run_state(&server_config, &nickname, &run_id)?;
-            print!(
-                "{}",
-                toml::to_string(&response).with_context(|| "failed to serialize run state")?
-            );
+            run_protocol("run-state", || {
+                let nickname = Nickname::new(nickname).with_context(|| "invalid nickname")?;
+                let run_id = RunId::new(run_id).with_context(|| "invalid run ID")?;
+                let response = run_state(&server_config, &nickname, &run_id)?;
+                print!(
+                    "{}",
+                    toml::to_string(&response).with_context(|| "failed to serialize run state")?
+                );
+                Ok(())
+            });
         }
         Command::ProcessRun { nickname, run_id } => {
-            let nickname = Nickname::new(nickname).with_context(|| "invalid nickname")?;
-            let run_id = RunId::new(run_id).with_context(|| "invalid run ID")?;
-            server_check(&server_config)?;
-            let response = process_run_target(&server_config, &nickname, &run_id)?;
-            println!(
-                "{}",
-                toml::to_string(&response)
-                    .with_context(|| "failed to serialize process-run response")?
-            );
+            run_protocol("process-run", || {
+                let nickname = Nickname::new(nickname).with_context(|| "invalid nickname")?;
+                let run_id = RunId::new(run_id).with_context(|| "invalid run ID")?;
+                server_check(&server_config)?;
+                let response = process_run_target(&server_config, &nickname, &run_id)?;
+                println!(
+                    "{}",
+                    toml::to_string(&response)
+                        .with_context(|| "failed to serialize process-run response")?
+                );
+                Ok(())
+            });
         }
     }
     Ok(())
