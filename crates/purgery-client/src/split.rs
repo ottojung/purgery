@@ -218,7 +218,7 @@ pub(crate) fn discover_split_entries(
 ///
 /// - source itself → empty (root already matches target)
 /// - top-level child → "/" (rsync destination parent)
-/// - nested child → "/parent" (no trailing slash — run_rsync adds it)
+/// - nested child → "/parent/" (directory intent preserves relative placement)
 pub(crate) fn split_target_suffix(source: &str, root: &str) -> String {
     if root == source {
         return String::new();
@@ -232,7 +232,7 @@ pub(crate) fn split_target_suffix(source: &str, root: &str) -> String {
         if parent.as_os_str().is_empty() {
             "/".to_string()
         } else {
-            format!("/{}", parent.to_string_lossy())
+            format!("/{}/", parent.to_string_lossy())
         }
     } else {
         String::new()
@@ -640,7 +640,7 @@ mod tests {
     #[test]
     fn nested_child_has_parent_suffix() {
         let suffix = split_target_suffix("/src", "/src/2024/a.mp4");
-        assert_eq!(suffix, "/2024");
+        assert_eq!(suffix, "/2024/");
     }
 
     #[test]

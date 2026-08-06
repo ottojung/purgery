@@ -149,7 +149,14 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
         let resolved = cwd.join(run_config.destination.as_str());
         let resolved_utf8 = camino::Utf8PathBuf::from_path_buf(resolved)
             .map_err(|_| anyhow::anyhow!("resolved destination path is not valid UTF-8"))?;
-        let resolved_dest = purgery_core::DestinationPath::new(resolved_utf8)
+        let resolved_base = resolved_utf8.as_str().trim_end_matches('/');
+        let resolved_operand = match run_config.destination.intent() {
+            purgery_core::DestinationIntent::ExactOrExistingDirectory => resolved_utf8.to_string(),
+            purgery_core::DestinationIntent::TrailingSlash => format!("{resolved_base}/"),
+            purgery_core::DestinationIntent::TerminalDot => format!("{resolved_base}/."),
+            purgery_core::DestinationIntent::TerminalDotSlash => format!("{resolved_base}/./"),
+        };
+        let resolved_dest = purgery_core::DestinationPath::new(resolved_operand.into())
             .with_context(|| "resolved destination path is invalid")?;
 
         // Atomically rewrite run.toml with the resolved destination so that
@@ -169,7 +176,7 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
         fs::rename(tmp_path.as_std_path(), run_config_path.as_std_path())
             .with_context(|| "failed to commit updated run config")?;
 
-        Some(resolved_dest.as_str().to_owned())
+        Some(resolved_dest.operand())
     } else {
         None
     };
@@ -846,6 +853,7 @@ delete_after_import = true
             format!("univ/{destination_path}")
         };
         let destination = test_destination_from_run_dir(dir, &requested);
+        let destination_operand = format!("{}/", destination.as_str().trim_end_matches('/'));
         let content = format!(
             r#"purgery_version = "0.1.0-test"
 nickname = "{}"
@@ -853,7 +861,7 @@ destination = "{}"
 delete_after_import = true
 "#,
             nickname.as_str(),
-            destination.as_str(),
+            destination_operand,
         );
         fs::write(dir.join("run.toml"), &content).unwrap();
     }
@@ -944,6 +952,94 @@ delete_after_import = true
         .unwrap();
 
         (config, staged_path)
+    }
+
+    fn write_test_lease_with_protocol(
+        run_dir: &Utf8Path,
+        nickname: &Nickname,
+        run_id: &RunId,
+        protocol_version: u32,
+    ) {
+        let lease = purgery_core::LeaseFile {
+            protocol_version,
+            purgery_version: purgery_core::current_purgery_version().to_owned(),
+            nickname: nickname.as_str().to_owned(),
+            run_id: run_id.as_str().to_owned(),
+            created_at_unix_secs: 1,
+            last_heartbeat_unix_secs: 1,
+            expires_at_unix_secs: u64::MAX,
+        };
+        fs::write(run_dir.join("lease.toml"), toml::to_string(&lease).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn ready_run_with_protocol_v2_lease_is_left_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("protocol-v2-ready".into()).unwrap();
+        let (config, staged_path) = setup_single_file_ready(
+            &work_dir,
+            &nickname,
+            &run_id,
+            "missing-target",
+            "video.mkv",
+            b"video",
+        );
+        let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
+        write_test_lease_with_protocol(&ready, &nickname, &run_id, 2);
+
+        let outcome = crate::process::claim_ready_run(&config, &nickname, &run_id);
+        assert!(matches!(
+            outcome,
+            crate::process::ReadyClaimOutcome::IncompatibleReady { .. }
+        ));
+        assert!(ready.exists());
+        assert!(staged_path.exists());
+        assert!(!ready.join("destination-plan.toml").exists());
+        assert!(!config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Processing)
+            .exists());
+    }
+
+    #[test]
+    fn processing_run_with_protocol_v2_lease_is_left_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("protocol-v2-processing".into()).unwrap();
+        let (config, staged_path) = setup_single_file_ready(
+            &work_dir,
+            &nickname,
+            &run_id,
+            "missing-target",
+            "video.mkv",
+            b"video",
+        );
+        let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
+        let processing = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        write_test_lease_with_protocol(&ready, &nickname, &run_id, 2);
+        fs::create_dir_all(processing.parent().unwrap()).unwrap();
+        fs::rename(&ready, &processing).unwrap();
+        let staged_path = processing.join(staged_path.strip_prefix(&ready).unwrap());
+
+        let error = recover_or_process_processing_run(&config, &nickname, &run_id).unwrap_err();
+        assert!(matches!(error, RecoveryError::IncompatibleStatus { .. }));
+        assert!(processing.exists());
+        assert!(staged_path.exists());
+        assert!(!processing.join("destination-plan.toml").exists());
+        assert!(!processing.join("status.toml").exists());
+        assert!(!config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Done)
+            .exists());
+        assert!(!config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Failed)
+            .exists());
     }
 
     // ── full processing pipeline nickname-free archive paths ──
@@ -2879,7 +2975,7 @@ delete_after_import = true
     }
 
     #[test]
-    fn prepare_run_rewrites_relative_destination() {
+    fn prepare_run_rewrites_relative_terminal_dot_without_losing_intent() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let mut config = test_server_config(&work_dir);
@@ -2900,7 +2996,7 @@ delete_after_import = true
             .run_dir(&nickname, &run_id, RunPhase::Incoming);
         fs::create_dir_all(&incoming).unwrap();
 
-        write_run_toml_with_raw_destination(&incoming, &nickname, "relative/path");
+        write_run_toml_with_raw_destination(&incoming, &nickname, "relative/path/.");
 
         let manifest = Manifest {
             purgery_version: "0.1.0-test".to_string(),
@@ -2936,7 +3032,7 @@ delete_after_import = true
             "resolved destination must be absolute, got: {resolved}"
         );
         assert!(
-            resolved.ends_with("relative/path"),
+            resolved.ends_with("relative/path/."),
             "resolved destination must end with the original relative path, got: {resolved}"
         );
 
@@ -2946,6 +3042,10 @@ delete_after_import = true
         assert!(
             run_config.destination.is_absolute(),
             "rewritten run.toml destination must be absolute"
+        );
+        assert_eq!(
+            run_config.destination.intent(),
+            purgery_core::DestinationIntent::TerminalDot
         );
     }
 
@@ -3903,6 +4003,18 @@ delete_after_import = true
                 })
                 .cloned()
                 .collect();
+            // Destination plans are durable run protocol data. Successful runs
+            // retain them in the terminal directory so crash recovery cannot
+            // lose a target decision before terminal publication.
+            v.extend(
+                actual
+                    .iter()
+                    .filter(|path| {
+                        path.file_name()
+                            .is_some_and(|name| name == "destination-plan.toml")
+                    })
+                    .cloned(),
+            );
             v.sort();
             v
         };
@@ -3932,6 +4044,7 @@ delete_after_import = true
 
         let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(done_path.exists());
+        assert!(done_path.join("destination-plan.toml").exists());
 
         let expected = vec![
             config.work_dir.as_path().join("univ"),

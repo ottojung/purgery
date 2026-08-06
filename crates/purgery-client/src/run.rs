@@ -1604,7 +1604,7 @@ pub(crate) fn run_sync_with_run_id(
         runner.run_rsync(
             &source_spec.operation_path,
             &remote.host,
-            remote.path.as_str(),
+            &remote.path.operand(),
         )?;
         info!("sync complete");
         return Ok(());
@@ -1635,7 +1635,7 @@ pub(crate) fn run_sync_with_run_id(
         runner.run_rsync(
             &source_spec.operation_path,
             &remote.host,
-            remote.path.as_str(),
+            &remote.path.operand(),
         )?;
         if let Some(ref state_path) = cleanup_state_path {
             cleanup::confirm_all_imports(state_path)?;
@@ -1713,7 +1713,7 @@ pub(crate) fn run_sync_with_run_id(
         runner.run_rsync(
             &source_spec.operation_path,
             &remote.host,
-            &begin_resp.files_dir,
+            &format!("{}/", begin_resp.files_dir.trim_end_matches('/')),
         )?;
 
         Ok(())
@@ -1846,7 +1846,7 @@ fn run_split(
             source_spec.kind,
             pattern,
             &target.host,
-            target.path.as_str(),
+            &target.path.operand(),
         );
     }
 

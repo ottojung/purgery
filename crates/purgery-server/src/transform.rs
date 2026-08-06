@@ -63,21 +63,19 @@ fn join_bounded_output(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn apply_transform(
+pub fn apply_transform_for_target(
     resolved: &ResolvedTransform,
     work_path: &Utf8Path,
-    destination_root: &Utf8Path,
-    target_directory: &Utf8Path,
+    target: &purgery_core::ResolvedDestinationPlan,
     progress_cb: &mut dyn FnMut(&purgery_core::ProgressUpdate),
     entry_index: usize,
     entry_total: usize,
     current_entry: &str,
 ) -> Result<Vec<Utf8PathBuf>, String> {
-    apply_transform_with_heartbeat(
+    apply_transform_for_target_with_heartbeat(
         resolved,
         work_path,
-        destination_root,
-        target_directory,
+        target,
         std::time::Duration::from_secs(DEFAULT_HEARTBEAT_SECS),
         progress_cb,
         entry_index,
@@ -87,11 +85,10 @@ pub fn apply_transform(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn apply_transform_with_heartbeat(
+pub fn apply_transform_for_target_with_heartbeat(
     resolved: &ResolvedTransform,
     work_path: &Utf8Path,
-    destination_root: &Utf8Path,
-    target_directory: &Utf8Path,
+    target: &purgery_core::ResolvedDestinationPlan,
     heartbeat_interval: std::time::Duration,
     progress_cb: &mut dyn FnMut(&purgery_core::ProgressUpdate),
     entry_index: usize,
@@ -109,7 +106,7 @@ pub fn apply_transform_with_heartbeat(
 
     match def.kind {
         purgery_core::TransformKind::Subprocess => {
-            let args = def.build_args(work_path, target_directory);
+            let args = def.build_args_for_target(work_path, target);
             info!(transform = %resolved.name, program = %def.program, "running transform");
             progress_cb(&purgery_core::ProgressUpdate::new(
                 "transform_started",
@@ -202,7 +199,7 @@ pub fn apply_transform_with_heartbeat(
             ));
 
             let expected = def
-                .resolve_expected_outputs(work_path, destination_root, target_directory)
+                .resolve_expected_outputs_for_target(work_path, target)
                 .map_err(|e| format!("{}: {e}", resolved.name))?;
             for exp in &expected {
                 let metadata = fs::symlink_metadata(exp.as_std_path()).map_err(|error| {
@@ -234,5 +231,66 @@ pub fn apply_transform_with_heartbeat(
             }
             Ok(results)
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn apply_transform(
+    resolved: &ResolvedTransform,
+    work_path: &Utf8Path,
+    destination_root: &Utf8Path,
+    target_directory: &Utf8Path,
+    progress_cb: &mut dyn FnMut(&purgery_core::ProgressUpdate),
+    entry_index: usize,
+    entry_total: usize,
+    current_entry: &str,
+) -> Result<Vec<Utf8PathBuf>, String> {
+    let target = test_target(work_path, destination_root, target_directory);
+    apply_transform_for_target(
+        resolved,
+        work_path,
+        &target,
+        progress_cb,
+        entry_index,
+        entry_total,
+        current_entry,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn apply_transform_with_heartbeat(
+    resolved: &ResolvedTransform,
+    work_path: &Utf8Path,
+    destination_root: &Utf8Path,
+    target_directory: &Utf8Path,
+    heartbeat_interval: std::time::Duration,
+    progress_cb: &mut dyn FnMut(&purgery_core::ProgressUpdate),
+    entry_index: usize,
+    entry_total: usize,
+    current_entry: &str,
+) -> Result<Vec<Utf8PathBuf>, String> {
+    let target = test_target(work_path, destination_root, target_directory);
+    apply_transform_for_target_with_heartbeat(
+        resolved,
+        work_path,
+        &target,
+        heartbeat_interval,
+        progress_cb,
+        entry_index,
+        entry_total,
+        current_entry,
+    )
+}
+
+fn test_target(
+    work_path: &Utf8Path,
+    destination_root: &Utf8Path,
+    target_directory: &Utf8Path,
+) -> purgery_core::ResolvedDestinationPlan {
+    purgery_core::ResolvedDestinationPlan {
+        operand: purgery_core::DestinationPath::new(destination_root.to_owned()).unwrap(),
+        target_path: target_directory.join(work_path.file_name().unwrap_or("output")),
+        target_directory: target_directory.to_owned(),
+        placement: purgery_core::DestinationPlacement::DirectoryTarget,
     }
 }

@@ -1,3 +1,4 @@
+use crate::ResolvedDestinationPlan;
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
 
@@ -47,24 +48,88 @@ pub struct TransformDefinition {
 }
 
 impl TransformDefinition {
+    fn expand_placeholders(
+        &self,
+        work_path: &Utf8Path,
+        target: Option<&ResolvedDestinationPlan>,
+        legacy_target_directory: Option<&Utf8Path>,
+        template: &str,
+    ) -> String {
+        let mut expanded = String::with_capacity(template.len());
+        let mut remaining = template;
+        while let Some(open) = remaining.find('{') {
+            expanded.push_str(&remaining[..open]);
+            let candidate = &remaining[open..];
+            let Some(close) = candidate.find('}') else {
+                expanded.push_str(candidate);
+                return expanded;
+            };
+            let token = &candidate[..=close];
+            let replacement = match token {
+                "{input}" => Some(work_path.as_str()),
+                "{parent}" => Some(work_path.parent().map(|p| p.as_str()).unwrap_or("")),
+                "{file_name}" => Some(work_path.file_name().unwrap_or("")),
+                "{file_stem}" => Some(work_path.file_stem().unwrap_or("")),
+                "{target_path}" => target.map(|plan| plan.target_path.as_str()),
+                "{target_directory}" => target
+                    .map(|plan| plan.target_directory.as_str())
+                    .or_else(|| legacy_target_directory.map(Utf8Path::as_str)),
+                "{target_file_name}" => {
+                    target.map(|plan| plan.target_path.file_name().unwrap_or(""))
+                }
+                "{target_file_stem}" => {
+                    target.map(|plan| plan.target_path.file_stem().unwrap_or(""))
+                }
+                _ => None,
+            };
+            if let Some(value) = replacement {
+                expanded.push_str(value);
+            } else {
+                expanded.push_str(token);
+            }
+            remaining = &candidate[close + 1..];
+        }
+        expanded.push_str(remaining);
+        expanded
+    }
+
+    pub fn build_args_for_target(
+        &self,
+        work_path: &Utf8Path,
+        target: &ResolvedDestinationPlan,
+    ) -> Vec<String> {
+        self.args
+            .iter()
+            .map(|arg| self.expand_placeholders(work_path, Some(target), None, arg))
+            .collect()
+    }
+
+    pub fn resolve_expected_outputs_for_target(
+        &self,
+        work_path: &Utf8Path,
+        target: &ResolvedDestinationPlan,
+    ) -> Result<Vec<Utf8PathBuf>, String> {
+        self.expected_outputs
+            .iter()
+            .map(|pattern| {
+                validate_expected_output_name(pattern)?;
+                let expanded = self.expand_placeholders(work_path, Some(target), None, pattern);
+                Ok(if Utf8Path::new(&expanded).is_absolute() {
+                    Utf8PathBuf::from(expanded)
+                } else {
+                    target.target_directory.join(expanded)
+                })
+            })
+            .collect()
+    }
     pub fn resolve_placeholders(&self, work_path: &Utf8Path, s: &str) -> String {
-        let input = work_path.as_str();
-        let parent = work_path.parent().map(|p| p.as_str()).unwrap_or("");
-        let file_name = work_path.file_name().unwrap_or("");
-        let file_stem = work_path.file_stem().unwrap_or("");
-        s.replace("{input}", input)
-            .replace("{parent}", parent)
-            .replace("{file_name}", file_name)
-            .replace("{file_stem}", file_stem)
+        self.expand_placeholders(work_path, None, None, s)
     }
 
     pub fn build_args(&self, work_path: &Utf8Path, target_directory: &Utf8Path) -> Vec<String> {
         self.args
             .iter()
-            .map(|a| {
-                self.resolve_placeholders(work_path, a)
-                    .replace("{target_directory}", target_directory.as_str())
-            })
+            .map(|a| self.expand_placeholders(work_path, None, Some(target_directory), a))
             .collect()
     }
 
@@ -77,9 +142,7 @@ impl TransformDefinition {
         let mut results = Vec::with_capacity(self.expected_outputs.len());
         for pat in &self.expected_outputs {
             validate_expected_output_name(pat)?;
-            let expanded = self
-                .resolve_placeholders(work_path, pat)
-                .replace("{target_directory}", target_directory.as_str());
+            let expanded = self.expand_placeholders(work_path, None, Some(target_directory), pat);
             let path = if Utf8Path::new(&expanded).is_absolute() {
                 Utf8PathBuf::from(expanded)
             } else {
@@ -119,7 +182,8 @@ pub fn validate_expected_output_name(name: &str) -> Result<(), String> {
     if name.contains("{input}") || name.contains("{parent}") {
         return Err("expected output name must not use {{input}} or {{parent}} \
              placeholders; only {{file_name}}, {{file_stem}}, and \
-             {{target_directory}} are allowed"
+             {{target_path}}, {{target_directory}}, {{target_file_name}}, and \
+             {{target_file_stem}} are allowed"
             .into());
     }
     Ok(())

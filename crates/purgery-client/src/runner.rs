@@ -846,8 +846,13 @@ impl RemoteRunner {
     }
 
     /// Run rsync to transfer files to a remote host.
-    pub(crate) fn run_rsync(&self, source: &str, host: &str, remote_dir: &str) -> Result<()> {
-        let rsync_dest = format!("{host}:{remote_dir}/");
+    pub(crate) fn run_rsync(
+        &self,
+        source: &str,
+        host: &str,
+        destination_operand: &str,
+    ) -> Result<()> {
+        let rsync_dest = format!("{host}:{destination_operand}");
         let rsync_cmd = format!(
             "rsync --recursive --partial --inplace --mkpath --archive --protect-args -- {source} {rsync_dest}"
         );
@@ -866,10 +871,10 @@ impl RemoteRunner {
                     cmd.stderr(std::process::Stdio::null());
                 }
                 let status = cmd.status().with_context(|| {
-                    format!("failed to execute rsync: {source} -> {host}:{remote_dir}")
+                    format!("failed to execute rsync: {source} -> {host}:{destination_operand}")
                 })?;
                 if !status.success() {
-                    anyhow::bail!("rsync failed: {source} -> {host}:{remote_dir}");
+                    anyhow::bail!("rsync failed: {source} -> {host}:{destination_operand}");
                 }
                 Ok(())
             }
@@ -1137,6 +1142,24 @@ mod tests {
         runner.add_rsync_error("other-host", "rsync failed");
         let result = runner.run_rsync("/src", "host", "/dest");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn rsync_command_preserves_destination_trailing_slash() {
+        let runner = RemoteRunner::fake();
+        runner
+            .run_rsync("/src", "host", "/archive/name.mkv")
+            .unwrap();
+        runner
+            .run_rsync("/src", "host", "/archive/name.mkv/")
+            .unwrap();
+        runner
+            .run_rsync("/src", "host", "/archive/name.mkv/.")
+            .unwrap();
+        let log = runner.command_log();
+        assert!(log[0].ends_with("host:/archive/name.mkv"));
+        assert!(log[1].ends_with("host:/archive/name.mkv/"));
+        assert!(log[2].ends_with("host:/archive/name.mkv/."));
     }
 
     #[test]

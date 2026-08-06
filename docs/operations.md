@@ -80,7 +80,7 @@ Passthrough syncs (without `--transform`) use direct rsync and do not call any s
 
 ### Source entry model
 
-The `SOURCE` operand may be a regular file, directory, or symlink. The target is a destination parent. The source entry is imported under the target using the source entry name.
+The `SOURCE` operand may be a regular file, directory, or symlink. `DESTINATION` has genuine rsync single-source semantics: an existing directory and a trailing slash place the source beneath it; a missing non-slash destination renames a file, symlink, or empty directory; and a non-empty directory is placed beneath the newly created destination directory.
 
 - Trailing slashes on source operands do not change source-entry semantics. `~/Videos` and `~/Videos/` both import the directory named `Videos`.
 - `.` imports the current directory as a source entry named after that directory. `.` is resolved to a concrete directory path before rsync.
@@ -88,7 +88,7 @@ The `SOURCE` operand may be a regular file, directory, or symlink. The target is
 - `/` is invalid in every mode — it has no source entry name.
 - Symlink sources remain symlink sources. Source paths are not canonicalized through symlinks.
 
-The source entry name is used consistently for the manifest `relative_path`, staged path, cleanup root, server expected staged path, and server base final path (`<destination>/<source_entry_name>`).
+The source entry name is used consistently for the manifest `relative_path`, staged path, cleanup root, and server expected staged path. The server base final path comes from the persisted destination plan and may instead be the exact destination operand.
 
 ## Split
 
@@ -251,7 +251,7 @@ For transform outputs, Purgery still does not perform atomic final publication. 
 
 Publication to the destination differs by run mode:
 
-- **Direct passthrough (no transform):** rsync writes the source entry directly to `<destination>/<source_entry_name>` with archive-mode semantics. Existing directories merge, regular files and symlinks replace destination entries. Non-atomic: interrupted rsync can leave partial contents at the destination path.
+- **Direct passthrough (no transform):** rsync writes the source entry using its single-source destination rules with archive-mode semantics. Existing directories merge, while an exact target can rename or replace a regular file or symlink. Non-atomic: interrupted rsync can leave partial contents at the destination path.
 
 - **Transform run:** The transform program writes outputs directly to the resolved expected output paths. Purgery checks that each declared `expected_outputs` exists after successful subprocess exit and records those paths in status. The source entry is consumed by the transform flow. If `expected_outputs = []`, successful subprocess exit alone is sufficient; no output-existence check is performed.
 

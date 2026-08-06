@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use purgery_core::{
-    path_is_within_root, validate_envelope, work_dir, DestinationPath, EntryStatusEntry,
-    FileStatus, Manifest, ManifestEntry, ManifestEntryKind, Nickname, NormalizedRelativePath,
-    ProcessRunOutcome, RunConfig, RunId, RunPhase, RunState, RunStatus, ServerConfig,
+    resolve_destination, validate_envelope, work_dir, DestinationPath, DestinationState,
+    EntryStatusEntry, FileStatus, Manifest, ManifestEntry, ManifestEntryKind, Nickname,
+    NormalizedRelativePath, ProcessRunOutcome, ResolvedDestinationPlan, RunConfig, RunId, RunPhase,
+    RunState, RunStatus, ServerConfig,
 };
 use std::fmt;
 use std::fs;
@@ -14,7 +15,7 @@ use crate::phases::{
     finalize_processing_run, move_to_failed, write_progress_best_effort, write_run_failure,
 };
 use crate::recover::{recover_or_process_processing_run, RecoveryError};
-use crate::transform::apply_transform;
+use crate::transform::apply_transform_for_target;
 use crate::ResolvedTransform;
 
 /// Outcome of attempting to process a run (ready → processing → done/failed).
@@ -199,6 +200,89 @@ fn failed_entry(entry: &ManifestEntry, error: impl Into<String>) -> EntryOutcome
     }
 }
 
+/// Rejects queued state written by a protocol with different persisted
+/// destination semantics before any run input is interpreted or mutated.
+pub(crate) fn validate_run_lease_protocol(run_dir: &Utf8Path) -> Result<(), ProcessingError> {
+    let lease_path = run_dir.join("lease.toml");
+    let contents = match fs::read_to_string(&lease_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(ProcessingError::Other(anyhow::anyhow!(
+                "failed to read run lease: {error}"
+            )))
+        }
+    };
+    let lease: purgery_core::LeaseFile = toml::from_str(&contents).map_err(|error| {
+        ProcessingError::Other(anyhow::anyhow!("failed to parse run lease: {error}"))
+    })?;
+    if lease.protocol_version != purgery_core::PROTOCOL_VERSION {
+        return Err(ProcessingError::Incompatible {
+            path: lease_path,
+            message: format!(
+                "incompatible run lease protocol version: producer {}, current {}; leaving run untouched",
+                lease.protocol_version,
+                purgery_core::PROTOCOL_VERSION,
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn load_or_resolve_destination_plan(
+    processing_path: &Utf8Path,
+    destination: &DestinationPath,
+    entry: &ManifestEntry,
+    source_path: &Utf8Path,
+) -> Result<ResolvedDestinationPlan, String> {
+    let plan_path = processing_path.join("destination-plan.toml");
+    if plan_path.exists() {
+        let contents = fs::read_to_string(&plan_path)
+            .map_err(|e| format!("failed to read destination plan: {e}"))?;
+        return toml::from_str(&contents)
+            .map_err(|e| format!("failed to parse destination plan: {e}"));
+    }
+    let destination_state = match fs::symlink_metadata(destination.as_path()) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            match fs::metadata(destination.as_path()) {
+                Ok(target) if target.is_dir() => DestinationState::Directory,
+                Ok(_) => DestinationState::NonDirectory,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    DestinationState::DanglingSymlink
+                }
+                Err(error) => {
+                    return Err(format!("failed to inspect destination symlink: {error}"))
+                }
+            }
+        }
+        Ok(metadata) if metadata.is_dir() => DestinationState::Directory,
+        Ok(_) => DestinationState::NonDirectory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => DestinationState::Missing,
+        Err(error) => return Err(format!("failed to inspect destination: {error}")),
+    };
+    let source_directory_empty = entry.kind == ManifestEntryKind::Directory
+        && fs::read_dir(source_path)
+            .map_err(|e| format!("failed to inspect source directory: {e}"))?
+            .next()
+            .is_none();
+    let plan = resolve_destination(
+        destination,
+        &entry.relative_path,
+        entry.kind,
+        source_directory_empty,
+        destination_state,
+    )
+    .map_err(|e| e.to_string())?;
+    let serialized =
+        toml::to_string(&plan).map_err(|e| format!("failed to serialize destination plan: {e}"))?;
+    let temporary = processing_path.join("destination-plan.toml.tmp");
+    fs::write(&temporary, serialized)
+        .map_err(|e| format!("failed to write destination plan: {e}"))?;
+    fs::rename(&temporary, &plan_path)
+        .map_err(|e| format!("failed to publish destination plan: {e}"))?;
+    Ok(plan)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_manifest_entry(
     config: &ServerConfig,
@@ -273,26 +357,15 @@ fn process_manifest_entry(
         ManifestEntryKind::Directory => {}
     }
 
-    let destination_root = destination.as_path();
-    let final_path = destination.join(&entry.relative_path);
-    if !path_is_within_root(&final_path, destination_root) {
-        return failed_entry(
-            entry,
-            format!("final path escapes destination: {}", final_path.as_str()),
-        );
-    }
+    let target =
+        match load_or_resolve_destination_plan(processing_path, destination, entry, &source_path) {
+            Ok(plan) => plan,
+            Err(error) => return failed_entry(entry, error),
+        };
     let work_path = match prepare_work_entry(entry, &source_path, work_area) {
         Ok(p) => p,
         Err(error) => return failed_entry(entry, error.to_string()),
     };
-
-    let Some(target_directory) = final_path.parent() else {
-        return failed_entry(
-            entry,
-            format!("final path has no parent: {}", final_path.as_str()),
-        );
-    };
-    let target_directory = target_directory.to_owned();
 
     let mut pp_helper = |update: &purgery_core::ProgressUpdate| {
         write_progress_best_effort(
@@ -318,11 +391,10 @@ fn process_manifest_entry(
             )
         }
     };
-    match apply_transform(
+    match apply_transform_for_target(
         &resolved,
         &work_path,
-        destination_root,
-        &target_directory,
+        &target,
         &mut pp_helper,
         entry_index,
         entry_total,
@@ -345,14 +417,15 @@ fn process_manifest_entry(
 /// Read and validate run.toml and manifest.toml from a run directory,
 /// checking version compatibility before any mutation.
 ///
-/// Returns `Incompatible` if purgery_version is missing, malformed, or
-/// major/minor-incompatible. Returns `Other` for IO errors or current-
-/// version parse failures.
+/// Returns `Incompatible` if a persisted lease has another protocol version,
+/// or if purgery_version is missing, malformed, or major/minor-incompatible.
+/// Returns `Other` for IO errors or current-version parse failures.
 fn read_compatible_run_inputs(
     run_dir: &Utf8Path,
     nickname: &Nickname,
     run_id: &RunId,
 ) -> std::result::Result<(RunConfig, Manifest), ProcessingError> {
+    validate_run_lease_protocol(run_dir)?;
     let run_config_path = run_dir.join("run.toml");
     let run_config_content = fs::read_to_string(&run_config_path)
         .map_err(|e| ProcessingError::Other(anyhow::anyhow!("failed to read run config: {e}")))?;
