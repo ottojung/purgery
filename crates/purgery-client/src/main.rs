@@ -80,7 +80,7 @@ struct SyncArgs {
     #[arg(allow_hyphen_values = true)]
     source: String,
 
-    /// Destination in rsync style: USER@HOST:DESTINATION
+    /// Rsync destination operand: USER@HOST:DESTINATION (a trailing slash forces a directory)
     #[arg(allow_hyphen_values = true)]
     destination: String,
 }

@@ -1,3 +1,4 @@
+use crate::ResolvedDestinationPlan;
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +48,53 @@ pub struct TransformDefinition {
 }
 
 impl TransformDefinition {
+    fn resolve_target_placeholders(&self, target: &ResolvedDestinationPlan, s: &str) -> String {
+        s.replace("{target_path}", target.target_path.as_str())
+            .replace("{target_directory}", target.target_directory.as_str())
+            .replace(
+                "{target_file_name}",
+                target.target_path.file_name().unwrap_or(""),
+            )
+            .replace(
+                "{target_file_stem}",
+                target.target_path.file_stem().unwrap_or(""),
+            )
+    }
+
+    pub fn build_args_for_target(
+        &self,
+        work_path: &Utf8Path,
+        target: &ResolvedDestinationPlan,
+    ) -> Vec<String> {
+        self.args
+            .iter()
+            .map(|arg| {
+                self.resolve_target_placeholders(target, &self.resolve_placeholders(work_path, arg))
+            })
+            .collect()
+    }
+
+    pub fn resolve_expected_outputs_for_target(
+        &self,
+        work_path: &Utf8Path,
+        target: &ResolvedDestinationPlan,
+    ) -> Result<Vec<Utf8PathBuf>, String> {
+        self.expected_outputs
+            .iter()
+            .map(|pattern| {
+                validate_expected_output_name(pattern)?;
+                let expanded = self.resolve_target_placeholders(
+                    target,
+                    &self.resolve_placeholders(work_path, pattern),
+                );
+                Ok(if Utf8Path::new(&expanded).is_absolute() {
+                    Utf8PathBuf::from(expanded)
+                } else {
+                    target.target_directory.join(expanded)
+                })
+            })
+            .collect()
+    }
     pub fn resolve_placeholders(&self, work_path: &Utf8Path, s: &str) -> String {
         let input = work_path.as_str();
         let parent = work_path.parent().map(|p| p.as_str()).unwrap_or("");
@@ -119,7 +167,8 @@ pub fn validate_expected_output_name(name: &str) -> Result<(), String> {
     if name.contains("{input}") || name.contains("{parent}") {
         return Err("expected output name must not use {{input}} or {{parent}} \
              placeholders; only {{file_name}}, {{file_stem}}, and \
-             {{target_directory}} are allowed"
+             {{target_path}}, {{target_directory}}, {{target_file_name}}, and \
+             {{target_file_stem}} are allowed"
             .into());
     }
     Ok(())

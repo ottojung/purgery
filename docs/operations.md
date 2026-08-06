@@ -80,7 +80,7 @@ Passthrough syncs (without `--transform`) use direct rsync and do not call any s
 
 ### Source entry model
 
-The `SOURCE` operand may be a regular file, directory, or symlink. The target is a destination parent. The source entry is imported under the target using the source entry name.
+The `SOURCE` operand may be a regular file, directory, or symlink. `DESTINATION` has genuine rsync single-source semantics: an existing directory and a trailing slash place the source beneath it; a missing non-slash destination renames a file, symlink, or empty directory; and a non-empty directory is placed beneath the newly created destination directory.
 
 - Trailing slashes on source operands do not change source-entry semantics. `~/Videos` and `~/Videos/` both import the directory named `Videos`.
 - `.` imports the current directory as a source entry named after that directory. `.` is resolved to a concrete directory path before rsync.

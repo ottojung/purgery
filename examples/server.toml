@@ -10,5 +10,5 @@ work_dir = ".local/state/purgery/work"
 name = "compress-video"
 kind = "subprocess"
 program = "my-compress-video"
-args = ["--input", "{input}", "--output", "{target_directory}/{file_stem}.Z.webm"]
-expected_outputs = ["{target_directory}/{file_stem}.Z.webm"]
+args = ["--input", "{input}", "--output", "{target_directory}/{target_file_stem}.Z.webm"]
+expected_outputs = ["{target_directory}/{target_file_stem}.Z.webm"]

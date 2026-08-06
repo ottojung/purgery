@@ -36,8 +36,8 @@ orphan_retention_secs = 86400
 name = "compress-video"
 kind = "subprocess"
 program = "/usr/local/bin/compress-video"
-args = ["--input", "{input}", "--output", "{target_directory}/{file_stem}.Z.webm"]
-expected_outputs = ["{target_directory}/{file_stem}.Z.webm"]
+args = ["--input", "{input}", "--output", "{target_directory}/{target_file_stem}.Z.webm"]
+expected_outputs = ["{target_directory}/{target_file_stem}.Z.webm"]
 ```
 
 ### Fields
@@ -96,12 +96,15 @@ Transforms are defined as an array of tables using `[[transform]]`. Each named t
 | `{parent}` | Work-area parent directory |
 | `{file_name}` | Input file name with extension |
 | `{file_stem}` | Input file name without extension |
-| `{target_directory}` | Directory where this entry's non-transform final path would be placed |
+| `{target_path}` | Resolved target path after rsync destination classification |
+| `{target_directory}` | Parent directory of the resolved target path |
+| `{target_file_name}` | Resolved target file name |
+| `{target_file_stem}` | Resolved target file name without its extension |
 
-`args` may use `{input}`, `{parent}`, `{file_name}`, `{file_stem}`, and `{target_directory}`. `expected_outputs` may use `{file_name}`, `{file_stem}`, and `{target_directory}`. After placeholder expansion:
+`args` may use every placeholder above. `expected_outputs` may use the source name placeholders and all target placeholders, but not `{input}` or `{parent}`. After placeholder expansion:
 
 - If the expanded path is absolute, it is used as-is.
-- If the expanded path is relative, it is resolved against `<DESTINATION>` (the run destination root).
+- If the expanded path is relative, it is resolved against `{target_directory}`. An exact file destination is therefore never used as a directory.
 
 ### Transform finalization contract
 

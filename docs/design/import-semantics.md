@@ -6,7 +6,9 @@ Purgery operates on one source entry per `sync` invocation.
 
 Without `--transform`, the client runs rsync directly to `USER@HOST:DESTINATION`. It does not create a server run, upload a manifest, poll status, or invoke `finish-run`.
 
-The source entry is transferred with trailing slashes stripped. Trailing slashes on the source operand do not change source-entry semantics. The source entry base final path is `<DESTINATION>/<SOURCE-NAME>`.
+The source entry is transferred with trailing slashes stripped. Trailing slashes on the source operand do not change source-entry semantics. Destination placement follows rsync: a file uses an existing directory or a slash-terminated operand as its parent, while a missing non-slash operand is its exact new name. An empty directory can likewise be renamed; a recursively transferred non-empty directory is placed beneath a missing destination directory.
+
+The lexical trailing slash on `DESTINATION` is retained in run and recovery data. Transform runs classify the staged source and destination once, atomically persist the resulting exact-target or directory-target plan, and reuse that plan on retries.
 
 With `--delete-after-import`, the client first records durable local identity. Successful rsync authorizes cleanup, but the local entry is removed only if its current kind and identity still match the recorded entry.
 

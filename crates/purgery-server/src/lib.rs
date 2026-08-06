@@ -149,7 +149,13 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
         let resolved = cwd.join(run_config.destination.as_str());
         let resolved_utf8 = camino::Utf8PathBuf::from_path_buf(resolved)
             .map_err(|_| anyhow::anyhow!("resolved destination path is not valid UTF-8"))?;
-        let resolved_dest = purgery_core::DestinationPath::new(resolved_utf8)
+        let resolved_operand =
+            if run_config.destination.intent() == purgery_core::DestinationIntent::Directory {
+                format!("{}/", resolved_utf8.as_str().trim_end_matches('/'))
+            } else {
+                resolved_utf8.to_string()
+            };
+        let resolved_dest = purgery_core::DestinationPath::new(resolved_operand.into())
             .with_context(|| "resolved destination path is invalid")?;
 
         // Atomically rewrite run.toml with the resolved destination so that
@@ -169,7 +175,7 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
         fs::rename(tmp_path.as_std_path(), run_config_path.as_std_path())
             .with_context(|| "failed to commit updated run config")?;
 
-        Some(resolved_dest.as_str().to_owned())
+        Some(resolved_dest.operand())
     } else {
         None
     };
@@ -846,6 +852,7 @@ delete_after_import = true
             format!("univ/{destination_path}")
         };
         let destination = test_destination_from_run_dir(dir, &requested);
+        let destination_operand = format!("{}/", destination.as_str().trim_end_matches('/'));
         let content = format!(
             r#"purgery_version = "0.1.0-test"
 nickname = "{}"
@@ -853,7 +860,7 @@ destination = "{}"
 delete_after_import = true
 "#,
             nickname.as_str(),
-            destination.as_str(),
+            destination_operand,
         );
         fs::write(dir.join("run.toml"), &content).unwrap();
     }

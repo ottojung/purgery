@@ -180,7 +180,7 @@ destination = "/archive"
 delete_after_import = true
 ```
 
-The `destination` field is the target parent directory. It may be absolute or relative. For transform runs, a relative destination is resolved against the server's working directory during `prepare-run` and the `run.toml` is atomically rewritten with the absolute path.
+The `destination` field is the validated rsync destination operand. It may be absolute or relative, and serialization retains a trailing slash because it forces directory intent. For transform runs, a relative destination is resolved against the server's working directory during `prepare-run` and the `run.toml` is atomically rewritten without discarding that intent. Protocol version 3 defines these operand semantics.
 
 The source entry base final path is `<destination>/<source_entry_name>`. `{target_directory}` is `<destination>` (the parent of the base final path).
 
@@ -425,5 +425,4 @@ A file with a compatible `purgery_version` but malformed content, wrong envelope
 - Allow patch-version interoperability so security fixes and minor improvements do not break compatibility.
 - Leave old state in place for operator inspection and manual cleanup.
 - Keep cleanup and deletion authority conservative by refusing to act on incompatible cleanup state.
-
 
