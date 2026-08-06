@@ -180,11 +180,11 @@ destination = "/archive"
 delete_after_import = true
 ```
 
-The `destination` field is the validated rsync destination operand. It may be absolute or relative, and serialization retains a trailing slash because it forces directory intent. For transform runs, a relative destination is resolved against the server's working directory during `prepare-run` and the `run.toml` is atomically rewritten without discarding that intent. Protocol version 3 defines these operand semantics.
+The `destination` field is the validated rsync destination operand. It may be absolute or relative, and serialization retains directory-forcing syntax: a trailing slash, terminal `/.`, `.`, or `./`. For transform runs, a relative destination is resolved against the server's working directory during `prepare-run` and the `run.toml` is atomically rewritten without discarding that intent. Protocol version 3 defines these operand semantics.
 
-The source entry base final path is `<destination>/<source_entry_name>`. `{target_directory}` is `<destination>` (the parent of the base final path).
+The resolved source entry base path is either the exact destination operand or `<destination>/<source_entry_name>`, according to the persisted destination plan. `{target_directory}` is the parent of that resolved target path.
 
-Transform programs are responsible for placing outputs at the resolved expected output paths. Purgery does not move or commit transform outputs. After the transform exits successfully, Purgery checks that each declared expected output exists. `expected_outputs` are path patterns: relative patterns resolve against `<DESTINATION>`, absolute patterns are used as-is, and `{target_directory}` is allowed.
+Transform programs are responsible for placing outputs at the resolved expected output paths. Purgery does not move or commit transform outputs. After the transform exits successfully, Purgery checks that each declared expected output exists. `expected_outputs` are path patterns: relative patterns resolve against the persisted `{target_directory}`, while absolute patterns are used as-is.
 
 `work_dir` is never final storage.
 
@@ -245,9 +245,9 @@ transform = "compress-video"
 
 ### Final path computation
 
-The source entry base final path is `<destination>/<source_entry_name>`. `{target_directory}` is `<destination>`.
+The source entry base final path and `{target_directory}` come from the persisted exact-target or directory-target plan.
 
-For transform entries, `final_paths` in the status records the resolved expected output paths whose existence Purgery confirmed after the transform. Relative `expected_outputs` resolve against `<DESTINATION>`, absolute paths are used as-is, and `{target_directory}` is allowed. If `expected_outputs = []`, no paths are checked and `final_paths` is empty. Purgery does not move or commit transform outputs; it only checks that declared expected outputs exist. Transformed inputs are consumed by the transform flow and are never placed as final outputs.
+For transform entries, `final_paths` in the status records the resolved expected output paths whose existence Purgery confirmed after the transform. Relative `expected_outputs` resolve against the persisted `{target_directory}`; absolute paths are used as-is. If `expected_outputs = []`, no paths are checked and `final_paths` is empty. Purgery does not move or commit transform outputs; it only checks that declared expected outputs exist. Transformed inputs are consumed by the transform flow and are never placed as final outputs.
 
 Examples:
 
@@ -425,4 +425,3 @@ A file with a compatible `purgery_version` but malformed content, wrong envelope
 - Allow patch-version interoperability so security fixes and minor improvements do not break compatibility.
 - Leave old state in place for operator inspection and manual cleanup.
 - Keep cleanup and deletion authority conservative by refusing to act on incompatible cleanup state.
-

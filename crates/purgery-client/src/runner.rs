@@ -1153,9 +1153,13 @@ mod tests {
         runner
             .run_rsync("/src", "host", "/archive/name.mkv/")
             .unwrap();
+        runner
+            .run_rsync("/src", "host", "/archive/name.mkv/.")
+            .unwrap();
         let log = runner.command_log();
         assert!(log[0].ends_with("host:/archive/name.mkv"));
         assert!(log[1].ends_with("host:/archive/name.mkv/"));
+        assert!(log[2].ends_with("host:/archive/name.mkv/."));
     }
 
     #[test]

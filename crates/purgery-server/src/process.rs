@@ -729,7 +729,6 @@ pub fn process_processing_run(
 
     if matches!(outcome, EntryOutcome::Success { .. }) {
         let _ = fs::remove_dir_all(&work_area);
-        let _ = fs::remove_file(processing_path.join("destination-plan.toml"));
     }
 
     write_progress_best_effort(

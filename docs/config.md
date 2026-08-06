@@ -154,8 +154,8 @@ The `destination` field is the client-supplied destination path. It may be absol
 
 Final path computation:
 
-- The source entry base final path is `<destination>/<source_entry_name>`.
-- `{target_directory}` is the parent directory of the base final path: `<destination>`.
+- The source entry base final path is the exact destination or a child of the destination, as recorded by the resolved destination plan.
+- `{target_directory}` is the parent directory of that resolved target path.
 - For transform entries, the transform program places outputs in `{target_directory}`. Purgery does not move or commit outputs.
 - `work_dir` is never final storage.
 

@@ -283,11 +283,13 @@ pub enum DestinationIntent {
 
 /// A validated rsync destination operand.
 ///
-/// `path` is normalized at the CLI/protocol boundary while `intent` preserves
-/// the trailing slash which rsync uses to force directory interpretation.
+/// `path` is normalized at the CLI/protocol boundary while `operand` preserves
+/// validated lexical syntax for direct rsync and `intent` records syntax that
+/// forces directory interpretation (`/`, `/.`, `.`, or `./`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DestinationPath {
     path: Utf8PathBuf,
+    operand: String,
     intent: DestinationIntent,
 }
 
@@ -301,7 +303,8 @@ impl DestinationPath {
             return Err(PathValidationError::EmptyComponent);
         }
 
-        let directory_intent = path.as_str().ends_with('/');
+        let raw = path.as_str();
+        let directory_intent = raw.ends_with('/') || raw == "." || raw.ends_with("/.");
         let absolute = path.is_absolute();
         let mut components = Vec::new();
         for component in path.components() {
@@ -322,12 +325,14 @@ impl DestinationPath {
             }
         } else {
             if components.is_empty() {
-                return Err(PathValidationError::EmptyComponent);
+                Utf8PathBuf::from(".")
+            } else {
+                Utf8PathBuf::from(components.join("/"))
             }
-            Utf8PathBuf::from(components.join("/"))
         };
         Ok(Self {
             path: normalized,
+            operand: raw.to_owned(),
             intent: if directory_intent {
                 DestinationIntent::Directory
             } else {
@@ -351,11 +356,7 @@ impl DestinationPath {
     /// Reconstructs the path portion of the rsync operand, including forced
     /// directory intent. Root already contains its slash.
     pub fn operand(&self) -> String {
-        if self.intent == DestinationIntent::Directory && self.path.as_str() != "/" {
-            format!("{}/", self.path)
-        } else {
-            self.path.to_string()
-        }
+        self.operand.clone()
     }
 
     pub fn join(&self, relative: &NormalizedRelativePath) -> Utf8PathBuf {
@@ -583,7 +584,15 @@ mod destination_tests {
         struct Envelope {
             destination: DestinationPath,
         }
-        for value in ["archive/name.mkv", "archive/name.mkv/", "/", "./archive/"] {
+        for value in [
+            "archive/name.mkv",
+            "archive/name.mkv/",
+            "archive/name.mkv/.",
+            "/",
+            ".",
+            "./",
+            "./archive/",
+        ] {
             let original = Envelope {
                 destination: operand(value),
             };
@@ -594,6 +603,76 @@ mod destination_tests {
                 original.destination.operand()
             );
         }
+    }
+
+    #[test]
+    fn terminal_dot_and_current_directory_force_directory_intent() {
+        for value in [".", "./", "/archive/new/."] {
+            let destination = operand(value);
+            assert_eq!(destination.intent(), DestinationIntent::Directory);
+            assert_eq!(destination.operand(), value);
+        }
+        let plan = resolve_destination(
+            &operand("/archive/new/."),
+            &entry("item"),
+            ManifestEntryKind::RegularFile,
+            false,
+            DestinationState::Missing,
+        )
+        .unwrap();
+        assert_eq!(plan.target_path, "/archive/new/item");
+        assert!(resolve_destination(
+            &operand("/archive/existing/."),
+            &entry("item"),
+            ManifestEntryKind::RegularFile,
+            false,
+            DestinationState::NonDirectory,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn terminal_dot_resolver_matches_installed_rsync() {
+        use std::process::Command;
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("item");
+        std::fs::write(&source, b"data").unwrap();
+        let forced_directory = temp.path().join("missing/.");
+        let status = Command::new("rsync")
+            .args([
+                "--recursive",
+                "--partial",
+                "--inplace",
+                "--mkpath",
+                "--archive",
+                "--protect-args",
+                "--",
+            ])
+            .arg(&source)
+            .arg(&forced_directory)
+            .status()
+            .expect("installed rsync is required for the destination differential test");
+        assert!(status.success());
+        assert!(temp.path().join("missing/item").is_file());
+
+        let existing_file = temp.path().join("existing");
+        std::fs::write(&existing_file, b"old").unwrap();
+        let status = Command::new("rsync")
+            .args([
+                "--recursive",
+                "--partial",
+                "--inplace",
+                "--mkpath",
+                "--archive",
+                "--protect-args",
+                "--",
+            ])
+            .arg(&source)
+            .arg(format!("{}/.", existing_file.display()))
+            .status()
+            .expect("installed rsync is required for the destination differential test");
+        assert!(!status.success());
+        assert_eq!(std::fs::read(&existing_file).unwrap(), b"old");
     }
 
     #[test]
@@ -783,6 +862,20 @@ mod destination_tests {
                 )
                 .unwrap(),
             [Utf8PathBuf::from("/archive/renamed.Z.webm")]
+        );
+
+        let literal_source_token = Utf8Path::new("/work/{target_file_name}");
+        assert_eq!(
+            transform.build_args_for_target(literal_source_token, &recovered)[0],
+            "renamed.mkv"
+        );
+        let source_only = crate::TransformDefinition {
+            args: vec!["{file_name}".into()],
+            ..transform
+        };
+        assert_eq!(
+            source_only.build_args_for_target(literal_source_token, &recovered),
+            ["{target_file_name}"]
         );
     }
 }

@@ -3910,6 +3910,18 @@ delete_after_import = true
                 })
                 .cloned()
                 .collect();
+            // Destination plans are durable run protocol data. Successful runs
+            // retain them in the terminal directory so crash recovery cannot
+            // lose a target decision before terminal publication.
+            v.extend(
+                actual
+                    .iter()
+                    .filter(|path| {
+                        path.file_name()
+                            .is_some_and(|name| name == "destination-plan.toml")
+                    })
+                    .cloned(),
+            );
             v.sort();
             v
         };
@@ -3939,6 +3951,7 @@ delete_after_import = true
 
         let done_path = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Done);
         assert!(done_path.exists());
+        assert!(done_path.join("destination-plan.toml").exists());
 
         let expected = vec![
             config.work_dir.as_path().join("univ"),
