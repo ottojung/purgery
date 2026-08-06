@@ -278,7 +278,9 @@ impl<'de> Deserialize<'de> for ServerWorkDir {
 #[serde(rename_all = "snake_case")]
 pub enum DestinationIntent {
     ExactOrExistingDirectory,
-    Directory,
+    TrailingSlash,
+    TerminalDot,
+    TerminalDotSlash,
 }
 
 /// A validated rsync destination operand.
@@ -304,7 +306,18 @@ impl DestinationPath {
         }
 
         let raw = path.as_str();
-        let directory_intent = raw.ends_with('/') || raw == "." || raw.ends_with("/.");
+        let without_trailing_slashes = raw.trim_end_matches('/');
+        let terminal_dot =
+            without_trailing_slashes == "." || without_trailing_slashes.ends_with("/.");
+        let intent = if raw.ends_with('/') && terminal_dot {
+            DestinationIntent::TerminalDotSlash
+        } else if raw.ends_with('/') {
+            DestinationIntent::TrailingSlash
+        } else if terminal_dot {
+            DestinationIntent::TerminalDot
+        } else {
+            DestinationIntent::ExactOrExistingDirectory
+        };
         let absolute = path.is_absolute();
         let mut components = Vec::new();
         for component in path.components() {
@@ -333,11 +346,7 @@ impl DestinationPath {
         Ok(Self {
             path: normalized,
             operand: raw.to_owned(),
-            intent: if directory_intent {
-                DestinationIntent::Directory
-            } else {
-                DestinationIntent::ExactOrExistingDirectory
-            },
+            intent,
         })
     }
 
@@ -451,6 +460,7 @@ pub enum DestinationState {
     Missing,
     Directory,
     NonDirectory,
+    DanglingSymlink,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -489,20 +499,36 @@ pub fn resolve_destination(
     source_directory_empty: bool,
     destination_state: DestinationState,
 ) -> Result<ResolvedDestinationPlan, DestinationResolutionError> {
-    if operand.intent() == DestinationIntent::Directory
-        && destination_state == DestinationState::NonDirectory
+    let forced_directory = operand.intent() != DestinationIntent::ExactOrExistingDirectory;
+    if forced_directory
+        && matches!(
+            destination_state,
+            DestinationState::NonDirectory | DestinationState::DanglingSymlink
+        )
     {
         return Err(DestinationResolutionError::DirectoryRequired);
     }
     if source_kind == ManifestEntryKind::Directory
-        && destination_state == DestinationState::NonDirectory
+        && (destination_state == DestinationState::NonDirectory
+            || (destination_state == DestinationState::DanglingSymlink && !source_directory_empty))
     {
         return Err(DestinationResolutionError::DirectoryOntoNonDirectory);
     }
 
-    let directory_target = operand.intent() == DestinationIntent::Directory
+    if destination_state == DestinationState::Missing
+        && (operand.intent() == DestinationIntent::TerminalDotSlash
+            || (operand.intent() == DestinationIntent::TerminalDot
+                && source_kind == ManifestEntryKind::Directory
+                && !source_directory_empty))
+    {
+        return Err(DestinationResolutionError::DirectoryRequired);
+    }
+
+    let directory_target = forced_directory
         || destination_state == DestinationState::Directory
-        || (source_kind == ManifestEntryKind::Directory && !source_directory_empty);
+        || (source_kind == ManifestEntryKind::Directory
+            && !source_directory_empty
+            && destination_state != DestinationState::DanglingSymlink);
     let (target_path, placement) = if directory_target {
         (
             operand.join(entry_path),
@@ -609,9 +635,24 @@ mod destination_tests {
     fn terminal_dot_and_current_directory_force_directory_intent() {
         for value in [".", "./", "/archive/new/."] {
             let destination = operand(value);
-            assert_eq!(destination.intent(), DestinationIntent::Directory);
+            assert_ne!(
+                destination.intent(),
+                DestinationIntent::ExactOrExistingDirectory
+            );
             assert_eq!(destination.operand(), value);
         }
+        assert_eq!(
+            operand("/archive/").intent(),
+            DestinationIntent::TrailingSlash
+        );
+        assert_eq!(
+            operand("/archive/.").intent(),
+            DestinationIntent::TerminalDot
+        );
+        assert_eq!(
+            operand("/archive/./").intent(),
+            DestinationIntent::TerminalDotSlash
+        );
         let plan = resolve_destination(
             &operand("/archive/new/."),
             &entry("item"),
@@ -673,6 +714,114 @@ mod destination_tests {
             .expect("installed rsync is required for the destination differential test");
         assert!(!status.success());
         assert_eq!(std::fs::read(&existing_file).unwrap(), b"old");
+    }
+
+    #[test]
+    fn directory_terminal_forms_match_installed_rsync() {
+        use std::process::Command;
+        let cases = [
+            (true, "missing/", true),
+            (true, "missing/.", true),
+            (true, "missing/./", false),
+            (false, "missing/", true),
+            (false, "missing/.", false),
+            (false, "missing/./", false),
+        ];
+        for (empty, destination_suffix, succeeds) in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source");
+            std::fs::create_dir(&source).unwrap();
+            if !empty {
+                std::fs::write(source.join("child"), b"data").unwrap();
+            }
+            let destination = temp.path().join(destination_suffix);
+            let status = Command::new("rsync")
+                .args([
+                    "--recursive",
+                    "--partial",
+                    "--inplace",
+                    "--mkpath",
+                    "--archive",
+                    "--protect-args",
+                    "--",
+                ])
+                .arg(&source)
+                .arg(&destination)
+                .status()
+                .expect("installed rsync is required for the destination differential test");
+            assert_eq!(status.success(), succeeds, "case {destination_suffix}");
+
+            let destination =
+                DestinationPath::new(Utf8PathBuf::from_path_buf(destination).unwrap()).unwrap();
+            let resolved = resolve_destination(
+                &destination,
+                &entry("source"),
+                ManifestEntryKind::Directory,
+                empty,
+                DestinationState::Missing,
+            );
+            assert_eq!(resolved.is_ok(), succeeds, "case {destination_suffix}");
+            if let Ok(plan) = resolved {
+                assert_eq!(plan.target_path.file_name(), Some("source"));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_destination_symlink_matrix_matches_installed_rsync() {
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+        let cases = [
+            (ManifestEntryKind::RegularFile, true, "dangling", true),
+            (ManifestEntryKind::Directory, true, "dangling", true),
+            (ManifestEntryKind::Directory, false, "dangling", false),
+            (ManifestEntryKind::RegularFile, true, "dangling/", false),
+            (ManifestEntryKind::RegularFile, true, "dangling/.", false),
+        ];
+        for (kind, empty, destination_suffix, succeeds) in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source");
+            match kind {
+                ManifestEntryKind::RegularFile => std::fs::write(&source, b"data").unwrap(),
+                ManifestEntryKind::Directory => {
+                    std::fs::create_dir(&source).unwrap();
+                    if !empty {
+                        std::fs::write(source.join("child"), b"data").unwrap();
+                    }
+                }
+                ManifestEntryKind::Symlink => unreachable!(),
+            }
+            let dangling = temp.path().join("dangling");
+            symlink("missing-target", &dangling).unwrap();
+            let destination = temp.path().join(destination_suffix);
+            let status = Command::new("rsync")
+                .args([
+                    "--recursive",
+                    "--partial",
+                    "--inplace",
+                    "--mkpath",
+                    "--archive",
+                    "--protect-args",
+                    "--",
+                ])
+                .arg(&source)
+                .arg(&destination)
+                .status()
+                .expect("installed rsync is required for the destination differential test");
+            assert_eq!(status.success(), succeeds, "case {destination_suffix}");
+
+            let destination =
+                DestinationPath::new(Utf8PathBuf::from_path_buf(destination).unwrap()).unwrap();
+            let resolved = resolve_destination(
+                &destination,
+                &entry("source"),
+                kind,
+                empty,
+                DestinationState::DanglingSymlink,
+            );
+            assert_eq!(resolved.is_ok(), succeeds, "case {destination_suffix}");
+        }
     }
 
     #[test]

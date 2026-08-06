@@ -180,7 +180,7 @@ destination = "/archive"
 delete_after_import = true
 ```
 
-The `destination` field is the validated rsync destination operand. It may be absolute or relative, and serialization retains directory-forcing syntax: a trailing slash, terminal `/.`, `.`, or `./`. For transform runs, a relative destination is resolved against the server's working directory during `prepare-run` and the `run.toml` is atomically rewritten without discarding that intent. Protocol version 3 defines these operand semantics.
+The `destination` field is the validated rsync destination operand. It may be absolute or relative, and serialization retains distinct directory-forcing forms: a trailing slash, terminal `/.`, `.`, or `./`. The forms are not interchangeable when `--mkpath` creates a destination for a recursive directory transfer. For transform runs, a relative destination is resolved against the server's working directory during `prepare-run` and the `run.toml` is atomically rewritten without discarding its form. Protocol version 3 defines these operand semantics.
 
 The resolved source entry base path is either the exact destination operand or `<destination>/<source_entry_name>`, according to the persisted destination plan. `{target_directory}` is the parent of that resolved target path.
 

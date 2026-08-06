@@ -213,7 +213,19 @@ fn load_or_resolve_destination_plan(
         return toml::from_str(&contents)
             .map_err(|e| format!("failed to parse destination plan: {e}"));
     }
-    let destination_state = match fs::metadata(destination.as_path()) {
+    let destination_state = match fs::symlink_metadata(destination.as_path()) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            match fs::metadata(destination.as_path()) {
+                Ok(target) if target.is_dir() => DestinationState::Directory,
+                Ok(_) => DestinationState::NonDirectory,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    DestinationState::DanglingSymlink
+                }
+                Err(error) => {
+                    return Err(format!("failed to inspect destination symlink: {error}"))
+                }
+            }
+        }
         Ok(metadata) if metadata.is_dir() => DestinationState::Directory,
         Ok(_) => DestinationState::NonDirectory,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => DestinationState::Missing,

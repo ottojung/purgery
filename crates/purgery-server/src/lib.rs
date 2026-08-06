@@ -149,12 +149,13 @@ pub fn prepare_run(config: &ServerConfig, nickname: &Nickname, run_id: &RunId) -
         let resolved = cwd.join(run_config.destination.as_str());
         let resolved_utf8 = camino::Utf8PathBuf::from_path_buf(resolved)
             .map_err(|_| anyhow::anyhow!("resolved destination path is not valid UTF-8"))?;
-        let resolved_operand =
-            if run_config.destination.intent() == purgery_core::DestinationIntent::Directory {
-                format!("{}/", resolved_utf8.as_str().trim_end_matches('/'))
-            } else {
-                resolved_utf8.to_string()
-            };
+        let resolved_base = resolved_utf8.as_str().trim_end_matches('/');
+        let resolved_operand = match run_config.destination.intent() {
+            purgery_core::DestinationIntent::ExactOrExistingDirectory => resolved_utf8.to_string(),
+            purgery_core::DestinationIntent::TrailingSlash => format!("{resolved_base}/"),
+            purgery_core::DestinationIntent::TerminalDot => format!("{resolved_base}/."),
+            purgery_core::DestinationIntent::TerminalDotSlash => format!("{resolved_base}/./"),
+        };
         let resolved_dest = purgery_core::DestinationPath::new(resolved_operand.into())
             .with_context(|| "resolved destination path is invalid")?;
 
@@ -2886,7 +2887,7 @@ delete_after_import = true
     }
 
     #[test]
-    fn prepare_run_rewrites_relative_destination() {
+    fn prepare_run_rewrites_relative_terminal_dot_without_losing_intent() {
         let tmp = tempfile::tempdir().unwrap();
         let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
         let mut config = test_server_config(&work_dir);
@@ -2907,7 +2908,7 @@ delete_after_import = true
             .run_dir(&nickname, &run_id, RunPhase::Incoming);
         fs::create_dir_all(&incoming).unwrap();
 
-        write_run_toml_with_raw_destination(&incoming, &nickname, "relative/path");
+        write_run_toml_with_raw_destination(&incoming, &nickname, "relative/path/.");
 
         let manifest = Manifest {
             purgery_version: "0.1.0-test".to_string(),
@@ -2943,7 +2944,7 @@ delete_after_import = true
             "resolved destination must be absolute, got: {resolved}"
         );
         assert!(
-            resolved.ends_with("relative/path"),
+            resolved.ends_with("relative/path/."),
             "resolved destination must end with the original relative path, got: {resolved}"
         );
 
@@ -2953,6 +2954,10 @@ delete_after_import = true
         assert!(
             run_config.destination.is_absolute(),
             "rewritten run.toml destination must be absolute"
+        );
+        assert_eq!(
+            run_config.destination.intent(),
+            purgery_core::DestinationIntent::TerminalDot
         );
     }
 

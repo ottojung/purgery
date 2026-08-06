@@ -8,7 +8,7 @@ Without `--transform`, the client runs rsync directly to `USER@HOST:DESTINATION`
 
 The source entry is transferred with trailing slashes stripped. Trailing slashes on the source operand do not change source-entry semantics. Destination placement follows rsync: a file uses an existing directory or a slash-terminated operand as its parent, while a missing non-slash operand is its exact new name. An empty directory can likewise be renamed; a recursively transferred non-empty directory is placed beneath a missing destination directory.
 
-Directory-forcing syntax on `DESTINATION` is retained in run and recovery data. A trailing slash, terminal `/.`, `.`, and `./` all express directory intent. Transform runs classify the staged source and destination once, atomically persist the resulting exact-target or directory-target plan, and reuse that plan on retries.
+Directory-forcing syntax on `DESTINATION` is retained in run and recovery data. A trailing slash, terminal `/.`, `.`, and `./` express directory intent, but remain distinct because rsync and `--mkpath` handle a missing terminal-dot directory differently for recursive directory sources. Transform runs classify the staged source, destination entry (including dangling symlinks), and operand form once, atomically persist the resulting plan, and reuse that plan on retries.
 
 With `--delete-after-import`, the client first records durable local identity. Successful rsync authorizes cleanup, but the local entry is removed only if its current kind and identity still match the recorded entry.
 
