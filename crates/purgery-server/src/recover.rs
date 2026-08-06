@@ -62,6 +62,7 @@ pub fn recover_or_process_processing_run(
     let processing_path = config
         .work_dir
         .run_dir(nickname, run_id, RunPhase::Processing);
+    crate::process::validate_run_lease_protocol(&processing_path)?;
     let status_path = processing_path.join("status.toml");
 
     match fs::read_to_string(&status_path) {

@@ -954,6 +954,94 @@ delete_after_import = true
         (config, staged_path)
     }
 
+    fn write_test_lease_with_protocol(
+        run_dir: &Utf8Path,
+        nickname: &Nickname,
+        run_id: &RunId,
+        protocol_version: u32,
+    ) {
+        let lease = purgery_core::LeaseFile {
+            protocol_version,
+            purgery_version: purgery_core::current_purgery_version().to_owned(),
+            nickname: nickname.as_str().to_owned(),
+            run_id: run_id.as_str().to_owned(),
+            created_at_unix_secs: 1,
+            last_heartbeat_unix_secs: 1,
+            expires_at_unix_secs: u64::MAX,
+        };
+        fs::write(run_dir.join("lease.toml"), toml::to_string(&lease).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn ready_run_with_protocol_v2_lease_is_left_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("protocol-v2-ready".into()).unwrap();
+        let (config, staged_path) = setup_single_file_ready(
+            &work_dir,
+            &nickname,
+            &run_id,
+            "missing-target",
+            "video.mkv",
+            b"video",
+        );
+        let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
+        write_test_lease_with_protocol(&ready, &nickname, &run_id, 2);
+
+        let outcome = crate::process::claim_ready_run(&config, &nickname, &run_id);
+        assert!(matches!(
+            outcome,
+            crate::process::ReadyClaimOutcome::IncompatibleReady { .. }
+        ));
+        assert!(ready.exists());
+        assert!(staged_path.exists());
+        assert!(!ready.join("destination-plan.toml").exists());
+        assert!(!config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Processing)
+            .exists());
+    }
+
+    #[test]
+    fn processing_run_with_protocol_v2_lease_is_left_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = Utf8PathBuf::from_path_buf(tmp.path().join("purgery")).unwrap();
+        let nickname = Nickname::new("laptop".into()).unwrap();
+        let run_id = RunId::new("protocol-v2-processing".into()).unwrap();
+        let (config, staged_path) = setup_single_file_ready(
+            &work_dir,
+            &nickname,
+            &run_id,
+            "missing-target",
+            "video.mkv",
+            b"video",
+        );
+        let ready = config.work_dir.run_dir(&nickname, &run_id, RunPhase::Ready);
+        let processing = config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Processing);
+        write_test_lease_with_protocol(&ready, &nickname, &run_id, 2);
+        fs::create_dir_all(processing.parent().unwrap()).unwrap();
+        fs::rename(&ready, &processing).unwrap();
+        let staged_path = processing.join(staged_path.strip_prefix(&ready).unwrap());
+
+        let error = recover_or_process_processing_run(&config, &nickname, &run_id).unwrap_err();
+        assert!(matches!(error, RecoveryError::IncompatibleStatus { .. }));
+        assert!(processing.exists());
+        assert!(staged_path.exists());
+        assert!(!processing.join("destination-plan.toml").exists());
+        assert!(!processing.join("status.toml").exists());
+        assert!(!config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Done)
+            .exists());
+        assert!(!config
+            .work_dir
+            .run_dir(&nickname, &run_id, RunPhase::Failed)
+            .exists());
+    }
+
     // ── full processing pipeline nickname-free archive paths ──
 
     #[test]

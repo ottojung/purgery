@@ -200,6 +200,35 @@ fn failed_entry(entry: &ManifestEntry, error: impl Into<String>) -> EntryOutcome
     }
 }
 
+/// Rejects queued state written by a protocol with different persisted
+/// destination semantics before any run input is interpreted or mutated.
+pub(crate) fn validate_run_lease_protocol(run_dir: &Utf8Path) -> Result<(), ProcessingError> {
+    let lease_path = run_dir.join("lease.toml");
+    let contents = match fs::read_to_string(&lease_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(ProcessingError::Other(anyhow::anyhow!(
+                "failed to read run lease: {error}"
+            )))
+        }
+    };
+    let lease: purgery_core::LeaseFile = toml::from_str(&contents).map_err(|error| {
+        ProcessingError::Other(anyhow::anyhow!("failed to parse run lease: {error}"))
+    })?;
+    if lease.protocol_version != purgery_core::PROTOCOL_VERSION {
+        return Err(ProcessingError::Incompatible {
+            path: lease_path,
+            message: format!(
+                "incompatible run lease protocol version: producer {}, current {}; leaving run untouched",
+                lease.protocol_version,
+                purgery_core::PROTOCOL_VERSION,
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn load_or_resolve_destination_plan(
     processing_path: &Utf8Path,
     destination: &DestinationPath,
@@ -388,14 +417,15 @@ fn process_manifest_entry(
 /// Read and validate run.toml and manifest.toml from a run directory,
 /// checking version compatibility before any mutation.
 ///
-/// Returns `Incompatible` if purgery_version is missing, malformed, or
-/// major/minor-incompatible. Returns `Other` for IO errors or current-
-/// version parse failures.
+/// Returns `Incompatible` if a persisted lease has another protocol version,
+/// or if purgery_version is missing, malformed, or major/minor-incompatible.
+/// Returns `Other` for IO errors or current-version parse failures.
 fn read_compatible_run_inputs(
     run_dir: &Utf8Path,
     nickname: &Nickname,
     run_id: &RunId,
 ) -> std::result::Result<(RunConfig, Manifest), ProcessingError> {
+    validate_run_lease_protocol(run_dir)?;
     let run_config_path = run_dir.join("run.toml");
     let run_config_content = fs::read_to_string(&run_config_path)
         .map_err(|e| ProcessingError::Other(anyhow::anyhow!("failed to read run config: {e}")))?;

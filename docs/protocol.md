@@ -182,6 +182,8 @@ delete_after_import = true
 
 The `destination` field is the validated rsync destination operand. It may be absolute or relative, and serialization retains distinct directory-forcing forms: a trailing slash, terminal `/.`, `.`, or `./`. The forms are not interchangeable when `--mkpath` creates a destination for a recursive directory transfer. For transform runs, a relative destination is resolved against the server's working directory during `prepare-run` and the `run.toml` is atomically rewritten without discarding its form. Protocol version 3 defines these operand semantics.
 
+Ready and processing runs retain `lease.toml`. Before claiming or recovering a queued run, the server requires its lease `protocol_version` to equal the current protocol version. A mismatch is incompatible persisted state and is left untouched for operator inspection.
+
 The resolved source entry base path is either the exact destination operand or `<destination>/<source_entry_name>`, according to the persisted destination plan. `{target_directory}` is the parent of that resolved target path.
 
 Transform programs are responsible for placing outputs at the resolved expected output paths. Purgery does not move or commit transform outputs. After the transform exits successfully, Purgery checks that each declared expected output exists. `expected_outputs` are path patterns: relative patterns resolve against the persisted `{target_directory}`, while absolute patterns are used as-is.
